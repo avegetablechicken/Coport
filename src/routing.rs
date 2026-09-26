@@ -69,12 +69,12 @@ impl Config {
                 .credential(&self.codex.base_url.api_key, identities.is_empty())
                 .await
             {
-                Ok((key, upstream)) if key == token => matches.push(Route {
-                    token: key,
-                    account_id: None,
+                Ok(credential) if credential.token == token => matches.push(Route {
+                    token: credential.token,
+                    account_id: credential.account_id,
                     provider: Some(p.label().into()),
                     proxy: p.proxy.clone(),
-                    upstream,
+                    upstream: credential.upstream,
                     custom_upstream: false,
                 }),
                 Ok(_) => {}

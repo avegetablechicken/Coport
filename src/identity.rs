@@ -83,14 +83,17 @@ impl Identity {
 struct Definition {
     env_key: Option<String>,
     base_url: Option<String>,
+    experimental_bearer_token: Option<String>,
     #[serde(default)]
     requires_openai_auth: bool,
 }
-fn definitions() -> Result<BTreeMap<String, Definition>> {
-    let home = std::env::var_os("CODEX_HOME")
+fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| expand("~/.codex"));
-    let path = home.join("config.toml");
+        .unwrap_or_else(|| expand("~/.codex"))
+}
+fn definitions() -> Result<BTreeMap<String, Definition>> {
+    let path = codex_home().join("config.toml");
     #[derive(Deserialize)]
     struct File {
         #[serde(default)]
@@ -108,7 +111,6 @@ fn definitions() -> Result<BTreeMap<String, Definition>> {
     if defs.contains_key("openai") {
         return Err(Error::config("Reserved Codex provider ID openai."));
     }
-    defs.retain(|_, v| !v.requires_openai_auth);
     if defs
         .values()
         .any(|d| d.env_key.as_ref().is_some_and(|k| k.trim().is_empty()))
@@ -121,17 +123,64 @@ fn definitions() -> Result<BTreeMap<String, Definition>> {
             env_key: Some("OPENAI_API_KEY".into()),
             base_url: None,
             requires_openai_auth: false,
+            experimental_bearer_token: None,
         },
     );
     Ok(defs)
 }
+pub struct ProviderCredential {
+    pub token: String,
+    pub upstream: String,
+    pub account_id: Option<String>,
+}
+
+fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>)> {
+    let raw =
+        std::fs::read(path).map_err(|_| Error::config("Cannot read Codex provider auth.json."))?;
+    let value: Value = serde_json::from_slice(&raw)
+        .map_err(|_| Error::config("Invalid Codex provider auth.json."))?;
+    let mode = value["auth_mode"].as_str().unwrap_or_else(|| {
+        if value["OPENAI_API_KEY"].is_string() {
+            "apikey"
+        } else {
+            "chatgpt"
+        }
+    });
+    match mode {
+        "apikey" => Ok((
+            key(value["OPENAI_API_KEY"].as_str().ok_or(Error::config(
+                "Codex provider auth.json requires OPENAI_API_KEY.",
+            ))?)?,
+            None,
+        )),
+        "chatgpt" => {
+            let token = key(value["tokens"]["access_token"]
+                .as_str()
+                .ok_or(Error::config(
+                    "Codex provider auth.json requires tokens.access_token.",
+                ))?)?;
+            let account = value["tokens"]["account_id"]
+                .as_str()
+                .filter(|s| valid_token(s))
+                .map(String::from);
+            Ok((token, account))
+        }
+        _ => Err(Error::config(
+            "Unsupported Codex provider auth.json auth_mode.",
+        )),
+    }
+}
 impl Provider {
-    pub async fn credential(&self, default: &str, shell: bool) -> Result<(String, String)> {
+    pub async fn credential(&self, default: &str, shell: bool) -> Result<ProviderCredential> {
         if let Some(path) = &self.api_key_file {
             let raw = std::fs::read_to_string(expand(path))
                 .map_err(|_| Error::config("Cannot read API Key file."))?;
             let upstream = unwrap_upstream(self.upstream_base_url.as_deref().unwrap_or(default))?;
-            return Ok((key(&raw)?, upstream));
+            return Ok(ProviderCredential {
+                token: key(&raw)?,
+                upstream,
+                account_id: None,
+            });
         }
         let defs = definitions()?;
         let selected_id = self
@@ -172,19 +221,19 @@ impl Provider {
             None
         };
         let definition = named.or(reversed);
-        let var = selected_env
-            .or(definition.and_then(|(_, d)| d.env_key.as_deref()))
-            .ok_or(Error::config(
-                "API Key environment variable is unavailable.",
-            ))?;
-        let raw = match std::env::var(var) {
-            Ok(v) => v,
-            Err(_) if shell => shell_value(var).await?,
-            Err(_) => {
-                return Err(Error::config(
-                    "API Key environment variable is unavailable.",
-                ));
-            }
+        let var = selected_env.or(definition.and_then(|(_, d)| d.env_key.as_deref()));
+        let (token, account_id) = if let Some(var) = var {
+            (environment_key_with_shell(var, shell).await?, None)
+        } else if let Some(token) =
+            definition.and_then(|(_, d)| d.experimental_bearer_token.as_deref())
+        {
+            (key(token)?, None)
+        } else if definition.is_some_and(|(_, d)| d.requires_openai_auth) {
+            saved_provider_auth(&codex_home().join("auth.json"))?
+        } else {
+            return Err(Error::config(
+                "Codex provider has no configured Bearer credential.",
+            ));
         };
         let upstream = self
             .upstream_base_url
@@ -193,7 +242,11 @@ impl Provider {
                 .filter(|(id, _)| *id != "openai")
                 .and_then(|(_, d)| d.base_url.as_deref()))
             .unwrap_or(default);
-        Ok((key(&raw)?, unwrap_upstream(upstream)?))
+        Ok(ProviderCredential {
+            token,
+            upstream: unwrap_upstream(upstream)?,
+            account_id,
+        })
     }
 }
 fn key(raw: &str) -> Result<String> {
@@ -337,7 +390,11 @@ impl Config {
             }
         }
         for p in &self.codex.providers {
-            if !keys.insert(p.credential(&self.codex.base_url.api_key, true).await?.0) {
+            if !keys.insert(
+                p.credential(&self.codex.base_url.api_key, true)
+                    .await?
+                    .token,
+            ) {
                 return Err(Error::config("Multiple routes have the same credential."));
             }
         }

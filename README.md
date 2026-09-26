@@ -137,6 +137,22 @@ as environment variable names and may reverse-match a provider by `env_key`.
 Multiple reverse matches are rejected. The built-in `openai` provider and unmatched
 variables use `codex.base_url.api_key`; custom providers use the `base_url` in
 Codex's `config.toml`, including supported explicit local wrapper URLs.
+Custom provider credentials are selected in this order: the configured `env_key`,
+then `experimental_bearer_token`, then saved OpenAI authentication only when
+`requires_openai_auth = true`. An unset flag means `false`, matching Codex; neither
+`false` nor omission falls back to saved OpenAI authentication. A configured but
+missing or empty environment key is an error, not a fallback trigger.
+Saved provider authentication is read from `$CODEX_HOME/auth.json` (default
+`~/.codex/auth.json`): `auth_mode = "apikey"` selects `OPENAI_API_KEY`, and
+`auth_mode = "chatgpt"` selects `tokens.access_token` and the optional
+`tokens.account_id`. Without `auth_mode`, a stored API key takes precedence.
+ChatGPT provider credentials retain the account header and the provider's upstream.
+This discovery reads file-backed API key/ChatGPT login state; it does not emulate
+Codex's keyring, in-memory authentication, command auth, or environment-only login
+overrides. Use an explicit environment/file credential source for those cases.
+Providers with no discoverable Bearer credential cannot use credential matching;
+unauthenticated incoming requests remain rejected. A shared token across multiple
+configured providers or an account route remains ambiguous and is rejected.
 Claude API Key selectors can be environment variable names (using `claude.base_url`)
 or explicit HTTPS upstream bases, as described below. Matched API credentials
 may use Bearer or `x-api-key`; they do not trigger OAuth profile lookup or receive

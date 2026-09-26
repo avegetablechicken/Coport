@@ -330,6 +330,74 @@ routing:
                 assert len(probe.requests) > before
                 assert probe.requests[-1].startswith(f"CONNECT {host}:443 ".encode())
             print("PASS: nested base_url/routing schema, independent account/API/MCP fallbacks and private migration")
+            # Provider auth selection mirrors Codex: env > explicit bearer > saved
+            # OpenAI auth (only when requires_openai_auth is true). All synthetic.
+            config.write_text(f'''listen_port: {port}
+request_timeout_seconds: 3
+proxies:
+  chosen: http://127.0.0.1:{a.server_address[1]}
+codex:
+  routing:
+    api_key:
+      custom: chosen
+''')
+            provider_config = codex_home / "config.toml"
+            provider_auth = codex_home / "auth.json"
+            provider_auth.write_text(json.dumps({"OPENAI_API_KEY": "saved-provider-key"}))
+            def set_provider(flag, extra=""):
+                setting = "" if flag is None else f"requires_openai_auth = {str(flag).lower()}\n"
+                provider_config.write_text(
+                    '[model_providers.custom]\nbase_url = "https://custom-provider.invalid/v1"\n'
+                    + setting + extra
+                )
+            def reaches_provider(token, account=None):
+                before, other = len(a.requests), len(b.requests)
+                assert request(token=token, account=account)[0] == 502
+                assert len(a.requests) > before and len(b.requests) == other
+                assert a.requests[-1].startswith(b"CONNECT custom-provider.invalid:443 ")
+            def refused(token, status=502):
+                before = len(a.requests) + len(b.requests)
+                assert request(token=token)[0] == status
+                assert len(a.requests) + len(b.requests) == before
+            set_provider(True)
+            restart()
+            subprocess.run([BINARY, "--config", str(config), "--check"], env=test_environment, check=True)
+            reaches_provider("saved-provider-key")
+            refused("wrong", 401)
+            for flag in [True, False, None]:
+                set_provider(flag, 'env_key = "REVERSE_TEST_KEY"\nexperimental_bearer_token = "explicit-provider-key"\n')
+                reaches_provider("provider-key-one")
+                refused("explicit-provider-key", 401)
+                refused("saved-provider-key", 401)
+                set_provider(flag, 'experimental_bearer_token = "explicit-provider-key"\n')
+                reaches_provider("explicit-provider-key")
+                refused("saved-provider-key", 401)
+                set_provider(flag)
+                if flag is True:
+                    reaches_provider("saved-provider-key")
+                else:
+                    refused("saved-provider-key")
+                    refused(None, 401)
+            set_provider(True, 'env_key = "REVERSE_TEST_KEY"\nexperimental_bearer_token = "explicit-provider-key"\n')
+            test_environment["REVERSE_TEST_KEY"] = ""  # A configured but empty key must not fall back.
+            restart()
+            refused("saved-provider-key")
+            refused("explicit-provider-key")
+            test_environment["REVERSE_TEST_KEY"] = "provider-key-one"
+            set_provider(True)
+            provider_auth.write_text(json.dumps({"auth_mode": "chatgpt", "OPENAI_API_KEY": "stale-key",
+                                                "tokens": {"access_token": "saved-chat-token", "account_id": "custom-account"}}))
+            reaches_provider("saved-chat-token", "custom-account")
+            refused("stale-key", 401)
+            before = len(a.requests)
+            assert request(token="saved-chat-token", account="wrong-account")[0] == 409
+            assert len(a.requests) == before
+            provider_auth.write_text(json.dumps({"OPENAI_API_KEY": "rotated-provider-key"}))
+            reaches_provider("rotated-provider-key")
+            refused("saved-chat-token", 401)
+            provider_auth.unlink()
+            refused("rotated-provider-key")
+            print("PASS: custom provider true/false/omitted auth, precedence, saved API/ChatGPT credentials and rotation")
             print("PASS: unmatched credentials use only configured OpenAI fallback proxy; ambiguity and invalid proxy refused")
             print("PASS: API Key mode, no auth.json dependency, designated CONNECT route, key rotation, missing-key refusal")
             print("PASS: startup route, per-request accounts/proxies, failures, request IDs, durations, credential/body/query exclusion")
