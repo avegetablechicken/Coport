@@ -187,7 +187,7 @@ fn parse_value(
                             apply_substitution(
                                 substitution_data,
                                 environment,
-                                &substitution_name.drain(..).collect::<String>(),
+                                &std::mem::take(&mut substitution_name),
                                 &mut output,
                             );
                             if c == '$' {
@@ -208,7 +208,7 @@ fn parse_value(
                             apply_substitution(
                                 substitution_data,
                                 environment,
-                                &substitution_name.drain(..).collect::<String>(),
+                                &std::mem::take(&mut substitution_name),
                                 &mut output,
                             );
                         } else {
@@ -259,7 +259,7 @@ fn parse_value(
         apply_substitution(
             substitution_data,
             environment,
-            &substitution_name.drain(..).collect::<String>(),
+            &std::mem::take(&mut substitution_name),
             &mut output,
         );
         Ok(output)
@@ -273,7 +273,7 @@ fn apply_substitution(
     output: &mut String,
 ) {
     if let Some(environment_value) = environment.get(substitution_name) {
-        output.push_str(&environment_value);
+        output.push_str(environment_value);
     } else {
         let stored_value = substitution_data
             .get(substitution_name)
