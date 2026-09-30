@@ -348,6 +348,7 @@ impl Claude {
         let mut identity = None;
         let mut unavailable = false;
         let mut matched_account = false;
+        let mut local_needs_profile = false;
         let account_sources = self.account_sources();
         if bearer {
             let mut sources = Vec::new();
@@ -367,7 +368,15 @@ impl Claude {
             if let Some((label, account, directory)) = sources.pop() {
                 matched_account = true;
                 identity = account.claude_identity(directory.as_deref());
-                matches.push((label, self.account_choice(identity.as_ref(), Some(label))?));
+                match self.account_choice(identity.as_ref(), Some(label)) {
+                    Ok(proxy) => matches.push((label, proxy)),
+                    // A saved token proves the credential source, not the account's
+                    // identity. Resolve missing metadata before selecting an email route.
+                    Err(_) if identity.is_none() && self.routing.account_probe.is_some() => {
+                        local_needs_profile = true;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         for (name, proxy) in self
@@ -382,7 +391,7 @@ impl Claude {
                 Err(_) => unavailable = true,
             }
         }
-        if matches.len() > 1 {
+        if matches.len() > 1 || (local_needs_profile && !matches.is_empty()) {
             return Err(Error::new(
                 409,
                 "Claude credential matches multiple routes.",
@@ -400,7 +409,7 @@ impl Claude {
                 "Claude token does not match a saved account credential.",
             ));
         }
-        let needs_profile = bearer && !matched_account && !matched_api;
+        let needs_profile = local_needs_profile || (bearer && !matched_account && !matched_api);
         let (label, proxy) = if let Some((label, proxy)) = matches.pop() {
             (label.clone(), proxy.clone())
         } else if needs_profile {

@@ -443,6 +443,71 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
 }
 
 #[tokio::test]
+async fn claude_saved_token_without_metadata_probes_then_routes_and_caches() {
+    for file_only in [false, true] {
+        let mut lookup = fixture("http", "sse").await;
+        let mut payload = fixture("http", "redirect").await;
+        let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+        let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+        let credentials = tempfile::tempdir().unwrap();
+        let file = credentials.path().join("credentials.json");
+        std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#).unwrap();
+        let file = serde_json::to_string(&file).unwrap();
+        let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  auth_file: {file}\n  account_auth_file_only: {file_only}\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
+        trust(&running, &lookup, &lookup_endpoint);
+        trust(&running, &payload, &payload_endpoint);
+        for first in [true, false] {
+            let response = http()
+                .post(format!("{}/anthropic/v1/messages", running.url))
+                .bearer_auth("saved-secret")
+                .body("private-payload")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 302);
+            if first {
+                assert!(
+                    lookup
+                        .requests
+                        .recv()
+                        .await
+                        .unwrap()
+                        .starts_with("CONNECT ")
+                );
+                let request = lookup.requests.recv().await.unwrap();
+                assert!(request.starts_with("GET /api/oauth/profile "));
+                assert!(request.contains("authorization: Bearer saved-secret"));
+                assert!(!request.contains("private-payload"));
+            }
+            assert!(lookup.requests.try_recv().is_err());
+            assert!(
+                payload
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .starts_with("CONNECT ")
+            );
+            let request = payload.requests.recv().await.unwrap();
+            assert!(request.starts_with("POST /v1/messages "));
+            assert!(request.ends_with("private-payload"));
+        }
+        assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 1);
+        if file_only {
+            let response = http()
+                .post(format!("{}/anthropic/v1/messages", running.url))
+                .bearer_auth("unknown-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+            assert!(lookup.requests.try_recv().is_err());
+            assert!(payload.requests.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() {
     let mut lookup = fixture("http", "sse").await;
     let mut payload = fixture("http", "redirect").await;

@@ -142,7 +142,11 @@ display name, and full name are matched in that order, followed by the source
 label (`default` for flat `auth_file`) and `claude.routing.account_fallback`.
 Metadata refreshes per request. Missing/malformed metadata leaves explicit source
 label and fallback routing available. An environment-backed account source has
-no associated metadata file and uses its configured label/fallback.
+no associated metadata file and uses its configured label/fallback. If a saved
+token has no usable local identity and neither source-label nor fallback routing
+matches, an explicit `account_probe` resolves its identity before account routing.
+This also applies in `account_auth_file_only: true` mode, since the token already
+matches a saved credential. Existing label/fallback routes do not require a probe.
 
 In `true` mode, even an explicit account fallback cannot admit an unmatched token.
 In `false` mode, `auth_file` may be omitted or unavailable and `--check` skips saved
