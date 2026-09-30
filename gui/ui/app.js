@@ -1,0 +1,636 @@
+"use strict";
+
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
+if (navigator.userAgent.includes("Mac")) document.documentElement.classList.add("macos");
+
+// ---------------------------------------------------------------- icons
+
+const svg = (body, extra = "") =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ${extra}>${body}</svg>`;
+
+const ICON = {
+  copy: svg('<rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/>'),
+  check: svg('<path d="m5 12.5 4.5 4.5L19 7.5"/>'),
+  restart: svg('<path d="M20 11.5A8 8 0 1 1 17.7 6"/><path d="M20 4v5h-5"/>'),
+  back: svg('<path d="m15 18-6-6 6-6"/>', 'stroke-width="2"'),
+  chevron: svg('<path d="m9 6 6 6-6 6"/>', 'stroke-width="2.4"'),
+  search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
+  trash: svg('<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>'),
+  folder: svg('<path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9.5a2 2 0 0 0-2-2h-7l-2-2.5H5a2 2 0 0 0-2 2.5z"/>'),
+};
+
+// ---------------------------------------------------------------- helpers
+
+const $ = (id) => document.getElementById(id);
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function fmtMs(ms) {
+  if (ms == null) return "—";
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+function fmtBytes(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes ?? 0;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function fmtUptime(secs) {
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${secs % 60}s`;
+  return `${secs}s`;
+}
+
+function fmtTime(ms) {
+  return ms == null ? "" : new Date(ms).toLocaleTimeString("en-GB", { hour12: false });
+}
+
+function statusClass(status) {
+  if (status == null) return "none";
+  return `s${Math.min(5, Math.max(2, Math.floor(status / 100)))}`;
+}
+
+/// Proxy candidates as plain text, e.g. "us → jp"; `none` means direct.
+function chain(names) {
+  return names.map((n) => (n === "none" ? "direct" : esc(n))).join(' <span class="faint">→</span> ');
+}
+
+let toastTimer;
+function toast(text) {
+  const el = $("toast");
+  el.textContent = text;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
+}
+
+// ---------------------------------------------------------------- state
+
+const ui = {
+  snap: null,
+  fetchedAt: 0,
+  page: "main",
+  filter: "requests",
+  search: "",
+  rows: [],
+  recent: [],
+  expanded: new Set(),
+  builtPage: null,
+  choosePath: false,
+};
+
+async function refresh() {
+  const [snap, recent] = await Promise.all([
+    invoke("get_state"),
+    invoke("get_activity", { filter: "requests", search: "" }),
+  ]);
+  ui.snap = snap;
+  ui.recent = recent.slice(0, 5);
+  ui.fetchedAt = Date.now();
+  if (ui.page === "activity") await loadActivity(false);
+  render();
+}
+
+let refreshTimer;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, 120);
+}
+
+async function loadActivity(rerender = true) {
+  ui.rows = await invoke("get_activity", { filter: ui.filter, search: ui.search });
+  if (rerender) renderActivityList();
+}
+
+function uptime() {
+  return ui.snap.phase.uptimeSecs + Math.floor((Date.now() - ui.fetchedAt) / 1000);
+}
+
+// ---------------------------------------------------------------- render
+
+function render() {
+  if (!ui.snap) return;
+  renderTop();
+  renderPage();
+  queueFit();
+}
+
+function renderTop() {
+  if (ui.page === "main") {
+    $("top").innerHTML = `
+      <span class="app-name">Coding Agent Proxy</span><span class="version">v${esc(ui.snap.version)}</span>
+      <nav class="links">
+        <button class="text-link" data-action="page" data-page="activity">Activity</button>
+        <button class="text-link" data-action="page" data-page="settings">Settings</button>
+        <button class="text-link" data-action="quit">Quit</button>
+      </nav>`;
+    return;
+  }
+  const title = ui.page === "activity" ? "Activity" : "Settings";
+  const tools =
+    ui.page === "activity"
+      ? `<nav class="links">
+          <button class="icon-btn" data-action="clear-activity" data-tip="Clear list" aria-label="Clear list">${ICON.trash}</button>
+          <button class="icon-btn" data-action="open" data-target="log" data-tip="Open log file" aria-label="Open log file">${ICON.folder}</button>
+        </nav>`
+      : "";
+  $("top").innerHTML = `
+    <button class="text-link back" data-action="page" data-page="main">${ICON.back}Back</button>
+    <span class="page-title">${title}</span>${tools}`;
+}
+
+function renderPage() {
+  const content = $("content");
+  if (ui.page === "activity") {
+    if (ui.builtPage !== "activity") {
+      content.innerHTML = activityShell();
+      ui.builtPage = "activity";
+    }
+    renderActivityList();
+    return;
+  }
+  ui.builtPage = ui.page;
+  content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : main()}</div>`;
+}
+
+/// A block: titled box with an optional right-aligned headline.
+function block(title, aside, body) {
+  return `<section class="block">
+    <div class="block-head"><span class="block-title">${title}</span>${aside ? `<span class="block-aside">${aside}</span>` : ""}</div>
+    ${body}</section>`;
+}
+
+function stat(label, value, cls = "") {
+  return `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${value}</div></div>`;
+}
+
+// ---------------------------------------------------------------- main
+
+function main() {
+  return [proxyBlock(), trafficBlock(), connectBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("");
+}
+
+function message(kind, text, actions = "") {
+  return `<div class="message ${kind}"><span class="message-dot"></span><div class="message-body">${text}${
+    actions ? `<div class="message-actions">${actions}</div>` : ""
+  }</div></div>`;
+}
+
+function proxyBlock() {
+  const s = ui.snap;
+  const state = s.phase.state;
+  const label = { running: "Running", stopped: "Stopped", failed: "Failed to start" }[state];
+  const head = `<span class="state"><span class="dot ${state}"></span>${label}</span>
+    <button class="switch" role="switch" aria-checked="${state === "running"}" data-action="power" aria-label="Start or stop the proxy"></button>`;
+  let messages = "";
+  if (!s.config.exists) {
+    messages += message(
+      "warn",
+      `No configuration file at <span class="selectable">${esc(s.config.path)}</span>.`,
+      `<button class="btn" data-action="create-config">Create from Example</button>
+       <button class="btn" data-action="choose-config">Choose File…</button>`
+    );
+  } else if (s.config.error) {
+    messages += message("bad", esc(s.config.error), `<button class="btn" data-action="open" data-target="config">Edit Configuration</button>`);
+  } else if (state === "failed") {
+    messages += message("bad", esc(s.phase.error));
+  }
+  if (s.config.changedSinceStart) {
+    messages += message("warn", "The configuration changed since the proxy started.", `<button class="btn" data-action="restart">Restart to Apply</button>`);
+  }
+  const strip = `<div class="strip">
+    ${stat("Address", `127.0.0.1:${s.phase.port}`)}
+    ${stat("Uptime", state === "running" ? `<span id="uptime">${fmtUptime(uptime())}</span>` : "—")}
+    ${stat("Config", s.config.error ? "Invalid" : s.config.exists ? "Valid" : "Missing", s.config.error ? "bad" : "")}
+  </div>`;
+  return block("Proxy", head, strip + messages);
+}
+
+function chart(values, errors) {
+  const n = values.length;
+  const max = Math.max(1, ...values);
+  const gap = 2;
+  const w = 300;
+  const h = 32;
+  const bar = (w - gap * (n - 1)) / n;
+  let bars = "";
+  values.forEach((v, i) => {
+    const x = (i * (bar + gap)).toFixed(2);
+    const bh = v ? Math.max(2.5, (v / max) * h) : 1;
+    bars += `<rect class="${v ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"><title>${v} requests</title></rect>`;
+    if (errors[i]) {
+      const eh = (bh * errors[i]) / v;
+      bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
+    }
+  });
+  return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+function trafficBlock() {
+  const st = ui.snap.stats;
+  let rate = "—";
+  let rateClass = "";
+  if (st.requests) {
+    const r = (st.errors / st.requests) * 100;
+    rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
+    rateClass = r >= 10 ? "bad" : "";
+  }
+  return block(
+    "Traffic",
+    "Last 30 minutes",
+    `${chart(st.perMinute, st.errorsPerMinute)}
+     <div class="strip">
+       ${stat("Requests", st.requests)}
+       ${stat("Error Rate", rate, rateClass)}
+       ${stat("Avg. Time", fmtMs(st.avgMs))}
+       ${stat("Received", fmtBytes(st.bytes))}
+     </div>`
+  );
+}
+
+function connectBlock() {
+  const s = ui.snap;
+  const row = (name, url) => `<div class="row">
+      <span class="row-label">${name}</span>
+      <span class="row-value selectable">${esc(url)}</span>
+      <button class="icon-btn" data-action="copy" data-text="${esc(url)}" data-tip="Copy" aria-label="Copy ${name} base URL">${ICON.copy}</button>
+    </div>`;
+  return block(
+    "Connect",
+    "",
+    `${row("Claude Code", s.urls.claude)}${row("Codex", s.urls.codex)}
+     <details class="disclosure"><summary>${ICON.chevron}Setup snippets</summary>
+       ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
+       ${snippet("Top of ~/.codex/config.toml, then restart Codex", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.base}/backend-api"`)}
+     </details>`
+  );
+}
+
+function snippet(label, code) {
+  return `<div class="snippet"><div class="snippet-label">${label}</div><pre>${esc(code)}</pre>
+    <button class="icon-btn" data-action="copy" data-text="${esc(code)}" aria-label="Copy snippet">${ICON.copy}</button></div>`;
+}
+
+function recentBlock() {
+  const rows = ui.recent;
+  const aside = rows.length ? `<button class="text-link" data-action="page" data-page="activity">View All</button>` : "";
+  const body = rows.length
+    ? rows.map((e) => requestRow(e, false)).join("")
+    : `<div class="placeholder">${ui.snap.phase.state === "running" ? "Waiting for the first request…" : "Start the proxy to see requests."}</div>`;
+  return block("Recent Requests", aside, body);
+}
+
+function proxiesBlock() {
+  const d = ui.snap.config.details;
+  if (!d) return "";
+  const aside = d.proxies.length ? `<button class="text-link" data-action="probe">Test All</button>` : "";
+  const body = d.proxies.length
+    ? d.proxies
+        .map((p) => {
+          let result = `<span class="row-value faint">—</span>`;
+          if (p.probe?.state === "pending") result = `<span class="row-value"><span class="spinner"></span></span>`;
+          else if (p.probe?.state === "ok") result = `<span class="row-value">${p.probe.ms} ms</span>`;
+          else if (p.probe?.state === "error")
+            result = `<span class="row-value bad" data-tip="${esc(p.probe.error)}">Unreachable</span>`;
+          return `<div class="row">
+            <span class="row-label"><span class="row-name">${esc(p.name)}</span><span class="row-sub">${esc(p.endpoint)}</span></span>
+            ${result}
+            <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
+          </div>`;
+        })
+        .join("")
+    : `<div class="placeholder">No proxies defined; every route connects directly.</div>`;
+  return block("Outbound Proxies", aside, body);
+}
+
+const FALLBACK_LABEL = {
+  accountFallback: "Account fallback",
+  apiKeyFallback: "API key fallback",
+  mcpFallback: "Docs MCP fallback",
+  accountProbe: "Account probe",
+};
+
+function routingBlock() {
+  const s = ui.snap;
+  const d = s.config.details;
+  if (!d) return "";
+  const report = Object.fromEntries(s.routes.map((r) => [r.name.toLowerCase(), r]));
+  const section = (name, svc) => {
+    const r = report[name.toLowerCase()];
+    const badge = r ? (r.ok ? "" : `<span class="bad" data-tip="${esc(r.reason ?? "")}">Unavailable</span>`) : "";
+    if (!svc.configured) {
+      return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
+    }
+    const rows = [...svc.accountRoutes, ...svc.apiKeyRoutes]
+      .map((x) => `<div class="row compact"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
+      .join("");
+    const fallbacks = svc.fallbacks
+      .filter((f) => f.proxies)
+      .map((f) => `<div class="row compact"><span class="row-label">${FALLBACK_LABEL[f.key]}</span><span class="row-value">${chain(f.proxies)}</span></div>`)
+      .join("");
+    return `<div class="subhead"><span>${name}</span>${badge}</div>${rows}${fallbacks}`;
+  };
+  const legacy = d.legacyProviders.length
+    ? `<div class="subhead"><span>Legacy providers</span></div>${d.legacyProviders
+        .map((x) => `<div class="row compact"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
+        .join("")}`
+    : "";
+  return block("Routing", `Timeout ${d.timeoutSecs} s`, section("Codex", d.codex) + section("Claude", d.claude) + legacy);
+}
+
+// ---------------------------------------------------------------- activity
+
+function activityShell() {
+  return `<div class="page">
+    <label class="search">${ICON.search}
+      <input class="field" id="search" type="search" spellcheck="false" placeholder="Filter by path, proxy or status" value="${esc(ui.search)}" /></label>
+    <div class="segmented" id="filters"></div>
+    <section class="block flush" id="activity-list"></section>
+  </div>`;
+}
+
+function renderActivityList() {
+  const filters = $("filters");
+  if (!filters) return;
+  filters.innerHTML = [
+    ["requests", "Requests"],
+    ["errors", "Errors"],
+    ["all", "All Events"],
+  ]
+    .map(([f, label]) => `<button aria-pressed="${ui.filter === f}" data-action="filter" data-filter="${f}">${label}</button>`)
+    .join("");
+  $("activity-list").innerHTML = ui.rows.length
+    ? ui.rows.map((e) => requestRow(e, true) + (ui.expanded.has(e.seq) ? detail(e) : "")).join("")
+    : `<div class="placeholder">${ui.snap.phase.state === "running" ? "No matching entries." : "The proxy is stopped."}</div>`;
+  queueFit();
+}
+
+function requestRow(e, expandable) {
+  const code = e.status ?? (e.error ? "ERR" : "—");
+  const meta = [fmtTime(e.time), e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
+    .filter(Boolean)
+    .join(" · ");
+  const tag = expandable ? "button" : "div";
+  const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
+  return `<${tag} class="req" ${attrs}>
+    <span class="status ${statusClass(e.status)}">${esc(code)}</span>
+    <span class="req-main">
+      <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(e.path ?? e.event)}</span>
+      ${expandable && meta ? `<span class="req-meta">${esc(meta)}</span>` : ""}
+    </span>
+    <span class="req-dur">${e.durationMs != null ? fmtMs(e.durationMs) : ""}</span>
+  </${tag}>`;
+}
+
+function detail(e) {
+  const rows = Object.entries(e.fields)
+    .map(([k, v]) => {
+      let value = typeof v === "string" ? v : JSON.stringify(v);
+      if (k === "duration_ms" || k === "headers_ms") value = fmtMs(Number(value));
+      if (k === "received_bytes") value = fmtBytes(Number(value));
+      return `<dt>${esc(k)}</dt><dd>${esc(value)}</dd>`;
+    })
+    .join("");
+  const json = JSON.stringify({ event: e.event, timestamp: e.time ? new Date(e.time).toISOString() : undefined, ...e.fields }, null, 2);
+  return `<div class="detail">
+    <dl class="kv"><dt>event</dt><dd>${esc(e.event)}</dd>${e.time ? `<dt>time</dt><dd>${esc(new Date(e.time).toLocaleString("en-GB"))}</dd>` : ""}${rows}</dl>
+    <button class="icon-btn" data-action="copy" data-text="${esc(json)}" data-tip="Copy as JSON" aria-label="Copy as JSON">${ICON.copy}</button>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- settings
+
+function settings() {
+  const s = ui.snap;
+  const set = s.settings;
+  const option = (value, label) => `<option value="${value}" ${value === set.appearance ? "selected" : ""}>${label}</option>`;
+  let status;
+  if (!s.config.exists) status = message("warn", "The file does not exist yet.");
+  else if (s.config.error) status = message("bad", esc(s.config.error));
+  else if (s.config.changedSinceStart)
+    status = message("warn", "Changed since the proxy started.", `<button class="btn" data-action="restart">Restart to Apply</button>`);
+  else status = message("good", "Configuration is valid.");
+  let check = "";
+  if (s.check.running) check = message("info", "Checking credentials…");
+  else if (s.check.message != null) check = message(s.check.ok ? "good" : "bad", esc(s.check.message));
+  return `
+    ${block(
+      "General",
+      "",
+      `<div class="row"><span class="row-label">Launch at login</span>
+         <button class="switch" role="switch" aria-checked="${set.launchAtLogin}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
+       <div class="row"><span class="row-label">Start proxy when the app opens</span>
+         <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy when the app opens"></button></div>
+       <div class="row"><span class="row-label">Appearance</span>
+         <select class="select" data-setting="appearance">${option("System", "System")}${option("Light", "Light")}${option("Dark", "Dark")}</select></div>`
+    )}
+    ${block(
+      "Configuration",
+      "",
+      `<div class="path selectable">${esc(s.config.path)}</div>
+       ${status}${check}
+       <div class="actions">
+         <button class="btn" data-action="open" data-target="config">Edit…</button>
+         <button class="btn" data-action="open" data-target="config-folder">Show in Folder</button>
+         <button class="btn" data-action="check" ${s.config.exists && !s.check.running ? "" : "disabled"}
+           data-tip="Validates credential sources like --check">Check Credentials</button>
+       </div>
+       <details class="disclosure" ${ui.choosePath ? "open" : ""}><summary>${ICON.chevron}Use another file</summary>
+         <div class="inline-form"><input class="field" id="config-path" spellcheck="false" value="${esc(s.config.path)}" />
+           <button class="btn" data-action="apply-path">Apply</button></div>
+       </details>`
+    )}
+    ${block(
+      "Request Log",
+      "",
+      `<div class="row"><span class="row-label path selectable">${esc(set.logPath)}</span>
+         <button class="icon-btn" data-action="open" data-target="log-folder" data-tip="Open folder" aria-label="Open log folder">${ICON.folder}</button></div>`
+    )}`;
+}
+
+// ---------------------------------------------------------------- sizing
+
+let fitQueued = false;
+let lastHeight = 0;
+function queueFit() {
+  if (fitQueued) return;
+  fitQueued = true;
+  requestAnimationFrame(() => {
+    fitQueued = false;
+    const page = $("content").firstElementChild;
+    if (!page) return;
+    const style = getComputedStyle($("content"));
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const height = Math.ceil($("top").offsetHeight + page.offsetHeight + padding);
+    if (Math.abs(height - lastHeight) > 1) {
+      lastHeight = height;
+      invoke("fit_panel", { height });
+    }
+  });
+}
+
+new ResizeObserver(queueFit).observe($("content"));
+
+// ---------------------------------------------------------------- actions
+
+async function act(action, el) {
+  const s = ui.snap;
+  switch (action) {
+    case "page":
+      ui.page = el.dataset.page;
+      if (ui.page === "activity") await loadActivity(false);
+      if (ui.page !== "settings") ui.choosePath = false;
+      render();
+      $("content").scrollTop = 0;
+      break;
+    case "power":
+      await invoke("set_running", { running: s.phase.state !== "running" });
+      await refresh();
+      break;
+    case "restart":
+      await invoke("restart_proxy");
+      toast("Proxy restarted");
+      await refresh();
+      break;
+    case "copy": {
+      await invoke("copy_text", { text: el.dataset.text });
+      const before = el.innerHTML;
+      el.innerHTML = ICON.check;
+      el.classList.add("done");
+      setTimeout(() => {
+        el.innerHTML = before;
+        el.classList.remove("done");
+      }, 1200);
+      break;
+    }
+    case "expand": {
+      const seq = Number(el.dataset.seq);
+      if (ui.expanded.has(seq)) ui.expanded.delete(seq);
+      else ui.expanded.add(seq);
+      renderActivityList();
+      break;
+    }
+    case "filter":
+      ui.filter = el.dataset.filter;
+      await loadActivity();
+      break;
+    case "clear-activity":
+      await invoke("clear_activity");
+      ui.expanded.clear();
+      await loadActivity();
+      break;
+    case "open":
+      await invoke("open_path", { target: el.dataset.target });
+      break;
+    case "probe":
+      await invoke("probe_proxy", { name: el.dataset.name ?? null });
+      await refresh();
+      break;
+    case "check":
+      await invoke("check_credentials");
+      await refresh();
+      break;
+    case "launch-at-login":
+      try {
+        await invoke("set_launch_at_login", { enabled: el.getAttribute("aria-checked") !== "true" });
+      } catch (e) {
+        toast(String(e));
+      }
+      await refresh();
+      break;
+    case "auto-start":
+      await invoke("update_settings", { patch: { startProxyOnLaunch: el.getAttribute("aria-checked") !== "true" } });
+      await refresh();
+      break;
+    case "create-config":
+      try {
+        await invoke("create_example_config");
+        toast("Example configuration created");
+      } catch (e) {
+        toast(String(e));
+      }
+      await refresh();
+      break;
+    case "choose-config":
+      ui.page = "settings";
+      ui.choosePath = true;
+      render();
+      $("config-path")?.focus();
+      break;
+    case "apply-path": {
+      const path = $("config-path").value.trim();
+      if (path) {
+        await invoke("set_config_path", { path });
+        ui.choosePath = false;
+        toast("Configuration file changed");
+        await refresh();
+      }
+      break;
+    }
+    case "quit":
+      await invoke("quit_app");
+      break;
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const el = event.target.closest("[data-action]");
+  if (el && !el.disabled) act(el.dataset.action, el);
+});
+
+document.addEventListener("change", async (event) => {
+  const key = event.target.dataset?.setting;
+  if (!key) return;
+  await invoke("update_settings", { patch: { [key]: event.target.value } });
+  await refresh();
+});
+
+let searchTimer;
+document.addEventListener("input", (event) => {
+  if (event.target.id !== "search") return;
+  ui.search = event.target.value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadActivity(), 120);
+});
+
+document.addEventListener("keydown", (event) => {
+  const mod = event.metaKey || event.ctrlKey;
+  if (event.key === "Escape") {
+    if (ui.page !== "main") act("page", { dataset: { page: "main" } });
+    else invoke("hide_panel");
+  } else if (mod && event.key === "q") {
+    invoke("quit_app");
+  } else if (mod && event.key === ",") {
+    act("page", { dataset: { page: "settings" } });
+  } else if (event.key === "Enter" && event.target.id === "config-path") {
+    act("apply-path");
+  }
+});
+
+document.addEventListener("contextmenu", (event) => {
+  if (!event.target.closest(".selectable, input, pre, dd")) event.preventDefault();
+});
+
+// Live uptime without refetching state.
+setInterval(() => {
+  const el = $("uptime");
+  if (el && ui.snap?.phase.state === "running") el.textContent = fmtUptime(uptime());
+}, 1000);
+
+listen("state-changed", scheduleRefresh);
+listen("panel-shown", () => refresh());
+refresh();

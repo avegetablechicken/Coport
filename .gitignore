@@ -8,3 +8,4 @@ logs/
 nohup.out
 __pycache__/
 target/
+gui/gen/

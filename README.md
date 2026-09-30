@@ -575,6 +575,56 @@ service's `SSL_CERT_FILE` CA bundle (include the system CAs), and restart. Other
 platforms use their native certificate stores. Linux builds vendor OpenSSL and
 require a C toolchain, make and Perl; no system libssl runtime is needed. No settings-directory discovery or disabled TLS verification is needed.
 
+## Desktop app (menu bar / tray)
+
+`coding-agent-proxy-gui` runs the same proxy in-process behind a status icon in
+the macOS menu bar (no Dock icon), the Windows notification area, or a Linux
+AppIndicator. Clicking the icon drops a panel below it, like a menu bar extra;
+clicking elsewhere or pressing Esc closes it. The panel is built with Tauri 2:
+the Rust side owns the proxy, and the UI in `gui/ui` is plain HTML/CSS/JS
+rendered by the system WebView, so text uses the platform's native fonts. No
+Node.js toolchain is needed; `cargo build` embeds the UI. Rust 1.89+ is required;
+the command-line proxy keeps its own minimum.
+
+```sh
+cargo build --locked --release -p coding-agent-proxy-gui
+target/release/coding-agent-proxy-gui --config config.yaml
+```
+
+The panel follows the layout of native menu bar utilities such as eul: on macOS
+it uses the system popover material, AppKit semantic colors and system fonts.
+The main page stacks blocks for the proxy (switch, address, uptime, config
+state), 30-minute traffic, client base URLs with setup snippets, recent requests,
+outbound proxies with reachability tests, and routing. The header links open:
+
+| Page | Content |
+| --- | --- |
+| Activity | Live, searchable request log from `logs/proxy.log`; click a request for all fields |
+| Settings | Launch at Login, auto-start, appearance, config file status and `--check` equivalent, log folder |
+
+The configuration is edited in your text editor; the panel validates it whenever
+the file changes and offers a restart when the running proxy is out of date. The
+right-click menu offers Open Panel, Start/Stop, Restart and Quit.
+
+`--config` is remembered; without it the app uses its saved choice, then
+`./config.yaml`, then `config.yaml` in the per-user configuration directory, where
+it offers to create one from `config.example.yaml`. Logs go to `logs/proxy.log`
+next to the configuration, exactly as with the CLI. Opening the app shows the
+panel; Launch at Login starts it with `--background`. Only one instance runs per
+user, and launching again opens its panel. Do not run the desktop app and the
+background service on the same port at the same time.
+
+- macOS: `scripts/bundle_macos.sh` builds `target/Coding Agent Proxy.app`
+  (`LSUIElement`, ad-hoc signed). A full menu bar hides status items behind the
+  notch while apps with long menus are frontmost; the panel then opens at the
+  top-right corner when launched or reopened.
+- Windows: requires the WebView2 runtime (included with Windows 10 21H2+ and 11).
+- Linux: install the WebKitGTK and AppIndicator libraries first, for example on
+  Ubuntu 22.04+:
+  `sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev`.
+  GNOME needs the AppIndicator extension (enabled by default on Ubuntu); KDE
+  supports it natively.
+
 ## Run as a background service
 
 Build the Rust release executable, prepare `config.yaml`, and run:
@@ -818,6 +868,8 @@ cargo build --locked
 python3 scripts/integration.py
 python3 scripts/test_proxy_auth.py
 python3 scripts/test_service_rust.py
+cargo clippy --locked -p coding-agent-proxy-gui --all-targets -- -D warnings
+cargo test --locked -p coding-agent-proxy-gui
 ```
 
 Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
@@ -851,6 +903,11 @@ the release executable.
 | `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming |
 | `src/logger.rs` | Redacted structured logs and rotation |
 | `scripts/service_rust.py` | Per-user platform service management |
+| `gui/src/main.rs` | Desktop app startup, Tauri commands registration |
+| `gui/src/core.rs` | Shared state and the snapshot sent to the panel |
+| `gui/src/panel.rs`, `gui/src/tray.rs` | Panel placement and dismissal, status icon and menu |
+| `gui/src/proxy.rs`, `gui/src/logs.rs` | In-process proxy lifecycle, log tailing and statistics |
+| `gui/ui/` | Panel UI (HTML, CSS, vanilla JS) |
 
 ## Acknowledgments
 

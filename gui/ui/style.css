@@ -1,0 +1,842 @@
+/* Native menu styling, modeled on eul's status menu: system material behind
+   light blocks, small system type, monochrome data, AppKit semantic colors
+   (exposed by WebKit as -apple-system-*), and color-only hover. */
+:root {
+  color-scheme: light dark;
+  --window: #ececec;
+  --label: rgba(0, 0, 0, 0.85);
+  --secondary: rgba(0, 0, 0, 0.5);
+  --tertiary: rgba(0, 0, 0, 0.26);
+  --separator: rgba(0, 0, 0, 0.1);
+  --block: rgba(255, 255, 255, 0.55);
+  --block-border: rgba(0, 0, 0, 0.06);
+  --block-shadow: 0 0 5px rgba(0, 0, 0, 0.06);
+  --track: rgba(0, 0, 0, 0.08);
+  --control: #ffffff;
+  --control-border: rgba(0, 0, 0, 0.12);
+  --accent: #007aff;
+  --green: #28cd41;
+  --red: #ff3b30;
+  --orange: #ff9500;
+  --blue: #007aff;
+  --text-red: #d70015;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --window: #2a2a2c;
+    --label: rgba(255, 255, 255, 0.85);
+    --secondary: rgba(255, 255, 255, 0.55);
+    --tertiary: rgba(255, 255, 255, 0.25);
+    --separator: rgba(255, 255, 255, 0.1);
+    --block: rgba(30, 30, 30, 0.5);
+    --block-border: rgba(255, 255, 255, 0.06);
+    --block-shadow: 0 0 5px rgba(0, 0, 0, 0.18);
+    --track: rgba(255, 255, 255, 0.1);
+    --control: rgba(255, 255, 255, 0.14);
+    --control-border: transparent;
+    --accent: #0a84ff;
+    --green: #32d74b;
+    --red: #ff453a;
+    --orange: #ff9f0a;
+    --blue: #0a84ff;
+    --text-red: #ff6961;
+  }
+}
+
+@supports (color: -apple-system-label) {
+  :root {
+    --label: -apple-system-label;
+    --secondary: -apple-system-secondary-label;
+    --tertiary: -apple-system-tertiary-label;
+    --separator: -apple-system-separator;
+    --accent: -apple-system-control-accent;
+    --green: -apple-system-green;
+    --red: -apple-system-red;
+    --orange: -apple-system-orange;
+    --blue: -apple-system-blue;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font: 11px/1.35 -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI Variable Text",
+    "Segoe UI", Ubuntu, "Noto Sans", sans-serif;
+  color: var(--label);
+  font-synthesis: none;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+  margin: 0;
+}
+
+button {
+  border: 0;
+  padding: 0;
+  background: none;
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--window);
+}
+
+/* The system popover material is the background on macOS. */
+.macos .panel {
+  background: transparent;
+  border-radius: 12px;
+}
+
+/* ------------------------------------------------------------------ header */
+
+.top {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 10px 15px 2px;
+  min-height: 34px;
+}
+
+.app-name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.version {
+  color: var(--secondary);
+}
+
+.page-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.text-link {
+  color: var(--secondary);
+  font-size: 11px;
+}
+
+.text-link:hover {
+  color: var(--label);
+}
+
+.text-link.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: -3px;
+}
+
+.text-link.back svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ----------------------------------------------------------------- content */
+
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 15px 15px;
+  scrollbar-width: none;
+}
+
+.content::-webkit-scrollbar {
+  display: none;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* A titled block, as in eul's menu. */
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--block);
+  box-shadow: 0 0 0 0.5px var(--block-border), var(--block-shadow);
+}
+
+.block.flush {
+  padding: 4px;
+  gap: 0;
+}
+
+.block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.block-title {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.block-aside {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--secondary);
+}
+
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--label);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tertiary);
+}
+
+.dot.running {
+  background: var(--green);
+}
+
+.dot.failed {
+  background: var(--red);
+}
+
+/* Evenly spread label/value pairs. */
+.strip {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--secondary);
+}
+
+.stat-value {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bad {
+  color: var(--text-red);
+}
+
+.faint {
+  color: var(--tertiary);
+}
+
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: 32px;
+  margin: 2px 0 4px;
+}
+
+.chart rect {
+  fill: var(--label);
+  opacity: 0.55;
+}
+
+.chart rect.idle {
+  fill: var(--track);
+  opacity: 1;
+}
+
+.chart rect.err {
+  fill: var(--red);
+  opacity: 0.9;
+}
+
+/* ------------------------------------------------------------------- rows */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.row.compact {
+  min-height: 19px;
+}
+
+.row-label {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  color: var(--secondary);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.row-name {
+  color: var(--label);
+}
+
+.row-sub {
+  font-size: 10px;
+  color: var(--secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-value {
+  max-width: 62%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.subhead {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 6px 0 1px;
+  font-weight: 600;
+}
+
+.subhead + .row,
+.subhead:first-child {
+  margin-top: 0;
+}
+
+.placeholder {
+  padding: 6px 0 4px;
+  color: var(--secondary);
+}
+
+/* ---------------------------------------------------------------- messages */
+
+.message {
+  display: flex;
+  gap: 7px;
+  padding: 6px 0 2px;
+  border-top: 0.5px solid var(--separator);
+  margin-top: 2px;
+}
+
+.message-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-top: 4.5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.message.warn .message-dot {
+  background: var(--orange);
+}
+
+.message.bad .message-dot {
+  background: var(--red);
+}
+
+.message.good .message-dot {
+  background: var(--green);
+}
+
+.message-body {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+  word-break: break-word;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.message-actions,
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* ----------------------------------------------------------------- controls */
+
+/* Small macOS push button. */
+.btn {
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 5px;
+  background: var(--control);
+  box-shadow: 0 0 0 0.5px var(--control-border), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.btn:active {
+  filter: brightness(0.93);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: var(--secondary);
+}
+
+.icon-btn:hover {
+  color: var(--label);
+}
+
+.icon-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.icon-btn.done {
+  color: var(--green);
+}
+
+.switch {
+  position: relative;
+  flex: none;
+  width: 26px;
+  height: 15px;
+  border-radius: 8px;
+  background: var(--track);
+  box-shadow: inset 0 0 0 0.5px var(--block-border);
+  transition: background 120ms ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0.5px 1.5px rgba(0, 0, 0, 0.3);
+  transition: transform 120ms ease;
+}
+
+.switch[aria-checked="true"] {
+  background: var(--accent);
+}
+
+.switch[aria-checked="true"]::after {
+  transform: translateX(11px);
+}
+
+select.select {
+  appearance: none;
+  height: 20px;
+  padding: 0 20px 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--control)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='10' viewBox='0 0 8 10'%3E%3Cpath d='M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5' fill='none' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    no-repeat right 6px center;
+  box-shadow: 0 0 0 0.5px var(--control-border), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+  font-size: 11px;
+}
+
+input.field {
+  width: 100%;
+  height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--block);
+  box-shadow: 0 0 0 0.5px var(--control-border);
+  outline: none;
+  font-size: 11px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+input.field:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+input.field::placeholder {
+  color: var(--tertiary);
+}
+
+.search {
+  position: relative;
+  display: block;
+}
+
+.search svg {
+  position: absolute;
+  left: 7px;
+  top: 5px;
+  width: 12px;
+  height: 12px;
+  color: var(--tertiary);
+}
+
+.search input {
+  padding-left: 24px;
+}
+
+.segmented {
+  display: flex;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--track);
+}
+
+.segmented button {
+  flex: 1;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--label);
+  font-size: 11px;
+}
+
+.segmented button[aria-pressed="true"] {
+  background: var(--control);
+  box-shadow: 0 0 0 0.5px var(--control-border), 0 0.5px 1px rgba(0, 0, 0, 0.12);
+}
+
+.inline-form {
+  display: flex;
+  gap: 6px;
+  padding-bottom: 4px;
+}
+
+.path {
+  color: var(--secondary);
+  word-break: break-all;
+  white-space: normal;
+}
+
+/* ---------------------------------------------------------------- requests */
+
+.req {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 22px;
+  padding: 2px 0;
+  text-align: left;
+}
+
+.block.flush .req {
+  padding: 5px 8px;
+  border-radius: 5px;
+}
+
+.block.flush .req + .req,
+.block.flush .detail + .req {
+  box-shadow: 0 -0.5px 0 var(--separator);
+}
+
+button.req:hover .req-path {
+  color: var(--label);
+}
+
+.req-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.req-path {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--label);
+}
+
+.method {
+  margin-right: 5px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--secondary);
+}
+
+.req-meta {
+  margin-top: 1px;
+  font-size: 10px;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.req-dur {
+  flex: none;
+  width: 44px;
+  text-align: right;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* HTTP status: colored dot and number in a fixed column. */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  width: 36px;
+  font-variant-numeric: tabular-nums;
+}
+
+.status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tertiary);
+}
+
+.status.s2::before {
+  background: var(--green);
+}
+
+.status.s3::before {
+  background: var(--blue);
+}
+
+.status.s4::before {
+  background: var(--orange);
+}
+
+.status.s5::before {
+  background: var(--red);
+}
+
+.detail {
+  position: relative;
+  margin: 0 8px 6px;
+  padding: 6px 26px 6px 8px;
+  border-radius: 5px;
+  background: var(--track);
+}
+
+.detail .icon-btn {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  font-size: 10.5px;
+}
+
+.kv dt {
+  color: var(--secondary);
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--track);
+  border-top-color: var(--secondary);
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------------------------------------------------------------- snippets */
+
+details.disclosure {
+  border-top: 0.5px solid var(--separator);
+  margin-top: 2px;
+}
+
+details.disclosure summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 0 2px;
+  color: var(--secondary);
+}
+
+details.disclosure summary:hover {
+  color: var(--label);
+}
+
+details.disclosure summary::-webkit-details-marker {
+  display: none;
+}
+
+details.disclosure summary svg {
+  width: 8px;
+  height: 8px;
+}
+
+details.disclosure[open] summary svg {
+  transform: rotate(90deg);
+}
+
+.snippet {
+  position: relative;
+  margin-top: 6px;
+}
+
+.snippet-label {
+  font-size: 10px;
+  color: var(--secondary);
+}
+
+.snippet pre {
+  margin: 3px 0 0;
+  padding: 6px 26px 6px 8px;
+  border-radius: 5px;
+  background: var(--track);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.snippet .icon-btn {
+  position: absolute;
+  top: 16px;
+  right: 3px;
+}
+
+/* ------------------------------------------------------------------- toast */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;
+  transform: translate(-50%, 4px);
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--window);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--separator);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* Tooltips, as in eul: small secondary text on a control-colored box. */
+[data-tip] {
+  position: relative;
+}
+
+[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: 10;
+  bottom: calc(100% + 4px);
+  right: 0;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--window);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16), 0 0 0 0.5px var(--separator);
+  color: var(--secondary);
+  font-size: 10.5px;
+  font-weight: 400;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: tip-in 1ms linear 500ms both;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+  }
+}

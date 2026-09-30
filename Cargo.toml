@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform loopback HTTP/SSE proxy with credential-based outbound routing"
 
+[workspace]
+members = ["gui"]
+
 [dependencies]
 async-stream = "0.3"
 base64 = "0.22"

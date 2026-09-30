@@ -1,0 +1,375 @@
+//! Tails the proxy's JSON-lines log file and keeps recent events in memory.
+
+use crate::proxy::Notify;
+use chrono::{DateTime, Local};
+use serde_json::{Map, Value};
+use std::{
+    collections::VecDeque,
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+const CAPACITY: usize = 5000;
+/// How much existing history to load when a log file is first opened.
+const BACKFILL: u64 = 512 * 1024;
+
+#[derive(Clone)]
+pub struct Entry {
+    pub seq: u64,
+    pub time: Option<DateTime<Local>>,
+    pub event: String,
+    pub fields: Map<String, Value>,
+}
+
+impl Entry {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.fields.get(key).and_then(Value::as_str)
+    }
+    pub fn is_request_end(&self) -> bool {
+        matches!(
+            self.event.as_str(),
+            "request_finished" | "request_rejected" | "request_failed"
+        )
+    }
+    pub fn status(&self) -> Option<u16> {
+        self.get("status")?.parse().ok()
+    }
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.get("duration_ms")?.parse().ok()
+    }
+    pub fn bytes(&self) -> u64 {
+        self.get("received_bytes")
+            .and_then(|b| b.parse().ok())
+            .unwrap_or(0)
+    }
+    pub fn is_error(&self) -> bool {
+        self.event == "request_failed"
+            || self.event == "request_rejected"
+            || self.event == "route_unavailable"
+            || self.status().is_some_and(|s| s >= 400)
+    }
+    /// Which client the request belongs to, inferred from its path.
+    pub fn service(&self) -> Option<&'static str> {
+        if let Some(service) = self.get("service") {
+            return match service {
+                "claude" => Some("Claude"),
+                "codex" => Some("Codex"),
+                _ => None,
+            };
+        }
+        let path = self.get("path")?;
+        if path.starts_with("/anthropic")
+            || path.starts_with("/claude")
+            || path.starts_with("/v1/messages")
+            || path.starts_with("/api/oauth")
+        {
+            Some("Claude")
+        } else if path.starts_with("/mcp") {
+            Some("MCP")
+        } else {
+            Some("Codex")
+        }
+    }
+}
+
+#[derive(Default)]
+struct Store {
+    path: PathBuf,
+    entries: VecDeque<Entry>,
+    next_seq: u64,
+    /// Bumped when the file changes identity so the tailer restarts.
+    generation: u64,
+}
+
+#[derive(Clone)]
+pub struct LogFeed {
+    store: Arc<Mutex<Store>>,
+}
+
+impl LogFeed {
+    pub fn new(path: PathBuf, notify: Notify) -> Self {
+        let store = Arc::new(Mutex::new(Store {
+            path,
+            ..Default::default()
+        }));
+        let feed = Self { store };
+        let tail = feed.clone();
+        std::thread::Builder::new()
+            .name("log-tail".into())
+            .spawn(move || tail.run(notify))
+            .expect("log tail thread");
+        feed
+    }
+
+    pub fn set_path(&self, path: PathBuf) {
+        let mut s = self.store.lock().unwrap();
+        if s.path != path {
+            s.path = path;
+            s.entries.clear();
+            s.generation += 1;
+        }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.store.lock().unwrap().path.clone()
+    }
+
+    pub fn clear(&self) {
+        self.store.lock().unwrap().entries.clear();
+    }
+
+    /// Snapshot of entries matching `keep`, newest last.
+    pub fn entries(&self, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
+        let s = self.store.lock().unwrap();
+        s.entries.iter().filter(|e| keep(e)).cloned().collect()
+    }
+
+    /// Aggregates requests since the most recent server start.
+    pub fn stats(&self) -> Stats {
+        let s = self.store.lock().unwrap();
+        let start = s
+            .entries
+            .iter()
+            .rposition(|e| e.event == "server_started")
+            .map_or(0, |i| i + 1);
+        let mut stats = Stats::default();
+        let now = Local::now();
+        let mut latency_total = 0u64;
+        let mut latency_count = 0u64;
+        for e in s.entries.range(start..) {
+            match e.event.as_str() {
+                "current_route" | "route_unavailable" => stats.routes.push(e.clone()),
+                _ => {}
+            }
+            if !e.is_request_end() {
+                continue;
+            }
+            stats.requests += 1;
+            if e.is_error() {
+                stats.errors += 1;
+            }
+            stats.bytes += e.bytes();
+            if let Some(ms) = e.duration_ms() {
+                latency_total += ms;
+                latency_count += 1;
+            }
+            if let Some(t) = e.time {
+                let age = (now - t).num_minutes();
+                if (0..SPARK_MINUTES as i64).contains(&age) {
+                    let slot = SPARK_MINUTES - 1 - age as usize;
+                    stats.per_minute[slot] += 1;
+                    if e.is_error() {
+                        stats.errors_per_minute[slot] += 1;
+                    }
+                }
+            }
+        }
+        stats.avg_latency_ms = (latency_count > 0).then(|| latency_total / latency_count);
+        stats
+    }
+
+    fn run(&self, notify: Notify) {
+        let mut file: Option<(std::fs::File, u64)> = None;
+        let mut offset = 0u64;
+        let mut partial = Vec::new();
+        let mut generation = u64::MAX;
+        loop {
+            let (path, current_gen) = {
+                let s = self.store.lock().unwrap();
+                (s.path.clone(), s.generation)
+            };
+            if current_gen != generation {
+                generation = current_gen;
+                file = None;
+            }
+            // Reopen when the file appears, is rotated, or is truncated.
+            let meta = std::fs::metadata(&path).ok();
+            let identity = meta.as_ref().map(file_identity);
+            let len = meta.as_ref().map_or(0, |m| m.len());
+            let reopen = match (&file, identity) {
+                (None, Some(_)) => true,
+                (Some((_, id)), Some(new_id)) => *id != new_id || len < offset,
+                (Some(_), None) => {
+                    file = None;
+                    false
+                }
+                (None, None) => false,
+            };
+            if reopen && let Ok(f) = std::fs::File::open(&path) {
+                // First open backfills history; later reopens mean rotation.
+                let fresh = generation_is_empty(&self.store);
+                offset = if fresh {
+                    len.saturating_sub(BACKFILL)
+                } else {
+                    0
+                };
+                partial.clear();
+                let skip_partial_line = offset > 0;
+                file = Some((f, identity.unwrap_or(0)));
+                if skip_partial_line {
+                    partial.push(b'\0');
+                }
+            }
+            if let Some((f, _)) = file.as_mut()
+                && len > offset
+                && f.seek(SeekFrom::Start(offset)).is_ok()
+            {
+                let mut buf = Vec::new();
+                if let Ok(n) = f.take(len - offset).read_to_end(&mut buf) {
+                    offset += n as u64;
+                    partial.extend_from_slice(&buf);
+                    if self.ingest(&mut partial) {
+                        notify();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(350));
+        }
+    }
+
+    /// Parses complete lines out of `pending`; returns whether any were added.
+    fn ingest(&self, pending: &mut Vec<u8>) -> bool {
+        let Some(last_newline) = pending.iter().rposition(|&b| b == b'\n') else {
+            return false;
+        };
+        let complete: Vec<u8> = pending.drain(..=last_newline).collect();
+        let mut s = self.store.lock().unwrap();
+        let mut added = false;
+        for line in complete.split(|&b| b == b'\n') {
+            // A leading NUL marks the truncated first line of a backfill.
+            if line.first() == Some(&b'\0') || line.is_empty() {
+                continue;
+            }
+            let Ok(Value::Object(mut fields)) = serde_json::from_slice(line) else {
+                continue;
+            };
+            let event = match fields.remove("event") {
+                Some(Value::String(e)) => e,
+                _ => continue,
+            };
+            let time = fields
+                .remove("timestamp")
+                .and_then(|t| t.as_str().map(str::to_owned))
+                .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
+                .map(|t| t.with_timezone(&Local));
+            let seq = s.next_seq;
+            s.next_seq += 1;
+            s.entries.push_back(Entry {
+                seq,
+                time,
+                event,
+                fields,
+            });
+            if s.entries.len() > CAPACITY {
+                s.entries.pop_front();
+            }
+            added = true;
+        }
+        added
+    }
+}
+
+fn generation_is_empty(store: &Mutex<Store>) -> bool {
+    store.lock().unwrap().entries.is_empty()
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn file_identity(meta: &std::fs::Metadata) -> u64 {
+    // Rotation renames the file away; its creation time identifies a new one.
+    meta.created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+pub const SPARK_MINUTES: usize = 30;
+
+#[derive(Default)]
+pub struct Stats {
+    pub requests: u64,
+    pub errors: u64,
+    pub bytes: u64,
+    pub avg_latency_ms: Option<u64>,
+    pub per_minute: [u32; SPARK_MINUTES],
+    pub errors_per_minute: [u32; SPARK_MINUTES],
+    pub routes: Vec<Entry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tails_appended_and_rotated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let feed = LogFeed::new(
+            path.clone(),
+            Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        let line = |event: &str, status: u16| {
+            format!(
+                "{{\"event\":\"{event}\",\"status\":\"{status}\",\"path\":\"/v1/messages\",\"duration_ms\":\"20\",\"received_bytes\":\"100\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n"
+            )
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"event\":\"server_started\"}}\n{}",
+                line("request_finished", 200)
+            ),
+        )
+        .unwrap();
+        wait_for(|| feed.stats().requests == 1);
+        // Partial line is not parsed until its newline arrives.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let next = line("request_rejected", 403);
+        f.write_all(&next.as_bytes()[..10]).unwrap();
+        f.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(feed.stats().requests, 1);
+        f.write_all(&next.as_bytes()[10..]).unwrap();
+        f.flush().unwrap();
+        wait_for(|| feed.stats().requests == 2);
+        let stats = feed.stats();
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.bytes, 200);
+        assert_eq!(stats.avg_latency_ms, Some(20));
+        assert_eq!(
+            feed.entries(|e| e.is_request_end())[0].service(),
+            Some("Claude")
+        );
+
+        // Rotation: the logger renames to `.1` and starts a fresh file.
+        std::fs::rename(&path, dir.path().join("proxy.log.1")).unwrap();
+        std::fs::write(&path, line("request_failed", 502)).unwrap();
+        wait_for(|| feed.stats().requests == 3);
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        for _ in 0..40 {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("condition not reached");
+    }
+}
