@@ -128,8 +128,10 @@ claude:
     # account_fallback: claude_official # Optional: allow other verified accounts.
 ```
 
-Successful profile identities are cached in memory per token for 5 minutes, up
-to 128 entries. Tokens without profile permission, rejected tokens, malformed
+Successful profile identities are cached in memory per token without time-based
+expiry, up to 128 entries. At capacity, inserting a new token evicts only the
+least recently used entry. A new token, an evicted entry, or a server restart
+requires another probe. Cached identity does not bypass upstream token validation. Tokens without profile permission, rejected tokens, malformed
 profiles and transport failures do not forward the model payload and are not
 cached. Lookup redirects are not followed. Lookup errors never trigger a direct
 retry. Profiles are limited to 64 KiB and lookup time to 10 seconds or the configured

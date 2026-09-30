@@ -29,6 +29,7 @@ pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    // Timestamps track last use for bounded LRU eviction, not expiry.
     claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
 }
 impl Server {
@@ -53,9 +54,11 @@ impl Server {
             .claude_profiles
             .lock()
             .map_err(|_| Error::config("Claude profile cache unavailable."))?
-            .get(&route.token)
-            .filter(|(time, _)| time.elapsed() < Duration::from_secs(300))
-            .map(|(_, identity)| identity.clone());
+            .get_mut(&route.token)
+            .map(|(last_used, identity)| {
+                *last_used = Instant::now();
+                identity.clone()
+            });
         let identity = if let Some(identity) = cached {
             identity
         } else {
@@ -107,19 +110,32 @@ impl Server {
             let value = serde_json::from_slice(&bytes)
                 .map_err(|_| Error::config("Invalid Claude profile JSON."))?;
             let identity = crate::claude::ClaudeIdentity::profile(&value)?;
-            let mut cache = self
-                .claude_profiles
-                .lock()
-                .map_err(|_| Error::config("Claude profile cache unavailable."))?;
-            cache.retain(|_, (time, _)| time.elapsed() < Duration::from_secs(300));
-            if cache.len() >= 128 {
-                cache.clear();
-            }
-            cache.insert(route.token.clone(), (Instant::now(), identity.clone()));
+            self.cache_claude_profile(route.token.clone(), identity.clone())?;
             identity
         };
         self.config.claude.apply_profile(&mut route, identity)?;
         Ok(route)
+    }
+    fn cache_claude_profile(
+        &self,
+        token: String,
+        identity: crate::claude::ClaudeIdentity,
+    ) -> Result<()> {
+        let mut cache = self
+            .claude_profiles
+            .lock()
+            .map_err(|_| Error::config("Claude profile cache unavailable."))?;
+        if cache.len() >= 128 && !cache.contains_key(&token) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (last_used, _))| *last_used)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(token, (Instant::now(), identity));
+        Ok(())
     }
     fn client(&self, endpoint: &str) -> Result<reqwest::Client> {
         self.client_transport(endpoint, false)

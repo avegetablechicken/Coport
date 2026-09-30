@@ -508,7 +508,7 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
         .unwrap()
         .get_mut("first-secret")
         .unwrap()
-        .0 = Instant::now() - Duration::from_secs(301);
+        .0 = Instant::now() - Duration::from_secs(30 * 24 * 60 * 60);
     let response = http()
         .post(format!("{}/anthropic/api/oauth/usage", running.url))
         .bearer_auth("first-secret")
@@ -516,27 +516,46 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
         .await
         .unwrap();
     assert_eq!(response.status(), 405); // A remotely identified account passes auth, then method validation.
-    assert!(
-        lookup
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("CONNECT ")
-    );
-    assert!(
-        lookup
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("GET /api/oauth/profile ")
-    );
+    assert!(lookup.requests.try_recv().is_err());
     assert!(payload.requests.try_recv().is_err());
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(log.contains("remote-account"));
     assert!(!log.contains("first-secret"));
     assert!(!log.contains("second-secret"));
+}
+
+#[tokio::test]
+async fn claude_profile_cache_evicts_only_least_recently_used_identity() {
+    let running = running("claude:\n  routing: {}\n").await;
+    let identity = crate::claude::ClaudeIdentity::profile(&json!({
+        "account": {"uuid": "id", "email": "person@example.invalid"}
+    }))
+    .unwrap();
+    for index in 0..128 {
+        running
+            .server
+            .cache_claude_profile(format!("token-{index}"), identity.clone())
+            .unwrap();
+    }
+    {
+        let mut cache = running.server.claude_profiles.lock().unwrap();
+        cache.get_mut("token-42").unwrap().0 = Instant::now() - Duration::from_secs(86400);
+    }
+    // Replacing an existing token at capacity must not evict another account.
+    running
+        .server
+        .cache_claude_profile("token-0".into(), identity.clone())
+        .unwrap();
+    assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 128);
+    running
+        .server
+        .cache_claude_profile("new-token".into(), identity)
+        .unwrap();
+    let cache = running.server.claude_profiles.lock().unwrap();
+    assert_eq!(cache.len(), 128);
+    assert!(!cache.contains_key("token-42"));
+    assert!(cache.contains_key("new-token"));
+    assert!(cache.contains_key("token-0"));
 }
 
 #[tokio::test]
