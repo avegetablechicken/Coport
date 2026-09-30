@@ -1,13 +1,13 @@
 use crate::{
     Error, Result,
-    config::{AccountSource, Config, Provider, expand, unwrap_upstream},
+    config::{AccountSource, Codex, Config, Provider, expand, unwrap_upstream},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
-    path::PathBuf,
+    path::Path,
 };
 
 #[derive(Clone)]
@@ -87,26 +87,21 @@ struct Definition {
     #[serde(default)]
     requires_openai_auth: bool,
 }
-fn codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| expand("~/.codex"))
-}
-fn definitions() -> Result<BTreeMap<String, Definition>> {
-    let path = codex_home().join("config.toml");
+fn definitions(home: Option<&Path>) -> Result<BTreeMap<String, Definition>> {
     #[derive(Deserialize)]
     struct File {
         #[serde(default)]
         model_providers: BTreeMap<String, Definition>,
     }
-    let mut defs = match std::fs::read_to_string(path) {
-        Ok(text) => {
+    let mut defs = match home.map(|home| std::fs::read_to_string(home.join("config.toml"))) {
+        Some(Ok(text)) => {
             toml::from_str::<File>(&text)
                 .map_err(|_| Error::config("Cannot parse Codex config.toml."))?
                 .model_providers
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(_) => return Err(Error::config("Cannot read Codex config.toml.")),
+        None => BTreeMap::new(),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Some(Err(_)) => return Err(Error::config("Cannot read Codex config.toml.")),
     };
     if defs.contains_key("openai") {
         return Err(Error::config("Reserved Codex provider ID openai."));
@@ -128,6 +123,7 @@ fn definitions() -> Result<BTreeMap<String, Definition>> {
     );
     Ok(defs)
 }
+#[derive(PartialEq, Eq)]
 pub struct ProviderCredential {
     pub token: String,
     pub upstream: String,
@@ -171,7 +167,52 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
     }
 }
 impl Provider {
-    pub async fn credential(&self, default: &str, shell: bool) -> Result<ProviderCredential> {
+    pub async fn credentials(
+        &self,
+        default: &str,
+        shell: bool,
+        codex: &Codex,
+    ) -> Result<Vec<ProviderCredential>> {
+        if codex.homes.is_empty() || self.api_key_file.is_some() {
+            return self
+                .credential(default, shell, None, None)
+                .await
+                .map(|value| vec![value]);
+        }
+        let mut values = Vec::new();
+        let mut error = Error::config("No credential found in configured Codex homes.");
+        let inherited = crate::codex_env::inherited();
+        for home in &codex.homes {
+            let home = expand(home);
+            let environment = crate::codex_env::load(&home.join(".env"), &inherited);
+            match self
+                .credential(default, shell, Some(&home), Some(&environment))
+                .await
+            {
+                Ok(value) => {
+                    // The same route may discover an identical credential in multiple homes.
+                    // Different upstreams remain separate matches and are rejected as ambiguous.
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+                Err(e) => error = e,
+            }
+        }
+        if values.is_empty() {
+            Err(error)
+        } else {
+            Ok(values)
+        }
+    }
+
+    async fn credential(
+        &self,
+        default: &str,
+        shell: bool,
+        home: Option<&Path>,
+        environment: Option<&crate::codex_env::Environment>,
+    ) -> Result<ProviderCredential> {
         if let Some(path) = &self.api_key_file {
             let raw = std::fs::read_to_string(expand(path))
                 .map_err(|_| Error::config("Cannot read API Key file."))?;
@@ -182,7 +223,7 @@ impl Provider {
                 account_id: None,
             });
         }
-        let defs = definitions()?;
+        let defs = definitions(home)?;
         let selected_id = self
             .name
             .as_deref()
@@ -223,13 +264,25 @@ impl Provider {
         let definition = named.or(reversed);
         let var = selected_env.or(definition.and_then(|(_, d)| d.env_key.as_deref()));
         let (token, account_id) = if let Some(var) = var {
-            (environment_key_with_shell(var, shell).await?, None)
+            (
+                match environment.and_then(|environment| environment.get(var)) {
+                    Some(value) => key(value)?,
+                    None => environment_key_with_shell(var, shell).await?,
+                },
+                None,
+            )
         } else if let Some(token) =
             definition.and_then(|(_, d)| d.experimental_bearer_token.as_deref())
         {
             (key(token)?, None)
         } else if definition.is_some_and(|(_, d)| d.requires_openai_auth) {
-            saved_provider_auth(&codex_home().join("auth.json"))?
+            saved_provider_auth(
+                &home
+                    .ok_or(Error::config(
+                        "Saved provider authentication requires a configured Codex home.",
+                    ))?
+                    .join("auth.json"),
+            )?
         } else {
             return Err(Error::config(
                 "Codex provider has no configured Bearer credential.",
@@ -273,6 +326,33 @@ pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Resul
     };
     key(&raw)
 }
+impl Codex {
+    pub(crate) async fn account_identity(&self, source: &AccountSource) -> Result<Identity> {
+        if let Some(name) = &source.auth_env {
+            let mut found = None;
+            let inherited = crate::codex_env::inherited();
+            for home in &self.homes {
+                let environment = crate::codex_env::load(&expand(home).join(".env"), &inherited);
+                if let Some(value) = environment.get(name) {
+                    let token = key(value)?;
+                    if found.as_ref().is_some_and(|previous| previous != &token) {
+                        return Err(Error::config(
+                            "Account environment variable has different values across Codex homes; use auth_file sources.",
+                        ));
+                    }
+                    found = Some(token);
+                }
+            }
+            if let Some(token) = found {
+                return Identity::from_token(&token).ok_or(Error::config(
+                    "Codex account token requires ChatGPT account claims.",
+                ));
+            }
+        }
+        source.codex_identity().await
+    }
+}
+
 impl AccountSource {
     pub(crate) async fn codex_identity(&self) -> Result<Identity> {
         if let Some(name) = &self.auth_env {
@@ -281,7 +361,9 @@ impl AccountSource {
                 "Codex account token requires ChatGPT account claims.",
             ));
         }
-        Identity::read(self.auth_file.as_deref().unwrap_or("~/.codex/auth.json"))
+        Identity::read(self.auth_file.as_deref().ok_or(Error::config(
+            "Codex account requires an explicit credential source.",
+        ))?)
     }
 }
 #[cfg(unix)]
@@ -381,8 +463,8 @@ impl Config {
         self.claude.check_credentials().await?;
         let mut keys = HashSet::new();
         if self.codex.account_auth_file_only {
-            for (label, source) in &self.codex.accounts {
-                let i = source.codex_identity().await?;
+            for (label, source, _) in &self.codex.account_sources() {
+                let i = self.codex.account_identity(source).await?;
                 self.account_choice(&i, Some(label))?;
                 if !keys.insert(i.token) {
                     return Err(Error::config("Multiple routes have the same credential."));
@@ -390,12 +472,13 @@ impl Config {
             }
         }
         for p in &self.codex.providers {
-            if !keys.insert(
-                p.credential(&self.codex.base_url.api_key, true)
-                    .await?
-                    .token,
-            ) {
-                return Err(Error::config("Multiple routes have the same credential."));
+            for credential in p
+                .credentials(&self.codex.base_url.api_key, true, &self.codex)
+                .await?
+            {
+                if !keys.insert(credential.token) {
+                    return Err(Error::config("Multiple routes have the same credential."));
+                }
             }
         }
         Ok(())
@@ -406,6 +489,120 @@ impl Config {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn configured_homes_keep_provider_config_and_credentials_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        for (home, token, host) in [
+            (&a, "key-a", "a.example.com"),
+            (&b, "key-b", "b.example.com"),
+        ] {
+            std::fs::create_dir(home).unwrap();
+            std::fs::write(home.join("config.toml"), format!(
+                "[model_providers.custom]\nenv_key = 'DIRECTORY_TEST_KEY_8371'\nbase_url = 'https://{host}/v1'\n"
+            )).unwrap();
+            std::fs::write(
+                home.join(".env"),
+                format!("DIRECTORY_TEST_KEY_8371={token}\n"),
+            )
+            .unwrap();
+        }
+        let mut c = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}, {}]\n  routing:\n    api_key: {{custom: none}}\n",
+            serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap()
+        )).unwrap();
+        c.check_credentials().await.unwrap();
+        for (token, upstream) in [
+            ("key-a", "https://a.example.com/v1"),
+            ("key-b", "https://b.example.com/v1"),
+        ] {
+            assert_eq!(
+                c.resolve(Some(&format!("Bearer {token}")), false)
+                    .await
+                    .unwrap()
+                    .upstream,
+                upstream
+            );
+        }
+        // An unlisted home is not searched, even when its files remain present.
+        c.codex.homes.pop();
+        assert_eq!(
+            c.resolve(Some("Bearer key-b"), false)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        c.codex.homes.push(b.to_string_lossy().into_owned());
+        std::fs::write(b.join(".env"), "DIRECTORY_TEST_KEY_8371=key-a\n").unwrap();
+        assert_eq!(
+            c.resolve(Some("Bearer key-a"), false)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+        assert!(c.check_credentials().await.is_err());
+        // Saved provider authentication must also stay in its own home.
+        for (home, token, host) in [
+            (&a, "saved-a", "a.example.com"),
+            (&b, "saved-b", "b.example.com"),
+        ] {
+            std::fs::write(home.join("config.toml"), format!(
+                "[model_providers.custom]\nrequires_openai_auth = true\nbase_url = 'https://{host}/v1'\n"
+            )).unwrap();
+            std::fs::write(
+                home.join("auth.json"),
+                json!({"OPENAI_API_KEY":token}).to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c.resolve(Some("Bearer saved-b"), false)
+                .await
+                .unwrap()
+                .upstream,
+            "https://b.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_account_files_use_each_configured_home() {
+        let dir = tempfile::tempdir().unwrap();
+        for label in ["a", "b"] {
+            let home = dir.path().join(label);
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(
+                home.join("login.json"),
+                json!({"tokens":{
+                    "account_id":label, "access_token":format!("token-{label}")
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let c = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}, {}]\n  auth_file: login.json\n  routing:\n    account: {{a: none, b: none}}\n",
+            serde_json::to_string(&dir.path().join("a")).unwrap(),
+            serde_json::to_string(&dir.path().join("b")).unwrap()
+        )).unwrap();
+        let c = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
+        c.check_credentials().await.unwrap();
+        for label in ["a", "b"] {
+            assert_eq!(
+                c.resolve(Some(&format!("Bearer token-{label}")), false)
+                    .await
+                    .unwrap()
+                    .account_id
+                    .as_deref(),
+                Some(label)
+            );
+        }
+    }
+
     fn jwt(value: Value) -> String {
         format!(
             "e30.{}.signature",

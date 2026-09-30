@@ -239,9 +239,11 @@ impl Server {
         ))
     }
     pub async fn startup_log(&self) {
-        for (label, source) in &self.config.codex.accounts {
-            match source
-                .codex_identity()
+        for (label, source, _) in &self.config.codex.account_sources() {
+            match self
+                .config
+                .codex
+                .account_identity(source)
                 .await
                 .and_then(|i| self.config.account_choice(&i, Some(label)).map(|p| (i, p)))
             {
@@ -263,7 +265,11 @@ impl Server {
         }
         for p in &self.config.codex.providers {
             let event = if p
-                .credential(&self.config.codex.base_url.api_key, true)
+                .credentials(
+                    &self.config.codex.base_url.api_key,
+                    true,
+                    &self.config.codex,
+                )
                 .await
                 .is_ok()
             {
@@ -279,7 +285,8 @@ impl Server {
                     .clone(),
             );
         }
-        if !self.config.claude.accounts.is_empty() || !self.config.claude.routing.api_key.is_empty()
+        if !self.config.claude.account_sources().is_empty()
+            || !self.config.claude.routing.api_key.is_empty()
         {
             self.logger.write(
                 if self.config.claude.check_credentials().await.is_ok() {

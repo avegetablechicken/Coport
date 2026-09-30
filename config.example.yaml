@@ -11,7 +11,9 @@ proxies:
 codex:
   base_url:
     account: "https://chatgpt.com/backend-api"
-  auth_file: "~/.codex/auth.json"
+  # Explicit credential directories; process CODEX_HOME is ignored.
+  homes: ["~/.codex"] # Default when omitted.
+  auth_file: "auth.json" # Relative to each configured home.
   # auth_env: CHATGPT_ACCESS_TOKEN # Alternative to auth_file, not both.
   account_auth_file_only: true
   routing:
@@ -23,7 +25,9 @@ codex:
 
 claude:
   base_url: "https://api.anthropic.com" # Root without /v1.
-  auth_file: "~/.claude/.credentials.json"
+  # Explicit credential directories; process CLAUDE_CONFIG_DIR is ignored.
+  config_dirs: ["~/.claude"] # Default when omitted.
+  auth_file: ".credentials.json" # Relative to each configured config dir.
   # auth_env: CLAUDE_CODE_OAUTH_TOKEN # Alternative to auth_file, not both.
   account_auth_file_only: true
   routing:

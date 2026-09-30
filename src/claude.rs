@@ -20,6 +20,7 @@ fn file_only() -> bool {
 }
 #[derive(Clone, Serialize)]
 pub struct Claude {
+    pub config_dirs: Vec<String>,
     pub account_auth_file_only: bool,
     pub base_url: String,
     pub accounts: BTreeMap<String, AccountSource>,
@@ -28,6 +29,7 @@ pub struct Claude {
 impl Default for Claude {
     fn default() -> Self {
         Self {
+            config_dirs: crate::config::default_claude_config_dirs(),
             account_auth_file_only: true,
             base_url: default_base(),
             accounts: BTreeMap::new(),
@@ -97,6 +99,8 @@ impl<'de> Deserialize<'de> for Claude {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Normalized {
+            #[serde(default = "crate::config::default_claude_config_dirs")]
+            config_dirs: Vec<String>,
             #[serde(default = "file_only")]
             account_auth_file_only: bool,
             #[serde(default = "default_base")]
@@ -107,6 +111,7 @@ impl<'de> Deserialize<'de> for Claude {
         }
         let n: Normalized = serde_yaml_ng::from_value(value).map_err(D::Error::custom)?;
         Ok(Self {
+            config_dirs: n.config_dirs,
             account_auth_file_only: n.account_auth_file_only,
             base_url: n.base_url,
             accounts: n.accounts,
@@ -115,25 +120,22 @@ impl<'de> Deserialize<'de> for Claude {
     }
 }
 impl AccountSource {
-    fn claude_credential_path(&self) -> std::path::PathBuf {
+    fn claude_credential_path(&self) -> Result<std::path::PathBuf> {
         self.auth_file
             .as_ref()
             .map(|s| expand(s))
-            .unwrap_or_else(|| {
-                std::env::var_os("CLAUDE_CONFIG_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| expand("~/.claude"))
-                    .join(".credentials.json")
-            })
+            .ok_or(Error::config(
+                "Claude account requires an explicit credential source.",
+            ))
     }
-    fn claude_identity(&self) -> Option<ClaudeIdentity> {
+    fn claude_identity(&self, directory: Option<&std::path::Path>) -> Option<ClaudeIdentity> {
         // An environment token is not evidence that it belongs to the local
         // CLI metadata. Such configured sources retain label/fallback routing.
         if self.auth_env.is_some() {
             return None;
         }
-        let path = self.claude_credential_path();
-        let directory = path.parent()?;
+        let path = self.claude_credential_path().ok()?;
+        let directory = directory.or_else(|| path.parent())?;
         let metadata = if directory == expand("~/.claude") {
             expand("~/.claude.json")
         } else {
@@ -147,7 +149,7 @@ impl AccountSource {
         if let Some(name) = &self.auth_env {
             return environment_key(name).await;
         }
-        let path = self.claude_credential_path();
+        let path = self.claude_credential_path()?;
         let raw = std::fs::read(path)
             .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
         let value: serde_json::Value = serde_json::from_slice(&raw)
@@ -231,7 +233,17 @@ pub fn target(target: &str) -> Option<&str> {
 }
 
 impl Claude {
+    pub(crate) fn account_sources(&self) -> Vec<crate::config::DirectoryAccount> {
+        crate::config::directory_accounts(
+            &self.accounts,
+            &self.config_dirs,
+            &self.routing,
+            ".credentials.json",
+        )
+    }
+
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
+        crate::config::validate_directories(&self.config_dirs, &self.accounts)?;
         validate_upstream(&self.base_url)?;
         if self.routing.mcp_fallback.is_some() {
             return Err(Error::config(
@@ -246,6 +258,7 @@ impl Claude {
         }
         if self.account_auth_file_only
             && self.accounts.is_empty()
+            && self.config_dirs.is_empty()
             && !self.routing.account.is_empty()
         {
             return Err(Error::config(
@@ -283,8 +296,11 @@ impl Claude {
     pub async fn check_credentials(&self) -> Result<()> {
         let mut keys = HashSet::new();
         if self.account_auth_file_only {
-            for (label, account) in &self.accounts {
-                self.account_choice(account.claude_identity().as_ref(), Some(label))?;
+            for (label, account, directory) in &self.account_sources() {
+                self.account_choice(
+                    account.claude_identity(directory.as_deref()).as_ref(),
+                    Some(label),
+                )?;
                 if !keys.insert(account.claude_token().await?) {
                     return Err(Error::config(
                         "Multiple Claude routes have the same credential.",
@@ -332,11 +348,12 @@ impl Claude {
         let mut identity = None;
         let mut unavailable = false;
         let mut matched_account = false;
+        let account_sources = self.account_sources();
         if bearer {
             let mut sources = Vec::new();
-            for (label, account) in &self.accounts {
+            for (label, account, directory) in &account_sources {
                 match account.claude_token().await {
-                    Ok(value) if value == token => sources.push((label, account)),
+                    Ok(value) if value == token => sources.push((label, account, directory)),
                     Ok(_) => {}
                     Err(_) => unavailable = true,
                 }
@@ -347,9 +364,9 @@ impl Claude {
                     "Claude credential matches multiple routes.",
                 ));
             }
-            if let Some((label, account)) = sources.pop() {
+            if let Some((label, account, directory)) = sources.pop() {
                 matched_account = true;
-                identity = account.claude_identity();
+                identity = account.claude_identity(directory.as_deref());
                 matches.push((label, self.account_choice(identity.as_ref(), Some(label))?));
             }
         }
@@ -566,6 +583,58 @@ impl ClaudeRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn configured_directories_resolve_relative_credentials_and_local_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        for label in ["a", "b"] {
+            let home = dir.path().join(label);
+            std::fs::create_dir_all(home.join("nested")).unwrap();
+            std::fs::write(
+                home.join("nested/login.json"),
+                serde_json::json!({
+                    "claudeAiOauth":{"accessToken":format!("token-{label}")}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(home.join(".claude.json"), serde_json::json!({
+                "oauthAccount":{"accountUuid":label,"emailAddress":format!("{label}@example.com")}
+            }).to_string()).unwrap();
+        }
+        let config = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  config_dirs: [{}, {}]\n  auth_file: nested/login.json\n  routing:\n    account: {{a: none, b: none}}\n",
+            serde_json::to_string(&dir.path().join("a")).unwrap(),
+            serde_json::to_string(&dir.path().join("b")).unwrap()
+        )).unwrap();
+        let mut c = Config::parse(&config.canonical_yaml().unwrap())
+            .unwrap()
+            .claude;
+        c.check_credentials().await.unwrap();
+        for label in ["a", "b"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!("Bearer token-{label}").parse().unwrap(),
+            );
+            let route = c.resolve(&headers).await.unwrap();
+            assert_eq!(route.label, "default");
+            assert_eq!(route.identity.unwrap().account_id, label);
+        }
+        c.config_dirs.pop();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token-b".parse().unwrap());
+        assert!(c.resolve(&headers).await.is_err());
+        // Legacy named sources also resolve relative files in each listed directory.
+        c.accounts.clear();
+        c.accounts.insert(
+            "a".into(),
+            AccountSource {
+                auth_file: Some("nested/login.json".into()),
+                auth_env: None,
+            },
+        );
+        c.check_credentials().await.unwrap();
+    }
 
     fn config(extra: &str) -> Config {
         Config::parse(&format!(
@@ -803,10 +872,10 @@ claude:
             );
         }
         let c = config(
-            "claude:\n  accounts:\n    local:\n      proxy: none\n  api_key:\n    ANTHROPIC_API_KEY: none\n  account_fallback: [none]\n",
+            "claude:\n  config_dirs: [~/.claude]\n  accounts:\n    local:\n      auth_file: .credentials.json\n      proxy: none\n  api_key:\n    ANTHROPIC_API_KEY: none\n  account_fallback: [none]\n",
         );
         let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
-        assert!(roundtrip.claude.accounts.contains_key("local"));
+        assert!(roundtrip.claude.accounts.contains_key("default"));
         assert!(
             roundtrip
                 .claude
@@ -815,7 +884,7 @@ claude:
                 .contains_key("ANTHROPIC_API_KEY")
         );
         assert!(roundtrip.claude.routing.account_fallback.is_some());
-        assert_eq!(roundtrip.claude.routing.account["local"].label(), "none");
+        assert_eq!(roundtrip.claude.routing.account["default"].label(), "none");
         assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
         assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
     }

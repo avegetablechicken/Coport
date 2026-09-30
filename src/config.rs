@@ -71,7 +71,7 @@ pub struct AccountSource {
 }
 impl AccountSource {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.auth_file.is_some() && self.auth_env.is_some()
+        if self.auth_file.is_some() == self.auth_env.is_some()
             || self.auth_file.as_ref().is_some_and(|s| s.trim().is_empty())
         {
             return Err(Error::config(
@@ -100,6 +100,7 @@ pub(crate) fn validate_env(name: &str) -> Result<()> {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Codex {
+    pub homes: Vec<String>,
     pub base_url: Bases,
     pub accounts: BTreeMap<String, AccountSource>,
     pub routing: Routing,
@@ -110,6 +111,7 @@ pub struct Codex {
 impl Default for Codex {
     fn default() -> Self {
         Self {
+            homes: default_codex_homes(),
             base_url: Bases::default(),
             accounts: BTreeMap::new(),
             routing: Routing::default(),
@@ -252,6 +254,7 @@ impl Config {
             legacy_label.push('_');
         }
         let mut codex = raw.codex.unwrap_or_else(|| Codex {
+            homes: default_codex_homes(),
             accounts: raw
                 .auth_file
                 .filter(|s| !s.is_empty())
@@ -351,6 +354,7 @@ impl Config {
     }
     fn validate(&self) -> Result<()> {
         self.claude.validate(self)?;
+        validate_directories(&self.codex.homes, &self.codex.accounts)?;
         if self.codex.routing.account_probe.is_some() {
             return Err(Error::config(
                 "account_probe is only supported under claude.routing.",
@@ -374,7 +378,10 @@ impl Config {
         let accounts =
             !self.codex.routing.account.is_empty() || self.codex.routing.account_fallback.is_some();
         if (!self.codex.accounts.is_empty() && !accounts)
-            || (self.codex.account_auth_file_only && accounts && self.codex.accounts.is_empty())
+            || (self.codex.account_auth_file_only
+                && accounts
+                && self.codex.accounts.is_empty()
+                && self.codex.homes.is_empty())
         {
             return Err(Error::config(
                 "Codex routing requires account sources and account mappings or account_fallback.",
@@ -515,7 +522,14 @@ impl Config {
         for name in ["codex", "claude"] {
             let map = output[name].as_mapping_mut().unwrap();
             let mut ordered = serde_yaml_ng::Mapping::new();
-            for key in ["base_url", "auth_file", "account_auth_file_only", "routing"] {
+            for key in [
+                "homes",
+                "config_dirs",
+                "base_url",
+                "auth_file",
+                "account_auth_file_only",
+                "routing",
+            ] {
                 if let Some(value) = map.remove(key) {
                     ordered.insert(key.into(), value);
                 }
@@ -526,6 +540,98 @@ impl Config {
         let text = serde_yaml_ng::to_string(&output)
             .map_err(|_| Error::config("Cannot serialize configuration."))?;
         inline_proxy_lists(&text)
+    }
+}
+
+pub(crate) fn default_codex_homes() -> Vec<String> {
+    vec!["~/.codex".into()]
+}
+
+pub(crate) fn default_claude_config_dirs() -> Vec<String> {
+    vec!["~/.claude".into()]
+}
+
+pub(crate) fn validate_directories(
+    directories: &[String],
+    accounts: &BTreeMap<String, AccountSource>,
+) -> Result<()> {
+    let mut paths = std::collections::HashSet::new();
+    for directory in directories {
+        let path = expand(directory);
+        if directory.trim().is_empty() || !path.is_absolute() || !paths.insert(path) {
+            return Err(Error::config(
+                "Credential directories must be unique absolute paths.",
+            ));
+        }
+    }
+    for source in accounts.values() {
+        if let Some(file) = &source.auth_file {
+            let path = expand(file);
+            if path.is_relative() {
+                if directories.is_empty() {
+                    return Err(Error::config(
+                        "Relative auth_file requires a configured credential directory.",
+                    ));
+                }
+                if path.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                }) {
+                    return Err(Error::config(
+                        "Relative auth_file must stay inside its credential directory.",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Keep the source label separate from its directory: every listed directory can
+// supply the same relative auth_file, while account ID/email still selects routing.
+pub(crate) type DirectoryAccount = (String, AccountSource, Option<PathBuf>);
+
+pub(crate) fn directory_accounts(
+    accounts: &BTreeMap<String, AccountSource>,
+    directories: &[String],
+    routing: &Routing,
+    filename: &str,
+) -> Vec<DirectoryAccount> {
+    let mut accounts = accounts.clone();
+    if accounts.is_empty() && (!routing.account.is_empty() || routing.account_fallback.is_some()) {
+        accounts.insert(
+            "default".into(),
+            AccountSource {
+                auth_file: Some(filename.into()),
+                auth_env: None,
+            },
+        );
+    }
+    let mut sources = Vec::new();
+    for (label, source) in accounts {
+        if let Some(file) = source
+            .auth_file
+            .as_ref()
+            .filter(|file| expand(file).is_relative())
+        {
+            for directory in directories {
+                let directory = expand(directory);
+                let mut resolved = source.clone();
+                resolved.auth_file = Some(directory.join(file).to_string_lossy().into_owned());
+                sources.push((label.clone(), resolved, Some(directory)));
+            }
+        } else {
+            sources.push((label, source, None));
+        }
+    }
+    sources
+}
+
+impl Codex {
+    pub(crate) fn account_sources(&self) -> Vec<DirectoryAccount> {
+        directory_accounts(&self.accounts, &self.homes, &self.routing, "auth.json")
     }
 }
 
@@ -775,6 +881,61 @@ pub fn redacted_endpoint(value: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn directory_lists_default_only_when_omitted_and_preserve_empty_lists() {
+        let base = "listen_port: 8787\nrequest_timeout_seconds: 3\n";
+        for extra in [
+            "",
+            "codex: {}\nclaude: {}\n",
+            "codex:\n  auth_file: auth.json\n  routing:\n    account: {default: none}\nclaude:\n  auth_file: .credentials.json\n  routing:\n    account: {default: none}\n",
+        ] {
+            let c = Config::parse(&format!("{base}{extra}")).unwrap();
+            assert_eq!(c.codex.homes, ["~/.codex"]);
+            assert_eq!(c.claude.config_dirs, ["~/.claude"]);
+            let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
+            assert_eq!(roundtrip.codex.homes, c.codex.homes);
+            assert_eq!(roundtrip.claude.config_dirs, c.claude.config_dirs);
+        }
+        let c = Config::parse(&format!(
+            "{base}codex:\n  homes: []\nclaude:\n  config_dirs: []\n"
+        ))
+        .unwrap();
+        let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
+        assert!(roundtrip.codex.homes.is_empty());
+        assert!(roundtrip.claude.config_dirs.is_empty());
+        assert!(roundtrip.codex.account_sources().is_empty());
+        assert!(roundtrip.claude.account_sources().is_empty());
+    }
+
+    #[test]
+    fn directory_settings_roundtrip_and_reject_unbound_or_escaping_files() {
+        for (service, field) in [("codex", "homes"), ("claude", "config_dirs")] {
+            let base = format!("listen_port: 8787\nrequest_timeout_seconds: 3\n{service}:\n");
+            let valid = format!(
+                "{base}  {field}: [~/work]\n  accounts:\n    work: {{auth_file: nested/login.json}}\n  routing:\n    account: {{work: none}}\n"
+            );
+            let c = Config::parse(&valid).unwrap();
+            let output = c.canonical_yaml().unwrap();
+            assert!(output.contains("nested/login.json"));
+            assert!(output.contains("~/work"));
+            assert_eq!(
+                Config::parse(&output).unwrap().canonical_yaml().unwrap(),
+                output
+            );
+            for invalid in [
+                format!("{base}  {field}: [relative/path]\n"),
+                format!("{base}  {field}: [~/same, ~/same]\n"),
+                format!(
+                    "{base}  {field}: []\n  auth_file: login.json\n  routing:\n    account: {{default: none}}\n"
+                ),
+                valid.replace("nested/login.json", "../login.json"),
+                format!("{base}  {field}: {{work: ~/work}}\n"),
+            ] {
+                assert!(Config::parse(&invalid).is_err(), "{invalid}");
+            }
+        }
+    }
+
+    #[test]
     fn rejects_invalid_layouts_and_proxy_choices() {
         let base = "listen_port: 7889\nrequest_timeout_seconds: 3\n";
         for invalid in [
@@ -784,7 +945,7 @@ mod tests {
             "routing:\n  unknown: none\n",
             "base_url: {}\nupstream_base_url: https://api.openai.com/v1\n",
             "routing: {}\naccounts: {}\n",
-            "routing:\n  account:\n    test: none\n",
+            "codex:\n  homes: []\n  routing:\n    account: {test: none}\n",
             "routing:\n  api_key:\n    TEST:\n      proxy: none\n",
         ] {
             assert!(
@@ -915,7 +1076,7 @@ claude:
             "codex:\n  accounts:\n    a: {auth_file: file, auth_env: TOKEN}\n  routing:\n    account: {a: none}\n",
             "claude:\n  routing: {}\n  api_key: {}\n",
             "claude:\n  accounts:\n    a: {auth_file: file, proxy: none}\n  routing:\n    account: {a: none}\n",
-            "claude:\n  routing:\n    account: {absent: none}\n",
+            "claude:\n  config_dirs: []\n  routing:\n    account: {absent: none}\n",
             "claude:\n  routing:\n    mcp_fallback: none\n",
         ] {
             assert!(

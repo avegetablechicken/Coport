@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import socket
 import socketserver
 import subprocess
@@ -81,7 +82,11 @@ accounts:
             codex_home = temp / "codex"
             codex_home.mkdir()
             (codex_home / "config.toml").write_text('[model_providers.reverse]\nenv_key = "REVERSE_TEST_KEY"\nbase_url = "https://provider-a.invalid/v1"\n')
-            test_environment = dict(os.environ, CODEX_HOME=str(codex_home), REVERSE_TEST_KEY="provider-key-one", EXTRA_KEY_A="extra-key-a", EXTRA_KEY_B="extra-key-b")
+            ignored_home = temp / "ignored-home"
+            ignored_home.mkdir()
+            (ignored_home / "config.toml").write_text("malformed = [")
+            (ignored_home / ".credentials.json").write_text("invalid JSON")
+            test_environment = dict(os.environ, HOME=str(temp), USERPROFILE=str(temp), CODEX_HOME=str(ignored_home), CLAUDE_CONFIG_DIR=str(ignored_home), REVERSE_TEST_KEY="provider-key-one", EXTRA_KEY_A="extra-key-a", EXTRA_KEY_B="extra-key-b")
             def restart():
                 nonlocal process
                 if process is not None:
@@ -205,15 +210,16 @@ accounts:
   account-a: us
 api_key_providers:
   - api_key_env: REVERSE_TEST_KEY
+    upstream_base_url: https://provider-a.invalid/v1
     proxy: us
   - name: provider-b
     upstream_base_url: "https://provider-b.invalid/v1"
     proxy: jp
     api_key_file: "{key_b.as_posix()}"
-  - name: reverse
+  - upstream_base_url: https://provider-a.invalid/v1
     api_key_env: EXTRA_KEY_A
     proxy: us
-  - name: reverse
+  - upstream_base_url: https://provider-a.invalid/v1
     api_key_env: EXTRA_KEY_B
     proxy: jp
 ''')
@@ -316,6 +322,7 @@ routing:
             assert os.name == "nt" or migrated.stat().st_mode & 0o777 == 0o600
             assert "base_url:" in migrated.read_text() and "routing:" in migrated.read_text()
             migrated.replace(config)
+            config.write_text(re.sub(r"(?m)^  homes: .*?$", lambda _: f"  homes: [{json.dumps(str(codex_home))}]", config.read_text()))
             restart()
             for credential, path, probe, host in [
                 ("fallback-account-token", "/v1/responses", a, "chatgpt-mixed.invalid"),
@@ -337,6 +344,7 @@ request_timeout_seconds: 3
 proxies:
   chosen: http://127.0.0.1:{a.server_address[1]}
 codex:
+  homes: [{json.dumps(str(codex_home))}]
   routing:
     api_key:
       custom: chosen
@@ -379,11 +387,32 @@ codex:
                     refused("saved-provider-key")
                     refused(None, 401)
             set_provider(True, 'env_key = "REVERSE_TEST_KEY"\nexperimental_bearer_token = "explicit-provider-key"\n')
-            test_environment["REVERSE_TEST_KEY"] = ""  # A configured but empty key must not fall back.
+            dotenv = codex_home / ".env"
+            dotenv.write_text("BASE=dotenv\nnot valid\nREVERSE_TEST_KEY=first\nexport REVERSE_TEST_KEY=${BASE}-key # last wins\n")
+            original_pid = process.pid
+            subprocess.run([BINARY, "--config", str(config), "--check"], env=test_environment, check=True)
+            reaches_provider("dotenv-key")  # File overrides the inherited process value.
+            refused("provider-key-one", 401)
+            dotenv.write_text('REVERSE_TEST_KEY="rotated-dotenv-key"\n')
+            reaches_provider("rotated-dotenv-key")
+            assert process.pid == original_pid
+            refused("dotenv-key", 401)
+            test_environment["REVERSE_TEST_KEY"] = ""
             restart()
-            refused("saved-provider-key")
-            refused("explicit-provider-key")
+            reaches_provider("rotated-dotenv-key")  # Even an empty process value is overridden.
             test_environment["REVERSE_TEST_KEY"] = "provider-key-one"
+            dotenv.write_text('REVERSE_TEST_KEY=\n')
+            for token in ["saved-provider-key", "explicit-provider-key", "rotated-dotenv-key", "provider-key-one"]:
+                refused(token)  # An empty file value does not fall back.
+            set_provider(True, 'env_key = "CODEX_FILTERED"\n')
+            test_environment["CODEX_FILTERED"] = "process-protected-key"
+            dotenv.write_text('CODEX_FILTERED=file-protected-key\nCoDeX_IGNORED=ignored\n')
+            restart()
+            reaches_provider("process-protected-key")
+            refused("file-protected-key", 401)
+            del test_environment["CODEX_FILTERED"]
+            dotenv.unlink()
+            print("PASS: Codex dotenv precedence, duplicates, interpolation, skipped errors, prefix filtering and live reload")
             set_provider(True)
             provider_auth.write_text(json.dumps({"auth_mode": "chatgpt", "OPENAI_API_KEY": "stale-key",
                                                 "tokens": {"access_token": "saved-chat-token", "account_id": "custom-account"}}))

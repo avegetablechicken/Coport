@@ -31,7 +31,8 @@ proxies:
 codex:
   base_url:
     account: "https://chatgpt.com/backend-api"
-  auth_file: "~/.codex/auth.json"
+  homes: ["~/.codex"] # Default when omitted.
+  auth_file: "auth.json"
   account_auth_file_only: true
   routing:
     account:
@@ -41,7 +42,8 @@ codex:
 
 claude:
   base_url: "https://api.anthropic.com"
-  auth_file: "~/.claude/.credentials.json"
+  config_dirs: ["~/.claude"] # Default when omitted.
+  auth_file: ".credentials.json"
   account_auth_file_only: true
   routing:
     account:
@@ -57,7 +59,8 @@ Either service section can be omitted. Within each section:
 | `base_url` | Claude: one upstream root for both OAuth and API Keys |
 | `base_url.account` | Codex: ChatGPT account upstream |
 | `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1` |
-| `auth_file` | Saved account credential file |
+| `codex.homes` / `claude.config_dirs` | Lists of directories allowed for local credential discovery |
+| `auth_file` | Account credential filename relative to each configured directory |
 | `auth_env` | Alternative: environment variable containing the account access token |
 | `routing.account.<label>` | Proxy choice for that account source |
 | `routing.api_key.<selector>` | Proxy choice for an API Key environment variable (Codex also accepts provider IDs) |
@@ -65,10 +68,50 @@ Either service section can be omitted. Within each section:
 | `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback` for compatibility |
 | `routing.api_key_fallback` | Proxy choice for an unmatched API Key credential |
 
-Place `auth_file` directly under `codex` or `claude`; the saved login is named
-`default` in `routing.account`. `auth_env` is an alternative environment variable
-source and cannot be combined with `auth_file`. Files are read per request, so
-credential rotation takes effect without restarting. The clients handle login
+`codex.homes` and `claude.config_dirs` are lists of directory paths. When
+omitted, they default to `["~/.codex"]` and `["~/.claude"]` respectively. An explicit
+list replaces the default; `[]` disables directory discovery. Paths must be
+absolute (`~` is supported). The proxy's `CODEX_HOME` and `CLAUDE_CONFIG_DIR`
+environment variables do not change these lists. These settings control local
+credential discovery; HTTP requests do not identify the client's configuration
+directory, and matching still uses the supplied token.
+
+`auth_file` is relative to each listed directory, never the proxy's working
+directory. A flat `auth_file` uses the source label `default` for all directories;
+older `accounts.<label>.auth_file` entries retain their source labels and search
+each directory for their relative filename. Relative paths cannot contain `..`.
+When accounts are omitted and account routing is enabled, directory sources use
+`auth.json` for Codex and `.credentials.json` for Claude. Account ID/email matching
+retains its existing priority; use those identities to distinguish accounts from
+different directories, or `default`/`account_fallback` for a shared route:
+
+```yaml
+codex:
+  homes: [~/.codex, ~/.codex-work]
+  auth_file: auth.json
+  routing:
+    account:
+      personal@example.com: us
+      work@example.com: jp
+```
+
+For API-only Codex routing, list `homes` and `routing.api_key` without an
+`auth_file` or account routes. Provider configuration and its `.env`/saved
+provider authentication always come from the same home. Multiple distinct keys
+for a provider are accepted; a shared key resolving to different upstreams is
+rejected as ambiguous. Identical provider credentials with the same upstream are
+deduplicated within a route.
+
+Explicit absolute `auth_file` sources remain supported for older configurations.
+They are separately authorized file sources,
+not implicit directory discovery. `auth_env` is an alternative account source
+and cannot be combined with `auth_file`; Codex also checks `.env` in the listed
+homes for that variable. Different account-token values for the same variable
+across homes are rejected as ambiguous. Claude reads saved OAuth
+credentials and local account metadata from each configured directory; it does
+not execute `apiKeyHelper` or load project settings. Account credential files are
+read per request, so their rotation takes effect without restarting; `.env` changes
+also take effect on the next credential lookup. The clients handle login
 and token refresh; keychain-only credentials are not read by this service.
 
 Only configure `routing.api_key` when needed. Migration omits empty API Key maps
@@ -149,8 +192,23 @@ then `experimental_bearer_token`, then saved OpenAI authentication only when
 `requires_openai_auth = true`. An unset flag means `false`, matching Codex; neither
 `false` nor omission falls back to saved OpenAI authentication. A configured but
 missing or empty environment key is an error, not a fallback trigger.
-Saved provider authentication is read from `$CODEX_HOME/auth.json` (default
-`~/.codex/auth.json`): `auth_mode = "apikey"` selects `OPENAI_API_KEY`, and
+Codex `.env` loading follows the Codex CLI's `dotenvy`/`set_filtered` behavior:
+file entries override inherited process values (including empty values), later
+duplicate entries win, and variables starting with `CODEX_` are ignored without
+regard to case. Missing/unreadable files and individual parse errors are ignored.
+Quoted values, comments, `export` and variable interpolation use dotenvy 0.15.7
+syntax; later references see earlier accepted overrides, just as in Codex.
+
+On every credential lookup, the proxy copies the inherited environment into an
+isolated map for each configured home, then simulates Codex's `.env` loading in
+file order. Edits take effect on the next lookup without restarting. This does
+not mutate the process environment or affect Claude credentials or other homes.
+The parser/quoted-line code is adapted from dotenvy under its MIT license so that
+variable interpolation uses the simulated environment. No helper process is
+used. An absent credential still uses the proxy's existing login-shell lookup
+where supported; an explicitly empty value is an error and never triggers fallback.
+Saved provider authentication is read from `auth.json` inside the same listed
+Codex home: `auth_mode = "apikey"` selects `OPENAI_API_KEY`, and
 `auth_mode = "chatgpt"` selects `tokens.access_token` and the optional
 `tokens.account_id`. Without `auth_mode`, a stored API key takes precedence.
 ChatGPT provider credentials retain the account header and the provider's upstream.
@@ -387,7 +445,8 @@ settings filename from an opaque token. Declare the third-party upstream directl
 ```yaml
 claude:
   base_url: "https://api.anthropic.com"
-  auth_file: "~/.claude/.credentials.json"
+  config_dirs: ["~/.claude"] # Default when omitted.
+  auth_file: ".credentials.json"
   account_auth_file_only: true
   routing:
     account:
@@ -458,10 +517,10 @@ Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to instal
 from other locations.
 
 Edit the runtime copy of `config.yaml`, then restart to apply changes. Updates
-preserve that copy. Absolute credential paths are recommended. Linux services can
-load exported API Keys and `CODEX_HOME` from a private `service.env` file beside
-that runtime config, using systemd EnvironmentFile syntax. Windows API Keys must
-be available in the scheduled task's process environment.
+preserve that copy. Configure allowed directories and relative `auth_file` names
+in YAML. Linux services can load exported API Keys from a private `service.env` file beside
+that runtime config, using systemd EnvironmentFile syntax. Codex API Keys can
+also be stored in `.env` in a configured home on all platforms.
 
 ```sh
 cargo build --locked --release

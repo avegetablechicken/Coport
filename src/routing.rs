@@ -47,8 +47,9 @@ impl Config {
             .ok_or(Error::new(401, "A configured Bearer token is required."))?;
         let mut unavailable = false;
         let mut identities = Vec::new();
-        for (label, source) in &self.codex.accounts {
-            match source.codex_identity().await {
+        let account_sources = self.codex.account_sources();
+        for (label, source, _) in &account_sources {
+            match self.codex.account_identity(source).await {
                 Ok(i) if i.token == token => identities.push((i, Some(label.as_str()))),
                 Ok(_) => {}
                 Err(_) => unavailable = true,
@@ -66,18 +67,25 @@ impl Config {
         let mut matches = Vec::new();
         for p in &self.codex.providers {
             match p
-                .credential(&self.codex.base_url.api_key, identities.is_empty())
+                .credentials(
+                    &self.codex.base_url.api_key,
+                    identities.is_empty(),
+                    &self.codex,
+                )
                 .await
             {
-                Ok(credential) if credential.token == token => matches.push(Route {
-                    token: credential.token,
-                    account_id: credential.account_id,
-                    provider: Some(p.label().into()),
-                    proxy: p.proxy.clone(),
-                    upstream: credential.upstream,
-                    custom_upstream: false,
-                }),
-                Ok(_) => {}
+                Ok(credentials) => {
+                    for credential in credentials.into_iter().filter(|c| c.token == token) {
+                        matches.push(Route {
+                            token: credential.token,
+                            account_id: credential.account_id,
+                            provider: Some(p.label().into()),
+                            proxy: p.proxy.clone(),
+                            upstream: credential.upstream,
+                            custom_upstream: false,
+                        });
+                    }
+                }
                 Err(_) => unavailable = true,
             }
         }
