@@ -62,6 +62,7 @@ Either service section can be omitted. Within each section:
 | `routing.account.<label>` | Proxy choice for that account source |
 | `routing.api_key.<selector>` | Proxy choice for an API Key environment variable (Codex also accepts provider IDs) |
 | `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
+| `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback` for compatibility |
 | `routing.api_key_fallback` | Proxy choice for an unmatched API Key credential |
 
 Place `auth_file` directly under `codex` or `claude`; the saved login is named
@@ -106,9 +107,12 @@ account requirements, just as for Codex. Matched local tokens still use local
 metadata; it is never reused for a different incoming token.
 
 Claude tokens are opaque, so an unknown token requires `GET /api/oauth/profile`
-on `claude.base_url`. Before identity is known, **`claude.routing.account_fallback`
-provides the lookup proxy** (including ordered candidates). It must be explicitly
-configured; no implicit direct route or another account's proxy is used. Only the
+on `claude.base_url`. Before identity is known, **`claude.routing.account_probe`
+provides the lookup proxy** (including ordered candidates or explicit `none` for
+direct access). When omitted, `account_fallback` supplies the lookup proxy for
+backward compatibility. If neither is configured, lookup fails; no implicit direct
+route or another account's proxy is used. `account_probe` does not authorize model
+requests: after identity lookup, an account mapping or `account_fallback` is required. Only the
 Bearer token and profile-request headers are sent, without model payload, cookies
 or client headers. The account returned by the API selects the final UUID/email
 route for the model request. Example:
@@ -120,7 +124,8 @@ claude:
   routing:
     account:
       "you@example.com": claude_official
-    account_fallback: claude_official
+    account_probe: claude_official
+    # account_fallback: claude_official # Optional: allow other verified accounts.
 ```
 
 Successful profile identities are cached in memory per token for 5 minutes, up

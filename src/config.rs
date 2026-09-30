@@ -55,6 +55,8 @@ pub struct Routing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fallback: Option<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_probe: Option<Choice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_fallback: Option<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_fallback: Option<Choice>,
@@ -349,6 +351,11 @@ impl Config {
     }
     fn validate(&self) -> Result<()> {
         self.claude.validate(self)?;
+        if self.codex.routing.account_probe.is_some() {
+            return Err(Error::config(
+                "account_probe is only supported under claude.routing.",
+            ));
+        }
         if self.listen_port == 0
             || !self.request_timeout_seconds.is_finite()
             || !(1.0..=3600.0).contains(&self.request_timeout_seconds)

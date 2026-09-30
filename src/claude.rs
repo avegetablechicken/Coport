@@ -269,6 +269,7 @@ impl Claude {
         crate::url_routing::validate_routes(&self.routing.api_key)?;
         for choice in [
             &self.routing.account_fallback,
+            &self.routing.account_probe,
             &self.routing.api_key_fallback,
         ]
         .into_iter()
@@ -383,13 +384,15 @@ impl Claude {
             ));
         }
         let needs_profile = bearer && !matched_account && !matched_api;
-        if needs_profile && self.routing.account_fallback.is_none() {
-            return Err(Error::config(
-                "Claude profile lookup requires routing.account_fallback.",
-            ));
-        }
         let (label, proxy) = if let Some((label, proxy)) = matches.pop() {
             (label.clone(), proxy.clone())
+        } else if needs_profile {
+            let proxy = self.routing.account_probe.as_ref()
+                .or(self.routing.account_fallback.as_ref())
+                .ok_or(Error::config(
+                    "Claude profile lookup requires routing.account_probe (or legacy routing.account_fallback).",
+                ))?;
+            ("claude-profile".into(), proxy.clone())
         } else if let Some(proxy) = if bearer {
             &self.routing.account_fallback
         } else {
@@ -569,6 +572,78 @@ mod tests {
             "listen_port: 7889\nrequest_timeout_seconds: 3\n{extra}"
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn account_probe_is_separate_from_model_fallback() {
+        let config = config(
+            r#"
+proxies:
+  lookup: http://127.0.0.1:8101
+  payload: http://127.0.0.1:8102
+claude:
+  account_auth_file_only: false
+  routing:
+    account_probe: [lookup, none]
+    account:
+      person@example.invalid: payload
+    account_fallback: payload
+"#,
+        );
+        let encoded = config.canonical_yaml().unwrap();
+        let mut c = Config::parse(&encoded).unwrap().claude;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer remote-secret".parse().unwrap());
+        let mut route = c.resolve(&headers).await.unwrap();
+        assert!(route.needs_profile);
+        assert_eq!(
+            route.proxy.label(),
+            c.routing.account_probe.as_ref().unwrap().label()
+        );
+        let known = || {
+            ClaudeIdentity::profile(&serde_json::json!({
+                "account": {"uuid": "id", "email": "person@example.invalid"}
+            }))
+            .unwrap()
+        };
+        let unknown = || {
+            ClaudeIdentity::profile(&serde_json::json!({
+                "account": {"uuid": "other", "email": "other@example.invalid"}
+            }))
+            .unwrap()
+        };
+        c.apply_profile(&mut route, unknown()).unwrap();
+        assert_eq!(route.proxy.label(), "payload");
+        c.routing.account_fallback = None;
+        let mut route = c.resolve(&headers).await.unwrap();
+        assert!(c.apply_profile(&mut route, unknown()).is_err());
+        c.apply_profile(&mut route, known()).unwrap();
+        assert_eq!(route.proxy.label(), "payload");
+        assert!(!route.needs_profile);
+        c.routing.account_probe = Some(Choice::One("none".into()));
+        assert_eq!(c.resolve(&headers).await.unwrap().proxy.label(), "none");
+        c.routing.account_probe = None;
+        assert!(c.resolve(&headers).await.is_err());
+        c.routing.account_fallback = Some(Choice::One("payload".into()));
+        assert_eq!(c.resolve(&headers).await.unwrap().proxy.label(), "payload");
+        c.account_auth_file_only = true;
+        assert_eq!(c.resolve(&headers).await.err().unwrap().status, 401);
+    }
+
+    #[test]
+    fn account_probe_validates_choices_and_service() {
+        for yaml in [
+            "claude:\n  routing:\n    account_probe: absent\n",
+            "claude:\n  routing:\n    account_probe: []\n",
+            "codex:\n  routing:\n    account_probe: none\n",
+        ] {
+            assert!(
+                Config::parse(&format!(
+                    "listen_port: 7889\nrequest_timeout_seconds: 3\n{yaml}"
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]

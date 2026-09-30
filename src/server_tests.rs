@@ -448,7 +448,7 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
     let mut payload = fixture("http", "redirect").await;
     let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
     let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
-    let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_fallback: lookup\n")).await;
+    let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
     trust(&running, &lookup, &lookup_endpoint);
     trust(&running, &payload, &payload_endpoint);
     for (token, expect_lookup) in [

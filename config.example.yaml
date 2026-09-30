@@ -30,9 +30,11 @@ claude:
     account:
       default: claude_official
       # "you@example.com": claude_official # UUID/email/name precedes default.
+    # account_probe: claude_official # OAuth account identity probe when file-only is false.
     # account_fallback: claude_official
   # With account_auth_file_only: false, other tokens are identified via profile API.
-  # account_fallback supplies the lookup proxy before the account is known.
+  # account_probe supplies the lookup proxy before the account is known.
+  # If omitted, account_fallback supplies it for backward compatibility.
   # With true, unmatched tokens are rejected even when a fallback exists.
 
 # Omit API Key entries unless configured. To enable them, add under routing:

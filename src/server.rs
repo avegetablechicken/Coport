@@ -59,8 +59,9 @@ impl Server {
         let identity = if let Some(identity) = cached {
             identity
         } else {
-            // Before the token's identity is known, account_fallback provides
-            // the explicitly configured lookup transport. Never use a direct
+            // Before the token's identity is known, account_probe (or the legacy
+            // account_fallback) provides the configured lookup transport.
+            // Never use a direct
             // or cross-account proxy inferred from an unverified identity.
             let url = self.config.claude.url("/api/oauth/profile")?;
             let selected = self.select(&route.proxy, &url, log).await?;
