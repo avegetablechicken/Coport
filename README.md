@@ -236,8 +236,8 @@ priority. Account/API fallbacks default to rejection when omitted/null.
 
 Default upstreams must be HTTPS public hostnames; explicitly declared third-party
 Claude API routes may also use public IPv4 addresses. Codex's account base is the ChatGPT
-backend root: model requests use `/codex`, usage uses `/wham`, and plugin APIs use
-`/ps`. A legacy `/backend-api/codex` base is normalized to `/backend-api`.
+backend root: model requests use `/codex`, usage, profile and reset-credit queries
+use `/wham`, and plugin APIs use `/ps`. A legacy `/backend-api/codex` base is normalized to `/backend-api`.
 Claude's single base URL is a root **without `/v1`**: native `/v1` and
 `/api/oauth` paths are preserved. The Claude base may point to a compatible
 Anthropic gateway; no model or protocol conversion is performed.
@@ -331,9 +331,27 @@ after editing. The service uses HTTP/SSE; WebSocket upgrades are unsupported.
 For matched ChatGPT credentials, `/responses`, `/v1/responses` and
 `/backend-api/codex/responses` map to the same model endpoint. Official
 `/backend-api/...` paths retain their full path, including plugin listing at
-`/backend-api/ps/plugins/installed` and analytics events. The usage endpoints
-`/backend-api/wham/usage` and `/backend-api/wham/rate-limit-reset-credits` require
-GET and a matched ChatGPT login; API Keys cannot read subscription limits.
+`/backend-api/ps/plugins/installed` and analytics events. The account endpoints
+`/backend-api/wham/usage`, `/backend-api/wham/profiles/me` and
+`/backend-api/wham/rate-limit-reset-credits` require GET, and
+`/backend-api/wham/rate-limit-reset-credits/consume` requires POST; all need a
+matched ChatGPT login. API Keys cannot read subscription limits or account
+profiles, or consume reset credits.
+
+ChatGPT login refreshes can also use the saved account's proxy. Codex reads the
+refresh URL from the environment rather than `config.toml`:
+
+```sh
+export CODEX_REFRESH_TOKEN_URL_OVERRIDE="http://127.0.0.1:7889/oauth/token"
+```
+
+`POST /oauth/token` (or `/https://auth.openai.com/oauth/token`) is forwarded to
+`https://auth.openai.com/oauth/token`. The request has no Bearer token, so the
+`refresh_token` in the JSON or form body selects the Codex `auth.json` login
+whose `refresh_token` matches, and that account's proxy is used. Unmatched refresh
+tokens use `account_fallback` only when `account_auth_file_only` is false;
+otherwise they are rejected with 403 before any connection. The body is sent
+unchanged and no credential is added; the refresh token is never logged.
 
 The explicit upstream URL form also works, for example:
 `http://127.0.0.1:7889/https://chatgpt.com/backend-api/codex/responses` or

@@ -133,6 +133,38 @@ impl Config {
         }
     }
 }
+impl Config {
+    /// Refresh requests carry no Bearer token; the refresh token selects the
+    /// saved login whose proxy is used. Nothing is injected upstream.
+    pub async fn resolve_refresh(&self, refresh_token: &str) -> Result<(Choice, Option<String>)> {
+        let mut unavailable = false;
+        for (label, source, _) in &self.codex.account_sources() {
+            match self.codex.account_identity(source).await {
+                Ok(i) if i.refresh_token.as_deref() == Some(refresh_token) => {
+                    let proxy = self.account_choice(&i, Some(label))?;
+                    return Ok((proxy, Some(i.account_id)));
+                }
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if !self.codex.account_auth_file_only {
+            if let Some(proxy) = &self.codex.routing.account_fallback {
+                return Ok((proxy.clone(), None));
+            }
+        }
+        if unavailable {
+            Err(Error::config(
+                "No matching refresh route; one or more credential sources are unavailable.",
+            ))
+        } else {
+            Err(Error::new(
+                403,
+                "Token refresh requires a refresh token saved in a configured Codex auth.json.",
+            ))
+        }
+    }
+}
 pub const MCP_PATH: &str = "/mcp/openaiDeveloperDocs";
 pub const MCP_UPSTREAM: &str = "https://developers.openai.com/mcp";
 fn valid_target(target: &str) -> Result<()> {
@@ -149,7 +181,8 @@ fn valid_target(target: &str) -> Result<()> {
     }
     Ok(())
 }
-pub fn account_query(target: &str) -> bool {
+/// Returns the only method allowed for a ChatGPT account endpoint.
+pub fn account_query(target: &str) -> Option<&'static str> {
     let path = if target.starts_with("/https://") || target.starts_with("/http://") {
         Url::parse(&target[1..])
             .ok()
@@ -158,10 +191,32 @@ pub fn account_query(target: &str) -> bool {
     } else {
         target.split('?').next().unwrap_or("").to_string()
     };
+    match path.as_str() {
+        "/backend-api/wham/usage"
+        | "/backend-api/wham/profiles/me"
+        | "/backend-api/wham/rate-limit-reset-credits" => Some("GET"),
+        "/backend-api/wham/rate-limit-reset-credits/consume" => Some("POST"),
+        _ => None,
+    }
+}
+pub const TOKEN_REFRESH_UPSTREAM: &str = "https://auth.openai.com/oauth/token";
+/// Codex sends refreshes here via CODEX_REFRESH_TOKEN_URL_OVERRIDE.
+pub fn token_refresh(target: &str) -> bool {
     matches!(
-        path.as_str(),
-        "/backend-api/wham/usage" | "/backend-api/wham/rate-limit-reset-credits"
+        target,
+        "/oauth/token" | "/https://auth.openai.com/oauth/token"
     )
+}
+pub fn refresh_token(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["refresh_token"].as_str().map(String::from))
+        .or_else(|| {
+            url::form_urlencoded::parse(body)
+                .find(|(k, _)| k == "refresh_token")
+                .map(|(_, v)| v.into_owned())
+        })
+        .filter(|s| valid_token(s))
 }
 pub fn upstream_url(base: &str, target: &str, account: bool) -> Result<Url> {
     valid_target(target)?;
@@ -226,7 +281,8 @@ pub fn upstream_url(base: &str, target: &str, account: bool) -> Result<Url> {
 }
 pub fn query_url(base: &str, target: &str) -> Result<Url> {
     let b = Url::parse(base).map_err(|_| Error::config("Invalid account query base."))?;
-    if !account_query(target) || !matches!(b.path(), "/backend-api" | "/backend-api/codex") {
+    if account_query(target).is_none() || !matches!(b.path(), "/backend-api" | "/backend-api/codex")
+    {
         return Err(Error::config(
             "Account queries require a ChatGPT /backend-api upstream.",
         ));
@@ -298,6 +354,24 @@ mod tests {
                 .as_str(),
             "https://chatgpt.com/backend-api/wham/usage?x=1"
         );
+        for (t, method) in [
+            ("/backend-api/wham/usage", "GET"),
+            ("/backend-api/wham/profiles/me", "GET"),
+            ("/backend-api/wham/rate-limit-reset-credits", "GET"),
+            ("/backend-api/wham/rate-limit-reset-credits/consume", "POST"),
+        ] {
+            assert_eq!(account_query(t), Some(method), "{t}");
+            assert_eq!(
+                query_url(b, t).unwrap().as_str(),
+                format!("https://chatgpt.com{t}")
+            );
+        }
+        assert_eq!(
+            account_query("/https://chatgpt.com/backend-api/wham/profiles/me"),
+            Some("GET")
+        );
+        assert!(account_query("/backend-api/wham/profiles/other").is_none());
+        assert!(query_url("https://api.openai.com/v1", "/backend-api/wham/usage").is_err());
         for t in [
             "//evil.com",
             "/https://evil.com/backend-api/a",
@@ -307,6 +381,34 @@ mod tests {
             "/responses#secret",
         ] {
             assert!(upstream_url(b, t, true).is_err(), "{t}");
+        }
+    }
+
+    #[test]
+    fn token_refresh_targets_and_bodies() {
+        for t in ["/oauth/token", "/https://auth.openai.com/oauth/token"] {
+            assert!(token_refresh(t), "{t}");
+        }
+        for t in [
+            "/oauth/token?x=1",
+            "/https://evil.com/oauth/token",
+            "/https://auth.openai.com/oauth/authorize",
+        ] {
+            assert!(!token_refresh(t), "{t}");
+        }
+        assert_eq!(
+            refresh_token(
+                br#"{"client_id":"c","grant_type":"refresh_token","refresh_token":"rt"}"#
+            )
+            .as_deref(),
+            Some("rt")
+        );
+        assert_eq!(
+            refresh_token(b"grant_type=refresh_token&refresh_token=rt%2B1").as_deref(),
+            Some("rt+1")
+        );
+        for body in [&b"{}"[..], b"{\"refresh_token\":\"a b\"}", b""] {
+            assert!(refresh_token(body).is_none());
         }
     }
 }

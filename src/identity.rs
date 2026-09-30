@@ -14,6 +14,7 @@ use std::{
 pub struct Identity {
     pub account_id: String,
     pub token: String,
+    pub refresh_token: Option<String>,
     pub usernames: Vec<String>,
 }
 pub fn valid_token(s: &str) -> bool {
@@ -61,6 +62,10 @@ impl Identity {
         Ok(Self {
             account_id: id.into(),
             token: token.into(),
+            refresh_token: tokens["refresh_token"]
+                .as_str()
+                .filter(|s| valid_token(s))
+                .map(String::from),
             usernames: usernames(
                 &claims(token),
                 &claims(tokens["id_token"].as_str().unwrap_or("")),
@@ -75,6 +80,7 @@ impl Identity {
         Some(Self {
             account_id: id.into(),
             token: token.into(),
+            refresh_token: None,
             usernames: usernames(&c, &Value::Null),
         })
     }

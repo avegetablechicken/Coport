@@ -42,6 +42,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
     let certified = rcgen::generate_simple_self_signed(vec![
         "upstream.invalid".into(),
         "developers.openai.com".into(),
+        "auth.openai.com".into(),
         "localhost".into(),
     ])
     .unwrap();
@@ -180,6 +181,72 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!log.contains("url-route-secret"));
     }
+}
+
+#[tokio::test]
+async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credentials() {
+    let mut fixture = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("auth.json"),
+        r#"{"tokens":{"account_id":"acct-1","access_token":"access-secret","refresh_token":"refresh-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!(
+        "proxies:\n  selected: {endpoint}\ncodex:\n  homes: [{}]\n  routing:\n    account:\n      acct-1: selected\n",
+        serde_json::to_string(&home.path()).unwrap()
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let body =
+        r#"{"client_id":"app","grant_type":"refresh_token","refresh_token":"refresh-secret"}"#;
+    for path in ["/https://auth.openai.com/oauth/token", "/oauth/token"] {
+        let response = http()
+            .post(format!("{}{path}", running.url))
+            .header("content-type", "application/json")
+            .header("cookie", "private-cookie")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(connect.starts_with("CONNECT auth.openai.com:443"));
+        assert!(!connect.contains("refresh-secret"));
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(request.contains("host: auth.openai.com"));
+        assert!(!request.to_lowercase().contains("authorization"));
+        assert!(!request.contains("access-secret"));
+        assert!(!request.contains("private-cookie"));
+        assert!(request.ends_with(body));
+        fixture.release.notify_one();
+        assert_eq!(
+            response.text().await.unwrap(),
+            "data: first\n\ndata: last\n\n"
+        );
+    }
+    for (method, body, status) in [
+        ("GET", "", 405),
+        ("POST", "{}", 400),
+        ("POST", r#"{"refresh_token":"unknown"}"#, 403),
+    ] {
+        let response = http()
+            .request(
+                method.parse().unwrap(),
+                format!("{}/oauth/token", running.url),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {body}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(log.contains("\"account_id\":\"acct-1\""));
+    assert!(!log.contains("refresh-secret"));
 }
 
 #[tokio::test]

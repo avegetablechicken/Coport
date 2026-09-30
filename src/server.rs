@@ -2,7 +2,10 @@ use crate::{
     Error, Result,
     config::{Choice, Config, redacted_endpoint},
     logger::{Logger, RequestLog},
-    routing::{MCP_PATH, MCP_UPSTREAM, account_query, query_url, upstream_url},
+    routing::{
+        MCP_PATH, MCP_UPSTREAM, TOKEN_REFRESH_UPSTREAM, account_query, query_url, refresh_token,
+        token_refresh, upstream_url,
+    },
 };
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
@@ -405,6 +408,9 @@ impl Server {
         let target = crate::routing::codex_target(target);
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
+        if !claude_scoped && token_refresh(target) {
+            return self.forward_token_refresh(incoming, log).await;
+        }
         let explicit_api_route = if codex_scoped {
             None
         } else {
@@ -551,15 +557,22 @@ impl Server {
                 .map_err(|_| Error::config("Invalid MCP request target."))?
         } else {
             let r = route.as_ref().unwrap();
-            if query {
+            if let Some(method) = query {
                 if r.account_id.is_none() {
                     return Err(Error::new(
                         403,
                         "Account usage queries require a matched ChatGPT login credential.",
                     ));
                 }
-                if incoming.method() != "GET" {
-                    return Err(Error::new(405, "Account usage queries support GET only."));
+                if incoming.method() != method {
+                    return Err(Error::new(
+                        405,
+                        if method == "GET" {
+                            "Account usage queries support GET only."
+                        } else {
+                            "Reset credit consumption supports POST only."
+                        },
+                    ));
                 }
                 query_url(&r.upstream, target)?
             } else {
@@ -567,20 +580,7 @@ impl Server {
             }
         };
         let (parts, body) = incoming.into_parts();
-        let bytes = tokio::time::timeout(
-            Duration::from_secs(30),
-            Limited::new(body, 32 * 1024 * 1024).collect(),
-        )
-        .await
-        .map_err(|_| Error::new(408, "Request body read timed out."))?
-        .map_err(|e| {
-            if e.is::<http_body_util::LengthLimitError>() {
-                Error::new(413, "Request body exceeds 32 MiB.")
-            } else {
-                Error::new(400, "Invalid HTTP request body.")
-            }
-        })?
-        .to_bytes();
+        let bytes = read_body(body).await?;
         let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
             || route.as_ref().is_some_and(|r| r.custom_upstream);
         let selected = self
@@ -637,6 +637,41 @@ impl Server {
                 Error::config("Upstream transport failed; no direct fallback was attempted.")
             })
     }
+    async fn forward_token_refresh(
+        &self,
+        incoming: Request<Incoming>,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        log.field("service", "codex_auth");
+        if incoming.method() != "POST" {
+            return Err(Error::new(405, "Token refresh supports POST only."));
+        }
+        let (parts, body) = incoming.into_parts();
+        let bytes = read_body(body).await?;
+        let token = refresh_token(&bytes)
+            .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
+        let (choice, account_id) = self.config.resolve_refresh(&token).await?;
+        if let Some(id) = &account_id {
+            log.field("account_id", id);
+        }
+        let url = Url::parse(TOKEN_REFRESH_UPSTREAM).unwrap();
+        let selected = self.select(&choice, &url, log).await?;
+        let endpoint = self.config.endpoint(&selected);
+        log.field("proxy", selected);
+        log.field("proxy_endpoint", redacted_endpoint(endpoint));
+        log.event("route_selected");
+        let mut headers = filtered_headers(&parts.headers);
+        headers.insert("accept-encoding", "identity".parse().unwrap());
+        self.client(endpoint)?
+            .post(url)
+            .headers(headers)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| {
+                Error::config("Upstream transport failed; no direct fallback was attempted.")
+            })
+    }
     pub async fn serve(
         self: Arc<Self>,
         listener: TcpListener,
@@ -678,6 +713,22 @@ impl Server {
     }
 }
 
+async fn read_body(body: Incoming) -> Result<Bytes> {
+    Ok(tokio::time::timeout(
+        Duration::from_secs(30),
+        Limited::new(body, 32 * 1024 * 1024).collect(),
+    )
+    .await
+    .map_err(|_| Error::new(408, "Request body read timed out."))?
+    .map_err(|e| {
+        if e.is::<http_body_util::LengthLimitError>() {
+            Error::new(413, "Request body exceeds 32 MiB.")
+        } else {
+            Error::new(400, "Invalid HTTP request body.")
+        }
+    })?
+    .to_bytes())
+}
 // Reject ambiguity before Hyper normalizes duplicate Content-Length or TE+CL.
 // Buffered bytes (including any body prefix) are then passed to Hyper unchanged.
 async fn read_head(socket: &mut tokio::net::TcpStream) -> Result<Bytes> {

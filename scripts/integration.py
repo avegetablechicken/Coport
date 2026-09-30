@@ -252,7 +252,11 @@ api_key_providers:
             assert request(token=None, path="/mcp/openaiDeveloperDocs")[0] == 502
             assert len(a.requests) > previous_a and len(b.requests) == previous_b
             print("PASS: MCP follows matched ChatGPT/API routes, missing credentials use independent fallback loaded at restart")
-            for path in ["/backend-api/wham/usage", "/backend-api/wham/rate-limit-reset-credits"]:
+            for path in [
+                "/backend-api/wham/usage",
+                "/backend-api/wham/profiles/me",
+                "/backend-api/wham/rate-limit-reset-credits",
+            ]:
                 previous_a, previous_b = len(a.requests), len(b.requests)
                 assert request(token="chat-mixed-token", path=path, method="GET")[0] == 502
                 assert len(a.requests) > previous_a and len(b.requests) == previous_b
@@ -260,7 +264,7 @@ api_key_providers:
                 total_before = len(a.requests) + len(b.requests)
                 assert request(token="provider-key-one", path=path, method="GET")[0] == 403
                 assert len(a.requests) + len(b.requests) == total_before
-            print("PASS: account usage/credits use matched ChatGPT proxy; API keys rejected before CONNECT")
+            print("PASS: account usage/profile/credits use matched ChatGPT proxy; API keys rejected before CONNECT")
             total = len(a.requests) + len(b.requests)
             assert request(token="unknown")[0] == 401
             key_b.write_text("provider-key-one")
