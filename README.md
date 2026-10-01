@@ -2,7 +2,8 @@
 
 A cross-platform Rust loopback reverse proxy for Codex, Claude Code, ChatGPT account APIs and
 OpenAI documentation MCP. It selects an outbound proxy by matching account or
-API Key credentials. HTTP/SSE data is passed through without model or protocol conversion.
+API Key credentials. HTTP/SSE and WebSocket data are passed through without model
+or protocol conversion. Explicit destination routes also support HTTP CONNECT tunnels.
 
 ## Configuration
 
@@ -326,7 +327,8 @@ chatgpt_base_url = "http://127.0.0.1:7889/backend-api"
 The first setting controls model requests; the second independently controls
 ChatGPT backend requests. Codex only adds `/backend-api` automatically for
 recognized official hostnames, so include it for a loopback URL. Restart Codex
-after editing. The service uses HTTP/SSE; WebSocket upgrades are unsupported.
+after editing. HTTP/SSE and HTTP/1.1 WebSocket upgrades use the same credential
+and upstream routes.
 
 For matched ChatGPT credentials, `/responses`, `/v1/responses` and
 `/backend-api/codex/responses` map to the same model endpoint. Official
@@ -410,6 +412,48 @@ with the URL-only configuration above, requests normally use that fallback.
 Model tokens, account IDs, cookies and other private headers are not sent to the
 public MCP upstream. MCP session/protocol headers, JSON and SSE are preserved.
 
+## HTTP CONNECT and WebSocket
+
+WebSocket clients use the same local paths, credentials and upstream routing as
+HTTP requests, with `ws://` in place of the local `http://` URL. The proxy forwards
+the handshake over HTTPS and, after a valid `101` response, relays frames in both
+directions, including binary data, ping/pong, close frames, negotiated subprotocols
+and extensions. Upstream handshake errors keep their HTTP status and body.
+
+To use the listener as an HTTP CONNECT proxy, configure exact destinations at
+the top level:
+
+```yaml
+connect:
+  "api.anthropic.com:443": claude_official
+  "platform.claude.com:443": claude_official
+  "chatgpt.com:443": [us, jp]
+```
+
+Values refer to names in `proxies`; `none` explicitly selects direct TCP.
+Unlisted destinations return 403. Hostnames are case-insensitive; ports must
+match. IPv6 literals use `[address]:port`. Configure any additional destinations
+needed by the client. This setting is preserved by configuration migration.
+
+Clients that support an HTTP proxy can then use
+`HTTPS_PROXY=http://127.0.0.1:8787` with their original HTTPS URLs. This also carries
+secure WebSocket connections through CONNECT. TLS stays between client and
+server, so the proxy cannot inspect the API path or token, apply per-account
+routing, or change headers inside the tunnel. CONNECT routes use the destination
+alone and are independent of `codex.routing` and `claude.routing`.
+
+Outbound HTTP and HTTPS proxies support Basic proxy authentication; SOCKS5
+supports optional username/password authentication and resolves destination
+hostnames remotely. HTTPS proxy certificates are verified using native system
+trust. Ordered route lists attempt tunnel establishment in order and retain the
+first successful connection; payloads are never replayed after establishment.
+
+CONNECT and upgraded WebSocket connections count toward the 128-connection
+limit, close on service shutdown, and have a maximum relay lifetime of
+`request_timeout_seconds` (measured after establishment). They preserve buffered
+early data and TCP half-closes. This listener supports CONNECT authority-form and
+API origin-form requests; it does not accept absolute-form plain HTTP proxy requests.
+
 ## Connect Claude Code / Anthropic
 
 Configure `claude.auth_file` and `claude.routing` as shown above, then set this
@@ -477,7 +521,8 @@ still identifies unmatched access tokens via the profile API before routing.
 The unprefixed `/v1/oauth/token` and explicit
 `/https://platform.claude.com/v1/oauth/token` paths are also supported, including
 `/anthropic` and `/claude` prefixes. Use the local URL as an OAuth base URL,
-not as an HTTP CONNECT proxy in the client's proxy setting.
+or configure the separate CONNECT destination routes before using the listener
+as an HTTP proxy.
 
 Implementation references: Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
 and [Claude header definitions](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/pkg/claude/constants.go).
@@ -756,7 +801,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - Default upstreams require HTTPS and a public service hostname. Explicit Claude API URL routes also accept public IPv4 addresses; private addresses and local hostnames remain rejected.
 - Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Optional username/password authentication uses `scheme://username:password@host:port`. Credentials are removed from logged proxy URLs.
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
-- `Expect: 100-continue` returns HTTP 417. WebSocket Upgrade returns HTTP 426.
+- `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.

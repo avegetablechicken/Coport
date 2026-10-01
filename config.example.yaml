@@ -8,6 +8,16 @@ proxies:
   jp: "socks5://127.0.0.1:8102"
   claude_official: "http://127.0.0.1:7893"
 
+# Optional inbound HTTP CONNECT destinations (exact host:port).
+# TLS stays end-to-end, so these routes cannot inspect account credentials.
+# connect:
+#   "api.anthropic.com:443": claude_official
+#   "platform.claude.com:443": claude_official
+#   "chatgpt.com:443": [us, jp]
+#   "api.openai.com:443": us
+# Unlisted destinations are denied; none explicitly enables direct TCP.
+# Lists attempt connection establishment in order; established tunnels never replay.
+
 codex:
   base_url:
     account: "https://chatgpt.com/backend-api"
@@ -57,7 +67,8 @@ claude:
 # This route uses the supplied API credential and does not require a fallback.
 # Claude Code settings.json env:
 #   ANTHROPIC_BASE_URL: http://127.0.0.1:8787/anthropic
-# Outbound proxies belong here, not in Claude's environment.
+# For credential routing, configure outbound proxies here.
+# Alternatively, HTTPS_PROXY=http://127.0.0.1:8787 uses the CONNECT routes above.
 
 # URL routing keys may omit https:// and /v1. A host-only key matches all paths;
 # an explicit path wins when it is the longest matching path prefix.

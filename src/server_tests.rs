@@ -88,6 +88,18 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     };
                     io.write_all(format!("HTTP/1.1 {status} Profile\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode=="websocket" || response_mode=="websocket_bad" {
+                    let accept = if response_mode=="websocket_bad" { "invalid" } else { "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" };
+                    io.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: test\r\n\r\n").as_bytes()).await.unwrap();
+                    // A text frame coalesced with the upgrade must survive both parsers.
+                    io.write_all(b"\x81\x02hi").await.unwrap();
+                    let mut frame = [0; 8];
+                    if io.read_exact(&mut frame).await.is_ok() {
+                        assert_eq!(&frame, b"\x81\x82\x01\x02\x03\x04ni");
+                        io.write_all(b"\x81\x02ok\x88\x00").await.unwrap();
+                        io.shutdown().await.unwrap();
+                    }
+                }
                 else if response_mode=="oauth_json" {
                     let body = if request.starts_with("POST /v1/oauth/token ") {
                         r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#
@@ -1073,4 +1085,282 @@ async fn claude_oauth_usage_and_refresh_preserve_json_and_headers() {
             .unwrap()
             .contains("refresh-secret")
     );
+}
+
+async fn read_response_head(socket: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        bytes.push(socket.read_u8().await.unwrap());
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn websocket_upgrade_preserves_auth_protocol_and_early_frames() {
+    for scoped in [false, true] {
+        let mut fixture = fixture("http", "websocket").await;
+        let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+        let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key:\n      upstream.invalid: selected\nclaude:\n  routing:\n    api_key:\n      upstream.invalid: selected\n")).await;
+        trust(&running, &fixture, &endpoint);
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let scope = if scoped { "anthropic" } else { "codex" };
+        socket.write_all(format!("GET /{scope}/https://upstream.invalid/v1/socket?model=test HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: test\r\n\r\n").as_bytes()).await.unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(head.to_lowercase().contains("sec-websocket-protocol: test"));
+        let mut early = [0; 4];
+        socket.read_exact(&mut early).await.unwrap();
+        assert_eq!(&early, b"\x81\x02hi");
+        socket
+            .write_all(b"\x81\x82\x01\x02\x03\x04ni")
+            .await
+            .unwrap();
+        let mut tail = Vec::new();
+        socket.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"\x81\x02ok\x88\x00");
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /v1/socket?model=test HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer ws-secret"));
+        assert!(request.contains("sec-websocket-protocol: test"));
+        assert!(request.contains("upgrade: websocket"));
+    }
+}
+
+#[tokio::test]
+async fn websocket_invalid_accept_is_rejected() {
+    let fixture = fixture("direct", "websocket_bad").await;
+    let running =
+        running("claude:\n  routing:\n    api_key:\n      upstream.invalid: none\n").await;
+    trust(&running, &fixture, "none");
+    let response = http()
+        .get(format!(
+            "{}/anthropic/https://upstream.invalid/socket",
+            running.url
+        ))
+        .bearer_auth("key")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+}
+
+#[tokio::test]
+async fn inbound_connect_direct_preserves_early_bytes_and_half_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut payload = Vec::new();
+        socket.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"early-later");
+        socket.write_all(b"reply-after-half-close").await.unwrap();
+    });
+    let running = running(&format!("connect:\n  '{destination}': none\n")).await;
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket
+        .write_all(
+            format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\nearly-")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_response_head(&mut socket).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    socket.write_all(b"later").await.unwrap();
+    socket.shutdown().await.unwrap();
+    let mut payload = Vec::new();
+    socket.read_to_end(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"reply-after-half-close");
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn inbound_connect_uses_http_proxy_without_forwarding_client_credentials() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with("CONNECT api.anthropic.com:443 HTTP/1.1"));
+        assert!(head.contains("Proxy-Authorization: Basic dTpw"));
+        assert!(!head.contains("private"));
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nearly-reply")
+            .await
+            .unwrap();
+        let mut payload = Vec::new();
+        socket.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"tunnel-data");
+    });
+    let running = running(&format!(
+        "proxies:\n  selected: http://u:p@{endpoint}\nconnect:\n  api.anthropic.com:443: selected\n"
+    ))
+    .await;
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket.write_all(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nAuthorization: Bearer private-token\r\nCookie: private-cookie\r\nProxy-Authorization: Basic private\r\n\r\n").await.unwrap();
+    assert!(
+        read_response_head(&mut socket)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    socket.write_all(b"tunnel-data").await.unwrap();
+    socket.shutdown().await.unwrap();
+    let mut data = Vec::new();
+    socket.read_to_end(&mut data).await.unwrap();
+    assert_eq!(&data, b"early-reply");
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn inbound_connect_rejects_unconfigured_destinations_and_bodies() {
+    let running = running("connect:\n  api.anthropic.com:443: none\n").await;
+    for (destination, extra, status) in [
+        ("other.invalid:443", "", 403),
+        ("api.anthropic.com:444", "", 403),
+        ("api.anthropic.com:443", "Content-Length: 1\r\n", 400),
+        (
+            "api.anthropic.com:443",
+            "Transfer-Encoding: chunked\r\n",
+            400,
+        ),
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n{extra}\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{head}");
+    }
+}
+
+#[tokio::test]
+async fn connect_relays_close_on_timeout_disconnect_and_shutdown() {
+    for mode in ["timeout", "disconnect", "shutdown"] {
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = destination.local_addr().unwrap();
+        let running = running(&format!("connect:\n  '{address}': none\n")).await;
+        running.task.abort();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let (shutdown, stop) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(running.server.clone().serve(listener, async {
+            let _ = stop.await;
+        }));
+        let mut socket = tokio::net::TcpStream::connect(local).await.unwrap();
+        socket
+            .write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(
+            read_response_head(&mut socket)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        let (mut peer, _) = destination.accept().await.unwrap();
+        let mut socket = Some(socket);
+        let mut shutdown = Some(shutdown);
+        if mode == "disconnect" {
+            drop(socket.take());
+        }
+        if mode == "shutdown" {
+            shutdown.take().unwrap().send(()).unwrap();
+        }
+        let mut bytes = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), peer.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "{mode}"
+        );
+        drop(peer);
+        if let Some(mut socket) = socket {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), socket.read(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "{mode}"
+            );
+        }
+        drop(shutdown);
+        serve.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn connect_only_falls_back_to_explicit_candidates_before_establishment() {
+    for allow_direct in [true, false] {
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = destination.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let reject = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let _ = read_response_head(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let candidates = if allow_direct {
+            "[rejected, none]"
+        } else {
+            "[rejected]"
+        };
+        let running = running(&format!(
+            "proxies:\n  rejected: http://{proxy_address}\nconnect:\n  '{address}': {candidates}\n"
+        ))
+        .await;
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket
+            .write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_response_head(&mut socket).await;
+        if allow_direct {
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            let (mut peer, _) = destination.accept().await.unwrap();
+            socket.write_all(b"x").await.unwrap();
+            assert_eq!(peer.read_u8().await.unwrap(), b'x');
+        } else {
+            assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), destination.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        reject.await.unwrap();
+    }
 }

@@ -6,6 +6,7 @@ pub mod identity;
 pub mod logger;
 pub mod routing;
 pub mod server;
+mod tunnel;
 pub mod url_routing;
 
 #[derive(Debug, Clone)]

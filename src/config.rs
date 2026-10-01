@@ -152,6 +152,8 @@ struct Raw {
     account_auth_file_only: Option<bool>,
     #[serde(default)]
     proxies: BTreeMap<String, String>,
+    #[serde(default)]
+    connect: BTreeMap<String, Choice>,
     base_url: Option<Bases>,
     routing: Option<Routing>,
     account_upstream_base_url: Option<String>,
@@ -169,6 +171,7 @@ pub struct Config {
     pub listen_port: u16,
     pub request_timeout_seconds: f64,
     pub proxies: BTreeMap<String, String>,
+    pub connect: BTreeMap<String, Choice>,
 }
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
@@ -295,6 +298,7 @@ impl Config {
             listen_port: raw.listen_port,
             request_timeout_seconds: raw.request_timeout_seconds,
             proxies: raw.proxies,
+            connect: raw.connect,
         };
         c.validate()?;
         Ok(c)
@@ -354,6 +358,14 @@ impl Config {
     }
     fn validate(&self) -> Result<()> {
         self.claude.validate(self)?;
+        let mut authorities = std::collections::HashSet::new();
+        for (authority, choice) in &self.connect {
+            let (host, port) = crate::tunnel::authority(authority)?;
+            if !authorities.insert((host, port)) {
+                return Err(Error::config("Duplicate CONNECT destination."));
+            }
+            self.validate_choice(choice)?;
+        }
         validate_directories(&self.codex.homes, &self.codex.accounts)?;
         if self.codex.routing.account_probe.is_some() {
             return Err(Error::config(
@@ -461,6 +473,8 @@ impl Config {
             listen_port: u16,
             request_timeout_seconds: f64,
             proxies: &'a BTreeMap<String, String>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            connect: &'a BTreeMap<String, Choice>,
             codex: Codex,
             claude: &'a crate::claude::Claude,
         }
@@ -504,6 +518,7 @@ impl Config {
             listen_port: self.listen_port,
             request_timeout_seconds: self.request_timeout_seconds,
             proxies: &self.proxies,
+            connect: &self.connect,
             codex,
             claude: &self.claude,
         })

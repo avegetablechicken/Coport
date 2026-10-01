@@ -27,6 +27,8 @@ use std::{
 use tokio::{net::TcpListener, sync::Semaphore};
 use url::Url;
 
+type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 pub struct Server {
     pub config: Config,
@@ -303,7 +305,8 @@ impl Server {
     }
     async fn handle(
         self: Arc<Self>,
-        incoming: Request<Incoming>,
+        mut incoming: Request<Incoming>,
+        relay: tokio::sync::mpsc::UnboundedSender<Relay>,
     ) -> std::result::Result<Response<Body>, Infallible> {
         let target = incoming
             .uri()
@@ -316,8 +319,80 @@ impl Server {
         }
         let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:502,bytes:0,outcome:"request_failed" };
         log.event("request_received");
+        if incoming.method() == "CONNECT" {
+            log.field("service", "connect");
+            let upstream = self.connect(&incoming, &mut log).await;
+            return Ok(match upstream {
+                Ok(upstream) => {
+                    log.status = 200;
+                    let upgraded = hyper::upgrade::on(&mut incoming);
+                    let _ = relay.send(relay_stream(
+                        upgraded,
+                        upstream,
+                        log,
+                        self.config.request_timeout_seconds,
+                    ));
+                    Response::builder().status(200).body(empty()).unwrap()
+                }
+                Err(error) => reject(&mut log, error),
+            });
+        }
+        let ws_key = incoming.headers().get("sec-websocket-key").cloned();
+        let upgrade = incoming
+            .headers()
+            .contains_key("upgrade")
+            .then(|| hyper::upgrade::on(&mut incoming));
         match self.forward(incoming, &target, &mut log).await {
             Ok(upstream) => {
+                if upstream.status() == 101 {
+                    let Some((upgrade, key)) = upgrade.zip(ws_key) else {
+                        return Ok(reject(
+                            &mut log,
+                            Error::config("Unexpected upstream protocol upgrade."),
+                        ));
+                    };
+                    let accept = crate::tunnel::websocket_accept(key.as_bytes());
+                    if !crate::tunnel::header_token(upstream.headers(), "connection", "upgrade")
+                        || upstream
+                            .headers()
+                            .get("upgrade")
+                            .is_none_or(|v| !v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+                        || upstream
+                            .headers()
+                            .get("sec-websocket-accept")
+                            .is_none_or(|v| v.as_bytes() != accept.as_bytes())
+                    {
+                        return Ok(reject(
+                            &mut log,
+                            Error::config("Invalid upstream WebSocket handshake."),
+                        ));
+                    }
+                    let mut headers = filtered_headers(upstream.headers());
+                    headers.insert("connection", "Upgrade".parse().unwrap());
+                    headers.insert("upgrade", "websocket".parse().unwrap());
+                    match upstream.upgrade().await {
+                        Ok(upstream) => {
+                            log.status = 101;
+                            log.event("upstream_response");
+                            let _ = relay.send(relay_stream(
+                                upgrade,
+                                Box::new(upstream),
+                                log,
+                                self.config.request_timeout_seconds,
+                            ));
+                            let mut response =
+                                Response::builder().status(101).body(empty()).unwrap();
+                            *response.headers_mut() = headers;
+                            return Ok(response);
+                        }
+                        Err(_) => {
+                            return Ok(reject(
+                                &mut log,
+                                Error::config("WebSocket upgrade failed."),
+                            ));
+                        }
+                    }
+                }
                 let status = upstream.status();
                 log.status = status.as_u16();
                 log.field("status", status.as_u16());
@@ -385,12 +460,7 @@ impl Server {
         {
             return Err(Error::new(413, "Request body exceeds 32 MiB."));
         }
-        if incoming.headers().contains_key("upgrade") {
-            return Err(Error::new(
-                426,
-                "Use HTTP/SSE; WebSocket upgrades are unsupported.",
-            ));
-        }
+        let websocket = crate::tunnel::websocket(&incoming)?;
         if incoming.headers().contains_key("expect") {
             return Err(Error::new(417, "Expect is unsupported."));
         }
@@ -629,6 +699,13 @@ impl Server {
                 );
             }
         }
+        if websocket {
+            headers.insert("connection", "Upgrade".parse().unwrap());
+            headers.insert("upgrade", "websocket".parse().unwrap());
+            for name in ["sec-websocket-key", "sec-websocket-version"] {
+                headers.insert(name, parts.headers[name].clone());
+            }
+        }
         headers.insert("accept-encoding", "identity".parse().unwrap());
         self.client_transport(endpoint, native_tls)?
             .request(parts.method, url)
@@ -640,6 +717,56 @@ impl Server {
                 Error::config("Upstream transport failed; no direct fallback was attempted.")
             })
     }
+    async fn connect(
+        &self,
+        incoming: &Request<Incoming>,
+        log: &mut RequestLog,
+    ) -> Result<crate::tunnel::Socket> {
+        if incoming.uri().scheme().is_some()
+            || incoming.uri().path_and_query().is_some()
+            || incoming.headers().contains_key("transfer-encoding")
+            || incoming
+                .headers()
+                .get("content-length")
+                .is_some_and(|v| v != "0")
+            || incoming.headers().contains_key("upgrade")
+        {
+            return Err(Error::new(400, "Invalid CONNECT request."));
+        }
+        let authority = incoming
+            .uri()
+            .authority()
+            .ok_or(Error::new(400, "CONNECT requires host:port."))?;
+        let (host, port) = crate::tunnel::authority(authority.as_str())?;
+        let choice = self
+            .config
+            .connect
+            .iter()
+            .find_map(|(name, choice)| {
+                (crate::tunnel::authority(name).ok() == Some((host.clone(), port)))
+                    .then_some(choice)
+            })
+            .ok_or(Error::new(403, "CONNECT destination is not configured."))?;
+        log.field("destination", format!("{host}:{port}"));
+        for name in choice.names() {
+            let endpoint = self.config.endpoint(name);
+            log.field("proxy", name);
+            log.field("proxy_endpoint", redacted_endpoint(endpoint));
+            let socket = tokio::time::timeout(
+                Duration::from_secs_f64(self.config.request_timeout_seconds),
+                crate::tunnel::open(&host, port, endpoint),
+            )
+            .await;
+            if let Ok(Ok(socket)) = socket {
+                log.event("route_selected");
+                return Ok(socket);
+            }
+        }
+        Err(Error::config(
+            "No configured CONNECT route could establish a tunnel.",
+        ))
+    }
+
     async fn forward_token_refresh(
         &self,
         incoming: Request<Incoming>,
@@ -714,8 +841,10 @@ impl Server {
                             return;
                         }
                     };
+                    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
                     let _=http1::Builder::new().keep_alive(false).max_buf_size(65536).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30))
-                        .serve_connection(TokioIo::new(PrefixedSocket { prefix, socket }),service_fn(move |r|server.clone().handle(r))).await;
+                        .serve_connection(TokioIo::new(PrefixedSocket { prefix, socket }),service_fn(move |r|server.clone().handle(r, relay_tx.clone()))).with_upgrades().await;
+                    if let Ok(relay) = relay_rx.try_recv() { relay.await; }
                     });
                 }
             }
@@ -724,6 +853,49 @@ impl Server {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
+}
+
+fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {
+    log.status = error.status;
+    if error.status < 500 {
+        log.outcome = "request_rejected";
+    }
+    log.field("reason", error.message);
+    response(
+        error.status,
+        &json!({"error":{"message":error.message}}).to_string(),
+    )
+}
+
+fn relay_stream(
+    upgrade: hyper::upgrade::OnUpgrade,
+    mut upstream: crate::tunnel::Socket,
+    mut log: RequestLog,
+    seconds: f64,
+) -> Relay {
+    Box::pin(async move {
+        let transfer = async {
+            let downstream = upgrade
+                .await
+                .map_err(|_| std::io::Error::other("Upgrade failed"))?;
+            let mut downstream = TokioIo::new(downstream);
+            tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+        };
+        match tokio::time::timeout(Duration::from_secs_f64(seconds), transfer).await {
+            Ok(Ok((sent, received))) => {
+                log.bytes = received as usize;
+                log.field("sent_bytes", sent);
+                log.outcome = "request_finished";
+            }
+            Ok(Err(_)) => {
+                log.field("reason", "tunnel_transport_error");
+            }
+            Err(_) => {
+                log.field("reason", "tunnel_timeout");
+            }
+        }
+        drop(log);
+    })
 }
 
 async fn read_body(body: Incoming) -> Result<Bytes> {
