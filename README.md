@@ -448,14 +448,38 @@ ChatGPT account headers are removed. Upstream errors and rate-limit headers pass
 through unchanged. `GET /anthropic/api/oauth/usage` requires a matched local OAuth account or an
 account identified by the profile API in `false` mode. API Keys cannot use it.
 
-Claude Code remains responsible for login and token refresh. The proxy reads
-credentials without changing them; it does not implement login, token refresh,
-macOS Keychain discovery, or OpenAI-to-Anthropic conversion. A keychain-only login
+The OAuth client remains responsible for initiating refreshes and saving
+new credentials. The proxy forwards refresh requests without changing credential
+files; it does not implement login, macOS Keychain discovery, or
+OpenAI-to-Anthropic conversion. A keychain-only login
 needs an explicit environment-backed credential or an account fallback.
 OAuth clients must still satisfy Anthropic's upstream client requirements.
 
-Implementation references: OpenQuota's local Claude credential reader and usage
-client, and Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
+### Claude OAuth usage and refresh
+
+Clients can send `GET /anthropic/api/oauth/usage` with an OAuth Bearer token
+and `anthropic-beta: oauth-2025-04-20`, and
+`POST /anthropic/v1/oauth/token` with a JSON or form refresh payload containing
+`refresh_token`. Usage goes to `claude.base_url` (default
+`https://api.anthropic.com`); refresh always goes to
+`https://platform.claude.com/v1/oauth/token`. JSON, status codes and `Retry-After`
+are passed through. The refresh `client_id`, `scope` and token are unchanged;
+no access token is injected.
+
+Refresh routing matches `claudeAiOauth.refreshToken` in the configured Claude
+credential files and uses that account's identity/label/fallback proxy route.
+Duplicate matches fail. For credentials held only by the client or Keychain,
+set `claude.account_auth_file_only: false` and explicitly configure
+`claude.routing.account_fallback` for refreshes. `account_probe` alone cannot
+route refreshes because a refresh token cannot query the profile API. Usage
+still identifies unmatched access tokens via the profile API before routing.
+
+The unprefixed `/v1/oauth/token` and explicit
+`/https://platform.claude.com/v1/oauth/token` paths are also supported, including
+`/anthropic` and `/claude` prefixes. Use the local URL as an OAuth base URL,
+not as an HTTP CONNECT proxy in the client's proxy setting.
+
+Implementation references: Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
 and [Claude header definitions](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/pkg/claude/constants.go).
 
 ### Third-party Claude APIs

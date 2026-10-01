@@ -43,6 +43,8 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
         "upstream.invalid".into(),
         "developers.openai.com".into(),
         "auth.openai.com".into(),
+        "platform.claude.com".into(),
+        "api.anthropic.com".into(),
         "localhost".into(),
     ])
     .unwrap();
@@ -75,7 +77,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     io.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
                 }
                 let Ok(tls)=acceptor.accept(io).await else { return; }; let mut io:TestIo=Box::new(tls);
-                let request=read_request(&mut io).await.unwrap(); let head=request.starts_with("HEAD "); let profile=request.starts_with("GET /api/oauth/profile "); tx.send(request).unwrap();
+                let request=read_request(&mut io).await.unwrap(); let head=request.starts_with("HEAD "); let profile=request.starts_with("GET /api/oauth/profile "); tx.send(request.clone()).unwrap();
                 if head { io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else if profile {
                     let (status, body) = match response_mode {
@@ -85,6 +87,14 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                         _ => (200, r#"{"account":{"uuid":"remote-account","email":"remote@example.invalid"}}"#),
                     };
                     io.write_all(format!("HTTP/1.1 {status} Profile\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                else if response_mode=="oauth_json" {
+                    let body = if request.starts_with("POST /v1/oauth/token ") {
+                        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#
+                    } else {
+                        r#"{"five_hour":{"utilization":42},"seven_day":{"utilization":12},"extra_usage":{"is_enabled":true}}"#
+                    };
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
                 else if response_mode=="redirect" { io.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else {
@@ -246,6 +256,78 @@ async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credenti
     assert!(fixture.requests.try_recv().is_err());
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(log.contains("\"account_id\":\"acct-1\""));
+    assert!(!log.contains("refresh-secret"));
+}
+
+#[tokio::test]
+async fn claude_token_refresh_uses_saved_account_proxy_without_injecting_credentials() {
+    let mut fixture = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!(
+        "proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  routing:\n    account_fallback: selected\n",
+        serde_json::to_string(&home.path()).unwrap()
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let body =
+        r#"{"client_id":"app","grant_type":"refresh_token","refresh_token":"refresh-secret"}"#;
+    for path in [
+        "/https://platform.claude.com/v1/oauth/token",
+        "/v1/oauth/token",
+        "/anthropic/v1/oauth/token",
+        "/claude/v1/oauth/token",
+        "/anthropic/https://platform.claude.com/v1/oauth/token",
+    ] {
+        let response = http()
+            .post(format!("{}{path}", running.url))
+            .header("content-type", "application/json")
+            .header("cookie", "private-cookie")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(connect.starts_with("CONNECT platform.claude.com:443"));
+        assert!(!connect.contains("refresh-secret"));
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /v1/oauth/token HTTP/1.1"));
+        assert!(request.contains("host: platform.claude.com"));
+        assert!(!request.to_lowercase().contains("authorization"));
+        assert!(!request.contains("access-secret"));
+        assert!(!request.contains("private-cookie"));
+        assert!(request.ends_with(body));
+        fixture.release.notify_one();
+        assert_eq!(
+            response.text().await.unwrap(),
+            "data: first\n\ndata: last\n\n"
+        );
+    }
+    for (method, body, status) in [
+        ("GET", "", 405),
+        ("POST", "{}", 400),
+        ("POST", r#"{"refresh_token":"unknown"}"#, 403),
+    ] {
+        let response = http()
+            .request(
+                method.parse().unwrap(),
+                format!("{}/anthropic/v1/oauth/token", running.url),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {body}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(log.contains("claude_auth"));
     assert!(!log.contains("refresh-secret"));
 }
 
@@ -926,4 +1008,69 @@ async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
             "failed streaming request must never be replayed"
         );
     }
+}
+
+#[tokio::test]
+async fn claude_oauth_usage_and_refresh_preserve_json_and_headers() {
+    let mut fixture = fixture("http", "oauth_json").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".credentials.json");
+    std::fs::write(
+        &file,
+        r#"{"claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  routing:\n    account_fallback: selected\n", serde_json::to_string(&home.path()).unwrap())).await;
+    trust(&running, &fixture, &endpoint);
+    let response = http()
+        .get(format!("{}/anthropic/api/oauth/usage", running.url))
+        .bearer_auth("access-secret")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("user-agent", "claude-code/2.1.69")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["retry-after"], "120");
+    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(value["five_hour"]["utilization"], 42);
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT api.anthropic.com:443")
+    );
+    let request = fixture.requests.recv().await.unwrap();
+    assert!(request.contains("authorization: Bearer access-secret"));
+    assert!(request.contains("user-agent: claude-code/2.1.69"));
+    assert_eq!(request.matches("oauth-2025-04-20").count(), 1);
+    let body = r#"{"grant_type":"refresh_token","refresh_token":"refresh-secret","client_id":"client","scope":"user:profile user:inference"}"#;
+    let response = http()
+        .post(format!("{}/anthropic/v1/oauth/token", running.url))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(value["access_token"], "new-access");
+    assert_eq!(value["refresh_token"], "new-refresh");
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT platform.claude.com:443")
+    );
+    assert!(fixture.requests.recv().await.unwrap().ends_with(body));
+    assert!(
+        std::fs::read_to_string(file)
+            .unwrap()
+            .contains("refresh-secret")
+    );
 }

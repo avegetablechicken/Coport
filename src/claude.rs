@@ -211,6 +211,23 @@ pub struct ClaudeRoute {
     pub custom_upstream: bool,
 }
 
+pub const TOKEN_REFRESH_UPSTREAM: &str = "https://platform.claude.com/v1/oauth/token";
+
+pub fn token_refresh(target: &str) -> bool {
+    let target = ["/anthropic", "/claude"]
+        .into_iter()
+        .find_map(|prefix| {
+            target
+                .strip_prefix(prefix)
+                .filter(|rest| rest.starts_with('/'))
+        })
+        .unwrap_or(target);
+    matches!(
+        target,
+        "/v1/oauth/token" | "/https://platform.claude.com/v1/oauth/token"
+    )
+}
+
 /// The namespace covers every Claude Code endpoint. Unprefixed Messages and
 /// OAuth endpoints also work; ambiguous endpoints such as /v1/models use /anthropic.
 pub fn target(target: &str) -> Option<&str> {
@@ -321,6 +338,56 @@ impl Claude {
             }
         }
         Ok(())
+    }
+
+    /// Refresh credentials select the same local account route as access tokens.
+    /// No profile lookup is possible with a refresh token alone.
+    pub async fn resolve_refresh(&self, token: &str) -> Result<(Choice, Option<String>)> {
+        let mut matches = Vec::new();
+        let mut unavailable = false;
+        for (label, account, directory) in self.account_sources() {
+            if account.auth_env.is_some() {
+                continue;
+            }
+            let value = account.claude_credential_path().and_then(|path| {
+                let raw = std::fs::read(path)
+                    .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
+                serde_json::from_slice::<serde_json::Value>(&raw)
+                    .map_err(|_| Error::config("Invalid Claude credentials file."))
+            });
+            match value {
+                Ok(value) if value["claudeAiOauth"]["refreshToken"].as_str() == Some(token) => {
+                    matches.push((label, account.claude_identity(directory.as_deref())));
+                }
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if matches.len() > 1 {
+            return Err(Error::new(
+                409,
+                "Claude refresh credential matches multiple routes.",
+            ));
+        }
+        if let Some((label, identity)) = matches.pop() {
+            let proxy = self.account_choice(identity.as_ref(), Some(&label))?;
+            return Ok((proxy, identity.map(|i| i.account_id)));
+        }
+        if !self.account_auth_file_only {
+            if let Some(proxy) = &self.routing.account_fallback {
+                return Ok((proxy.clone(), None));
+            }
+        }
+        if unavailable {
+            Err(Error::config(
+                "No matching Claude refresh route; credential source unavailable.",
+            ))
+        } else {
+            Err(Error::new(
+                403,
+                "Claude refresh requires a saved refreshToken or an explicit account fallback with account_auth_file_only: false.",
+            ))
+        }
     }
 
     pub async fn resolve(&self, headers: &HeaderMap) -> Result<ClaudeRoute> {
@@ -592,6 +659,80 @@ impl ClaudeRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn refresh_routing_reloads_credentials_and_requires_explicit_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".credentials.json");
+        let mut claude = Claude::default();
+        claude.config_dirs = vec![dir.path().to_string_lossy().into_owned()];
+        claude.routing.account_fallback = Some(Choice::direct());
+        for token in ["old-refresh", "new-refresh"] {
+            std::fs::write(
+                &file,
+                serde_json::json!({"claudeAiOauth": {
+                    "accessToken": "access", "refreshToken": token
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                claude.resolve_refresh(token).await.unwrap().0.label(),
+                "none"
+            );
+        }
+        assert_eq!(
+            claude
+                .resolve_refresh("old-refresh")
+                .await
+                .err()
+                .unwrap()
+                .status,
+            403
+        );
+        claude.account_auth_file_only = false;
+        assert!(claude.resolve_refresh("external-refresh").await.is_ok());
+        claude.routing.account_fallback = None;
+        claude.routing.account_probe = Some(Choice::direct());
+        assert_eq!(
+            claude
+                .resolve_refresh("external-refresh")
+                .await
+                .err()
+                .unwrap()
+                .status,
+            403
+        );
+        claude.routing.account_fallback = Some(Choice::direct());
+        let other = tempfile::tempdir().unwrap();
+        std::fs::copy(&file, other.path().join(".credentials.json")).unwrap();
+        claude
+            .config_dirs
+            .push(other.path().to_string_lossy().into_owned());
+        assert_eq!(
+            claude
+                .resolve_refresh("new-refresh")
+                .await
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+    }
+
+    #[test]
+    fn refresh_endpoint_is_exact_and_separate_from_codex() {
+        for path in [
+            "/oauth/token",
+            "/codex/https://platform.claude.com/v1/oauth/token",
+            "/https://platform.claude.com.evil.invalid/v1/oauth/token",
+            "/https://platform.claude.com:444/v1/oauth/token",
+            "/anthropic/v1/oauth/token?redirect=evil",
+            "/anthropic-evil/v1/oauth/token",
+        ] {
+            assert!(!token_refresh(path), "{path}");
+        }
+    }
+
     #[tokio::test]
     async fn configured_directories_resolve_relative_credentials_and_local_identity() {
         let dir = tempfile::tempdir().unwrap();

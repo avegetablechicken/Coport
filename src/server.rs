@@ -408,8 +408,11 @@ impl Server {
         let target = crate::routing::codex_target(target);
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
+        if !codex_scoped && crate::claude::token_refresh(target) {
+            return self.forward_token_refresh(incoming, log, true).await;
+        }
         if !claude_scoped && token_refresh(target) {
-            return self.forward_token_refresh(incoming, log).await;
+            return self.forward_token_refresh(incoming, log, false).await;
         }
         let explicit_api_route = if codex_scoped {
             None
@@ -641,8 +644,9 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         log: &mut RequestLog,
+        claude: bool,
     ) -> Result<reqwest::Response> {
-        log.field("service", "codex_auth");
+        log.field("service", if claude { "claude_auth" } else { "codex_auth" });
         if incoming.method() != "POST" {
             return Err(Error::new(405, "Token refresh supports POST only."));
         }
@@ -650,11 +654,20 @@ impl Server {
         let bytes = read_body(body).await?;
         let token = refresh_token(&bytes)
             .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
-        let (choice, account_id) = self.config.resolve_refresh(&token).await?;
+        let (choice, account_id) = if claude {
+            self.config.claude.resolve_refresh(&token).await?
+        } else {
+            self.config.resolve_refresh(&token).await?
+        };
         if let Some(id) = &account_id {
             log.field("account_id", id);
         }
-        let url = Url::parse(TOKEN_REFRESH_UPSTREAM).unwrap();
+        let url = Url::parse(if claude {
+            crate::claude::TOKEN_REFRESH_UPSTREAM
+        } else {
+            TOKEN_REFRESH_UPSTREAM
+        })
+        .unwrap();
         let selected = self.select(&choice, &url, log).await?;
         let endpoint = self.config.endpoint(&selected);
         log.field("proxy", selected);
