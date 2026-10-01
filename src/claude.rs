@@ -816,6 +816,15 @@ claude:
         );
         let encoded = config.canonical_yaml().unwrap();
         let mut c = Config::parse(&encoded).unwrap().claude;
+        // A readable local login that differs from the request token, so the
+        // result does not depend on the machine's own ~/.claude.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth": {"accessToken": "local-secret"}}"#,
+        )
+        .unwrap();
+        c.config_dirs = vec![dir.path().to_string_lossy().into_owned()];
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer remote-secret".parse().unwrap());
         let mut route = c.resolve(&headers).await.unwrap();

@@ -20,6 +20,7 @@ const GREY: Rgba = [0.62, 0.64, 0.68, 1.0];
 const RED: Rgba = [0.94, 0.30, 0.30, 1.0];
 
 /// Monochrome glyph for the macOS menu bar; only alpha is significant.
+#[cfg(target_os = "macos")]
 pub fn template(size: u32, status: Status) -> Vec<u8> {
     let running = status == Status::Running;
     let alpha = if running { 1.0 } else { 0.6 };

@@ -577,7 +577,19 @@ async fn claude_third_party_explicit_url_streams_directly_without_oauth_lookup_o
 
 #[tokio::test]
 async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
-    let running = running("routing:\n  api_key_fallback: none\nclaude:\n  account_fallback: none\n  api_key_fallback: none\n").await;
+    // A readable saved login that differs from the request token, independent
+    // of the machine's own ~/.claude.
+    let login = tempfile::tempdir().unwrap();
+    std::fs::write(
+        login.path().join(".credentials.json"),
+        r#"{"claudeAiOauth": {"accessToken": "saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!(
+        "routing:\n  api_key_fallback: none\nclaude:\n  config_dirs: [{:?}]\n  account_fallback: none\n  api_key_fallback: none\n",
+        login.path().to_string_lossy()
+    ))
+    .await;
     for path in [
         "/anthropic/api/oauth/usage",
         "/anthropic/api/oauth/%75sage",
