@@ -663,9 +663,14 @@ mod tests {
     async fn refresh_routing_reloads_credentials_and_requires_explicit_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(".credentials.json");
-        let mut claude = Claude::default();
-        claude.config_dirs = vec![dir.path().to_string_lossy().into_owned()];
-        claude.routing.account_fallback = Some(Choice::direct());
+        let mut claude = Claude {
+            config_dirs: vec![dir.path().to_string_lossy().into_owned()],
+            routing: Routing {
+                account_fallback: Some(Choice::direct()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         for token in ["old-refresh", "new-refresh"] {
             std::fs::write(
                 &file,
