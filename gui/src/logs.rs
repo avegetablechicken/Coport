@@ -126,7 +126,7 @@ impl LogFeed {
         s.entries.iter().filter(|e| keep(e)).cloned().collect()
     }
 
-    /// Aggregates requests since the most recent server start.
+    /// Aggregates retained requests in the last 30 minutes since the latest start.
     pub fn stats(&self) -> Stats {
         let s = self.store.lock().unwrap();
         let start = s
@@ -144,6 +144,13 @@ impl LogFeed {
                 _ => {}
             }
             if !e.is_request_end() {
+                continue;
+            }
+            let Some(t) = e.time else { continue };
+            let age = now - t;
+            if age < chrono::Duration::zero()
+                || age >= chrono::Duration::minutes(SPARK_MINUTES as i64)
+            {
                 continue;
             }
             stats.requests += 1;
@@ -321,7 +328,8 @@ mod tests {
         );
         let line = |event: &str, status: u16| {
             format!(
-                "{{\"event\":\"{event}\",\"status\":\"{status}\",\"path\":\"/v1/messages\",\"duration_ms\":\"20\",\"received_bytes\":\"100\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n"
+                "{{\"event\":\"{event}\",\"status\":\"{status}\",\"path\":\"/v1/messages\",\"duration_ms\":\"20\",\"received_bytes\":\"100\",\"timestamp\":\"{}\"}}\n",
+                Local::now().to_rfc3339()
             )
         };
         std::fs::write(
@@ -361,6 +369,35 @@ mod tests {
         std::fs::write(&path, line("request_failed", 502)).unwrap();
         wait_for(|| feed.stats().requests == 3);
         assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn stats_exclude_old_future_and_undated_requests() {
+        let feed = LogFeed {
+            store: Arc::new(Mutex::new(Store::default())),
+        };
+        let now = Local::now();
+        let mut lines = Vec::new();
+        for (time, status) in [
+            (Some(now - chrono::Duration::minutes(31)), "502"),
+            (Some(now - chrono::Duration::minutes(30)), "502"),
+            (Some(now + chrono::Duration::seconds(10)), "502"),
+            (None, "502"),
+            (Some(now - chrono::Duration::minutes(29)), "200"),
+            (Some(now - chrono::Duration::seconds(1)), "502"),
+        ] {
+            let value = serde_json::json!({"event":"request_finished", "timestamp":time.map(|t| t.to_rfc3339()),
+                "status":status, "received_bytes":"100", "duration_ms":"20"});
+            lines.extend_from_slice(format!("{value}\n").as_bytes());
+        }
+        feed.ingest(&mut lines);
+        let stats = feed.stats();
+        assert_eq!(stats.requests, 2);
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.bytes, 200);
+        assert_eq!(stats.avg_latency_ms, Some(20));
+        assert_eq!(stats.per_minute.iter().sum::<u32>(), 2);
+        assert_eq!(stats.errors_per_minute.iter().sum::<u32>(), 1);
     }
 
     fn wait_for(cond: impl Fn() -> bool) {
