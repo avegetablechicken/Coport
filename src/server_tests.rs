@@ -891,7 +891,7 @@ async fn tls_connect_and_https_connect_stream_before_completion() {
 }
 
 #[tokio::test]
-async fn ordered_probes_are_credential_free_and_repeated_per_request() {
+async fn ordered_probes_are_credential_free_and_cached() {
     let mut fixture = fixture("direct", "redirect").await;
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_port = dead.local_addr().unwrap().port();
@@ -903,7 +903,7 @@ async fn ordered_probes_are_credential_free_and_repeated_per_request() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let response = client
             .post(format!("{}/responses?secret=query", running.url))
             .bearer_auth("model-secret")
@@ -912,10 +912,12 @@ async fn ordered_probes_are_credential_free_and_repeated_per_request() {
             .await
             .unwrap();
         assert_eq!(response.status(), 302);
-        let probe = fixture.requests.recv().await.unwrap().to_lowercase();
-        assert!(probe.starts_with("head / http"));
-        for s in ["authorization", "private-body", "query", "model-secret"] {
-            assert!(!probe.contains(s));
+        if attempt == 0 {
+            let probe = fixture.requests.recv().await.unwrap().to_lowercase();
+            assert!(probe.starts_with("head / http"));
+            for s in ["authorization", "private-body", "query", "model-secret"] {
+                assert!(!probe.contains(s));
+            }
         }
         let request = fixture.requests.recv().await.unwrap();
         assert!(request.starts_with("POST /v1/responses?secret=query "));
@@ -1404,4 +1406,95 @@ async fn claude_named_settings_forward_to_file_upstream_through_selected_proxy()
     assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
     fixture.release.notify_one();
     assert_eq!(response.chunk().await.unwrap().unwrap(), "data: last\n\n");
+}
+
+#[tokio::test]
+async fn unavailable_proxy_recovers_while_idle() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let healthy = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = healthy.clone();
+    let c = calls.clone();
+    let upstream = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut io: TestIo = Box::new(socket);
+            let request = read_request(&mut io).await.unwrap();
+            assert!(request.starts_with("HEAD http://example.invalid/ HTTP"));
+            assert!(!request.contains("secret"));
+            c.fetch_add(1, Ordering::SeqCst);
+            let status = if h.load(Ordering::SeqCst) { 200 } else { 503 };
+            io.write_all(
+                format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let running = running(&format!("proxies:\n  test: {endpoint}\n")).await;
+    let choice = Choice::List(vec!["test".into()]);
+    let url = Url::parse("http://example.invalid/private?secret=yes").unwrap();
+    let mut log = RequestLog {
+        logger: running.server.logger.clone(),
+        fields: Default::default(),
+        started: Instant::now(),
+        status: 200,
+        bytes: 0,
+        outcome: "test_finished",
+    };
+    let mut concurrent_log = RequestLog {
+        logger: running.server.logger.clone(),
+        fields: Default::default(),
+        started: Instant::now(),
+        status: 200,
+        bytes: 0,
+        outcome: "test_finished",
+    };
+    let (first, second) = tokio::join!(
+        running.server.select(&choice, &url, &mut log),
+        running.server.select(&choice, &url, &mut concurrent_log),
+    );
+    assert!(first.is_err() && second.is_err());
+    assert!(
+        running
+            .server
+            .select(&choice, &url, &mut log)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    healthy.store(true, Ordering::SeqCst);
+    // No client requests: the serve-owned timer must discover recovery itself.
+    tokio::time::timeout(Duration::from_secs(36), async {
+        loop {
+            let state = running
+                .server
+                .probes
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            if *state.lock().await == Some(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        running
+            .server
+            .select(&choice, &url, &mut log)
+            .await
+            .unwrap(),
+        "test"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    upstream.abort();
 }

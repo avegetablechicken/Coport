@@ -303,7 +303,15 @@ Lists probe candidates sequentially with unauthenticated `HEAD /` requests to
 the actual upstream HTTPS origin, without model tokens, account headers, bodies
 or query parameters. HTTP 200–499 other than 407 establishes reachability;
 redirects are not followed. Each probe is limited to 5 seconds or the request
-timeout, whichever is lower. Selection repeats per request. Empty lists and
+timeout, whichever is lower. Results are cached by proxy endpoint, upstream
+origin, and TLS mode (up to 256 entries); concurrent initial lookups share a probe.
+Requests select the first available candidate in configured order using the cache.
+Every 30 seconds, the running server starts a background refresh of previously
+probed candidates, including unavailable ones, even without incoming requests.
+Refreshes use at most eight concurrent probes and leave cached results readable;
+the next refresh starts 30 seconds after the previous batch finishes. Recovery
+restores the preferred candidate automatically. Single-proxy routes do not probe.
+Empty lists and
 unknown names are rejected at startup. All failed candidates return 502.
 The payload is sent once; API/streaming failures never replay it on another proxy.
 

@@ -30,10 +30,20 @@ use url::Url;
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ProbeKey {
+    endpoint: String,
+    origin: String,
+    native_tls: bool,
+}
+type ProbeState = Arc<tokio::sync::Mutex<Option<bool>>>;
+
 pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
+    probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     // Timestamps track last use for bounded LRU eviction, not expiry.
     claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
 }
@@ -43,6 +53,7 @@ impl Server {
             config,
             logger,
             clients: Mutex::new(HashMap::new()),
+            probes: Mutex::new(HashMap::new()),
             claude_profiles: Mutex::new(HashMap::new()),
         }
     }
@@ -218,22 +229,36 @@ impl Server {
         origin.set_fragment(None);
         for name in choice.names() {
             let endpoint = self.config.endpoint(name);
-            let available = match self
-                .client_transport(endpoint, native_tls)?
-                .head(origin.clone())
-                .timeout(Duration::from_secs_f64(
-                    self.config.request_timeout_seconds.min(5.0),
-                ))
-                .send()
-                .await
-            {
-                Ok(r) => (200..500).contains(&r.status().as_u16()) && r.status().as_u16() != 407,
-                Err(_) => false,
+            let key = ProbeKey {
+                endpoint: endpoint.to_owned(),
+                origin: origin.to_string(),
+                native_tls,
             };
+            let state = {
+                let mut probes = self.probes.lock().unwrap();
+                // Bound memory for configurations accepting arbitrary upstream origins.
+                if probes.len() >= 256 && !probes.contains_key(&key) {
+                    if let Some(old) = probes.keys().next().cloned() {
+                        probes.remove(&old);
+                    }
+                }
+                probes.entry(key.clone()).or_default().clone()
+            };
+            // Only cold lookups wait for a probe. Concurrent cold requests share it.
+            let mut cached = state.lock().await;
+            let available = match *cached {
+                Some(available) => available,
+                None => {
+                    let available = self.probe(&key).await;
+                    *cached = Some(available);
+                    available
+                }
+            };
+            drop(cached);
             log.field("proxy", name);
             log.field("proxy_endpoint", redacted_endpoint(endpoint));
             log.field("available", available);
-            log.event("proxy_probe");
+            // Probe events are emitted only for actual network checks.
             if available {
                 log.fields.remove("available");
                 return Ok(name.clone());
@@ -243,6 +268,64 @@ impl Server {
             "No available outbound proxy in the configured list.",
         ))
     }
+    async fn probe(&self, key: &ProbeKey) -> bool {
+        let available = match self.client_transport(&key.endpoint, key.native_tls) {
+            Ok(client) => match client
+                .head(&key.origin)
+                .timeout(Duration::from_secs_f64(
+                    self.config.request_timeout_seconds.min(5.0),
+                ))
+                .send()
+                .await
+            {
+                Ok(r) => (200..500).contains(&r.status().as_u16()) && r.status().as_u16() != 407,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        self.logger.write(
+            "proxy_probe",
+            json!({
+                "proxy_endpoint": redacted_endpoint(&key.endpoint),
+                "origin": key.origin,
+                "available": available.to_string()
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        available
+    }
+
+    async fn refresh_probes(&self) {
+        let entries: Vec<_> = self
+            .probes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .collect();
+        futures_util::stream::iter(entries)
+            .for_each_concurrent(8, |(key, state)| async move {
+                // A cold lookup already owns its initial probe; do not duplicate it.
+                match state.try_lock() {
+                    Ok(cached) if cached.is_some() => {}
+                    _ => return,
+                }
+                // Leave the previous value readable while the background check runs.
+                let available = self.probe(&key).await;
+                *state.lock().await = Some(available);
+            })
+            .await;
+    }
+
+    async fn monitor_probes(&self) {
+        loop {
+            tokio::time::sleep(PROBE_INTERVAL).await;
+            self.refresh_probes().await;
+        }
+    }
+
     pub async fn startup_log(&self) {
         for (label, source, _) in &self.config.codex.account_sources() {
             match self
@@ -824,10 +907,13 @@ impl Server {
     ) -> std::io::Result<()> {
         let limit = Arc::new(Semaphore::new(128));
         let mut tasks = tokio::task::JoinSet::new();
+        let monitor = self.monitor_probes();
+        tokio::pin!(monitor);
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 _=&mut shutdown=>break,
+                _=&mut monitor=>{},
                 Some(_)=tasks.join_next(), if !tasks.is_empty()=>{},
                 accepted=listener.accept()=> {
                     let (socket,_)=accepted?;
