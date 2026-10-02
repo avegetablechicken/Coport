@@ -30,7 +30,7 @@ impl Entry {
     pub fn is_request_end(&self) -> bool {
         matches!(
             self.event.as_str(),
-            "request_finished" | "request_rejected" | "request_failed"
+            "request_finished" | "request_rejected" | "request_failed" | "request_cancelled"
         )
     }
     pub fn status(&self) -> Option<u16> {
@@ -398,6 +398,27 @@ mod tests {
         assert_eq!(stats.avg_latency_ms, Some(20));
         assert_eq!(stats.per_minute.iter().sum::<u32>(), 2);
         assert_eq!(stats.errors_per_minute.iter().sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn cancellation_is_visible_without_counting_as_a_gateway_error() {
+        let feed = LogFeed {
+            store: Arc::new(Mutex::new(Store::default())),
+        };
+        let mut lines = format!(
+            "{}\n",
+            serde_json::json!({
+                "event":"request_cancelled", "reason":"request_dropped",
+                "timestamp":Local::now().to_rfc3339()
+            })
+        )
+        .into_bytes();
+        feed.ingest(&mut lines);
+        assert_eq!(feed.entries(|e| e.is_request_end()).len(), 1);
+        let stats = feed.stats();
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(feed.entries(|_| true)[0].status(), None);
     }
 
     fn wait_for(cond: impl Fn() -> bool) {

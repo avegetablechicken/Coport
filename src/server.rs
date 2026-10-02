@@ -405,7 +405,7 @@ impl Server {
         if incoming.method() == "GET" && target == "/health" {
             return Ok(response(200, "{\"ok\":true}"));
         }
-        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:502,bytes:0,outcome:"request_failed" };
+        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
         log.event("request_received");
         if incoming.method() == "CONNECT" {
             log.field("service", "connect");
@@ -505,7 +505,7 @@ impl Server {
                     while let Some(chunk)=stream.next().await {
                         match chunk {
                             Ok(bytes)=> { log.bytes+=bytes.len(); yield Ok::<_,std::io::Error>(Frame::data(bytes)); }
-                            Err(_)=> { log.field("reason","transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
+                            Err(_)=> { log.outcome="request_failed"; log.field("reason","transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
                         }
                     }
                     log.outcome="request_finished";
@@ -515,6 +515,7 @@ impl Server {
             }
             Err(e) => {
                 log.status = e.status;
+                log.outcome = "request_failed";
                 if e.status < 500 {
                     log.outcome = "request_rejected";
                 }
@@ -948,6 +949,7 @@ impl Server {
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {
     log.status = error.status;
+    log.outcome = "request_failed";
     if error.status < 500 {
         log.outcome = "request_rejected";
     }
@@ -979,9 +981,11 @@ fn relay_stream(
                 log.outcome = "request_finished";
             }
             Ok(Err(_)) => {
+                log.outcome = "request_failed";
                 log.field("reason", "tunnel_transport_error");
             }
             Err(_) => {
+                log.outcome = "request_failed";
                 log.field("reason", "tunnel_timeout");
             }
         }

@@ -108,6 +108,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     };
                     io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode=="delayed_headers" {
+                    let _ = io.read_u8().await;
+                    let _ = tx.send("DISCONNECTED".into());
+                }
                 else if response_mode=="redirect" { io.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else {
                     io.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close, x-hop\r\nx-hop: remove-me\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nD\r\ndata: first\n\n\r\n").await.unwrap(); io.flush().await.unwrap();
@@ -1033,6 +1037,35 @@ async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
             fixture.requests.try_recv().is_err(),
             "failed streaming request must never be replayed"
         );
+        let expected = if disconnect {
+            "request_cancelled"
+        } else {
+            "request_failed"
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+                if let Some(event) = raw
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|e| e["event"] == expected)
+                {
+                    assert_eq!(event["status"], "200");
+                    assert_eq!(
+                        event["reason"],
+                        if disconnect {
+                            "request_dropped"
+                        } else {
+                            "transport_error"
+                        }
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -1497,4 +1530,36 @@ async fn unavailable_proxy_recovers_while_idle() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     upstream.abort();
+}
+
+#[tokio::test]
+async fn disconnect_before_headers_does_not_invent_a_502() {
+    let mut fixture = fixture("direct", "delayed_headers").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket.write_all(b"GET /models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer model-secret\r\n\r\n").await.unwrap();
+    assert!(fixture.requests.recv().await.unwrap().starts_with("GET "));
+    drop(socket);
+    let path = running._temp.path().join("proxy.log");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            if let Some(event) = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|e| e["event"] == "request_cancelled")
+            {
+                assert!(event.get("status").is_none());
+                assert_eq!(event["reason"], "request_dropped");
+                assert!(!raw.contains("request_failed"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

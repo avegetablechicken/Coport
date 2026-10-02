@@ -431,7 +431,7 @@ function renderActivityList() {
 }
 
 function requestRow(e, expandable) {
-  const code = e.status ?? (e.error ? "ERR" : "—");
+  const code = e.event === "request_cancelled" ? "CANCEL" : e.status ?? (e.error ? "ERR" : "—");
   const meta = [fmtTime(e.time), e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
     .join(" · ");

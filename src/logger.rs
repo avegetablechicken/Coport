@@ -92,6 +92,7 @@ pub struct RequestLog {
     pub logger: std::sync::Arc<Logger>,
     pub fields: Map<String, Value>,
     pub started: Instant,
+    /// Zero means no response status was established.
     pub status: u16,
     pub bytes: usize,
     pub outcome: &'static str,
@@ -106,7 +107,13 @@ impl RequestLog {
 }
 impl Drop for RequestLog {
     fn drop(&mut self) {
-        self.field("status", self.status);
+        if self.status != 0 {
+            self.field("status", self.status);
+        }
+        if self.outcome == "request_cancelled" {
+            // Includes client disconnects and shutdown cancellation, not a gateway response.
+            self.field("reason", "request_dropped");
+        }
         self.field("received_bytes", self.bytes);
         self.field("duration_ms", self.started.elapsed().as_millis());
         self.event(self.outcome);

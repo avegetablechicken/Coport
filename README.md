@@ -896,6 +896,7 @@ Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB and retain one
 | `route_selected` | Account and proxy actually selected for this request. |
 | `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
+| `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
 | `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
 
 Logs contain **full account IDs and proxy endpoints**. They do not record tokens, authentication headers, query parameters, or request/response bodies. Keep logs private. `/health` requests are excluded from request logs.
