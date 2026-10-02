@@ -673,23 +673,19 @@ mod tests {
             };
             let files: Vec<_> = sources
                 .iter()
-                .map(|(label, source, _)| (label.as_str(), source.auth_file.clone().unwrap()))
+                .map(|(label, source, _)| {
+                    (
+                        label.as_str(),
+                        PathBuf::from(source.auth_file.as_ref().unwrap()),
+                    )
+                })
                 .collect();
+            // Compare path components: Windows accepts both slash styles.
             assert_eq!(
                 files,
                 [
-                    (
-                        "default",
-                        expand("~/work/nested/login.json")
-                            .to_string_lossy()
-                            .into_owned()
-                    ),
-                    (
-                        "default",
-                        expand("~/other/nested/login.json")
-                            .to_string_lossy()
-                            .into_owned()
-                    ),
+                    ("default", expand("~/work/nested/login.json")),
+                    ("default", expand("~/other/nested/login.json")),
                 ]
             );
             for invalid in [
