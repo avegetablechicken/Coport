@@ -173,6 +173,45 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
     }
 }
 impl Provider {
+    /// Upstream base URLs this route forwards to, one per configured home,
+    /// resolved like requests are but without reading any credential.
+    pub fn upstreams(&self, default: &str, codex: &Codex) -> Vec<Result<String>> {
+        let homes: Vec<_> = if codex.homes.is_empty() {
+            vec![None]
+        } else {
+            codex.homes.iter().map(|home| Some(expand(home))).collect()
+        };
+        homes
+            .iter()
+            .map(|home| {
+                let defs = definitions(home.as_deref())?;
+                provider_upstream(self.definition(&defs)?, default)
+            })
+            .collect()
+    }
+
+    /// The definition a selector names: a Codex provider ID, or else the one
+    /// provider whose `env_key` it is.
+    fn definition<'a>(
+        &self,
+        defs: &'a BTreeMap<String, Definition>,
+    ) -> Result<Option<(&'a str, &'a Definition)>> {
+        let selector = self.selector.as_str();
+        if let Some((id, definition)) = defs.get_key_value(selector) {
+            return Ok(Some((id, definition)));
+        }
+        let candidates: Vec<_> = defs
+            .iter()
+            .filter(|(_, d)| d.env_key.as_deref() == Some(selector))
+            .collect();
+        if candidates.len() > 1 {
+            return Err(Error::config(
+                "API Key environment variable matches multiple Codex providers.",
+            ));
+        }
+        Ok(candidates.first().map(|(id, d)| (id.as_str(), *d)))
+    }
+
     pub async fn credentials(
         &self,
         default: &str,
@@ -223,37 +262,8 @@ impl Provider {
         // A selector is a Codex provider ID when one is defined, otherwise an
         // API Key environment variable name.
         let selector = self.selector.as_str();
-        let selected_id = defs.contains_key(selector).then_some(selector);
-        let selected_env = selected_id.is_none().then_some(selector);
-        let named = if let Some(id) = selected_id {
-            Some((
-                id,
-                defs.get(id).ok_or(Error::config(
-                    "Codex Provider ID has no API Key configuration.",
-                ))?,
-            ))
-        } else {
-            None
-        };
-        let reversed = if named.is_none() {
-            if let Some(var) = selected_env {
-                let candidates: Vec<_> = defs
-                    .iter()
-                    .filter(|(_, d)| d.env_key.as_deref() == Some(var))
-                    .collect();
-                if candidates.len() > 1 {
-                    return Err(Error::config(
-                        "API Key environment variable matches multiple Codex providers.",
-                    ));
-                }
-                candidates.first().map(|(id, d)| (id.as_str(), *d))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let definition = named.or(reversed);
+        let selected_env = (!defs.contains_key(selector)).then_some(selector);
+        let definition = self.definition(&defs)?;
         let var = selected_env.or(definition.and_then(|(_, d)| d.env_key.as_deref()));
         let (token, account_id) = if let Some(var) = var {
             (
@@ -280,16 +290,22 @@ impl Provider {
                 "Codex provider has no configured Bearer credential.",
             ));
         };
-        let upstream = definition
-            .filter(|(id, _)| *id != "openai")
-            .and_then(|(_, d)| d.base_url.as_deref())
-            .unwrap_or(default);
         Ok(ProviderCredential {
             token,
-            upstream: unwrap_upstream(upstream)?,
+            upstream: provider_upstream(definition, default)?,
             account_id,
         })
     }
+}
+/// The built-in `openai` provider and providers without `base_url` use the
+/// configured API Key base.
+fn provider_upstream(definition: Option<(&str, &Definition)>, default: &str) -> Result<String> {
+    unwrap_upstream(
+        definition
+            .filter(|(id, _)| *id != "openai")
+            .and_then(|(_, d)| d.base_url.as_deref())
+            .unwrap_or(default),
+    )
 }
 fn key(raw: &str) -> Result<String> {
     let k = raw.trim();
