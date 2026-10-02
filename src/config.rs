@@ -808,6 +808,16 @@ pub fn validate_upstream(value: &str) -> Result<Url> {
     }
     Ok(u)
 }
+// Codex custom providers may point at a public IPv4 HTTPS endpoint, like
+// explicit API routes; private, loopback and reserved addresses stay rejected.
+// Values without a scheme keep the strict hostname check.
+fn validate_provider_upstream(value: &str) -> Result<()> {
+    if value.contains("://") {
+        crate::url_routing::validate_upstream(value).map(|_| ())
+    } else {
+        validate_upstream(value).map(|_| ())
+    }
+}
 pub fn unwrap_upstream(value: &str) -> Result<String> {
     if let Ok(u) = Url::parse(value) {
         if u.scheme() == "http"
@@ -820,11 +830,11 @@ pub fn unwrap_upstream(value: &str) -> Result<String> {
             && u.path().starts_with("/https://")
         {
             let inner = &u.path()[1..];
-            validate_upstream(inner)?;
+            validate_provider_upstream(inner)?;
             return Ok(inner.into());
         }
     }
-    validate_upstream(value)?;
+    validate_provider_upstream(value)?;
     Ok(value.into())
 }
 pub fn validate_proxy(value: &str) -> Result<Url> {
@@ -1014,6 +1024,29 @@ mod tests {
             unwrap_upstream("http://127.0.0.1:7889/https://provider.invalid/v1").unwrap(),
             "https://provider.invalid/v1"
         );
+        // Provider upstreams accept public IPv4 HTTPS addresses, directly or
+        // through the local wrapper form, while base URLs stay hostname-only.
+        assert_eq!(
+            unwrap_upstream("https://182.92.106.196:6060").unwrap(),
+            "https://182.92.106.196:6060"
+        );
+        assert_eq!(
+            unwrap_upstream("http://127.0.0.1:7889/https://182.92.106.196:6060/v1").unwrap(),
+            "https://182.92.106.196:6060/v1"
+        );
+        assert!(validate_upstream("https://182.92.106.196:6060").is_err());
+        for u in [
+            "https://10.0.0.1:6060",
+            "https://192.168.1.2/v1",
+            "https://127.0.0.1:6060",
+            "https://169.254.1.1",
+            "http://182.92.106.196:6060",
+            "https://u:p@182.92.106.196:6060",
+            "182.92.106.196:6060",
+            "http://127.0.0.1:7889/https://10.0.0.1/v1",
+        ] {
+            assert!(unwrap_upstream(u).is_err(), "{u}");
+        }
         assert_eq!(
             redacted_endpoint("https://u:p@proxy.invalid:443"),
             "https://proxy.invalid:443"

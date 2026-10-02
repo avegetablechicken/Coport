@@ -236,7 +236,7 @@ priority. Account/API fallbacks default to rejection when omitted/null.
 ### Upstreams, proxies and ordered candidates
 
 Default upstreams must be HTTPS public hostnames; explicitly declared third-party
-Claude API routes may also use public IPv4 addresses. Codex's account base is the ChatGPT
+API routes and Codex custom provider upstreams may also use public IPv4 addresses. Codex's account base is the ChatGPT
 backend root: model requests use `/codex`, usage, profile and reset-credit queries
 use `/wham`, and plugin APIs use `/ps`. A legacy `/backend-api/codex` base is normalized to `/backend-api`.
 Claude's single base URL is a root **without `/v1`**: native `/v1` and
@@ -848,7 +848,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 
 ## Limits and troubleshooting
 
-- Default upstreams require HTTPS and a public service hostname. Explicit Claude API URL routes also accept public IPv4 addresses; private addresses and local hostnames remain rejected.
+- Default upstreams require HTTPS and a public service hostname. Explicit API URL routes and Codex custom provider upstreams also accept public IPv4 addresses; private addresses and local hostnames remain rejected.
 - Proxy URLs require an explicit port and support `http`, `https`, or `socks5`. Optional username/password authentication uses `scheme://username:password@host:port`. Credentials are removed from logged proxy URLs.
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
