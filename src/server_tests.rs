@@ -1376,3 +1376,32 @@ async fn connect_only_falls_back_to_explicit_candidates_before_establishment() {
         reject.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn claude_named_settings_forward_to_file_upstream_through_selected_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("api.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://upstream.invalid/custom","ANTHROPIC_AUTH_TOKEN":"profile-secret"}}"#).unwrap();
+    let mut fixture = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key:\n      api: selected\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &fixture, &endpoint);
+    let mut response = http()
+        .post(format!("{}/anthropic/v1/messages", running.url))
+        .bearer_auth("profile-secret")
+        .body("model-body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(connect.starts_with("CONNECT upstream.invalid:443"));
+    assert!(!connect.contains("profile-secret"));
+    let request = fixture.requests.recv().await.unwrap();
+    assert!(request.starts_with("POST /custom/v1/messages HTTP/1.1"));
+    assert!(request.contains("authorization: Bearer profile-secret"));
+    assert!(!request.contains("oauth-2025-04-20"));
+    assert!(request.ends_with("model-body"));
+    assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+    fixture.release.notify_one();
+    assert_eq!(response.chunk().await.unwrap().unwrap(), "data: last\n\n");
+}

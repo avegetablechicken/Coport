@@ -293,13 +293,18 @@ impl Server {
         if !self.config.claude.account_sources().is_empty()
             || !self.config.claude.routing.api_key.is_empty()
         {
+            let check = self.config.claude.check_credentials().await;
+            let mut fields = json!({"service": "claude"}).as_object().unwrap().clone();
+            if let Err(error) = &check {
+                fields.insert("reason".into(), json!(error.message));
+            }
             self.logger.write(
-                if self.config.claude.check_credentials().await.is_ok() {
+                if check.is_ok() {
                     "current_route"
                 } else {
                     "route_unavailable"
                 },
-                json!({"service": "claude"}).as_object().unwrap().clone(),
+                fields,
             );
         }
     }

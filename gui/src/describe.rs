@@ -3,12 +3,6 @@
 
 use coding_agent_proxy::config::{Config, redacted_endpoint};
 
-/// Mirrors the core's rule: names with a dot, colon or slash are upstreams,
-/// which the row already shows.
-fn is_url(selector: &str) -> bool {
-    selector.contains(['.', ':', '/'])
-}
-
 /// Userinfo is omitted, as for proxy endpoints.
 fn display(url: &str) -> String {
     if url.contains('@') {
@@ -41,12 +35,29 @@ pub fn codex_api_key(config: &Config, selector: &str) -> Option<String> {
 }
 
 pub fn claude_api_key(config: &Config, selector: &str) -> Option<String> {
-    (!is_url(selector)).then(|| display(&config.claude.base_url))
+    match config.claude.api_key_upstream(selector) {
+        Ok(upstream) => upstream.map(|url| display(&url)),
+        Err(error) => Some(error.message.to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_settings_details_use_selected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://custom.invalid","ANTHROPIC_API_KEY":"secret"}}"#).unwrap();
+        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key: {{api: none}}\n", serde_json::to_string(dir.path()).unwrap())).unwrap();
+        for name in ["api", "api.json"] {
+            assert_eq!(
+                claude_api_key(&config, name).as_deref(),
+                Some("https://custom.invalid")
+            );
+        }
+        assert_eq!(claude_api_key(&config, "api.example.com"), None);
+    }
 
     #[test]
     fn api_key_selectors_show_the_forwarded_upstream() {

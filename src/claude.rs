@@ -254,14 +254,14 @@ impl Claude {
             config.validate_choice(choice)?;
         }
         for (name, choice) in &self.routing.api_key {
-            if crate::url_routing::is_url_selector(name) {
+            if crate::claude_settings::is_url(name) {
                 crate::claude_api::validate_api_upstream(name)?;
             } else {
-                validate_env(name)?;
+                crate::claude_settings::validate_name(name)?;
             }
             config.validate_choice(choice)?;
         }
-        crate::url_routing::validate_routes(&self.routing.api_key)?;
+        crate::url_routing::validate_routes(&self.url_routes())?;
         for choice in [
             &self.routing.account_fallback,
             &self.routing.account_probe,
@@ -273,6 +273,27 @@ impl Claude {
             config.validate_choice(choice)?;
         }
         Ok(())
+    }
+
+    fn url_routes(&self) -> BTreeMap<String, Choice> {
+        self.routing
+            .api_key
+            .iter()
+            .filter(|(name, _)| crate::claude_settings::is_url(name))
+            .map(|(name, choice)| (name.clone(), choice.clone()))
+            .collect()
+    }
+
+    /// The same named settings lookup used for forwarding, without exposing credentials.
+    pub fn api_key_upstream(&self, selector: &str) -> Result<Option<String>> {
+        if crate::claude_settings::is_url(selector) {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::claude_settings::load(&self.config_dirs, selector)?
+                .map(|profile| profile.upstream)
+                .unwrap_or_else(|| self.base_url.clone()),
+        ))
     }
 
     pub async fn check_credentials(&self) -> Result<()> {
@@ -294,9 +315,16 @@ impl Claude {
             .routing
             .api_key
             .keys()
-            .filter(|s| !crate::url_routing::is_url_selector(s))
+            .filter(|s| !crate::claude_settings::is_url(s))
         {
-            if !keys.insert(environment_key(name).await?) {
+            let token = match crate::claude_settings::load(&self.config_dirs, name)? {
+                Some(profile) => profile.token,
+                None => {
+                    validate_env(name)?;
+                    environment_key_with_shell(name, true).await?
+                }
+            };
+            if !keys.insert(token) {
                 return Err(Error::config(
                     "Multiple Claude routes have the same credential.",
                 ));
@@ -380,6 +408,7 @@ impl Claude {
         let mut identity = None;
         let mut unavailable = false;
         let mut matched_account = false;
+        let mut api_upstream = None;
         let mut local_needs_profile = false;
         let account_sources = self.account_sources();
         if bearer {
@@ -415,10 +444,21 @@ impl Claude {
             .routing
             .api_key
             .iter()
-            .filter(|(s, _)| !crate::url_routing::is_url_selector(s))
+            .filter(|(s, _)| !crate::claude_settings::is_url(s))
         {
-            match environment_key_with_shell(name, !matched_account).await {
-                Ok(value) if value == token => matches.push((name, proxy.clone())),
+            let profile = crate::claude_settings::load(&self.config_dirs, name)?;
+            let (credential, upstream) = match profile {
+                Some(profile) => (Ok(profile.token), Some(profile.upstream)),
+                None => (
+                    environment_key_with_shell(name, !matched_account).await,
+                    None,
+                ),
+            };
+            match credential {
+                Ok(value) if value == token => {
+                    matches.push((name, proxy.clone()));
+                    api_upstream = upstream;
+                }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
             }
@@ -483,9 +523,9 @@ impl Claude {
             proxy,
             identity,
             needs_profile,
-            upstream: self.base_url.clone(),
+            custom_upstream: api_upstream.is_some(),
+            upstream: api_upstream.unwrap_or_else(|| self.base_url.clone()),
             oauth: bearer && !matched_api,
-            custom_upstream: false,
         })
     }
 
@@ -497,8 +537,8 @@ impl Claude {
         let Some(explicit) = crate::claude_api::explicit_target(target) else {
             return Ok(None);
         };
-        let Some((base, proxy)) = crate::url_routing::match_route(&self.routing.api_key, explicit)?
-        else {
+        let routes = self.url_routes();
+        let Some((base, proxy)) = crate::url_routing::match_route(&routes, explicit)? else {
             return Ok(None);
         };
         let auth = headers.get("authorization");
@@ -967,6 +1007,55 @@ claude:
             c.resolve(&HeaderMap::new()).await.err().unwrap().status,
             401
         );
+    }
+
+    #[tokio::test]
+    async fn named_settings_route_uses_file_credentials_and_upstream_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.json");
+        for selector in ["api", "api.json"] {
+            let c = config(&format!(
+                "claude:\n  config_dirs: [{}]\n  routing:\n    api_key:\n      {selector}: none\n",
+                serde_json::to_string(dir.path()).unwrap()
+            ))
+            .claude;
+            for (field, key) in [
+                ("ANTHROPIC_API_KEY", "first-key"),
+                ("ANTHROPIC_AUTH_TOKEN", "rotated-key"),
+            ] {
+                std::fs::write(&path, format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://provider.invalid/api","{field}":"{key}"}}}}"#)).unwrap();
+                c.check_credentials().await.unwrap();
+                for header in ["x-api-key", "authorization"] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header,
+                        (if header == "authorization" {
+                            format!("Bearer {key}")
+                        } else {
+                            key.into()
+                        })
+                        .parse()
+                        .unwrap(),
+                    );
+                    let route = c.resolve(&headers).await.unwrap();
+                    assert_eq!(route.label, selector);
+                    assert_eq!(route.proxy.label(), "none");
+                    assert_eq!(route.upstream, "https://provider.invalid/api");
+                    assert!(route.custom_upstream);
+                    assert!(!route.oauth);
+                    assert_eq!(
+                        route.url("/v1/messages").unwrap().as_str(),
+                        "https://provider.invalid/api/v1/messages"
+                    );
+                }
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", "first-key".parse().unwrap());
+            assert!(c.resolve(&headers).await.is_err());
+            std::fs::write(&path, "broken").unwrap();
+            assert!(c.check_credentials().await.is_err());
+            assert!(c.resolve(&headers).await.is_err());
+        }
     }
 
     #[test]

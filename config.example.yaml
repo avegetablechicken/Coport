@@ -72,3 +72,11 @@ claude:
 
 # URL routing keys may omit https:// and /v1. A host-only key matches all paths;
 # an explicit path wins when it is the longest matching path prefix.
+
+# Claude API selectors also resolve named JSON settings in config_dirs (recursively):
+# claude.routing.api_key.api: none # api.json, or a unique settings*api*.json match.
+# The file supplies env.ANTHROPIC_BASE_URL and env.ANTHROPIC_AUTH_TOKEN or
+# env.ANTHROPIC_API_KEY (root-level fields are also accepted).
+# Client base: http://127.0.0.1:8787/anthropic, using the same API credential.
+# Keep the original HTTPS upstream in the selected file. Ambiguous/invalid files
+# are errors; only a missing file falls back to the selector's environment variable.

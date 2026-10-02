@@ -64,7 +64,7 @@ Either service section can be omitted. Within each section:
 | `auth_file` | Account credential filename relative to each configured directory |
 | `auth_env` | Alternative: environment variable containing the account access token |
 | `routing.account.<label>` | Proxy choice for that account source |
-| `routing.api_key.<selector>` | Proxy choice for an API Key environment variable (Codex also accepts provider IDs) |
+| `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, or Claude settings name |
 | `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
 | `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback` for compatibility |
 | `routing.api_key_fallback` | Proxy choice for an unmatched API Key credential |
@@ -181,6 +181,43 @@ retry. Profiles are limited to 64 KiB and lookup time to 10 seconds or the confi
 request timeout, whichever is lower. API Key routes are unaffected by this flag.
 Missing authentication never activates any fallback.
 
+Claude API Key selectors also accept settings names:
+
+```yaml
+claude:
+  config_dirs: ["~/.claude"] # Default when omitted.
+  routing:
+    api_key:
+      api: none # Finds api.json; forwards directly to its configured upstream.
+```
+
+Example `~/.claude/api.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://provider.example.com",
+    "ANTHROPIC_API_KEY": "your-api-key"
+  }
+}
+```
+
+The client sends the same key to `http://127.0.0.1:8787/anthropic`.
+The proxy reads the original HTTPS upstream from the selected file; do not
+replace that file's upstream with the local client URL. `ANTHROPIC_AUTH_TOKEN`
+is also supported and takes precedence over `ANTHROPIC_API_KEY`. Fields are read
+from `env` first, then from the JSON root. The selected file must contain both
+an API credential and `ANTHROPIC_BASE_URL`.
+
+Search is recursive across `claude.config_dirs`, without following child symlinks.
+As in OpenQuota, JSON filenames containing both `settings` and the selector take
+priority; otherwise the filename or its stem must equal the selector (`api` or
+`api.json`). Multiple matching files are an error; use a more specific filename.
+File credentials and upstreams are reloaded for requests. Only when no file
+matches is the selector treated as an environment variable, using `claude.base_url`.
+Malformed or incomplete selected files never fall back to environment values.
+Domain/URL selectors retain their explicit-upstream routing behavior.
+
 Codex API Key URL selectors match explicit upstream requests (see below).
 Other selectors first match Codex provider IDs; otherwise they are treated
 as environment variable names and may reverse-match a provider by `env_key`.
@@ -218,8 +255,8 @@ overrides. Use an explicit environment/file credential source for those cases.
 Providers with no discoverable Bearer credential cannot use credential matching;
 unauthenticated incoming requests remain rejected. A shared token across multiple
 configured providers or an account route remains ambiguous and is rejected.
-Claude API Key selectors can be environment variable names (using `claude.base_url`)
-or explicit HTTPS upstream bases, as described below. Matched API credentials
+Claude API Key selectors can be named settings files, environment variable names
+(using `claude.base_url` when no file matches), or explicit HTTPS upstream bases. Matched API credentials
 may use Bearer or `x-api-key`; they do not trigger OAuth profile lookup or receive
 injected OAuth beta flags. Requests matching multiple credentials in a
 namespace are rejected. The two services never use each other's fallbacks.
