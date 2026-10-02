@@ -92,7 +92,9 @@ function tagColors(names) {
 /// flags only annotate exit addresses.
 function tag(name) {
   if (name === "none") return `<span class="tag direct">direct</span>`;
-  return `<span class="tag c${ui.tagColors[name] ?? 0}">${esc(name)}</span>`;
+  // A proxy whose last test failed is grey wherever it is named.
+  const down = ui.proxies[name]?.probe?.state === "error";
+  return `<span class="tag ${down ? "down" : `c${ui.tagColors[name] ?? 0}`}">${esc(name)}</span>`;
 }
 
 /// Proxy candidates in order, e.g. [jp_lab] → [jp].

@@ -966,6 +966,12 @@ details.disclosure[open] summary svg {
   font-weight: 400;
 }
 
+/* Unreachable at the last test. */
+.tag.down {
+  --tag: var(--tertiary);
+  color: var(--tertiary);
+}
+
 .flag {
   font-size: 10.5px;
   line-height: 1;
