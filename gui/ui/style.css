@@ -780,6 +780,11 @@ input.field::placeholder {
   color: var(--tertiary);
 }
 
+/* Match the numeric input column, leaving its unit column empty. */
+.config-action-row { display: grid; grid-template-columns: minmax(0, 1fr) 68px; row-gap: 0; }
+.config-action-row .switch { justify-self: end; margin-right: 10px; }
+.config-action-row .setting-description { grid-column: 1 / -1; }
+
 /* ---------------------------------------------------------------- requests */
 
 .req {
@@ -1403,3 +1408,19 @@ details.disclosure[open] summary svg {
   color: var(--label);
   background: var(--track);
 }
+
+.device-form { padding: 12px 16px; }
+.device-form label { display: block; margin-bottom: 10px; color: var(--secondary); font-size: 12px; }
+.device-form input.field { display: block; width: 100%; margin-top: 5px; }
+.device-form .connection-choice { display: flex; align-items: center; gap: 7px; color: var(--label); }
+.device-form input[type="checkbox"] { accent-color: var(--accent); }
+
+.devices-traffic-range { display: flex; justify-content: flex-end; padding: 0 12px 10px; }
+
+.device-setting-name { display: inline-flex; align-items: center; gap: 7px; }
+.device-setting-actions { display: inline-flex; align-items: center; gap: 8px; }
+
+.device-setting-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; row-gap: 0; }
+.device-setting-row .device-setting-name { flex-direction: row; grid-column: 1; grid-row: 1; align-self: center; }
+.device-setting-row .device-setting-actions { max-width: none; grid-column: 2; grid-row: 1; align-self: center; }
+.device-setting-transport { color: var(--tertiary); font-size: 10px; font-weight: 400; flex: none; }

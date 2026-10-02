@@ -5,7 +5,7 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
@@ -14,7 +14,7 @@ use std::{
 };
 
 /// Endpoint category, not an assertion that the upstream actually charged quota.
-#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficScope {
     All,
@@ -54,8 +54,9 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
 }
 
 /// The fields traffic reads from log records; file summaries keep only these.
-const FIELDS: [&str; 16] = [
+const FIELDS: [&str; 19] = [
     "account_id",
+    "credential_ref",
     "account_label",
     "cache_creation_input_tokens",
     "cached_input_tokens",
@@ -71,6 +72,8 @@ const FIELDS: [&str; 16] = [
     "service",
     "status",
     "upstream_base_url",
+    "proxy_endpoint",
+    "proxy",
 ];
 
 /// A request or model call merged from its lifecycle records. The most
@@ -188,7 +191,7 @@ impl FileTraffic {
             }
             if !included_in_scope(&entry, scope)
                 || lifecycle_rank(&entry) == 0
-                || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
+                || entry.time.is_none_or(|t| t.timestamp_millis() >= end)
             {
                 return;
             }
@@ -247,7 +250,69 @@ struct FileStamp {
 /// are dropped, so a long range read once does not stay in memory.
 type Summaries = HashMap<(FileStamp, bool), (Instant, Arc<FileTraffic>)>;
 static SUMMARIES: Mutex<Option<Summaries>> = Mutex::new(None);
+#[cfg(test)]
+static LIVE_SCANS: Mutex<Option<HashMap<std::path::PathBuf, usize>>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) fn live_scans(path: &Path) -> usize {
+    LIVE_SCANS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|counts| counts.get(path))
+        .copied()
+        .unwrap_or(0)
+}
 const SUMMARY_TTL: Duration = Duration::from_secs(600);
+
+struct SnapshotFile {
+    summary: Arc<FileTraffic>,
+    archived_modified: Option<i64>,
+}
+
+/// One immutable scan per scope/end shared by all ranges in a refresh.
+pub(crate) struct Snapshot {
+    end: i64,
+    all: Vec<SnapshotFile>,
+    model: Vec<SnapshotFile>,
+}
+impl Snapshot {
+    pub(crate) fn load(path: &Path, end: i64) -> Result<Self, String> {
+        let start = end - 43200 * 60_000;
+        Ok(Self {
+            end,
+            all: file_summaries(path, start, TrafficScope::All, end)?,
+            model: file_summaries(path, start, TrafficScope::Model, end)?,
+        })
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ReadSource<'a> {
+    Path(&'a Path),
+    Snapshot(&'a Snapshot),
+}
+impl ReadSource<'_> {
+    fn entries(
+        self,
+        start: i64,
+        end: i64,
+        scope: TrafficScope,
+        labels: &mut BTreeMap<(String, String), String>,
+    ) -> Result<Vec<Entry>, String> {
+        match self {
+            Self::Path(path) => processed_entries(path, start, end, scope, labels),
+            Self::Snapshot(snapshot) => {
+                if end != snapshot.end {
+                    return Err("Traffic snapshot boundary differs".into());
+                }
+                let files = match scope {
+                    TrafficScope::All => &snapshot.all,
+                    TrafficScope::Model => &snapshot.model,
+                };
+                Ok(entries_from_files(files, start, end, scope, labels))
+            }
+        }
+    }
+}
 
 /// Each file's contribution, in file order; see `for_each_file`. A cached
 /// summary keeps the window end of the read that made it, which a rotated
@@ -257,15 +322,39 @@ fn file_summaries(
     start: i64,
     scope: TrafficScope,
     end: i64,
-) -> Result<Vec<Arc<FileTraffic>>, String> {
+) -> Result<Vec<SnapshotFile>, String> {
     let model = scope == TrafficScope::Model;
     let mut summaries = Vec::new();
     for_each_file(path, start, |file, live, _path| {
         let meta = file
             .metadata()
             .map_err(|_| "Cannot read traffic history".to_owned())?;
+        let backup = path.with_file_name(format!(
+            "{}.1",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let archived_modified = if live || _path == backup {
+            None
+        } else {
+            meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|t| t.as_millis() as i64)
+        };
         if live {
-            summaries.push(Arc::new(FileTraffic::scan(file, scope, end)?));
+            #[cfg(test)]
+            {
+                *LIVE_SCANS
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .entry(path.to_owned())
+                    .or_default() += 1;
+            }
+            summaries.push(SnapshotFile {
+                summary: Arc::new(FileTraffic::scan(file, scope, end)?),
+                archived_modified,
+            });
             return Ok(());
         }
         let stamp = FileStamp {
@@ -301,7 +390,10 @@ fn file_summaries(
                 summary
             }
         };
-        summaries.push(summary);
+        summaries.push(SnapshotFile {
+            summary,
+            archived_modified,
+        });
         Ok(())
     })?;
     Ok(summaries)
@@ -372,6 +464,23 @@ pub fn read(
     scope: TrafficScope,
     identities: &Identities,
 ) -> Result<Traffic, String> {
+    read_at(
+        ReadSource::Path(path),
+        minutes,
+        labels,
+        scope,
+        identities,
+        Local::now().timestamp_millis(),
+    )
+}
+fn read_at(
+    source: ReadSource<'_>,
+    minutes: u64,
+    labels: &BTreeMap<(String, String), String>,
+    scope: TrafficScope,
+    identities: &Identities,
+    end: i64,
+) -> Result<Traffic, String> {
     let bucket_minutes = match minutes {
         30 => 1,
         360 => 15,
@@ -382,61 +491,10 @@ pub fn read(
         _ => return Err("Unsupported traffic range".into()),
     };
     let bucket_count = (minutes / bucket_minutes) as usize;
-    let end = Local::now().timestamp_millis();
     let start = end - minutes as i64 * 60_000;
     let mut groups = BTreeMap::new();
     let mut labels = labels.clone();
-    let mut seen_requests = HashSet::new();
-    let files = file_summaries(path, start, scope, end)?;
-    let mut entries = Vec::<&Record>::new();
-    // Most requests lie within one file; only those in several are copied.
-    let mut requests = BTreeMap::<&str, std::borrow::Cow<Record>>::new();
-    let mut explicit_call_requests = HashSet::new();
-    for file in &files {
-        for (service, id, label) in &file.evidence {
-            if labels
-                .iter()
-                .any(|((s, _), current)| s == service && current == label)
-            {
-                labels
-                    .entry((service.clone(), id.clone()))
-                    .or_insert_with(|| label.clone());
-            }
-        }
-        for (id, record) in &file.requests {
-            match requests.get_mut(id.as_str()) {
-                Some(current) => current.to_mut().merge(record),
-                None => {
-                    requests.insert(id, std::borrow::Cow::Borrowed(record));
-                }
-            }
-        }
-        for (identity, record) in &file.uncorrelated {
-            if seen_requests.insert(*identity) {
-                entries.push(record);
-            }
-        }
-        explicit_call_requests.extend(file.explicit_call_requests.iter().map(String::as_str));
-    }
-    let in_window = |record: &&Record| {
-        record
-            .time
-            .is_some_and(|t| (start..end).contains(&t.timestamp_millis()))
-    };
-    for entry in entries
-        .into_iter()
-        .chain(requests.values().map(|record| record.as_ref()))
-        .filter(in_window)
-        .map(Record::entry)
-    {
-        if scope == TrafficScope::Model
-            && is_historical_http_call(&entry)
-            && entry
-                .get("request_id")
-                .is_some_and(|id| explicit_call_requests.contains(id))
-        {
-            continue;
-        }
+    for entry in source.entries(start, end, scope, &mut labels)? {
         let resolved = identities.resolve(&entry, entry.service().unwrap_or("Unknown"), &labels);
         aggregate(
             &mut groups,
@@ -516,6 +574,21 @@ fn add_tokens(total: &mut Option<u64>, value: Option<u64>) {
     }
 }
 
+fn credential_name(
+    entry: &Entry,
+    service: &str,
+    labels: &BTreeMap<(String, String), String>,
+    resolved: Option<&Resolution>,
+) -> String {
+    resolved.map(|r| r.label.clone()).unwrap_or_else(|| {
+        ["provider", "account_id", "account_label"]
+            .into_iter()
+            .filter_map(|key| entry.get(key))
+            .find_map(|name| labels.get(&(service.to_owned(), name.to_owned())).cloned())
+            .unwrap_or_else(|| UNIDENTIFIED.into())
+    })
+}
+
 fn aggregate(
     groups: &mut BTreeMap<(String, String), CredentialTraffic>,
     e: &Entry,
@@ -539,16 +612,8 @@ fn aggregate(
         .or_else(|| e.get("service"))
         .unwrap_or("Unknown")
         .to_owned();
-    // Only current configuration mappings can identify a historical name.
-    let credential = ["provider", "account_id", "account_label"]
-        .into_iter()
-        .filter_map(|key| e.get(key))
-        .find_map(|name| labels.get(&(service.clone(), name.to_owned())).cloned())
-        .unwrap_or_else(|| UNIDENTIFIED.into());
-    let (credential, source) = match resolved {
-        Some(Resolution { label, source }) => (label, source),
-        None => (credential, None),
-    };
+    let credential = credential_name(e, &service, labels, resolved.as_ref());
+    let source = resolved.and_then(|r| r.source);
     let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
     let claude = service == "Claude";
     let group = groups
@@ -614,14 +679,326 @@ fn aggregate(
     }
 }
 
+fn processed_entries(
+    path: &Path,
+    start: i64,
+    end: i64,
+    scope: TrafficScope,
+    labels: &mut BTreeMap<(String, String), String>,
+) -> Result<Vec<Entry>, String> {
+    let files = file_summaries(path, start, scope, end)?;
+    Ok(entries_from_files(&files, start, end, scope, labels))
+}
+fn entries_from_files(
+    files: &[SnapshotFile],
+    start: i64,
+    end: i64,
+    scope: TrafficScope,
+    labels: &mut BTreeMap<(String, String), String>,
+) -> Vec<Entry> {
+    let mut seen_requests = HashSet::new();
+    let mut entries = Vec::<&Record>::new();
+    // Most requests lie within one file; only those in several are copied.
+    let mut requests = BTreeMap::<&str, std::borrow::Cow<Record>>::new();
+    let mut explicit_call_requests = HashSet::new();
+    for file in files
+        .iter()
+        .filter(|f| f.archived_modified.is_none_or(|modified| modified >= start))
+    {
+        let file = &file.summary;
+        for (service, id, label) in &file.evidence {
+            if labels
+                .iter()
+                .any(|((s, _), current)| s == service && current == label)
+            {
+                labels
+                    .entry((service.clone(), id.clone()))
+                    .or_insert_with(|| label.clone());
+            }
+        }
+        for (id, record) in &file.requests {
+            match requests.get_mut(id.as_str()) {
+                Some(current) => current.to_mut().merge(record),
+                None => {
+                    requests.insert(id, std::borrow::Cow::Borrowed(record));
+                }
+            }
+        }
+        for (identity, record) in &file.uncorrelated {
+            if seen_requests.insert(*identity) {
+                entries.push(record);
+            }
+        }
+        explicit_call_requests.extend(file.explicit_call_requests.iter().map(String::as_str));
+    }
+    let in_window = |record: &&Record| {
+        record
+            .time
+            .is_some_and(|t| (start..end).contains(&t.timestamp_millis()))
+    };
+    let mut result = Vec::new();
+    for entry in entries
+        .into_iter()
+        .chain(requests.values().map(|record| record.as_ref()))
+        .filter(in_window)
+        .map(Record::entry)
+    {
+        if scope == TrafficScope::Model
+            && is_historical_http_call(&entry)
+            && entry
+                .get("request_id")
+                .is_some_and(|id| explicit_call_requests.contains(id))
+        {
+            continue;
+        }
+        result.push(entry);
+    }
+    result
+}
+
+/// Already observed identities belong to this device; matching them to a peer
+/// does not import any peer configuration or expose names in a shared snapshot.
+pub(crate) fn observed_identity_labels(
+    path: &Path,
+    mut labels: BTreeMap<(String, String), String>,
+) -> Result<BTreeMap<(String, String), String>, String> {
+    let end = chrono::Utc::now().timestamp_millis();
+    let start = end - 43200 * 60_000;
+    let _ = processed_entries(path, start, end, TrafficScope::Model, &mut labels)?;
+    Ok(labels)
+}
+/// This device uses exactly Activity Traffic's own identity resolution. It must
+/// not be passed through the remote privacy projection and then re-identified.
+pub(crate) fn local_named_groups(
+    source: ReadSource<'_>,
+    config: &coport::config::Config,
+    labels: &BTreeMap<(String, String), String>,
+    end: i64,
+    minutes: u64,
+    scope: TrafficScope,
+) -> Result<
+    Vec<(
+        coport_gui::data_api::Service,
+        String,
+        coport_gui::data_api::Stats,
+    )>,
+    String,
+> {
+    let assignments = crate::traffic_identity::Compatibility::load(
+        &crate::settings::traffic_compatibility_path(),
+    )
+    .unwrap_or_default();
+    let identities = Identities::from_config(config, &assignments.assignments);
+    let traffic = read_at(source, minutes, labels, scope, &identities, end)?;
+    Ok(traffic
+        .credentials
+        .into_iter()
+        .map(|g| {
+            (
+                match g.service.as_str() {
+                    "Codex" => coport_gui::data_api::Service::Codex,
+                    "Claude" => coport_gui::data_api::Service::Claude,
+                    _ => coport_gui::data_api::Service::Other,
+                },
+                g.credential,
+                coport_gui::data_api::Stats {
+                    requests: g.requests,
+                    errors: g.errors,
+                    bytes: g.bytes,
+                    input_tokens: g.input_tokens,
+                    output_tokens: g.output_tokens,
+                    cached_input_tokens: g.cached_input_tokens,
+                    uncached_input_tokens: g.uncached_input_tokens,
+                    cache_write_tokens: g.cache_write_tokens,
+                    cache_read: g.cache_read,
+                    cache_prompt: g.cache_prompt,
+                    latency_total_ms: g.latency_total,
+                    latency_samples: g.latency_count,
+                    counts: g.counts,
+                    error_counts: g.error_counts,
+                    token_counts: g.token_counts,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Only numeric results and keyed opaque references leave the device.
+#[derive(Clone, Copy)]
+pub(crate) struct ExportOptions {
+    pub end: i64,
+    pub minutes: u64,
+    pub scope: TrafficScope,
+    pub limit: usize,
+}
+pub(crate) struct ExportIdentities {
+    labels: BTreeMap<(String, String), String>,
+    identities: Identities,
+    references: Vec<coport::identity::TrafficProviderReference>,
+}
+
+impl ExportIdentities {
+    pub(crate) fn from_config(config: &coport::config::Config) -> Self {
+        let assignments = crate::traffic_identity::Compatibility::load(
+            &crate::settings::traffic_compatibility_path(),
+        )
+        .unwrap_or_default();
+        let identities = Identities::from_config(config, &assignments.assignments);
+        let config = config.clone();
+        let (labels, references) = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|rt| {
+                    rt.block_on(async {
+                        (
+                            config.traffic_credential_labels().await,
+                            config.traffic_provider_references().await,
+                        )
+                    })
+                })
+                .unwrap_or_default()
+        })
+        .join()
+        .unwrap_or_default();
+        Self {
+            labels,
+            identities,
+            references,
+        }
+    }
+}
+pub(crate) fn export_window_limit(
+    source: ReadSource<'_>,
+    config: &coport::config::Config,
+    key: &coport::external_access::DataKey,
+    options: ExportOptions,
+    context: &ExportIdentities,
+) -> Result<Vec<coport_gui::data_api::Group>, String> {
+    let ExportOptions {
+        end,
+        minutes,
+        scope,
+        limit,
+    } = options;
+    let bucket =
+        coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    let start = end - minutes as i64 * 60_000;
+    let identities = &context.identities;
+    let references = &context.references;
+    let mut labels = context.labels.clone();
+    let entries = source.entries(start, end, scope, &mut labels)?;
+    let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
+    let mut groups = BTreeMap::new();
+    for entry in entries {
+        let service = entry.service().unwrap_or("Unknown").to_owned();
+        let resolved = identities.resolve(&entry, &service, &labels);
+        let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
+        let proxy = entry
+            .get("proxy_endpoint")
+            .map(str::to_owned)
+            .or_else(|| {
+                entry
+                    .get("proxy")
+                    .and_then(|name| config.proxies.get(name))
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                if entry.get("proxy") == Some("none") {
+                    "none"
+                } else {
+                    "unknown"
+                }
+                .into()
+            });
+        let mut proxy_ref = key.reference("proxy", &coport_gui::data_api::canonical(&proxy));
+        // Resolve/group locally first. Historical endpoints and names cannot
+        // create extra upstream accounts in the exported result.
+        let mut upstream_ref = key.reference("upstream", &format!("{service}\0{credential}"));
+        let mut account_ref = identities
+            .provider_reference(&service, &credential, references)
+            .or_else(|| {
+                coport_gui::data_api::account_reference(
+                    &service,
+                    entry.get("account_id").unwrap_or(""),
+                )
+            })
+            .or_else(|| {
+                if resolved.is_some() {
+                    return None;
+                }
+                entry
+                    .get("credential_ref")
+                    .filter(|r| r.len() == 64 && r.bytes().all(|c| c.is_ascii_hexdigit()))
+                    .map(str::to_owned)
+            });
+        let label = format!("{proxy_ref}/{upstream_ref}");
+        if groups.len() >= limit && !groups.contains_key(&(service.clone(), label)) {
+            proxy_ref = key.reference("proxy", "overflow");
+            upstream_ref = key.reference("upstream", "overflow");
+            account_ref = None;
+        }
+        let label = format!("{proxy_ref}/{upstream_ref}");
+        account_refs
+            .entry((service, label.clone()))
+            .or_default()
+            .insert(account_ref);
+        aggregate(
+            &mut groups,
+            &entry,
+            start,
+            end,
+            bucket,
+            &labels,
+            Some(Resolution {
+                label,
+                source: None,
+            }),
+        );
+    }
+    Ok(groups
+        .into_values()
+        .map(|g| {
+            let (proxy_ref, upstream_ref) = g.credential.split_once('/').unwrap();
+            coport_gui::data_api::Group {
+                service: match g.service.as_str() {
+                    "Codex" => coport_gui::data_api::Service::Codex,
+                    "Claude" => coport_gui::data_api::Service::Claude,
+                    _ => coport_gui::data_api::Service::Other,
+                },
+                proxy_ref: proxy_ref.into(),
+                upstream_ref: upstream_ref.into(),
+                account_ref: account_refs
+                    .remove(&(g.service.clone(), g.credential.clone()))
+                    .filter(|refs| refs.len() == 1)
+                    .and_then(|refs| refs.into_iter().next().flatten()),
+                stats: coport_gui::data_api::Stats {
+                    requests: g.requests,
+                    errors: g.errors,
+                    bytes: g.bytes,
+                    input_tokens: g.input_tokens,
+                    output_tokens: g.output_tokens,
+                    cached_input_tokens: g.cached_input_tokens,
+                    uncached_input_tokens: g.uncached_input_tokens,
+                    cache_write_tokens: g.cache_write_tokens,
+                    cache_read: g.cache_read,
+                    cache_prompt: g.cache_prompt,
+                    latency_total_ms: g.latency_total,
+                    latency_samples: g.latency_count,
+                    counts: g.counts,
+                    error_counts: g.error_counts,
+                    token_counts: g.token_counts,
+                },
+            }
+        })
+        .collect())
+}
+
 /// Calls `visit` for every entry of the log at `path` and its rotated history,
 /// in file order. Archives last written before `start` (epoch milliseconds)
 /// cannot hold later entries and are skipped.
-pub(crate) fn for_each_entry(
-    path: &Path,
-    start: i64,
-    mut visit: impl FnMut(Entry),
-) -> Result<(), String> {
+pub fn for_each_entry(path: &Path, start: i64, mut visit: impl FnMut(Entry)) -> Result<(), String> {
     for_each_file(path, start, |file, _, _| for_each_line(file, &mut visit))
 }
 
@@ -707,6 +1084,107 @@ fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_snapshot_matches_every_range_and_remains_immutable_across_log_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let row = |id: &str| {
+            serde_json::json!({"timestamp":chrono::DateTime::from_timestamp_millis(end - 120_000).unwrap().to_rfc3339(), "event":"request_finished", "request_id":id, "method":"POST", "path":"/v1/responses", "service":"codex", "status":"200", "received_bytes":"42", "input_tokens":"12", "duration_ms":"100"}).to_string()+"\n"
+        };
+        std::fs::write(&path, row("first")).unwrap();
+        let before = live_scans(&path);
+        let snapshot = Snapshot::load(&path, end).unwrap();
+        assert_eq!(live_scans(&path) - before, 2);
+        let labels = BTreeMap::new();
+        let identities = Identities::default();
+        for minutes in crate::data_api::RANGES {
+            for scope in [TrafficScope::All, TrafficScope::Model] {
+                let shared = read_at(
+                    ReadSource::Snapshot(&snapshot),
+                    minutes,
+                    &labels,
+                    scope,
+                    &identities,
+                    end,
+                )
+                .unwrap();
+                let direct = read_at(
+                    ReadSource::Path(&path),
+                    minutes,
+                    &labels,
+                    scope,
+                    &identities,
+                    end,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(shared).unwrap(),
+                    serde_json::to_value(direct).unwrap()
+                );
+            }
+        }
+        std::fs::write(&path, row("first") + &row("second")).unwrap();
+        let frozen = read_at(
+            ReadSource::Snapshot(&snapshot),
+            30,
+            &labels,
+            TrafficScope::Model,
+            &identities,
+            end,
+        )
+        .unwrap();
+        assert_eq!(frozen.summary.requests, 1);
+        let fresh = Snapshot::load(&path, end).unwrap();
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&fresh),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            2
+        );
+        std::fs::rename(&path, path.with_file_name("proxy.log.1")).unwrap();
+        std::fs::write(&path, row("third")).unwrap();
+        let rotated = Snapshot::load(&path, end).unwrap();
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&rotated),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            3
+        );
+        std::fs::write(&path, "").unwrap();
+        let truncated = Snapshot::load(&path, end).unwrap();
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&truncated),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            2
+        );
+    }
 
     #[test]
     fn changed_configurations_merge_with_reasons_and_unmatched_requests_are_unidentified() {
@@ -951,6 +1429,40 @@ mod tests {
                 ("renamed", Some(api), None),
             ]
         );
+        let key = coport::external_access::DataKey::new(&"e".repeat(64)).unwrap();
+        let context = ExportIdentities {
+            labels,
+            identities,
+            references: Vec::new(),
+        };
+        let exported = export_window_limit(
+            ReadSource::Path(&path),
+            &config,
+            &key,
+            ExportOptions {
+                end: traffic.end,
+                minutes: 30,
+                scope: TrafficScope::All,
+                limit: 24,
+            },
+            &context,
+        )
+        .unwrap();
+        assert_eq!(exported.len(), traffic.credentials.len());
+        for local in &traffic.credentials {
+            let reference = key.reference(
+                "upstream",
+                &format!("{}\0{}", local.service, local.credential),
+            );
+            let remote = exported
+                .iter()
+                .find(|g| g.upstream_ref == reference)
+                .unwrap();
+            assert_eq!(remote.stats.requests, local.requests);
+            assert_eq!(remote.stats.bytes, local.bytes);
+            assert_eq!(remote.stats.counts, local.counts);
+            assert_eq!(remote.stats.token_counts, local.token_counts);
+        }
     }
 
     fn configured(names: &[&str]) -> BTreeMap<(String, String), String> {

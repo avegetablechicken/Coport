@@ -134,7 +134,9 @@ impl Controller {
 
     pub fn try_start(&mut self, config_path: &Path, log_path: PathBuf) -> Result<(), String> {
         // Validate before stopping the working listener.
-        if let Err(error) = Config::read(config_path) {
+        if let Err(error) =
+            Config::read(config_path).and_then(|config| config.check_external_data())
+        {
             let message = error.message.to_string();
             if !self.is_running() {
                 self.lock().phase = Some(Phase::Failed(message.clone()));

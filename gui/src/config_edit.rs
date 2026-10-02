@@ -15,8 +15,11 @@ enum Kind {
 type Getter = fn(&Config) -> Value;
 
 /// Configuration values the Settings page may change, as dotted YAML keys.
-const EDITABLE: [(&str, Kind, Getter); 9] = [
+const EDITABLE: [(&str, Kind, Getter); 10] = [
     ("listen_port", Kind::Port, |c| json!(c.listen_port)),
+    ("allow_external_access", Kind::Flag, |c| {
+        json!(c.allow_external_access)
+    }),
     ("request_timeout_seconds", Kind::Seconds, |c| {
         json!(c.request_timeout_seconds)
     }),
@@ -220,6 +223,18 @@ mod tests {
     const EXAMPLE: &str = include_str!("../../config.example.yaml");
     const BASE: &str = "listen_port: 8787 # local\nrequest_timeout_seconds: 300\n";
 
+    #[test]
+    fn external_access_can_be_enabled_and_disabled_without_changing_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, format!("{BASE}external_data:\n  port: 8788\n  token_env: COPORT_DATA_KEY\n  trusted_lan: [10.42.0.0/24]\n")).unwrap();
+        set_value(&path, "allow_external_access", &json!(true)).unwrap();
+        assert!(Config::read(&path).unwrap().allow_external_access);
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(BASE));
+        set_value(&path, "allow_external_access", &json!(false)).unwrap();
+        assert!(!Config::read(&path).unwrap().allow_external_access);
+        assert!(set_value(&path, "allow_external_access", &json!("true")).is_err());
+    }
     #[test]
     fn replaces_only_the_value_and_keeps_comments() {
         let out = set_scalar(BASE, &["listen_port"], "9000").unwrap();

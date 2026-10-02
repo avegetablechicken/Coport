@@ -13,10 +13,12 @@ const svg = (body, extra = "") =>
   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ${extra}>${body}</svg>`;
 
 const ICON = {
+  plus: svg('<path d="M12 5v14M5 12h14"/>'),
   copy: svg('<rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/>'),
   check: svg('<path d="m5 12.5 4.5 4.5L19 7.5"/>'),
   restart: svg('<path d="M20 11.5A8 8 0 1 1 17.7 6"/><path d="M20 4v5h-5"/>'),
   back: svg('<path d="m15 18-6-6 6-6"/>', 'stroke-width="2"'),
+  settings: svg('<path d="m9 3-.5 2-2 1-2-.5-1 2 1.5 1.5v3L3.5 14.5l1 2 2-.5 2 1 .5 2h3l.5-2 2-1 2 .5 1-2-1.5-1.5v-3L18 8.5l-1-2-2 .5-2-1L12.5 3z"/><circle cx="10.75" cy="11" r="3"/>'),
   chevron: svg('<path d="m9 6 6 6-6 6"/>', 'stroke-width="2.4"'),
   search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
   trash: svg('<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>'),
@@ -145,6 +147,19 @@ function serviceMark(service) {
 
 const ui = {
   snap: null,
+  devices: [],
+  mergedData: null,
+  mergedDataError: "",
+  mergedDataLoading: false,
+  mergedDataRequest: 0,
+  deviceTrafficViews: Object.create(null),
+  deviceTrafficFetchedAt: 0,
+  mergedDataUpdating: false,
+  deviceTrafficMinutes: 30,
+  deviceTrafficOpen: Object.create(null),
+  deviceStates: Object.create(null),
+  devicesLoaded: false,
+  deviceRefresh: false,
   fetchedAt: 0,
   refreshRequest: 0,
   page: "main",
@@ -168,6 +183,7 @@ const ui = {
   recent: [],
   trafficMinutes: 30,
   trafficScope: "model",
+  localTrafficViews: Object.create(null),
   homeTraffic: null,
   homeTrafficMinutes: 30,
   homeTrafficRequest: 0,
@@ -356,18 +372,19 @@ function renderTop() {
       <span class="app-name">Coport</span><span class="version">v${esc(ui.snap.version)}</span>
       <nav class="links">
         <button class="text-link" data-action="page" data-page="activity">Activity</button>
+        ${(ui.devicesLoaded ? ui.devices.length : ui.snap.settings?.deviceCount || 0) > 0 ? `<button class="text-link" data-action="page" data-page="devices">Devices</button>` : ""}
         <button class="text-link" data-action="page" data-page="settings">Settings</button>
         <button class="text-link" data-action="quit">Quit</button>
       </nav>`;
     return;
   }
-  const title = ui.page === "activity" ? "Activity" : "Settings";
+  const title = ui.page === "activity" ? "Activity" : ui.page === "devices" ? "Devices" : "Settings";
   const tools =
     ui.page === "activity"
       ? `<nav class="links">
           <button class="icon-btn" data-action="open" data-target="log" data-tip="Open log file" aria-label="Open log file">${ICON.folder}</button>
         </nav>`
-      : "";
+      : ui.page === "devices" ? `<nav class="links"><button class="icon-btn" data-action="page" data-page="settings" data-tip="Configure devices" aria-label="Configure devices in Settings">${ICON.settings}</button></nav>` : "";
   $("top").innerHTML = `
     <button class="text-link back" data-action="page" data-page="main" aria-keyshortcuts="${BACK_KEYS}">${ICON.back}Back</button>
     <span class="page-title">${title}</span>${tools}`;
@@ -376,6 +393,7 @@ function renderTop() {
 function renderPage() {
   hideRouteTooltip();
   const content = $("content");
+  for (const details of content.querySelectorAll("details[data-device-traffic]")) (ui.deviceTrafficOpen ||= Object.create(null))[details.dataset.deviceTraffic] = details.open;
   if (ui.page === "activity") {
     if (ui.builtPage !== "activity") {
       closeSelect();
@@ -393,7 +411,7 @@ function renderPage() {
     ? document.activeElement : null;
   const typing = focused && { id: focused.id, value: focused.value, start: focused.selectionStart, end: focused.selectionEnd };
   ui.rendering = true;
-  content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : main()}</div>`;
+  content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : ui.page === "devices" ? devicesPage() : main()}</div>`;
   const field = typing && $(typing.id);
   if (field) {
     field.value = typing.value;
@@ -498,15 +516,23 @@ function chart(stats, scope, showPeak = false) {
   </div>`;
 }
 
+function rememberLocalTraffic(traffic, minutes, scope) {
+  (ui.localTrafficViews ||= Object.create(null))[`${minutes}:${scope}`] = {
+    ...traffic.summary, credentials: traffic.credentials, scope,
+  };
+}
+
 async function loadHomeTraffic(force = false) {
   if (ui.homeTrafficLoading && !force) return;
   const request = ++ui.homeTrafficRequest;
   ui.homeTrafficLoading = true;
   // As on the Activity page, stats follow the category their data was read for.
   const scope = ui.trafficScope;
+  const minutes = ui.homeTrafficMinutes;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes, scope });
+    const traffic = await invoke("get_traffic", { minutes, scope });
     if (request !== ui.homeTrafficRequest) return;
+    rememberLocalTraffic(traffic, minutes, scope);
     ui.homeTraffic = { ...traffic.summary, scope };
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
@@ -516,7 +542,7 @@ async function loadHomeTraffic(force = false) {
   } finally {
     if (request === ui.homeTrafficRequest) ui.homeTrafficLoading = false;
   }
-  if (ui.page === "main") render();
+  if (ui.page === "main" || ui.page === "devices") render();
 }
 
 function trafficBlock() {
@@ -916,9 +942,11 @@ async function loadTraffic() {
   // Charts follow the category their data was read for, so a switch keeps
   // the previous charts consistent until the replacement arrives.
   const scope = ui.trafficScope;
+  const minutes = ui.trafficMinutes;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes, scope });
+    const traffic = await invoke("get_traffic", { minutes, scope });
     if (request !== ui.trafficRequest) return;
+    rememberLocalTraffic(traffic, minutes, scope);
     ui.traffic = { ...traffic, scope };
     ui.trafficError = "";
   } catch (error) {
@@ -928,6 +956,7 @@ async function loadTraffic() {
     if (request === ui.trafficRequest) ui.trafficLoading = false;
   }
   if (ui.page === "activity") renderActivityTraffic();
+  else if (ui.page === "devices") render();
 }
 
 function modelTokenStats(stats, scope) {
@@ -1273,21 +1302,24 @@ function renderActivityList() {
 }
 
 function requestRow(e, expandable) {
+  const deviceQuery = ["device_statistics_succeeded", "device_statistics_failed", "device_statistics_recovered"].includes(e.event);
+  const queryDevice = deviceQuery && ui.devices.find(device => device.id === e.fields?.device_id);
+  const queryLabel = deviceQuery ? `Statistics query · ${queryDevice?.name || `Device ${String(e.fields?.device_id || "").slice(0, 8)}`}` : "";
   const cancelled = e.event === "request_cancelled" || e.event === "model_call_cancelled";
   const modelCall = e.event.startsWith("model_call_");
   const unknown = e.event === "model_call_unknown";
   const incomplete = e.event === "model_call_incomplete";
-  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : incomplete ? "INC" : e.event === "model_call_finished" ? "OK" : "RUN") : e.error && !(e.status >= 400) ? "ERR" : e.status ?? "—";
-  const tip = cancelled ? "Cancelled" : unknown ? "Outcome unavailable" : incomplete ? `Incomplete${e.fields?.incomplete_reason ? `: ${e.fields.incomplete_reason}` : ""}` : "";
-  const meta = [fmtTime(e.time), modelCall && e.fields?.model, e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
+  const code = deviceQuery ? (e.error ? "ERR" : "OK") : cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : incomplete ? "INC" : e.event === "model_call_finished" ? "OK" : "RUN") : e.error && !(e.status >= 400) ? "ERR" : e.status ?? "—";
+  const tip = deviceQuery ? (e.error ? "Statistics query failed" : e.event === "device_statistics_recovered" ? "Statistics connection recovered" : "Statistics query succeeded") : cancelled ? "Cancelled" : unknown ? "Outcome unavailable" : incomplete ? `Incomplete${e.fields?.incomplete_reason ? `: ${e.fields.incomplete_reason}` : ""}` : "";
+  const meta = [fmtTime(e.time), deviceQuery && e.fields?.transport?.toUpperCase(), deviceQuery && e.fields?.query_count > 1 && `${e.fields.query_count} queries since previous event`, modelCall && e.fields?.model, e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
     .join(" · ");
   const tag = expandable ? "button" : "div";
   const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
   return `<${tag} class="req" ${attrs}>
-    <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : modelCall ? (incomplete ? "s4" : e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${tip ? ` title="${esc(tip)}" aria-label="${esc(tip)}"` : ""}>${esc(code)}</span>
+    <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : deviceQuery ? "s2" : modelCall ? (incomplete ? "s4" : e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${tip ? ` title="${esc(tip)}" aria-label="${esc(tip)}"` : ""}>${esc(code)}</span>
     <span class="req-main">
-      <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(e.path ?? e.event)}</span>
+      <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(deviceQuery ? queryLabel : e.path ?? e.event)}</span>
       ${expandable && meta ? `<span class="req-meta">${esc(meta)}</span>` : ""}
     </span>
     <span class="req-dur">${e.durationMs != null ? fmtMs(e.durationMs) : ""}</span>
@@ -1310,6 +1342,177 @@ function detail(e) {
   </div>`;
 }
 
+// ---------------------------------------------------------------- devices
+
+function selectDeviceTraffic() {
+  const cached = ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes}:${ui.trafficScope}`];
+  if (!cached) return false;
+  ui.mergedData = cached;
+  return true;
+}
+async function loadMergedData(force = false) {
+  if (ui.mergedDataLoading && !force) return;
+  const request = ++ui.mergedDataRequest;
+  ui.mergedDataLoading = true;
+  const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
+  try {
+    const data = await invoke("get_merged_data");
+    if (request !== ui.mergedDataRequest) return;
+    if (Array.isArray(data)) {
+      relabelDeviceViews(data, requestedDevices, ui.devices || []);
+      ui.deviceTrafficViews = Object.fromEntries(data.map(view => [`${view.minutes}:${view.scope}`, view]));
+      selectDeviceTraffic();
+    } else { ui.mergedData = data; }
+    ui.deviceTrafficFetchedAt = Date.now();
+    ui.mergedDataError = ""; ui.mergedDataUpdating = false;
+  } catch (e) {
+    if (request === ui.mergedDataRequest) {
+      ui.mergedDataUpdating = String(e).includes("TRAFFIC_UPDATING");
+      ui.mergedDataError = ui.mergedDataUpdating ? "" : String(e);
+    }
+  }
+  finally { if (request === ui.mergedDataRequest) { ui.mergedDataLoading = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
+}
+function deviceTrafficContent(traffic, scope, detailsKey = "merged") {
+  const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
+  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">
+    ${trafficShare(traffic.credentials, scope)}${chart(traffic, scope)}
+    <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", traffic.requests)}${stat("Error Rate", rate, traffic.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(traffic.avgMs))}${stat("Received", fmtBytes(traffic.bytes))}</div>
+    ${modelTokenStats(traffic, scope)}</div>`;
+  if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
+    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
+    ${chart(c, scope, true)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
+  return body;
+}
+document.addEventListener("toggle", event => {
+  const details = event.target;
+  if (!details.isConnected || !details.matches?.("details[data-device-traffic]")) return;
+  (ui.deviceTrafficOpen ||= Object.create(null))[details.dataset.deviceTraffic] = details.open;
+}, true);
+function mergedDataBlock() {
+  const data = ui.mergedData;
+  const range = trafficControls("devices-traffic", ui.deviceTrafficMinutes, "Device traffic time range");
+  let body = `<div class="devices-traffic-range">${range}</div>`;
+  if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
+  if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
+  if (data) {
+    body += deviceTrafficContent(data.traffic, data.scope);
+    for (const source of data.sources) if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
+  }
+  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading ? "disabled" : ""}>Refresh</button>`, body);
+}
+function deviceConnectionKey(devices) {
+  return JSON.stringify(devices.map(d => {
+    const transport = d.data?.transport || (d.ssh ? "ssh" : "http");
+    return [d.id, transport, transport === "ssh"
+      ? [d.ssh?.host, d.ssh?.binary === "coportd" ? "" : d.ssh?.binary || ""]
+      : [d.data?.url, d.data?.tokenFile, d.data?.tokenEnv, d.data?.caCertificate]];
+  }).sort((a,b) => String(a[0]).localeCompare(String(b[0]))));
+}
+function relabelDeviceViews(views, previous, current) {
+  const renamed = new Map(previous.map(d => [d.name, current.find(c => c.id === d.id)?.name || d.name]));
+  for (const view of new Set(views)) {
+    for (const source of view?.sources || []) source.name = renamed.get(source.name) || source.name;
+  }
+}
+async function loadDeviceDefinitions() {
+  let changed = false;
+  try {
+    const devices = await invoke("get_devices");
+    changed = ui.devicesLoaded && deviceConnectionKey(devices) !== deviceConnectionKey(ui.devices);
+    if (changed) {
+      ++ui.mergedDataRequest; ui.mergedDataLoading = false;
+      ui.deviceTrafficViews = Object.create(null); ui.mergedData = null;
+    } else {
+      relabelDeviceViews([...Object.values(ui.deviceTrafficViews || {}), ui.mergedData], ui.devices, devices);
+    }
+    ui.devices = devices; ui.devicesLoaded = true;
+  }
+  catch (error) { toast(String(error)); }
+  if (ui.page === "settings") render();
+  return changed;
+}
+async function loadDevices() {
+  if (ui.deviceRefresh) return;
+  ui.deviceRefresh = true;
+  try {
+    await loadDeviceDefinitions();
+    if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
+        && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
+    loadMergedData();
+
+  } catch (error) { toast(String(error)); }
+  finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
+}
+
+function devicesPage() {
+  const local = ui.snap.phase;
+  const data = ui.mergedData;
+  const localTraffic = data?.local || ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`];
+  const localScope = data?.scope || ui.trafficScope || "model";
+  let cards = block("This Device", "",
+    `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.state === "running" ? "Running" : "Stopped"}</span></div>` +
+    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local")}` : `<div class="placeholder">Loading traffic…</div>`));
+  for (const device of ui.devices) {
+    const source = data?.sources.find(source => source.name === device.name);
+    const traffic = source?.traffic;
+    const ssh = device.data?.transport === "ssh" || !device.data;
+    const protocol = ssh ? "SSH" : device.data.url.startsWith("https:") ? "HTTPS" : "HTTP";
+    const status = deviceConnectionStatus(device);
+    cards += block(esc(device.name), "",
+      `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
+      (source?.error ? message("warn", esc(source.error)) : "") +
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : "Loading traffic…"}</div>`));
+  }
+  return mergedDataBlock() + cards;
+}
+function deviceConnectionStatus(device) {
+  const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
+  const source = (ui.deviceTrafficViews?.["30:model"] || ui.mergedData)?.sources?.find(s => s.name === device.name);
+  if (!source || age < 0 || age > 45000 || ui.mergedDataError) return {
+    state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently",
+  };
+  if (source.error) return { state: "failed", label: String(source.error) };
+  return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
+}
+function deviceSettings() {
+  const d = ui.deviceDraft || { transport: "ssh" };
+  const rows = ui.devices.map(device => {
+    const status = deviceConnectionStatus(device);
+    return `<div class="row device-setting-row"><span class="device-setting-name row-label"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>`;
+  }).join("");
+  const form = ui.deviceFormOpen ? `<div class="device-form">
+    <label>Connection<select class="field" id="device-transport"><option value="ssh" ${d.transport === "ssh" ? "selected" : ""}>SSH</option><option value="http" ${d.transport !== "ssh" ? "selected" : ""}>HTTP / HTTPS</option></select></label>
+    <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" placeholder="Defaults to the SSH config name or HTTP origin"></label>
+    ${d.transport === "ssh" ? `
+      <label>SSH config name or host<input class="field" id="device-host" value="${esc(d.host || "")}" maxlength="255" placeholder="mbp16"></label>
+      <label>Remote executable (optional; discovered automatically)<input class="field" id="device-binary" value="${esc(d.binary === "coportd" ? "" : d.binary || "")}" maxlength="4096" placeholder="Automatic discovery"></label>
+    ` : `
+      <label>Data API origin<input class="field" id="device-url" value="${esc(d.url || "")}" placeholder="http://LAN-IP:8788 or https://host:8788"></label>
+      <label>Local access key file<input class="field" id="device-key-file" value="${esc(d.key || "")}" placeholder="/absolute/path/to/data.key"></label>
+      <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" placeholder="Use either a file or an environment variable"></label>
+      <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
+    `}
+    <p class="setting-description">Both connections return read-only statistics. SSH needs no HTTP URL or data key. Unknown configurations stay anonymous.</p>
+    <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
+  </div>` : "";
+  return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + `<div class="placeholder">Maximum 32 devices · Choose HTTP/HTTPS or SSH for read-only statistics.</div>` + form);
+}
+function captureDeviceDraft() {
+  if (!$("device-name")) return;
+  const d = ui.deviceDraft || {};
+  ui.deviceDraft = { ...d, name: $("device-name").value, transport: $("device-transport").value,
+    host: $("device-host")?.value ?? d.host ?? "", binary: $("device-binary")?.value ?? d.binary ?? "",
+    url: $("device-url")?.value ?? d.url ?? "", key: $("device-key-file")?.value ?? d.key ?? "",
+    env: $("device-key-env")?.value ?? d.env ?? "", ca: $("device-ca-file")?.value ?? d.ca ?? "" };
+}
+document.addEventListener("input", event => { if (event.target.id?.startsWith("device-")) captureDeviceDraft(); });
+document.addEventListener("change", event => {
+  if (!event.target.id?.startsWith("device-")) return;
+  captureDeviceDraft();
+  if (event.target.id === "device-transport") render();
+});
+
 // ---------------------------------------------------------------- settings
 
 function settings() {
@@ -1329,7 +1532,8 @@ function settings() {
          ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
     )}
     ${configSettings()}
-    ${filesBlock()}`;
+    ${filesBlock()}
+    ${deviceSettings()}`;
 }
 
 /// The fixed configuration and log files: a status per file, actions in a ⋯ menu.
@@ -1386,15 +1590,17 @@ function configSettings() {
       <span class="number-field"><input class="field" id="${id}" data-config="${key}" inputmode="decimal" spellcheck="false"
         value="${esc(String(v[key]))}" aria-label="${label}"${description ? ` aria-describedby="${id}-description"` : ""} /><span class="unit">${unit}</span></span></div>`;
   };
-  const flag = (key, label, description) => {
+  const flag = (key, label, description, separateNote = false) => {
     const id = `config-${key.replaceAll(".", "-")}`;
-    return `<div class="row"><span class="row-label">${label}<span class="setting-description" id="${id}-description">${description}</span></span>
-      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}" aria-describedby="${id}-description"></button></div>`;
+    const note = `<span class="setting-description" id="${id}-description">${description}</span>`;
+    return `<div class="row${separateNote ? " config-action-row" : ""}"><span class="row-label">${label}${separateNote ? "" : note}</span>
+      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}" aria-describedby="${id}-description"></button>${separateNote ? note : ""}</div>`;
   };
   return `${block(
     "Network",
     "",
     `${field("listen_port", "Listen port")}
+     ${flag("allow_external_access", "Share statistics", "Enable the separate read-only data API. Configure external_data in YAML first; restart to apply.", true)}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}
@@ -1478,16 +1684,57 @@ async function act(action, el) {
     case "page":
       ui.page = el.dataset.page;
       if (ui.page === "activity") {
+        if (s.settings?.deviceCount > 0) {
+          try { await loadDeviceDefinitions(); } catch (error) { toast(String(error)); }
+        }
         loadTraffic();
         // Presets follow the clock; a custom range stays as chosen.
         resolveActivityRange();
         await loadActivity();
       }
       if (ui.page === "main") loadHomeTraffic();
+      if (ui.page === "devices") loadDevices();
+      if (ui.page === "settings") loadDevices();
       ui.pinLog = ui.page === "activity" && el.dataset.target === "log";
       render();
       $("content").scrollTop = 0;
       if (ui.pinLog) scrollToLog();
+      break;
+    case "device-new":
+      ui.deviceDraft = { id: null, transport: "ssh" };
+      ui.deviceFormOpen = true; render(); $("device-name")?.focus();
+      break;
+    case "device-cancel":
+      ui.deviceFormOpen = false; ui.deviceDraft = null; render();
+      break;
+    case "device-edit": {
+      const d = ui.devices.find(device => device.id === el.dataset.id);
+      if (d) {
+        ui.deviceDraft = { id: d.id, name: d.name, sshEnabled: !!d.ssh, dataEnabled: !!d.data, host: d.ssh?.host, binary: d.ssh?.binary,
+          url: d.data?.url, key: d.data?.tokenFile, env: d.data?.tokenEnv, ca: d.data?.caCertificate, transport: d.data?.transport || (d.ssh ? "ssh" : "http") };
+        ui.deviceFormOpen = true; render(); $("device-name")?.focus();
+      }
+      break;
+    }
+    case "merged-refresh":
+      await loadMergedData();
+      break;
+    case "devices-refresh":
+      await loadDevices();
+      break;
+    case "device-save": {
+      captureDeviceDraft(); const d = ui.deviceDraft;
+      const ssh = d.transport === "ssh";
+      const device = { id: d.id || null, name: d.name.trim() || (ssh ? d.host.trim() : d.url.trim()),
+        ssh: ssh ? { host: d.host.trim(), binary: d.binary.trim() } : null,
+        data: { transport: d.transport, url: ssh ? "" : d.url.trim(), tokenFile: ssh ? null : d.key.trim() || null, tokenEnv: ssh ? null : d.env.trim() || null, caCertificate: ssh ? null : d.ca.trim() || null } };
+      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); if (changed || !ui.mergedData) loadMergedData(true); }
+      catch (e) { toast(String(e)); }
+      break;
+    }
+    case "device-remove":
+      try { await invoke("remove_device", { id: el.dataset.id }); delete ui.deviceStates[el.dataset.id]; await loadDeviceDefinitions(); if (ui.devices.length) loadMergedData(true); }
+      catch (e) { toast(String(e)); }
       break;
     case "power":
       try {
@@ -1645,6 +1892,16 @@ document.addEventListener("change", async (event) => {
     await loadActivity();
     return;
   }
+  if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {
+    if (event.target.id === "devices-traffic-scope") {
+      ui.trafficScope = event.target.value;
+      ++ui.trafficRequest; ++ui.homeTrafficRequest;
+      ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
+    } else { ui.deviceTrafficMinutes = Number(event.target.value); }
+    if (selectDeviceTraffic()) { render(); return; }
+    const loading = loadMergedData(); render(); await loading;
+    return;
+  }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {
     ui.trafficScope = event.target.value;
     // Both views share the category. In-flight results from the old category
@@ -1799,5 +2056,7 @@ setInterval(() => {
   if (ui.page === "activity") {
     loadTraffic();
     scheduleActivityLog();
-  } else if (ui.page === "main") refresh();
+  } else if (ui.page === "devices") { refresh(); loadDevices(); }
+  else if (ui.page === "settings" && ui.devices.length) loadDevices();
+  else if (ui.page === "main") refresh();
 }, 15000);

@@ -9,16 +9,13 @@ mod config_edit;
 mod core;
 mod describe;
 mod icon;
-mod logs;
 mod panel;
 mod placement;
 mod platform;
 mod single_instance;
-mod traffic;
-mod traffic_identity;
 mod tray;
 
-use coport_gui::{proxy, settings};
+use coport_gui::{logs, proxy, settings, traffic, traffic_identity};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -93,6 +90,10 @@ fn main() {
         .manage(ExitState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
+            commands::get_devices,
+            commands::get_merged_data,
+            commands::save_device,
+            commands::remove_device,
             commands::get_activity,
             commands::get_traffic,
             commands::set_traffic_assignment,

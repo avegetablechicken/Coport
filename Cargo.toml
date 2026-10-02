@@ -23,6 +23,7 @@ flate2 = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 httparse = "1"
+ipnet = { version = "2", features = ["serde"] }
 native-tls = "0.2"
 ring = "0.17"
 tokio-native-tls = "0.3"

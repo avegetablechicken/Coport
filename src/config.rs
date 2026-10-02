@@ -125,6 +125,10 @@ struct Raw {
     #[serde(default)]
     claude: crate::claude::Claude,
     listen_port: u16,
+    #[serde(default)]
+    allow_external_access: bool,
+    #[serde(default)]
+    external_data: Option<crate::external_access::DataConfig>,
     request_timeout_seconds: f64,
     #[serde(default)]
     websocket: WebSocketTimeouts,
@@ -195,12 +199,28 @@ pub struct Config {
     pub codex: Codex,
     pub claude: crate::claude::Claude,
     pub listen_port: u16,
+    pub allow_external_access: bool,
+    pub external_data: Option<crate::external_access::DataConfig>,
     pub request_timeout_seconds: f64,
     pub websocket: WebSocketTimeouts,
     pub proxies: BTreeMap<String, String>,
     pub connect: BTreeMap<String, Choice>,
 }
 impl Config {
+    /// Validate private credentials and TLS before stopping an existing daemon.
+    pub fn check_external_data(&self) -> Result<()> {
+        if self.allow_external_access {
+            let data = self
+                .external_data
+                .as_ref()
+                .ok_or_else(|| Error::config("Missing external data configuration."))?;
+            data.load_key()?;
+            if let Some(tls) = &data.tls {
+                crate::external_access::tls_acceptor(tls)?;
+            }
+        }
+        Ok(())
+    }
     pub fn parse(text: &str) -> Result<Self> {
         let mut root: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)
             .map_err(|_| Error::config("Invalid YAML configuration."))?;
@@ -232,6 +252,8 @@ impl Config {
             codex,
             claude: raw.claude,
             listen_port: raw.listen_port,
+            allow_external_access: raw.allow_external_access,
+            external_data: raw.external_data,
             request_timeout_seconds: raw.request_timeout_seconds,
             websocket: raw.websocket,
             proxies: raw.proxies,
@@ -262,6 +284,15 @@ impl Config {
         )
     }
     fn validate(&self) -> Result<()> {
+        if let Some(data) = &self.external_data {
+            data.validate(self.listen_port)?;
+        }
+        if self.allow_external_access && self.external_data.is_none() {
+            return Err(Error::config(
+                "External data access requires an external_data configuration.",
+            ));
+        }
+
         self.claude.validate(self)?;
         let mut authorities = std::collections::HashSet::new();
         for (authority, choice) in &self.connect {
@@ -613,6 +644,20 @@ pub fn redacted_endpoint(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn external_access_is_explicit_and_strictly_boolean() {
+        let base = "listen_port: 8787\nrequest_timeout_seconds: 30\n";
+        let local = Config::parse(base).unwrap();
+        assert!(!local.allow_external_access);
+        assert!(local.external_data.is_none());
+        assert!(Config::parse(&format!("{base}allow_external_access: true\n")).is_err());
+        let external = Config::parse(&format!("{base}allow_external_access: true\nexternal_data:\n  port: 8788\n  token_env: COPORT_DATA_KEY\n  trusted_lan: [10.42.0.0/24]\n")).unwrap();
+        assert!(external.allow_external_access);
+        assert!(external.external_data.is_some());
+        for value in ["1", "[]", "null", "'true'"] {
+            assert!(Config::parse(&format!("{base}allow_external_access: {value}\n")).is_err());
+        }
+    }
     #[test]
     fn websocket_phase_timeouts_are_independent_and_validated() {
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\n").unwrap();

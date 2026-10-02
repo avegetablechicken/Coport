@@ -1164,6 +1164,186 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
 - After rebuilding a running service, restart that process to use the new executable.
 
+## Share and merge processed statistics
+
+The desktop daemon can expose an independent, authenticated **read-only data API**.
+The model proxy and daemon management port always remain on loopback. Sharing is
+opt-in and does not expose API forwarding, CONNECT, WebSockets, configuration,
+raw logs, credentials, or lifecycle operations.
+
+Create a separate 256-bit sharing key without printing it:
+
+```sh
+umask 077
+openssl rand -hex 32 > ~/.coport-data.key
+```
+
+Protect this file and privately provide the same key to an authorized receiving
+device. Sharing keys are separate from model account/API credentials and SSH
+keys. The desktop app reads the key file at daemon startup. Rotate the file and
+restart to revoke the previous key; configure the receiver with the new key.
+
+```yaml
+allow_external_access: true
+external_data:
+  port: 8788
+  token_file: "~/.coport-data.key"
+  # Or token_env: COPORT_DATA_KEY; exactly one key source is required.
+  trusted_lan: [10.42.0.0/24]
+  # Configure these to allow public HTTPS clients:
+  # tls:
+  #   certificate: "/absolute/path/to/fullchain.pem"
+  #   private_key: "/absolute/path/to/private.key"
+```
+
+**LAN HTTP** is accepted only from explicitly trusted RFC1918 CIDRs; the peer's
+actual socket address is used, not forwarded headers. **Public clients require
+HTTPS**, with a server certificate valid for the hostname/IP they connect to.
+All data requests, including local ones, require `Authorization: Bearer <sharing-key>`.
+HTTP transmits the sharing key in plaintext: use it only on an isolated, trusted
+LAN; use HTTPS on shared or untrusted networks. Configured TLS errors fail startup
+instead of falling back to HTTP. On Unix, sharing-key and TLS-key files must be
+owned by the daemon's user with mode 600 or 400. Private-file permission checking
+is currently supported on Linux/macOS; other platforms can use environment keys
+for LAN sharing, but cannot load server TLS private keys through this interface.
+The existing loopback CA is not used for public HTTPS.
+
+Only **`GET /v1/summary`** is implemented, with no query parameters or request
+body. The versioned JSON contains a random installation ID, aligned traffic
+windows (default: the last 30 completed minutes of model calls), and numeric statistics grouped
+by service and opaque proxy/upstream references. No proxy names/addresses, upstream
+URLs, account IDs, email addresses, configuration paths, per-request IDs or raw
+log entries are included. Private proxy/upstream references use domain-separated
+HMAC-SHA256 with a separate, server-private
+identity key. A data reader cannot derive them from the sharing key or use it
+for offline guesses of unknown configuration values. The identity key is never
+returned by either API. On Linux/macOS it persists in the owner-only
+`data-identity.key`; other platforms use an in-memory key renewed on restart.
+
+The exporter reuses the local traffic processor's deduplication and token-counting
+rules. Summaries refresh every 15 seconds; read failures expire the cached result
+after 90 seconds. Requests and connections have fixed size/concurrency/time limits.
+Unsupported routes and methods are rejected, and the interface has no code path
+to mutate files or control the proxy on behalf of a request.
+
+In the last **Settings → Devices** block, add a device and select **HTTP / HTTPS**. Enter its origin
+(`http://10.42.0.196:8788` or `https://host:8788`), the receiver's local key-file
+path, and optionally a private CA certificate. The client verifies HTTPS names and
+certificates, disables redirects and environment proxies, and pins validated LAN
+DNS results before sending a key over HTTP. Strict schema, freshness and size
+validation precede merging. Duplicate installation IDs are counted once. The receiver automatically chooses
+the newest complete window shared by the devices and retries minute-boundary races. Latency sums/sample counts
+are merged, rather than averaging averages; unreported token usage remains unknown.
+
+The snapshot contains all six Traffic ranges (30 minutes, 6/12 hours,
+1/7/30 days), for both All requests and Models. Each range uses aligned completed
+minutes and the same bucket sizes as local Traffic. The client selects one window
+and never sums overlapping windows. The Devices page shows the combined Traffic
+and a full Traffic block for each device: charts, account usage, request/error
+counts, received bytes, weighted latency, reported tokens and weighted cache hit
+rate. Each window retains up to 24 detailed groups; remaining groups fold into
+anonymous service totals without losing counts. Snapshots remain capped at 1 MiB; large snapshots reduce detail to eight groups
+per window and preserve remaining counts in anonymous service totals.
+Version three also retains two preceding minute boundaries so clock offsets and
+cached responses align automatically. Updating keeps the previous display visible
+and needs no manual refresh or clock adjustment. Version-one peers still support the 30-minute Models view and require an update
+for the other ranges/categories.
+
+This Device uses the same local identities, history evidence and configuration
+assignments as Activity Traffic, without anonymizing and re-identifying its own
+data. Already observed local account IDs can identify the same known accounts
+on peers. Unknown peer traffic is one Unidentified group per service; different
+proxies/endpoints do not manufacture additional apparent accounts. All unknown
+labels in the application are English. Settings Devices uses icon add/remove
+actions and shows green only after a recent successful statistics retrieval.
+
+A single refresh fetches each device once and prepares all twelve display views.
+Models/All and time-range switches select in-memory views immediately, without
+repeating SSH connections or account probes. Periodic refresh updates the cache
+in the background. Expanded upstream accounts use the same order as Activity
+Traffic: known accounts by received bytes descending, unidentified accounts last.
+
+Each device selects one read-only transport: **HTTP/HTTPS** or **SSH**.
+HTTP/HTTPS requests the authenticated service described above. SSH invokes
+`coportd --summary`, returning exactly the same versioned DTO without requiring
+an HTTP listener or sharing key. New devices default to SSH; entering only the SSH
+config alias uses it as the display name and automatically discovers the executable.
+SSH statistics calls do not invoke lifecycle operations,
+read raw credentials, request configuration matching, or modify files.
+
+Unknown proxy/upstream references display **Unidentified proxy / Unidentified** and never create
+or modify local configuration. The server-private identity key is never exported.
+Random UUIDv4 account IDs additionally produce a service-separated SHA-256 reference.
+The receiver matches it only against accounts already known to its own configuration
+and uses its own display name. Emails, names, URLs and other guessable identifiers
+never produce a shared reference. Unknown accounts stay anonymous. This allows the
+same known account on multiple devices to merge without exporting IDs or labels.
+
+If saved Claude OAuth metadata does not identify a configured account, the
+receiver uses its configured account-probe transport and locally available
+credential to read the authenticated profile. Only a profile matching local
+routing restores a name. Positive identities and failed checks are cached to
+avoid repeated probes; credentials and profile data stay on the receiving device.
+A statistics request to another device never triggers this probe or exports a profile.
+
+Named API providers such as ShareCoder additionally use a domain-separated
+HMAC-SHA256 proof keyed by their high-entropy API credential and bound to the
+service/upstream. The receiver restores its own configuration name only when its
+configured credential/upstream produces that proof. Emails, provider names, URLs
+and keys are not exported. New traffic records retain the credential proof; older
+records can match an unambiguous current provider with the same logged name and
+upstream. Weak/missing credentials and ambiguous histories remain anonymous.
+
+For the SSH route, create a dedicated read-only SSH key restricted on the server
+to the summary command, for example an `authorized_keys` entry beginning with
+`restrict,command="/absolute/path/to/coportd --summary"`. This prevents that key
+from running management commands, shells, PTYs, or port/agent/X11 forwarding.
+The service creates its private identity during startup; summary requests only
+read existing identity, configuration and processed log results.
+
+This option is provided by desktop `coportd`; standalone `coport` remains a local
+model proxy. Its `--check` validates sharing credentials and TLS configuration,
+but starting it with sharing enabled reports that the data API requires `coportd`.
+
+## Read statistics from existing devices over SSH
+
+Configure up to 32 devices in the last **Settings → Devices** block. Choose one
+connection: SSH or HTTP/HTTPS. New devices default to SSH. Enter the SSH config
+alias (for example `mbp16`) and select **Add Device**; no URL or sharing key is
+required. The display name defaults to the alias. Leave the executable blank for
+automatic discovery; `coportd` in older preferences also means automatic discovery.
+An explicit executable path overrides discovery.
+
+**Edit** updates the device's stable ID, so renaming never overwrites another
+device. Duplicate display names are rejected. Older separate SSH/data settings
+are preserved. Removing a device deletes only its saved connection. The Devices
+page merges processed statistics and never starts, stops or restarts remote services.
+
+Both machines need this version of Coport. The destination must have existing
+GUI configuration and identity files created by starting its desktop daemon.
+At startup the daemon atomically records its executable in the owner-only
+`summary-executable` file in its application data directory. SSH reads that record
+locally, checks ownership, permissions and file type, and executes only `--summary`.
+The path stays on the destination. A stale or unsafe record fails closed with an
+instruction to restart the destination app. When no record exists, discovery checks
+`PATH`, standard user/system binary locations and macOS Applications bundles.
+No directory scanning, configuration export, service restart or registration write
+occurs during a statistics request.
+SSH runs only `coportd --summary`, which returns processed statistics without
+an HTTP listener. Raw logs and remote configurations are not returned.
+
+Set up key authentication (or an SSH agent) and connect once from a terminal to
+verify and trust the destination's host key. SSH ports, keys and jump hosts come
+from local SSH config; Coport stores no SSH passwords or private keys. Use a
+restricted read-only key as described above.
+
+SSH agent/X11 forwarding, configured port forwards and local commands are disabled.
+The destination requires a POSIX shell (Linux/macOS). Paths containing spaces are
+supported; `~` is not expanded in executable paths. Batch authentication and strict
+host-key checking reject missing keys and untrusted hosts without prompting.
+Connection attempts have a five-second connection timeout and a 25-second overall
+limit. A failed source does not prevent other devices' statistics from merging.
+
 ## Development
 
 ```sh

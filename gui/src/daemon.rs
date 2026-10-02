@@ -36,6 +36,10 @@ pub struct Status {
     #[serde(default)]
     pub metadata_supported: bool,
     pub port: u16,
+    #[serde(default)]
+    pub allow_external_access: bool,
+    #[serde(default)]
+    pub data_port: Option<u16>,
     pub uptime_ms: u64,
     pub config_path: PathBuf,
     pub log_path: PathBuf,
@@ -49,6 +53,7 @@ enum Action {
     Probe { name: String },
     AccountStates,
     CredentialLabels,
+    RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +69,7 @@ enum Response {
     Probe(crate::proxy::Probe),
     AccountStates([std::collections::BTreeMap<String, String>; 2]),
     CredentialLabels(Vec<((String, String), String)>),
+    Recorded,
     Error(String),
 }
 
@@ -169,6 +175,16 @@ impl Client {
             Err(_) if self.registration_is_unlocked() => Ok(()),
             Err(e) => Err(e),
             _ => Err(io::Error::other("Unexpected daemon stop response")),
+        }
+    }
+
+    pub(crate) fn record_device_query(
+        &self,
+        event: crate::device_events::QueryEvent,
+    ) -> io::Result<()> {
+        match self.request(Action::RecordDeviceQuery(event), STATUS_TIMEOUT)? {
+            Response::Recorded => Ok(()),
+            _ => Err(io::Error::other("Unexpected device query audit response")),
         }
     }
 
@@ -408,7 +424,15 @@ async fn handle_control(
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
             },
             Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
-            Action::CredentialLabels => Response::CredentialLabels(server.config.traffic_credential_labels().await.into_iter().collect()),
+            Action::CredentialLabels => Response::CredentialLabels(server.traffic_credential_labels().await.into_iter().collect()),
+            Action::RecordDeviceQuery(event) => {
+                if event.validate() {
+                    server.logger.write(event.event(), event.fields());
+                    Response::Recorded
+                } else {
+                    Response::Error("Invalid device query audit".into())
+                }
+            }
             // The serve loop acknowledges once the listener has been released.
             Action::Stop => {
                 let _ = stops.send(stream);
@@ -457,6 +481,15 @@ async fn serve_until(
     let log_path = std::path::absolute(log)?;
     let config_modified = std::fs::metadata(&config_path)?.modified().ok();
     let config = Config::read(&config_path).map_err(|e| io::Error::other(e.message))?;
+    crate::data_api::prepare_identity(dir)?;
+    crate::remote::register_summary_executable(dir, &std::env::current_exe()?)?;
+    let allow_external_access = config.allow_external_access;
+    let _data_api = if allow_external_access {
+        Some(crate::data_api::start(config.clone(), dir, log_path.clone()).await?)
+    } else {
+        None
+    };
+    let data_port = _data_api.as_ref().map(|api| api.port);
     let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, config.listen_port)).await?;
     let port = proxy.local_addr()?.port();
     let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -505,6 +538,8 @@ async fn serve_until(
         metadata_supported: true,
         port,
         uptime_ms: 0,
+        allow_external_access,
+        data_port,
         config_path,
         log_path,
         config_modified,
@@ -608,6 +643,8 @@ pub(crate) mod tests {
                     metadata_supported: false,
                     port,
                     uptime_ms: 0,
+                    allow_external_access: false,
+                    data_port: None,
                     config_path: dir.join("config.yaml"),
                     log_path: dir.join("proxy.log"),
                     config_modified: None,
@@ -695,6 +732,39 @@ pub(crate) mod tests {
         assert!(Client::discover(dir.path()).is_none());
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, status.port)).unwrap();
         drop(idle);
+    }
+
+    #[test]
+    fn device_query_audit_requires_local_auth_and_accepts_only_bounded_metadata() {
+        let _guard = spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (_signal, daemon) = serve_in_thread(dir.path());
+        let (client, status) = wait_for_daemon(dir.path());
+        let event = crate::device_events::QueryEvent {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            transport: crate::device_events::Protocol::Ssh,
+            outcome: crate::device_events::Outcome::Succeeded,
+            duration_ms: 42,
+            query_count: 1,
+        };
+        let mut unauthorized = client.clone();
+        unauthorized.endpoint.token = "invalid".into();
+        assert!(unauthorized.record_device_query(event.clone()).is_err());
+        let mut invalid = event.clone();
+        invalid.device_id = "https://private.example".into();
+        assert!(client.record_device_query(invalid).is_err());
+        client.record_device_query(event.clone()).unwrap();
+        client.stop().unwrap();
+        daemon.join().unwrap().unwrap();
+        let raw = std::fs::read_to_string(status.log_path).unwrap();
+        let events: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["event"] == "device_statistics_succeeded")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["device_id"], event.device_id);
+        assert!(!raw.contains("private.example"));
     }
 
     #[test]

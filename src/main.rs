@@ -66,6 +66,7 @@ async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     if args.check {
+        config.check_external_data()?;
         config.check_credentials().await?;
         println!(
             "Configuration, credential and route are valid. Proxy reachability was not tested."
@@ -78,12 +79,17 @@ async fn run(args: Args) -> Result<()> {
             .join("logs/proxy.log")
     });
     let logger = Arc::new(Logger::new(log_path));
-    let listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.listen_port))
-            .await
-            .map_err(|_| Error::config("Cannot bind loopback listener; check the port."))?;
+    if config.allow_external_access {
+        return Err(Error::config(
+            "The read-only external data API is provided by coportd; the CLI proxy remains local.",
+        ));
+    }
+    let listen_address = std::net::Ipv4Addr::LOCALHOST;
+    let listener = tokio::net::TcpListener::bind((listen_address, config.listen_port))
+        .await
+        .map_err(|_| Error::config("Cannot bind proxy listener; check the address and port."))?;
     println!(
-        "coport listening on http://127.0.0.1:{}",
+        "coport listening on http://{listen_address}:{}",
         config.listen_port
     );
     let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));

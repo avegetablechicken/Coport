@@ -77,6 +77,7 @@ test('traffic data keeps the category it was read for', async () => {
   const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, page: 'main' };
   const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
   vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
   const load = context.loadTraffic();
   // The selector already shows the new category while the old data renders.
@@ -91,6 +92,7 @@ test('a traffic read still running is not started again', async () => {
   const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 43200, page: 'activity' };
   const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
   vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
   const first = context.loadTraffic();
   context.loadTraffic();
@@ -113,6 +115,7 @@ test('home traffic keeps the category it was read for', async () => {
   const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'activity' };
   const context = { ui, render() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
   vm.runInContext(source.slice(source.indexOf('async function loadHomeTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
   const load = context.loadHomeTraffic();
   ui.trafficScope = 'model';

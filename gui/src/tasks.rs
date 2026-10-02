@@ -48,7 +48,17 @@ impl Tasks {
         if let Some(client) = self.backend().await? {
             return client.account_states().await.map_err(|e| e.to_string());
         }
-        let server = {
+        let server = self.local_server().await;
+        Ok(server.account_route_states().await.map(|states| {
+            states
+                .into_iter()
+                .map(|(key, value)| (key, value.to_owned()))
+                .collect()
+        }))
+    }
+
+    async fn local_server(&self) -> Arc<Server> {
+        {
             let mut local = self.local.lock().await;
             local
                 .get_or_insert_with(|| {
@@ -60,20 +70,14 @@ impl Tasks {
                     ))
                 })
                 .clone()
-        };
-        Ok(server.account_route_states().await.map(|states| {
-            states
-                .into_iter()
-                .map(|(key, value)| (key, value.to_owned()))
-                .collect()
-        }))
+        }
     }
 
     pub async fn credential_labels(&self) -> Result<CredentialLabels, String> {
         if let Some(client) = self.backend().await? {
             return client.credential_labels().await.map_err(|e| e.to_string());
         }
-        Ok(self.config.traffic_credential_labels().await)
+        Ok(self.local_server().await.traffic_credential_labels().await)
     }
 }
 

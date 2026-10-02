@@ -17,6 +17,11 @@ pub enum Appearance {
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    pub managed_devices: Vec<crate::devices::Device>,
+    #[serde(skip_serializing)]
+    devices: Vec<crate::remote::Device>,
+    #[serde(skip_serializing)]
+    data_sources: Vec<crate::data_client::Source>,
     pub start_proxy_on_launch: bool,
     pub keep_proxy_running_on_quit: bool,
 }
@@ -25,6 +30,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             appearance: Appearance::System,
+            managed_devices: Vec::new(),
+            devices: Vec::new(),
+            data_sources: Vec::new(),
             start_proxy_on_launch: true,
             keep_proxy_running_on_quit: false,
         }
@@ -33,12 +41,34 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load() -> Self {
-        std::fs::read(settings_file())
+        let mut settings: Self = std::fs::read(settings_file())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if settings.managed_devices.is_empty()
+            && (!settings.devices.is_empty() || !settings.data_sources.is_empty())
+        {
+            settings.managed_devices =
+                crate::devices::migrate(&settings.devices, &settings.data_sources);
+            // Atomic migration keeps stable IDs across launches; a failed write
+            // leaves the original file and connections available for a retry.
+            let _ = settings.try_save();
+        }
+        settings
     }
 
+    pub fn ssh_devices(&self) -> Vec<crate::remote::Device> {
+        self.managed_devices
+            .iter()
+            .filter_map(crate::devices::Device::ssh_connection)
+            .collect()
+    }
+    pub fn data_sources(&self) -> Vec<crate::data_client::Source> {
+        self.managed_devices
+            .iter()
+            .filter_map(crate::devices::Device::data_source)
+            .collect()
+    }
     pub fn save(&self) {
         let _ = self.try_save();
     }

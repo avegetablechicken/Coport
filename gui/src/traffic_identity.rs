@@ -292,6 +292,39 @@ impl Identities {
         }
     }
 
+    /// Select proofs from the current configuration after historical name/base
+    /// mapping, without making those local names part of the wire format.
+    pub(crate) fn provider_reference(
+        &self,
+        service: &str,
+        label: &str,
+        references: &[coport::identity::TrafficProviderReference],
+    ) -> Option<String> {
+        if label == UNIDENTIFIED {
+            return None;
+        }
+        let candidates: BTreeSet<_> = references
+            .iter()
+            .filter(|r| {
+                r.service == service
+                    && canonical(&r.upstream)
+                        .is_some_and(|base| self.label(service, &base, &r.name) == label)
+            })
+            .map(|r| r.reference.clone())
+            .collect();
+        (candidates.len() == 1).then(|| candidates.into_iter().next().unwrap())
+    }
+
+    /// Use the same local name and upstream disambiguation for peer proofs as
+    /// for this device's own Traffic rows. No peer-supplied labels are used.
+    pub(crate) fn provider_label(
+        &self,
+        provider: &coport::identity::TrafficProviderReference,
+    ) -> Option<String> {
+        let base = canonical(&provider.upstream)?;
+        Some(self.label(&provider.service, &base, &provider.name))
+    }
+
     fn label(&self, service: &str, base: &str, name: &str) -> String {
         // A selector can resolve to different bases in different configured homes.
         // Keep those bases distinct even though their current names coincide.

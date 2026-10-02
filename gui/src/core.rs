@@ -396,6 +396,7 @@ impl Core {
                 }),
             },
             settings: SettingsDto {
+                device_count: self.settings.managed_devices.len(),
                 appearance: self.settings.appearance,
                 start_proxy_on_launch: self.settings.start_proxy_on_launch,
                 keep_proxy_running_on_quit: self.settings.keep_proxy_running_on_quit,
@@ -785,6 +786,7 @@ struct Fallback {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsDto {
+    device_count: usize,
     appearance: crate::settings::Appearance,
     start_proxy_on_launch: bool,
     keep_proxy_running_on_quit: bool,

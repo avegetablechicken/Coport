@@ -676,6 +676,83 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
 }
 
 #[tokio::test]
+async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely() {
+    for (behavior, succeeds) in [("sse", true), ("profile_unauthorized", false)] {
+        let mut lookup = fixture("http", behavior).await;
+        let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join(".credentials.json");
+        let saved = r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#;
+        std::fs::write(&credentials, saved).unwrap();
+        let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n",serde_json::to_string(dir.path()).unwrap())).await;
+        trust(&running, &lookup, &endpoint);
+        let (first, second) = tokio::join!(
+            running.server.traffic_credential_labels(),
+            running.server.traffic_credential_labels()
+        );
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .get(&("Claude".into(), "remote-account".into()))
+                .map(String::as_str),
+            if succeeds {
+                Some("remote@example.invalid")
+            } else {
+                None
+            }
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /api/oauth/profile ")
+        );
+        assert!(lookup.requests.try_recv().is_err());
+        assert_eq!(std::fs::read_to_string(&credentials).unwrap(), saved);
+        let checks = running.server.account_checks.lock().await;
+        let before = checks.values().next().unwrap().0;
+        drop(checks);
+        assert_eq!(running.server.traffic_credential_labels().await, first);
+        assert_eq!(
+            running
+                .server
+                .account_checks
+                .lock()
+                .await
+                .values()
+                .next()
+                .unwrap()
+                .0,
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn traffic_labels_do_not_probe_without_an_explicit_lookup_route() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("claude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account: {{'remote@example.invalid': none}}\n",serde_json::to_string(dir.path()).unwrap())).await;
+    let labels = running.server.traffic_credential_labels().await;
+    assert!(!labels.contains_key(&("Claude".into(), "remote-account".into())));
+    assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn account_status_probes_remote_identity_and_preserves_warning_state() {
     for (behavior, expected) in [("sse", "remote"), ("profile_unauthorized", "probe_failed")] {
         let mut lookup = fixture("http", behavior).await;

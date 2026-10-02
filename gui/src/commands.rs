@@ -390,3 +390,48 @@ pub fn hide_panel(app: AppHandle) {
 pub fn quit_app(app: AppHandle) {
     app.exit(0);
 }
+
+#[tauri::command]
+pub fn get_devices(state: State<AppState>) -> Vec<coport_gui::devices::Device> {
+    state.core.lock().unwrap().settings.managed_devices.clone()
+}
+#[tauri::command]
+pub fn save_device(state: State<AppState>, device: coport_gui::devices::Draft) -> Result<String> {
+    let mut core = state.core.lock().unwrap();
+    let mut settings = core.settings.clone();
+    let id = coport_gui::devices::save(&mut settings.managed_devices, device)?;
+    settings.try_save().map_err(|e| e.to_string())?;
+    core.settings = settings;
+    Ok(id)
+}
+#[tauri::command]
+pub fn remove_device(state: State<AppState>, id: String) -> Result {
+    let mut core = state.core.lock().unwrap();
+    let mut settings = core.settings.clone();
+    settings.managed_devices.retain(|device| device.id != id);
+    settings.try_save().map_err(|e| e.to_string())?;
+    core.settings = settings;
+    Ok(())
+}
+#[tauri::command]
+pub async fn get_merged_data(
+    state: State<'_, AppState>,
+) -> Result<Vec<coport_gui::data_client::Merged>> {
+    let (sources, config, log, probe) = {
+        let mut core = state.core.lock().unwrap();
+        core.refresh_config();
+        (
+            core.settings.data_sources(),
+            core.loaded_config()
+                .cloned()
+                .ok_or("Cannot read local configuration")?,
+            core.logs.path(),
+            core.account_tasks(),
+        )
+    };
+    let labels = match probe {
+        Some(tasks) => tasks.credential_labels().await?,
+        None => config.traffic_credential_labels().await,
+    };
+    coport_gui::data_client::merge_views_with_labels(sources, config, log, labels).await
+}

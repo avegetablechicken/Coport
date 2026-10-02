@@ -1,7 +1,16 @@
 //! Headless proxy process and its local control protocol.
+extern crate self as coport_gui;
 pub mod daemon;
+pub mod data_api;
+pub mod data_client;
 pub mod data_migration;
+mod device_events;
+pub mod devices;
+pub mod logs;
 pub mod proxy;
+pub mod remote;
 pub mod settings;
 
 pub mod tasks;
+pub mod traffic;
+pub mod traffic_identity;

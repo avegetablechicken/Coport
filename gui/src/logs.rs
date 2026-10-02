@@ -76,7 +76,8 @@ impl Entry {
         if self.event.starts_with("model_call_") {
             return self.event == "model_call_failed";
         }
-        self.event == "request_failed"
+        self.event == "device_statistics_failed"
+            || self.event == "request_failed"
             || self.event == "request_rejected"
             || self.event == "route_unavailable"
             || self.status().is_some_and(|s| s >= 400)

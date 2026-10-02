@@ -580,7 +580,83 @@ async fn shell_value(_: &str) -> Result<String> {
     ))
 }
 
+/// Processed proof that two local configurations use the same high-entropy API
+/// credential and upstream. Neither the credential nor endpoint is exported.
+pub fn shared_api_reference(service: &str, upstream: &str, token: &str) -> Option<String> {
+    if token.len() < 32 || !valid_token(token) || token.bytes().collect::<HashSet<_>>().len() < 16 {
+        return None;
+    }
+    let upstream = unwrap_upstream(upstream).ok()?;
+    let base = upstream.trim_end_matches('/');
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let message = format!("coport-shared-api-v1\0{service}\0{base}");
+    Some(
+        ring::hmac::sign(&key, message.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+#[derive(Clone)]
+pub struct TrafficProviderReference {
+    pub service: String,
+    pub name: String,
+    pub upstream: String,
+    pub reference: String,
+}
 impl Config {
+    /// Used locally for matching processed traffic; never invokes a shell or
+    /// exports raw credentials/configuration to a peer.
+    pub async fn traffic_provider_references(&self) -> Vec<TrafficProviderReference> {
+        let mut result = Vec::new();
+        for provider in &self.codex.providers {
+            if let Ok(credentials) = provider
+                .credentials(&self.codex.base_url.api_key, false, &self.codex)
+                .await
+            {
+                for credential in credentials {
+                    if let Some(reference) =
+                        shared_api_reference("Codex", &credential.upstream, &credential.token)
+                    {
+                        result.push(TrafficProviderReference {
+                            service: "Codex".into(),
+                            name: provider.label().into(),
+                            upstream: credential.upstream,
+                            reference,
+                        });
+                    }
+                }
+            }
+        }
+        for name in self
+            .claude
+            .routing
+            .api_key
+            .keys()
+            .filter(|name| !crate::claude_settings::is_url(name))
+        {
+            let pair = match crate::claude_settings::load(&self.claude.config_dirs, name) {
+                Ok(Some(profile)) => Some((profile.upstream, profile.token)),
+                Ok(None) => environment_key_with_shell(name, false)
+                    .await
+                    .ok()
+                    .map(|token| (self.claude.base_url.clone(), token)),
+                Err(_) => None,
+            };
+            if let Some((upstream, token)) = pair {
+                if let Some(reference) = shared_api_reference("Claude", &upstream, &token) {
+                    result.push(TrafficProviderReference {
+                        service: "Claude".into(),
+                        name: name.clone(),
+                        upstream,
+                        reference,
+                    });
+                }
+            }
+        }
+        result
+    }
     /// Local route activation, not upstream token validity. Archived logins are
     /// deliberately excluded: only configured sources can admit requests.
     pub async fn account_route_states(&self) -> [BTreeMap<String, &'static str>; 2] {
@@ -800,6 +876,27 @@ pub(crate) fn routing_account_label(
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_api_proofs_bind_service_endpoint_and_secret_without_names() {
+        let token = "sk-synthetic-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdef";
+        let reference = shared_api_reference("Codex", "https://private.example/v1", token).unwrap();
+        assert_eq!(
+            Some(reference.clone()),
+            shared_api_reference("Codex", "https://private.example/v1/", token)
+        );
+        assert_ne!(
+            Some(reference.clone()),
+            shared_api_reference("Claude", "https://private.example/v1", token)
+        );
+        assert_ne!(
+            Some(reference),
+            shared_api_reference("Codex", "https://other.example/v1", token)
+        );
+        assert!(shared_api_reference("Codex", "https://private.example/v1", "password").is_none());
+        assert!(
+            shared_api_reference("Codex", "https://private.example/v1", &"a".repeat(64)).is_none()
+        );
+    }
     #[tokio::test]
     async fn shell_lookups_are_reused_including_failures_and_not_duplicated() {
         use std::sync::atomic::{AtomicUsize, Ordering};

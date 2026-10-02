@@ -1,5 +1,17 @@
 # Shared server settings. Restart after changing YAML.
 listen_port: 8787
+# Opt in to the independent read-only statistics API (desktop coportd only).
+# The model proxy and management listener always stay on loopback.
+allow_external_access: false
+# external_data:
+#   port: 8788
+#   token_file: "~/.coport-data.key" # 64 hex characters; owner-only file.
+#   # Alternatively: token_env: COPORT_DATA_KEY (not both).
+#   trusted_lan: [10.42.0.0/24] # HTTP allowed only from these RFC1918 CIDRs.
+#   # Public peers require HTTPS with a certificate valid for your hostname/IP.
+#   # tls:
+#   #   certificate: "/absolute/path/to/fullchain.pem"
+#   #   private_key: "/absolute/path/to/private.key"
 request_timeout_seconds: 300
 
 # Model WebSockets use per-call phases instead of the HTTP/CONNECT timeout.

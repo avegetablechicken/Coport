@@ -173,6 +173,101 @@ impl Server {
         }
         states
     }
+    pub async fn traffic_credential_labels(
+        &self,
+    ) -> std::collections::BTreeMap<(String, String), String> {
+        let mut labels = self.config.traffic_credential_labels().await;
+        let Some(proxy) = self.config.claude.routing.account_probe.as_ref().or(self
+            .config
+            .claude
+            .routing
+            .account_fallback
+            .as_ref())
+        else {
+            return labels;
+        };
+        for (source, account) in self.config.claude.account_sources() {
+            if account.claude_identity().is_some_and(|identity| {
+                labels.contains_key(&("Claude".into(), identity.account_id))
+            }) {
+                continue;
+            }
+            let Ok(token) = account.claude_token().await else {
+                continue;
+            };
+            let mut checks = self.account_checks.lock().await;
+            checks.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+            if checks
+                .get(&token)
+                .is_some_and(|(_, result)| result.is_err())
+            {
+                continue;
+            }
+            if let Ok(mut profiles) = self.claude_profiles.lock() {
+                if profiles
+                    .get(&token)
+                    .is_some_and(|(at, _)| at.elapsed() >= Duration::from_secs(300))
+                {
+                    profiles.remove(&token);
+                }
+            }
+            let cached =
+                self.claude_profiles.lock().ok().and_then(|profiles| {
+                    profiles.get(&token).map(|(_, identity)| identity.clone())
+                });
+            if let Some(identity) = cached {
+                if let Some(label) = crate::identity::routing_account_label(
+                    &self.config.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                ) {
+                    labels.insert(("Claude".into(), identity.account_id), label);
+                }
+                continue;
+            }
+            let mut log = RequestLog {
+                logger: self.logger.clone(),
+                fields: json!({"service":"claude"}).as_object().unwrap().clone(),
+                started: Instant::now(),
+                status: 0,
+                bytes: 0,
+                outcome: "account_probe_failed",
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
+                self.lookup_claude_identity(&token, proxy, &mut log),
+            )
+            .await
+            .unwrap_or_else(|_| Err(Error::config("Claude account probe timed out.")));
+            match result {
+                Ok(identity) => {
+                    log.outcome = "account_probe_finished";
+                    let label = crate::identity::routing_account_label(
+                        &self.config.claude.routing,
+                        &identity.account_id,
+                        &identity.usernames,
+                        &source,
+                    );
+                    if let Some(label) = &label {
+                        labels.insert(("Claude".into(), identity.account_id), label.clone());
+                    }
+                    if checks.len() >= 128 {
+                        checks.clear();
+                    }
+                    checks.insert(token, (Instant::now(), Ok(label)));
+                }
+                Err(error) => {
+                    log.field("reason", error.message);
+                    if checks.len() >= 128 {
+                        checks.clear();
+                    }
+                    checks.insert(token, (Instant::now(), Err(error)));
+                }
+            }
+        }
+        labels
+    }
     async fn claude_route(
         &self,
         headers: &HeaderMap,
@@ -188,11 +283,23 @@ impl Server {
         if !route.needs_profile {
             return Ok(route);
         }
+        let identity = self
+            .lookup_claude_identity(&route.token, &route.proxy, log)
+            .await?;
+        self.config.claude.apply_profile(&mut route, identity)?;
+        Ok(route)
+    }
+    async fn lookup_claude_identity(
+        &self,
+        token: &str,
+        proxy: &Choice,
+        log: &mut RequestLog,
+    ) -> Result<crate::claude::ClaudeIdentity> {
         let cached = self
             .claude_profiles
             .lock()
             .map_err(|_| Error::config("Claude profile cache unavailable."))?
-            .get_mut(&route.token)
+            .get_mut(token)
             .map(|(last_used, identity)| {
                 *last_used = Instant::now();
                 identity.clone()
@@ -209,7 +316,7 @@ impl Server {
             let request = self
                 .client("none")?
                 .get(url)
-                .bearer_auth(&route.token)
+                .bearer_auth(token)
                 .header("accept", "application/json")
                 // The proxy reads this profile itself and does not decompress it.
                 .header("accept-encoding", "identity")
@@ -218,7 +325,7 @@ impl Server {
                 .map_err(|_| Error::config("Invalid Claude profile request."))?;
             let mut response = self
                 .send_via(
-                    &route.proxy,
+                    proxy,
                     request,
                     false,
                     Deadline::new(self.config.request_timeout_seconds.min(10.0)),
@@ -256,11 +363,10 @@ impl Server {
             let value = serde_json::from_slice(&bytes)
                 .map_err(|_| Error::config("Invalid Claude profile JSON."))?;
             let identity = crate::claude::ClaudeIdentity::profile(&value)?;
-            self.cache_claude_profile(route.token.clone(), identity.clone())?;
+            self.cache_claude_profile(token.to_owned(), identity.clone())?;
             identity
         };
-        self.config.claude.apply_profile(&mut route, identity)?;
-        Ok(route)
+        Ok(identity)
     }
     fn cache_claude_profile(
         &self,
@@ -618,6 +724,13 @@ impl Server {
             log.field("service", "claude");
             log.field("provider", &r.label);
             log.field("upstream_base_url", &r.upstream);
+            if r.identity.is_none() {
+                if let Some(reference) =
+                    crate::identity::shared_api_reference("Claude", &r.upstream, &r.token)
+                {
+                    log.field("credential_ref", reference);
+                }
+            }
             if let Some(identity) = &r.identity {
                 log.field("account_id", &identity.account_id);
                 if let Some(label) = crate::identity::routing_account_label(
@@ -664,6 +777,13 @@ impl Server {
         };
         if let Some(r) = &route {
             log.field("upstream_base_url", &r.upstream);
+            if r.account_id.is_none() {
+                if let Some(reference) =
+                    crate::identity::shared_api_reference("Codex", &r.upstream, &r.token)
+                {
+                    log.field("credential_ref", reference);
+                }
+            }
             if let Some(label) = &r.account_label {
                 log.field("account_label", label);
             }

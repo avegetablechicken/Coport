@@ -1,0 +1,306 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { test } = require('node:test');
+const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.js'), 'utf8');
+const start = source.indexOf('function deviceConnectionKey(');
+const code = source.slice(start, source.indexOf('// ---------------------------------------------------------------- settings', start));
+function harness(invoke) {
+  const ui = { page: 'devices', devices: [], snap: { phase: { state: 'running', port: 8787 } } };
+  const fields = {}, listeners = {};
+  const context = { ui, invoke, Promise, ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', loadMergedData() {}, toast() {},
+    esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
+    $: id => fields[id], document: { addEventListener: (event, callback) => { listeners[event] = callback; } } };
+  context.render = () => {
+    for (const key of Object.keys(fields)) delete fields[key];
+    if (!ui.deviceFormOpen) return;
+    const html = context.deviceSettings();
+    for (const match of html.matchAll(/<input[^>]*id="([^"]+)"[^>]*value="([^"]*)"/g)) fields[match[1]] = { value: match[2], id: match[1], focus() {} };
+    fields['device-transport'] = { value: ui.deviceDraft.transport, id: 'device-transport' };
+  };
+  vm.createContext(context);
+  const relabelStart = source.indexOf("function relabelDeviceViews(");
+  const relabelEnd = source.indexOf("async function loadDeviceDefinitions",relabelStart);
+  vm.runInContext(source.slice(relabelStart,relabelEnd),context);
+  vm.runInContext(code, context);
+  context.fields = fields; context.listeners = listeners;
+  context.action = async name => {
+    const start = source.indexOf(`    case "${name}":`);
+    const end = source.indexOf('    case ', start + 10);
+    await vm.runInContext(`(async () => { switch ('${name}') { ${source.slice(start, end)} } })()`, context);
+  };
+  return context;
+}
+
+test('adding a device with only an SSH config name sends an SSH data source, not HTTP', async () => {
+  let saved;
+  const h = harness(async (command, args) => { if (command === 'save_device') saved = args.device; return []; });
+  await h.action('device-new');
+  assert.equal(h.fields['device-transport'].value, 'ssh');
+  assert.equal(h.fields['device-url'], undefined);
+  h.fields['device-host'].value = 'mbp16';
+  h.listeners.input({ target: h.fields['device-host'] });
+  await h.action('device-save');
+  assert.equal(saved.name, 'mbp16');
+  assert.equal(saved.ssh.host, 'mbp16');
+  assert.equal(saved.ssh.binary, '');
+  assert.equal(saved.data.transport, 'ssh');
+  assert.equal(saved.data.url, '');
+  assert.equal(saved.data.tokenFile, null);
+  assert.equal(saved.data.tokenEnv, null);
+  assert.equal(saved.data.caCertificate, null);
+});
+
+test('switching HTTP to SSH uses one selector and never submits previous HTTP credentials', async () => {
+  let saved;
+  const h = harness(async (command, args) => { if (command === 'save_device') saved = args.device; return []; });
+  await h.action('device-new');
+  h.fields['device-transport'].value = 'http';
+  h.listeners.change({ target: h.fields['device-transport'] });
+  assert.ok(h.fields['device-url']);
+  assert.equal(h.fields['device-host'], undefined);
+  h.fields['device-url'].value = 'https://old.example';
+  h.fields['device-key-file'].value = '/old.key';
+  h.fields['device-transport'].value = 'ssh';
+  h.listeners.change({ target: h.fields['device-transport'] });
+  assert.equal(h.fields['device-url'], undefined);
+  h.fields['device-host'].value = 'MS';
+  await h.action('device-save');
+  assert.equal(saved.data.transport, 'ssh');
+  assert.equal(saved.data.url, '');
+  assert.equal(saved.data.tokenFile, null);
+  assert.equal(saved.ssh.host, 'MS');
+});
+
+test('HTTP save retains URL and credentials and creates no SSH connection', async () => {
+  let saved;
+  const h = harness(async (command, args) => { if (command === 'save_device') saved = args.device; return []; });
+  await h.action('device-new');
+  h.fields['device-transport'].value = 'http'; h.listeners.change({ target: h.fields['device-transport'] });
+  h.fields['device-url'].value = 'https://data.example'; h.fields['device-key-file'].value = '/data.key';
+  await h.action('device-save');
+  assert.equal(saved.ssh, null); assert.equal(saved.data.transport, 'http');
+  assert.equal(saved.data.url, 'https://data.example'); assert.equal(saved.data.tokenFile, '/data.key');
+});
+
+test('refresh loads definitions and statistics without invoking remote lifecycle commands', async () => {
+  const calls = [];
+  const h = harness(async command => { calls.push(command); return [{ id: 'remote', name: 'Remote', ssh: { host: '<remote>', management: true } }]; });
+  await h.loadDevices();
+  assert.deepEqual(calls, ['get_devices']);
+  const html = h.devicesPage();
+  assert.match(html, /&lt;remote>/); assert.doesNotMatch(html, /Read-only statistics/);
+  assert.doesNotMatch(html, /device-control|Remote Port|PID|Uptime/);
+  assert.doesNotMatch(html, /data-action="power"/);
+  assert.doesNotMatch(source, /control_device|device-management|device-ssh-enabled|device-data-enabled/);
+});
+
+test('configuration lives in Settings and Settings loading makes no remote requests', async () => {
+  const calls = [];
+  const h = harness(async command => { calls.push(command); return []; });
+  h.ui.page = 'settings'; await h.loadDeviceDefinitions(); assert.deepEqual(calls, ['get_devices']);
+  const html = h.devicesPage(); assert.doesNotMatch(html, /device-save|Configure in Settings|Updates automatically/);
+});
+
+test('one Devices configuration block is the last block in Settings', () => {
+  const code = source.slice(source.indexOf('function settings()'), source.indexOf('/// The fixed configuration'));
+  const rendered = vm.runInNewContext(code + '\nsettings()', {
+    ui: { snap: { settings: {} } }, ICON: {}, panelSelect: () => '',
+    block: title => `[${title}]`, configSettings: () => '[Network]', filesBlock: () => '[Files]', deviceSettings: () => '[Devices]',
+  });
+  assert.ok(rendered.trim().endsWith('[Devices]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
+});
+
+test('each device renders full Traffic metrics and an offline peer leaves other devices visible', () => {
+  const h = harness(async () => []);
+  Object.assign(h, { chart: () => '<svg class="chart"></svg>', stat: (name, value) => `${name}:${value};`, fmtMs: v => `${v} ms`, fmtBytes: v => `${v} B`, modelTokenStats: t => `Input Tokens:${t.inputTokens};Hit Rate:${t.cacheHitRate};`, trafficShare: () => '<div class="traffic-share">Account usage</div>', serviceMark: () => '', message: (kind, value) => value, ICON: { chevron: '' } });
+  const start = source.indexOf('function deviceTrafficContent(');
+  vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
+  const traffic = { requests: 5, errors: 1, avgMs: 200, bytes: 1234, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
+  h.ui.devices = [{ name: 'Online', ssh: { host: 'online' }, data: { transport: 'ssh' } }, { name: 'Offline', ssh: { host: 'offline' }, data: { transport: 'ssh' } }];
+  h.ui.mergedData = { scope: 'model', local: traffic, sources: [{ name: 'Online', traffic }, { name: 'Offline', error: 'Unavailable' }] };
+  const html = h.devicesPage();
+  assert.equal((html.match(/Calls:5/g) || []).length, 2);
+  for (const metric of ['Error Rate:20.0%', 'Avg. Time:200 ms', 'Received:1234 B', 'Input Tokens:100', 'Hit Rate:0.3', 'traffic-share', 'class="chart"']) assert.ok(html.includes(metric), metric);
+  assert.match(html, /Offline/); assert.match(html, /Traffic unavailable/);
+});
+
+test('traffic range changes reject late responses from the previous selection', async () => {
+  const pending = [];
+  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: (command, args) => new Promise(resolve => pending.push({ command, args, resolve })), render() {} };
+  vm.createContext(context);
+  const start = source.indexOf('async function loadMergedData(');
+  vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
+  const first = context.loadMergedData();
+  context.ui.deviceTrafficMinutes = 1440; context.ui.trafficScope = 'all';
+  const next = context.loadMergedData(true);
+  assert.equal(pending[0].command, 'get_merged_data');
+  assert.equal(pending[1].command, 'get_merged_data');
+  pending[1].resolve({ selected: 'new' }); await next;
+  pending[0].resolve({ selected: 'old' }); await first;
+  assert.equal(context.ui.mergedData.selected, 'new');
+  assert.equal(context.ui.mergedDataLoading, false);
+});
+
+test('Devices button is visible only with configured peers and the redundant Devices block is removed', () => {
+  const top = source.slice(source.indexOf('function renderTop()'), source.indexOf('function renderPage(', source.indexOf('function renderTop()')));
+  let html;
+  const context = { ui: { page: 'main', snap: { version: 'test', settings: { deviceCount: 0 } } }, esc: v => v, $: () => ({ set innerHTML(value) { html = value; } }) };
+  vm.createContext(context); vm.runInContext(top, context);
+  context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
+  context.ui.snap.settings.deviceCount = 1; context.renderTop(); assert.match(html, /data-page="devices"/);
+  context.ui.devicesLoaded = true; context.ui.devices = []; context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
+  const devices = source.slice(source.indexOf('function devicesPage()'), source.indexOf('function deviceSettings()'));
+  assert.doesNotMatch(devices, /block\("Devices"/);
+});
+
+test('automatic alignment retains previous traffic while refreshing without an error message', async () => {
+  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0, mergedData: { selected: 'last-good' } }, invoke: async () => { throw 'TRAFFIC_UPDATING'; }, render() {} };
+  vm.createContext(context);
+  const start = source.indexOf('async function loadMergedData(');
+  vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
+  await context.loadMergedData();
+  assert.equal(context.ui.mergedData.selected, 'last-good');
+  assert.equal(context.ui.mergedDataError, '');
+  assert.equal(context.ui.mergedDataUpdating, true);
+});
+
+test('upstream account disclosures retain per-device expansion and place rings before charts', () => {
+  const h = harness(async () => []);
+  const events = {};
+  Object.assign(h, { chart: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
+  const start = source.indexOf('function deviceTrafficContent(');
+  vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
+  const traffic = { requests: 1, errors: 0, credentials: [{ credential: 'Known', service: 'Claude', requests: 1, errors: 0 }] };
+  events.toggle({ target: { isConnected: true, matches: () => true, dataset: { deviceTraffic: 'device/a' }, open: true } });
+  let html = h.deviceTrafficContent(traffic, 'model', 'device/a');
+  assert.match(html, /data-device-traffic="device\/a" open/);
+  assert.ok(html.indexOf('<ring>') < html.indexOf('<chart>'));
+  assert.doesNotMatch(h.deviceTrafficContent(traffic, 'model', 'device/b'), /data-device-traffic="device\/b" open/);
+  events.toggle({ target: { isConnected: false, matches: () => true, dataset: { deviceTraffic: 'device/a' }, open: false } });
+  assert.match(h.deviceTrafficContent(traffic, 'model', 'device/a'), /data-device-traffic="device\/a" open/);
+  events.toggle({ target: { isConnected: true, matches: () => true, dataset: { deviceTraffic: 'device/a' }, open: false } });
+  assert.doesNotMatch(h.deviceTrafficContent(traffic, 'model', 'device/a'), /data-device-traffic="device\/a" open/);
+});
+
+test('Devices title contains only a settings icon and no redundant update/configure text', () => {
+  const top = source.slice(source.indexOf('function renderTop()'), source.indexOf('function renderPage()', source.indexOf('function renderTop()')));
+  let html;
+  const context = { ui: { page: 'devices' }, ICON: { settings: '<settings-icon>', back: '' }, BACK_KEYS: 'Alt+Left', $: () => ({ set innerHTML(value) { html = value; } }) };
+  vm.createContext(context); vm.runInContext(top, context); context.renderTop();
+  assert.match(html, /data-page="settings"/); assert.match(html, /<settings-icon>/);
+  assert.doesNotMatch(html, /Updates automatically|Configure in Settings/);
+});
+
+test('Models and All switch immediately from one snapshot without new IPC requests', async () => {
+  let calls = 0;
+  const views = [{ minutes: 30, scope: 'model', traffic: { requests: 3 } }, { minutes: 30, scope: 'all', traffic: { requests: 5 } }, { minutes: 360, scope: 'all', traffic: { requests: 8 } }];
+  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: async () => { calls++; return views; }, render() {} };
+  vm.createContext(context);
+  const a = source.indexOf('function relabelDeviceViews(');
+  vm.runInContext(source.slice(a,source.indexOf('async function loadDeviceDefinitions',a)),context);
+  const start = source.indexOf('function selectDeviceTraffic(');
+  vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
+  await context.loadMergedData();
+  assert.equal(context.ui.mergedData.traffic.requests, 3);
+  for (let i=0;i<10;i++) {
+    context.ui.trafficScope = i%2 ? 'model' : 'all';
+    assert.equal(context.selectDeviceTraffic(),true);
+    assert.equal(context.ui.mergedData.traffic.requests,i%2 ? 3 : 5);
+  }
+  context.ui.deviceTrafficMinutes = 360; context.ui.trafficScope = 'all';
+  assert.equal(context.selectDeviceTraffic(),true);
+  assert.equal(context.ui.mergedData.traffic.requests,8);
+  assert.equal(calls,1);
+});
+
+test('Settings devices use add/remove icons and show green only for recent verified data', () => {
+  const h = harness(async () => []);
+  h.ui.devices = [{ id: 'ok', name: 'Working', ssh: { host: 'ok' }, data: { transport: 'ssh' } }, { id: 'bad', name: 'Failed', ssh: { host: 'bad' }, data: { transport: 'ssh' } }];
+  h.ui.deviceTrafficFetchedAt = Date.now();
+  h.ui.deviceTrafficViews = { '30:model': { sources: [{ name: 'Working', included: true }, { name: 'Failed', included: false, error: 'Data rejected' }] } };
+  let html = h.deviceSettings();
+  assert.match(html, /data-action="device-new"[^>]*><plus>/);
+  assert.match(html, /data-action="device-remove"[^>]*><trash>/);
+  assert.match(html, /dot running/); assert.match(html, /dot failed/);
+  assert.doesNotMatch(html, />Remove<|>Add Device</);
+  h.ui.deviceTrafficFetchedAt = Date.now() - 46000;
+  html = h.deviceSettings(); assert.doesNotMatch(html, /dot running/);
+});
+
+test('device cards show transport beside the same verified status light as Settings', () => {
+  const h = harness(async () => []);
+  h.deviceTrafficContent = () => '';
+  h.message = (_, text) => text;
+  h.ui.devices = [
+    { id: 'ssh', name: 'SSH peer', ssh: { host: 'peer' }, data: { transport: 'ssh' } },
+    { id: 'http', name: 'HTTP peer', data: { transport: 'http', url: 'http://10.0.0.2' } },
+    { id: 'https', name: 'HTTPS peer', data: { transport: 'http', url: 'https://peer.example' } },
+  ];
+  h.ui.deviceTrafficFetchedAt = Date.now();
+  h.ui.mergedData = { sources: h.ui.devices.map(d => ({ name: d.name, included: true })) };
+  let html = h.devicesPage();
+  for (const protocol of ['SSH', 'HTTP', 'HTTPS']) {
+    assert.match(html, new RegExp(`class="state"><span class="dot running"[^>]*></span>${protocol}</span>`));
+  }
+  assert.doesNotMatch(html, /SSH request|HTTP \/ HTTPS/);
+  h.ui.mergedData.sources[0] = { name: 'SSH peer', error: 'Unavailable' };
+  html = h.devicesPage();
+  assert.match(html, /dot failed"[^>]*><\/span>SSH/);
+  h.ui.deviceTrafficFetchedAt = Date.now() - 46000;
+  html = h.devicesPage();
+  assert.doesNotMatch(html, /dot running"[^>]*><\/span>(SSH|HTTP|HTTPS)/);
+});
+
+test('renaming only a device alias preserves all cached traffic and does not refetch it', async () => {
+  const old = { id: 'stable', name: 'Old name', ssh: { host: 'MS', binary: '' }, data: { transport: 'ssh' } };
+  const next = { ...old, name: 'New name' };
+  const calls = [];
+  const h = harness(async command => { calls.push(command); return [next]; });
+  h.ui.devices = [old]; h.ui.devicesLoaded = true;
+  const view = { traffic: { requests: 99 }, sources: [{ name: 'Old name', included: true }] };
+  h.ui.deviceTrafficViews = { '30:model': view }; h.ui.mergedData = view;
+  const changed = await h.loadDeviceDefinitions();
+  assert.equal(changed,false);
+  assert.equal(h.ui.mergedData,view);
+  assert.equal(h.ui.deviceTrafficViews['30:model'].traffic.requests,99);
+  assert.equal(view.sources[0].name,'New name');
+  assert.deepEqual(calls,['get_devices']);
+});
+
+test('statistics query events display local aliases, transport and failure/recovery clearly', () => {
+  const ui = { devices: [{ id: 'device-id', name: 'MS' }], expanded: new Set() };
+  const context = { ui, esc: value => String(value).replace(/</g, '&lt;'), fmtTime: () => '12:00', fmtBytes: String, fmtMs: value => `${value} ms`, statusClass: () => '' };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function requestRow('), source.indexOf('function detail(')), context);
+  const entry = { event: 'device_statistics_succeeded', time: 1, durationMs: 42, fields: { device_id: 'device-id', transport: 'ssh', query_count: 3 } };
+  let html = context.requestRow(entry, true);
+  assert.match(html, /Statistics query · MS/); assert.match(html, /SSH/);
+  assert.match(html, /3 queries since previous event/); assert.match(html, /42 ms/);
+  assert.match(html, /class="status s2"/);
+  entry.event = 'device_statistics_failed'; entry.error = true;
+  html = context.requestRow(entry, true); assert.match(html, />ERR</); assert.match(html, /Statistics query failed/);
+  entry.event = 'device_statistics_recovered'; entry.error = false;
+  html = context.requestRow(entry, true); assert.match(html, />OK</); assert.match(html, /Statistics connection recovered/);
+  ui.devices[0].name = '<Renamed>';
+  assert.match(context.requestRow(entry, true), /Statistics query · &lt;Renamed>/);
+  ui.devices = [];
+  assert.match(context.requestRow(entry, true), /Statistics query · Device device-i/);
+});
+
+
+test('first Devices render reuses local Traffic before remote statistics arrive', () => {
+  const h = harness(async () => { throw new Error('Cached rendering must not query'); });
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), h);
+  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model';
+  h.rememberLocalTraffic({ summary: { requests: 17 }, credentials: [{ credential: 'Known', requests: 17 }] }, 30, 'model');
+  h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}:${traffic.credentials.length}`;
+  let html = h.devicesPage();
+  assert.match(html, /local:model:17:1/);
+  assert.doesNotMatch(html, /Loading traffic/);
+  h.ui.trafficScope = 'all';
+  assert.doesNotMatch(h.devicesPage(), /local:model:17:1/);
+  h.ui.trafficScope = 'model';
+  h.ui.mergedData = { scope: 'model', local: { requests: 18, credentials: [] }, sources: [] };
+  assert.match(h.devicesPage(), /local:model:18:0/);
+});
