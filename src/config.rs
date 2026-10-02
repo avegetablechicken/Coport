@@ -253,7 +253,12 @@ impl Config {
             return Err(Error::config("Invalid port or timeout (1–3600 seconds)."));
         }
         crate::url_routing::validate_routes(&self.codex.routing.api_key)?;
-        validate_upstream(&self.codex.base_url.account)?;
+        let account = validate_upstream(&self.codex.base_url.account)?;
+        if account.path().trim_matches('/') == "backend-api/codex" {
+            return Err(Error::config(
+                "codex.base_url.account is the ChatGPT /backend-api root, without /codex.",
+            ));
+        }
         validate_upstream(&self.codex.base_url.api_key)?;
         for (label, source) in &self.codex.accounts {
             if label.trim().is_empty() {
@@ -720,6 +725,7 @@ mod tests {
             "claude:\n  account_fallback: none\n",
             "claude:\n  api_key_fallback: none\n",
             "claude:\n  base_url: {account: https://api.anthropic.com, api_key: https://api.anthropic.com}\n",
+            "codex:\n  base_url: {account: https://chatgpt.com/backend-api/codex}\n",
         ] {
             assert!(
                 Config::parse(&format!("{BASE}{invalid}")).is_err(),

@@ -233,7 +233,7 @@ priority. Account/API fallbacks default to rejection when omitted/null.
 Default upstreams must be HTTPS public hostnames; explicitly declared third-party
 API routes and Codex custom provider upstreams may also use public IPv4 addresses. Codex's account base is the ChatGPT
 backend root: model requests use `/codex`, usage, profile and reset-credit queries
-use `/wham`, and plugin APIs use `/ps`. A legacy `/backend-api/codex` base is normalized to `/backend-api`.
+use `/wham`, and plugin APIs use `/ps`; a `/backend-api/codex` base is rejected.
 Claude's single base URL is a root **without `/v1`**: native `/v1` and
 `/api/oauth` paths are preserved. The Claude base may point to a compatible
 Anthropic gateway; no model or protocol conversion is performed.

@@ -221,14 +221,7 @@ pub fn refresh_token(body: &[u8]) -> Option<String> {
 pub fn upstream_url(base: &str, target: &str, account: bool) -> Result<Url> {
     valid_target(target)?;
     let mut b = Url::parse(base).map_err(|_| Error::config("Invalid upstream URL."))?;
-    let backend = account
-        && matches!(
-            b.path().trim_matches('/'),
-            "backend-api" | "backend-api/codex"
-        );
-    if backend {
-        b.set_path("/backend-api");
-    }
+    let backend = account && b.path().trim_matches('/') == "backend-api";
     if target.starts_with("/https://") || target.starts_with("/http://") {
         let dest =
             Url::parse(&target[1..]).map_err(|_| Error::config("Invalid explicit upstream."))?;
@@ -281,8 +274,7 @@ pub fn upstream_url(base: &str, target: &str, account: bool) -> Result<Url> {
 }
 pub fn query_url(base: &str, target: &str) -> Result<Url> {
     let b = Url::parse(base).map_err(|_| Error::config("Invalid account query base."))?;
-    if account_query(target).is_none() || !matches!(b.path(), "/backend-api" | "/backend-api/codex")
-    {
+    if account_query(target).is_none() || b.path().trim_end_matches('/') != "/backend-api" {
         return Err(Error::config(
             "Account queries require a ChatGPT /backend-api upstream.",
         ));
@@ -322,7 +314,7 @@ mod tests {
 
     #[test]
     fn paths_and_origin_boundaries() {
-        let b = "https://chatgpt.com/backend-api/codex";
+        let b = "https://chatgpt.com/backend-api";
         for t in [
             "/responses",
             "/v1/responses",
