@@ -63,7 +63,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let icon = TrayIconBuilder::with_id("main")
         .icon(image(Status::Stopped))
         .icon_as_template(cfg!(target_os = "macos"))
-        .tooltip("Coding Agent Proxy")
+        .tooltip("Agent Router")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -184,7 +184,7 @@ pub fn sync(app: &AppHandle) {
         let _ = tray.headline.set_text(&view.headline);
         let _ = tray
             .icon
-            .set_tooltip(Some(format!("Coding Agent Proxy — {}", view.headline)));
+            .set_tooltip(Some(format!("Agent Router — {}", view.headline)));
     }
     if old.map(|v| &v.stats) != Some(&view.stats) {
         let _ = tray.stats.set_text(&view.stats);
@@ -201,7 +201,7 @@ pub fn sync(app: &AppHandle) {
     if relabel {
         let _ = tray.open.set_text("Open Panel");
         let _ = tray.restart.set_text("Restart Proxy");
-        let _ = tray.quit.set_text("Quit Coding Agent Proxy");
+        let _ = tray.quit.set_text("Quit Agent Router");
     }
     *last = Some(view);
 }

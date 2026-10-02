@@ -38,10 +38,10 @@ jobs:
       - run: cargo build --locked --release
       - uses: actions/upload-artifact@v4
         with:
-          name: coding-agent-proxy-${{ matrix.os }}
+          name: agent-router-${{ matrix.os }}
           path: |
-            target/release/coding-agent-proxy
-            target/release/coding-agent-proxy.exe
+            target/release/agent-router
+            target/release/agent-router.exe
           if-no-files-found: error
 
   gui:
@@ -59,16 +59,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - run: cargo clippy --locked -p coding-agent-proxy-gui --all-targets -- -D warnings
-      - run: cargo test --locked -p coding-agent-proxy-gui
-      - run: cargo build --locked --release -p coding-agent-proxy-gui
+      - run: cargo clippy --locked -p agent-router-gui --all-targets -- -D warnings
+      - run: cargo test --locked -p agent-router-gui
+      - run: cargo build --locked --release -p agent-router-gui
       - if: runner.os == 'macOS'
         run: ./scripts/bundle_macos.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: coding-agent-proxy-gui-${{ matrix.os }}
+          name: agent-router-gui-${{ matrix.os }}
           path: |
-            target/release/coding-agent-proxy-gui
-            target/release/coding-agent-proxy-gui.exe
-            target/Coding Agent Proxy.app
+            target/release/agent-router-gui
+            target/release/agent-router-gui.exe
+            target/Agent Router.app
           if-no-files-found: error

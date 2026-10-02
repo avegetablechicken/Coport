@@ -1,4 +1,4 @@
-//! Menu bar (macOS) / system tray (Windows, Linux) app for coding-agent-proxy.
+//! Menu bar (macOS) / system tray (Windows, Linux) app for agent-router.
 //! The panel UI is HTML/CSS in `../ui`, rendered by the system WebView.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -27,7 +27,7 @@ pub struct AppState {
 }
 
 const USAGE: &str = "\
-Usage: coding-agent-proxy-gui [--config <path>] [--background]
+Usage: agent-router-gui [--config <path>] [--background]
 
   --config <path>              Use and remember this configuration file
   --background                 Start in the menu bar / tray without the panel
@@ -49,7 +49,7 @@ fn main() {
                 let Some(path) = args.next() else {
                     return usage_error();
                 };
-                let path = coding_agent_proxy::config::expand(&path);
+                let path = agent_router::config::expand(&path);
                 let path = std::path::absolute(&path).unwrap_or(path);
                 settings.config_path = path.to_string_lossy().into_owned();
                 settings.save();
@@ -69,7 +69,7 @@ fn main() {
                 return;
             }
             "-V" | "--version" => {
-                println!("coding-agent-proxy-gui {}", env!("CARGO_PKG_VERSION"));
+                println!("agent-router-gui {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "-h" | "--help" => {
@@ -83,7 +83,7 @@ fn main() {
     let instance = match single_instance::acquire(settings::app_dir()) {
         single_instance::Instance::Primary(guard) => guard,
         single_instance::Instance::Secondary => {
-            eprintln!("Coding Agent Proxy is already running; showing its panel.");
+            eprintln!("Agent Router is already running; showing its panel.");
             return;
         }
     };

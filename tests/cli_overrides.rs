@@ -1,10 +1,10 @@
-use coding_agent_proxy::config::Config;
+use agent_router::config::Config;
 use std::process::{Command, Output};
 
 const BASE: &str = "listen_port: 8787\nrequest_timeout_seconds: 30\n";
 
 fn run(config: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coding-agent-proxy"))
+    Command::new(env!("CARGO_BIN_EXE_agent-router"))
         .arg("--config")
         .arg(config)
         .args(args)

@@ -40,7 +40,7 @@ fn exe() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 mod login {
     use super::*;
-    const LABEL: &str = "io.github.coding-agent-proxy.gui";
+    const LABEL: &str = "io.github.agent-router.gui";
 
     fn plist() -> Option<PathBuf> {
         Some(dirs::home_dir()?.join(format!("Library/LaunchAgents/{LABEL}.plist")))
@@ -88,7 +88,7 @@ mod login {
     use super::*;
     use std::os::windows::process::CommandExt;
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const VALUE: &str = "CodingAgentProxy";
+    const VALUE: &str = "AgentRouter";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     fn reg(args: &[&str]) -> bool {
@@ -134,7 +134,7 @@ mod login {
     use super::*;
 
     fn desktop_file() -> Option<PathBuf> {
-        Some(dirs::config_dir()?.join("autostart/coding-agent-proxy.desktop"))
+        Some(dirs::config_dir()?.join("autostart/agent-router.desktop"))
     }
     pub fn enabled() -> bool {
         desktop_file().is_some_and(|p| p.is_file())
@@ -154,7 +154,7 @@ mod login {
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         let body = format!(
-            "[Desktop Entry]\nType=Application\nName=Coding Agent Proxy\n\
+            "[Desktop Entry]\nType=Application\nName=Agent Router\n\
              Comment=Loopback proxy for Codex and Claude Code\nExec=\"{exe}\" --background\n\
              Terminal=false\nX-GNOME-Autostart-enabled=true\n"
         );

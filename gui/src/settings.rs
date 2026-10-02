@@ -47,7 +47,7 @@ impl Settings {
     }
 
     pub fn config_path(&self) -> PathBuf {
-        coding_agent_proxy::config::expand(&self.config_path)
+        agent_router::config::expand(&self.config_path)
     }
 
     /// Same location the CLI uses: `logs/proxy.log` next to the config file.
@@ -62,7 +62,7 @@ impl Settings {
 pub fn app_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("coding-agent-proxy")
+        .join("agent-router")
 }
 
 fn settings_file() -> PathBuf {

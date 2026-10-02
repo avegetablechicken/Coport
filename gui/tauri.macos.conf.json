@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "panel",
-        "title": "Coding Agent Proxy",
+        "title": "Agent Router",
         "url": "index.html",
         "width": 360,
         "height": 560,

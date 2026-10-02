@@ -8,7 +8,7 @@ use crate::{
     proxy::{Controller, Notify, Phase, Probe},
     settings::Settings,
 };
-use coding_agent_proxy::config::{AccountSource, Choice, Config, Routing, redacted_endpoint};
+use agent_router::config::{AccountSource, Choice, Config, Routing, redacted_endpoint};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,

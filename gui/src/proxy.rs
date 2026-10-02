@@ -1,6 +1,6 @@
 //! Runs the proxy server in-process on a background Tokio runtime.
 
-use coding_agent_proxy::{config::Config, logger::Logger, server::Server};
+use agent_router::{config::Config, logger::Logger, server::Server};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

@@ -1,20 +1,20 @@
 #!/bin/sh
-# Builds "Coding Agent Proxy.app", a menu bar app (no Dock icon), into target/.
+# Builds "Agent Router.app", a menu bar app (no Dock icon), into target/.
 set -eu
 
 cd "$(dirname "$0")/.."
-cargo build --locked --release -p coding-agent-proxy-gui
+cargo build --locked --release -p agent-router-gui
 
-app="target/Coding Agent Proxy.app"
+app="target/Agent Router.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/coding-agent-proxy-gui "$app/Contents/MacOS/"
+cp target/release/agent-router-gui "$app/Contents/MacOS/"
 
 # The icon is drawn by the app itself; iconutil packs the standard sizes.
 iconset=$(mktemp -d)/AppIcon.iconset
 mkdir -p "$iconset"
-target/release/coding-agent-proxy-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
+target/release/agent-router-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
 for size in 16 32 128 256 512; do
     sips -z $size $size "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
@@ -27,10 +27,10 @@ cat > "$app/Contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Coding Agent Proxy</string>
-  <key>CFBundleDisplayName</key><string>Coding Agent Proxy</string>
-  <key>CFBundleIdentifier</key><string>io.github.coding-agent-proxy.gui</string>
-  <key>CFBundleExecutable</key><string>coding-agent-proxy-gui</string>
+  <key>CFBundleName</key><string>Agent Router</string>
+  <key>CFBundleDisplayName</key><string>Agent Router</string>
+  <key>CFBundleIdentifier</key><string>io.github.agent-router.gui</string>
+  <key>CFBundleExecutable</key><string>agent-router-gui</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

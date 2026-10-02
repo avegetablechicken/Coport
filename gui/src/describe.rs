@@ -1,7 +1,7 @@
 //! Hover details for API key routing selectors: the upstream base URL each
 //! one is forwarded to.
 
-use coding_agent_proxy::config::{Config, redacted_endpoint};
+use agent_router::config::{Config, redacted_endpoint};
 
 /// Userinfo is omitted, as for proxy endpoints.
 fn display(url: &str) -> String {

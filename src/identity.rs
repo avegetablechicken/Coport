@@ -402,7 +402,7 @@ async fn shell_value(name: &str) -> Result<String> {
         "-i",
         "-c",
         "umask 077; exec /usr/bin/printenv \"$1\" > \"$2\"",
-        "coding-agent-proxy",
+        "agent-router",
         name,
     ])
     .arg(&output)

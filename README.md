@@ -1,4 +1,4 @@
-# coding-agent-proxy
+# Agent Router
 
 A cross-platform Rust loopback reverse proxy for Codex, Claude Code, ChatGPT account APIs and
 OpenAI documentation MCP. It selects an outbound proxy by matching account or
@@ -14,7 +14,7 @@ cargo build --locked --release
 cp config.example.yaml config.yaml
 ```
 
-On Windows PowerShell, use `Copy-Item` and `coding-agent-proxy.exe`.
+On Windows PowerShell, use `Copy-Item` and `agent-router.exe`.
 The executable has no Python runtime dependency; Python 3.10+ is needed only
 for the optional service manager and integration tests.
 
@@ -316,8 +316,8 @@ Shell startup must not require terminal interaction. Saved Codex account matches
 do not launch a shell to resolve unrelated API Key providers.
 
 ```sh
-target/release/coding-agent-proxy --config config.yaml --check
-target/release/coding-agent-proxy --config config.yaml
+target/release/agent-router --config config.yaml --check
+target/release/agent-router --config config.yaml
 ```
 
 `--check` validates configuration and enabled credential sources, not network
@@ -329,7 +329,7 @@ Use repeatable `-c PATH=VALUE` arguments to override YAML settings. Dots
 separate nested mapping keys; names match the YAML fields, including underscores.
 
 ```sh
-target/release/coding-agent-proxy --config config.yaml \
+target/release/agent-router --config config.yaml \
   -c listen_port=8888 \
   -c request_timeout_seconds=120 \
   -c codex.account_auth_file_only=false \
@@ -621,7 +621,7 @@ require a C toolchain, make and Perl; no system libssl runtime is needed. No set
 
 ## Desktop app (menu bar / tray)
 
-`coding-agent-proxy-gui` runs the same proxy in-process behind a status icon in
+`agent-router-gui` runs the same proxy in-process behind a status icon in
 the macOS menu bar (no Dock icon), the Windows notification area, or a Linux
 AppIndicator. Clicking the icon drops a panel below it, like a menu bar extra;
 clicking elsewhere or pressing Esc closes it. The panel is built with Tauri 2:
@@ -631,8 +631,8 @@ Node.js toolchain is needed; `cargo build` embeds the UI. Rust 1.89+ is required
 the command-line proxy keeps its own minimum.
 
 ```sh
-cargo build --locked --release -p coding-agent-proxy-gui
-target/release/coding-agent-proxy-gui --config config.yaml
+cargo build --locked --release -p agent-router-gui
+target/release/agent-router-gui --config config.yaml
 ```
 
 The panel follows the layout of native menu bar utilities such as eul: on macOS
@@ -660,7 +660,7 @@ panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
 
-- macOS: `scripts/bundle_macos.sh` builds `target/Coding Agent Proxy.app`
+- macOS: `scripts/bundle_macos.sh` builds `target/Agent Router.app`
   (`LSUIElement`, ad-hoc signed). A full menu bar hides status items behind the
   notch while apps with long menus are frontmost; the panel then opens at the
   top-right corner when launched or reopened.
@@ -686,9 +686,9 @@ the native executable directly, without a Python supervisor:
 
 | Platform | Background runner | Runtime directory |
 | --- | --- | --- |
-| macOS | launchd user agent | `~/Library/Application Support/coding-agent-proxy-rust` |
-| Linux | systemd user service | `$XDG_DATA_HOME/coding-agent-proxy-rust`, default `~/.local/share/coding-agent-proxy-rust` |
-| Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/coding-agent-proxy-rust` |
+| macOS | launchd user agent | `~/Library/Application Support/agent-router-rust` |
+| Linux | systemd user service | `$XDG_DATA_HOME/agent-router-rust`, default `~/.local/share/agent-router-rust` |
+| Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/agent-router-rust` |
 
 The Windows task runs in the logged-in user's session; it is not a system service
 that runs before login. Linux requires an available systemd user manager. On all
@@ -697,7 +697,7 @@ an external proxy core. The complete Linux service lifecycle has been verified
 on Ubuntu 20.04 with systemd 245. Windows task registration still needs native
 verification.
 
-The service/task name is `local.coding-agent-proxy.rust`. Stop any existing
+The service/task name is `local.agent-router.rust`. Stop any existing
 listener on the configured port before installing. The script manages only its
 own service registration and runtime directory.
 Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
@@ -914,8 +914,8 @@ cargo build --locked
 python3 scripts/integration.py
 python3 scripts/test_proxy_auth.py
 python3 scripts/test_service_rust.py
-cargo clippy --locked -p coding-agent-proxy-gui --all-targets -- -D warnings
-cargo test --locked -p coding-agent-proxy-gui
+cargo clippy --locked -p agent-router-gui --all-targets -- -D warnings
+cargo test --locked -p agent-router-gui
 ```
 
 Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
@@ -936,8 +936,8 @@ This test uses a temporary runtime directory, a unique service name, and an
 ephemeral loopback port. It verifies installation, configuration-preserving
 updates, restart, stop, and uninstall without changing the normal service.
 
-The Python transport tests default to `target/debug/coding-agent-proxy` (with
-`.exe` on Windows). Set `CODING_AGENT_PROXY_BINARY` to test another build, such as
+The Python transport tests default to `target/debug/agent-router` (with
+`.exe` on Windows). Set `AGENT_ROUTER_BINARY` to test another build, such as
 the release executable.
 
 | File | Responsibility |

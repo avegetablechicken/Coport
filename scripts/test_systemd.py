@@ -45,9 +45,9 @@ def main():
         raise SystemExit("This test requires Linux with a systemd user session.")
     subprocess.run(["systemctl", "--user", "show-environment"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    binary = Path(os.environ.get("CODING_AGENT_PROXY_BINARY",
-                                service.ROOT / "target/release/coding-agent-proxy")).resolve()
-    service.LABEL = "local.coding-agent-proxy.test-" + uuid.uuid4().hex
+    binary = Path(os.environ.get("AGENT_ROUTER_BINARY",
+                                service.ROOT / "target/release/agent-router")).resolve()
+    service.LABEL = "local.agent-router.test-" + uuid.uuid4().hex
     unit = service.LABEL + ".service"
     registration = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user" / unit
     with tempfile.TemporaryDirectory(prefix="coding-proxy-systemd-") as directory:
