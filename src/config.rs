@@ -304,17 +304,30 @@ impl Config {
         Ok(c)
     }
     pub fn read(path: &std::path::Path, migrate: bool) -> Result<Self> {
+        Self::read_with_overrides(path, migrate, &[])
+    }
+    /// Apply dotted YAML overrides in order before configuration validation.
+    /// The source file is never modified.
+    pub fn read_with_overrides(
+        path: &std::path::Path,
+        migrate: bool,
+        overrides: &[String],
+    ) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|_| Error::config("Cannot read configuration file."))?;
-        if !migrate {
+        if !migrate && overrides.is_empty() {
             return Self::parse(&text);
         }
         let mut root: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
             .map_err(|_| Error::config("Invalid YAML configuration."))?;
+        for entry in overrides {
+            apply_override(&mut root, entry)?;
+        }
         if let Some(entries) = root
             .get("routing")
             .and_then(|v| v.get("api_key"))
             .and_then(|v| v.as_sequence())
+            .filter(|_| migrate)
             .cloned()
         {
             let mut map = serde_yaml_ng::Mapping::new();
@@ -648,6 +661,55 @@ impl Codex {
     pub(crate) fn account_sources(&self) -> Vec<DirectoryAccount> {
         directory_accounts(&self.accounts, &self.homes, &self.routing, "auth.json")
     }
+}
+
+fn apply_override(root: &mut serde_yaml_ng::Value, entry: &str) -> Result<()> {
+    use serde_yaml_ng::{Mapping, Value};
+
+    let (path, text) = entry
+        .split_once('=')
+        .ok_or(Error::config("Expected -c PATH=VALUE."))?;
+    let mut segments = Vec::new();
+    let mut segment = String::new();
+    let mut chars = path.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some(escaped @ ('.' | '\\')) => segment.push(escaped),
+                _ => {
+                    return Err(Error::config(
+                        "Only dots and backslashes can be escaped in -c paths.",
+                    ));
+                }
+            },
+            '.' => segments.push(std::mem::take(&mut segment)),
+            _ => segment.push(ch),
+        }
+    }
+    segments.push(segment);
+    if segments.iter().any(|s| s.trim().is_empty()) {
+        return Err(Error::config("A -c path cannot contain empty components."));
+    }
+    // An empty assignment is an empty string; use explicit null for YAML null.
+    let value = if text.is_empty() {
+        Value::String(String::new())
+    } else {
+        serde_yaml_ng::from_str(text).map_err(|_| Error::config("Invalid YAML value in -c."))?
+    };
+    let mut current = root;
+    for (index, key) in segments.iter().enumerate() {
+        let map = current.as_mapping_mut().ok_or(Error::config(
+            "A -c path must traverse mappings; replace scalar or list values as a whole.",
+        ))?;
+        if index + 1 == segments.len() {
+            map.insert(Value::String(key.clone()), value);
+            return Ok(());
+        }
+        current = map
+            .entry(Value::String(key.clone()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+    }
+    Ok(())
 }
 
 // Canonical config sequences are ordered proxy choices. Render them on the

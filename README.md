@@ -292,6 +292,34 @@ target/release/coding-agent-proxy --config config.yaml
 `--check` validates configuration and enabled credential sources, not network
 reachability. Stop with Ctrl-C or SIGTERM.
 
+### Command-line configuration overrides
+
+Use repeatable `-c PATH=VALUE` arguments to override YAML settings. Dots
+separate nested mapping keys; names match the YAML fields, including underscores.
+
+```sh
+target/release/coding-agent-proxy --config config.yaml \
+  -c listen_port=8888 \
+  -c request_timeout_seconds=120 \
+  -c codex.account_auth_file_only=false \
+  -c 'codex.routing.account_fallback=[us, jp]' \
+  -c 'claude.routing.account.you@example\.com=jp'
+```
+
+Values use YAML syntax: numbers, booleans, strings, lists, maps and `null`.
+Quote the entire argument for shell-sensitive values; to force a YAML string,
+use e.g. `-c 'proxies.office="none"'`. An empty value (`PATH=`) is an empty
+string. Escape literal dots in keys with `\.` and backslashes with `\\`.
+Replace lists as a whole, e.g. `-c 'codex.homes=["~/.codex"]'`.
+
+Overrides apply in command-line order (the last assignment wins), create missing
+mapping sections, and undergo the same validation as the configuration file.
+Paths cannot traverse existing scalar, null or list values. Unknown settings and
+invalid types are rejected. With legacy configurations, use the paths present in
+that file; the existing restrictions on mixing old and new layouts still apply.
+Overrides affect startup and `--check` without modifying the source file.
+To save the resulting configuration, add `--write-config config.new.yaml`.
+
 ### Migrate older configurations
 
 Older top-level Codex `auth_file`, `account_auth_file_only`, `base_url` and `routing`

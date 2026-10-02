@@ -23,6 +23,9 @@ struct Args {
     print_listen_port: bool,
     #[arg(long)]
     write_config: Option<String>,
+    /// Override a YAML setting using a dotted path (repeatable; last value wins).
+    #[arg(short = 'c', value_name = "PATH=VALUE")]
+    overrides: Vec<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -33,7 +36,7 @@ async fn main() {
 }
 async fn run(args: Args) -> Result<()> {
     let path = expand(&args.config);
-    let config = Config::read(&path, args.write_config.is_some())?;
+    let config = Config::read_with_overrides(&path, args.write_config.is_some(), &args.overrides)?;
     if let Some(dest) = args.write_config {
         let text = config.canonical_yaml()?;
         Config::parse(&text)?;
