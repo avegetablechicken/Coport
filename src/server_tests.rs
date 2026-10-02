@@ -172,7 +172,7 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
         } else {
             format!("http://127.0.0.1:{}", fixture.addr.port())
         };
-        let running = running(&format!("proxies:\n  selected: {endpoint}\nrouting:\n  api_key:\n    'upstream.invalid/v1': selected\n")).await;
+        let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key:\n      'upstream.invalid/v1': selected\n")).await;
         trust(&running, &fixture, &endpoint);
         let mut response = http()
             .post(format!(
@@ -463,8 +463,8 @@ async fn claude_native_auth_paths_and_sse_passthrough() {
         let credentials = tempfile::tempdir().unwrap();
         let file = credentials.path().join("credentials.json");
         std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"model-secret"}}"#).unwrap();
-        let file = serde_json::to_string(&file.to_string_lossy()).unwrap();
-        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  auth_file: {file}\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
+        let dir = serde_json::to_string(&credentials.path()).unwrap();
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{dir}]\n  auth_file: credentials.json\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
         trust(&running, &fixture, &endpoint);
         let name = if bearer { "authorization" } else { "x-api-key" };
         let value = if bearer {
@@ -586,7 +586,7 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
     )
     .unwrap();
     let running = running(&format!(
-        "routing:\n  api_key_fallback: none\nclaude:\n  config_dirs: [{:?}]\n  account_fallback: none\n  api_key_fallback: none\n",
+        "claude:\n  config_dirs: [{:?}]\n  routing:\n    account_fallback: none\n    api_key_fallback: none\ncodex:\n  routing:\n    api_key_fallback: none\n",
         login.path().to_string_lossy()
     ))
     .await;
@@ -605,7 +605,7 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
             .unwrap();
         assert_eq!(response.status(), 401);
     }
-    let running = self::running("routing:\n  api_key_fallback: none\n").await;
+    let running = self::running("codex:\n  routing:\n    api_key_fallback: none\n").await;
     let response = http()
         .post(format!("{}/v1/messages", running.url))
         .bearer_auth("openai-secret")
@@ -625,8 +625,8 @@ async fn claude_saved_token_without_metadata_probes_then_routes_and_caches() {
         let credentials = tempfile::tempdir().unwrap();
         let file = credentials.path().join("credentials.json");
         std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#).unwrap();
-        let file = serde_json::to_string(&file).unwrap();
-        let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  auth_file: {file}\n  account_auth_file_only: {file_only}\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
+        let dir = serde_json::to_string(&credentials.path()).unwrap();
+        let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  config_dirs: [{dir}]\n  auth_file: credentials.json\n  account_auth_file_only: {file_only}\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
         trust(&running, &lookup, &lookup_endpoint);
         trust(&running, &payload, &payload_endpoint);
         for first in [true, false] {
@@ -839,7 +839,7 @@ async fn tls_connect_and_https_connect_stream_before_completion() {
             "{mode}://test%40user:p%3Ass%40word@localhost:{}",
             fixture.addr.port()
         );
-        let running=running(&format!("proxies:\n  selected: {endpoint}\nrouting:\n  api_key_fallback: selected\nbase_url:\n  api_key: https://upstream.invalid/v1\n")).await;
+        let running=running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key_fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
         trust(&running, &fixture, &endpoint);
         let response = http()
             .post(format!("{}/v1/responses?private=hidden", running.url))
@@ -896,7 +896,7 @@ async fn ordered_probes_are_credential_free_and_repeated_per_request() {
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_port = dead.local_addr().unwrap().port();
     drop(dead);
-    let running=running(&format!("proxies:\n  dead: http://127.0.0.1:{dead_port}\nrouting:\n  api_key_fallback: [dead, none]\nbase_url:\n  api_key: https://upstream.invalid/v1\n")).await;
+    let running=running(&format!("proxies:\n  dead: http://127.0.0.1:{dead_port}\ncodex:\n  routing:\n    api_key_fallback: [dead, none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
     trust(&running, &fixture, "none");
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -929,7 +929,7 @@ async fn ordered_probes_are_credential_free_and_repeated_per_request() {
 #[tokio::test]
 async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
     let mut fixture = fixture("direct", "redirect").await;
-    let running = running("routing:\n  mcp_fallback: none\n").await;
+    let running = running("codex:\n  routing:\n    mcp_fallback: none\n").await;
     trust(&running, &fixture, "none");
     let response = reqwest::Client::builder()
         .no_proxy()
@@ -958,7 +958,7 @@ async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
 async fn request_limits_duplicates_and_chunked_upload() {
     let mut fixture = fixture("direct", "redirect").await;
     let running = running(
-        "routing:\n  api_key_fallback: none\nbase_url:\n  api_key: https://upstream.invalid/v1\n",
+        "codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
     )
     .await;
     trust(&running, &fixture, "none");
@@ -998,7 +998,7 @@ async fn request_limits_duplicates_and_chunked_upload() {
 async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
     for disconnect in [true, false] {
         let mut fixture = fixture("direct", "sse").await;
-        let running=running("routing:\n  api_key_fallback: none\nbase_url:\n  api_key: https://upstream.invalid/v1\n").await;
+        let running=running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
         trust(&running, &fixture, "none");
         let response = http()
             .post(format!("{}/responses", running.url))

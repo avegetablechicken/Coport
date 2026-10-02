@@ -98,7 +98,7 @@ def exercise(scheme, password, expected_password=PASSWORD):
         folder = Path(directory)
         endpoint = f'{scheme}://{quote(USER, safe="")}:{quote(password, safe="")}@127.0.0.1:{probe.server_address[1]}'
         config = folder/'config.yaml'
-        config.write_text(f'listen_port: {port}\nrequest_timeout_seconds: 3\nproxies:\n  authenticated: "{endpoint}"\nopenai_fallback_proxy: authenticated\n')
+        config.write_text(f'listen_port: {port}\nrequest_timeout_seconds: 3\nproxies:\n  authenticated: "{endpoint}"\ncodex:\n  routing:\n    api_key_fallback: authenticated\n')
         process = subprocess.Popen([BINARY, '--config', str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for _ in range(100):

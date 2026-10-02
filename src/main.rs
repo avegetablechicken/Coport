@@ -5,7 +5,7 @@ use coding_agent_proxy::{
     logger::Logger,
     server::Server,
 };
-use std::{io::Write, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -21,8 +21,6 @@ struct Args {
     check: bool,
     #[arg(long, hide = true)]
     print_listen_port: bool,
-    #[arg(long)]
-    write_config: Option<String>,
     /// Override a YAML setting using a dotted path (repeatable; last value wins).
     #[arg(short = 'c', value_name = "PATH=VALUE")]
     overrides: Vec<String>,
@@ -36,27 +34,7 @@ async fn main() {
 }
 async fn run(args: Args) -> Result<()> {
     let path = expand(&args.config);
-    let config = Config::read_with_overrides(&path, args.write_config.is_some(), &args.overrides)?;
-    if let Some(dest) = args.write_config {
-        let text = config.canonical_yaml()?;
-        Config::parse(&text)?;
-        let destination = expand(&dest);
-        let parent = destination
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|_| Error::config("Cannot create private configuration file."))?;
-        temp.write_all(text.as_bytes())
-            .map_err(|_| Error::config("Cannot write configuration."))?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|_| Error::config("Cannot sync configuration."))?;
-        temp.persist(destination)
-            .map_err(|_| Error::config("Cannot replace configuration."))?;
-        println!("Wrote configuration using symmetric codex and claude sections.");
-        return Ok(());
-    }
+    let config = Config::read_with_overrides(&path, &args.overrides)?;
     if args.print_listen_port {
         println!("{}", config.listen_port);
         return Ok(());

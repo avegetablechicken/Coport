@@ -253,10 +253,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connect_config_validates_and_roundtrips() {
+    fn connect_config_validates() {
         let config = crate::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nconnect:\n  'api.anthropic.com:443': none\n  '[::1]:8443': none\n").unwrap();
-        let reloaded = crate::config::Config::parse(&config.canonical_yaml().unwrap()).unwrap();
-        assert_eq!(reloaded.connect.len(), 2);
+        assert_eq!(config.connect.len(), 2);
         for value in [
             "api.anthropic.com",
             "api.anthropic.com:0",

@@ -344,12 +344,7 @@ function routingBlock() {
       .join("");
     return `<div class="subhead"><span>${name}</span>${badge}</div>${rows}${fallbacks}`;
   };
-  const legacy = d.legacyProviders.length
-    ? `<div class="subhead"><span>Legacy providers</span></div>${d.legacyProviders
-        .map((x) => `<div class="row compact"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
-        .join("")}`
-    : "";
-  return block("Routing", `Timeout ${d.timeoutSecs} s`, section("Codex", d.codex) + section("Claude", d.claude) + legacy);
+  return block("Routing", `Timeout ${d.timeoutSecs} s`, section("Codex", d.codex) + section("Claude", d.claude));
 }
 
 // ---------------------------------------------------------------- activity

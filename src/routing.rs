@@ -295,7 +295,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn explicit_url_routes_need_auth_but_no_local_key_source_or_fallback() {
-        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\nrouting:\n  api_key:\n    'api.invalid/v1': none\n").unwrap();
+        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  routing:\n    api_key:\n      'api.invalid/v1': none\n").unwrap();
         config.check_credentials().await.unwrap();
         assert!(config.codex.providers.is_empty());
         for target in [
@@ -317,15 +317,6 @@ mod tests {
                 .resolve_url(Some("Bearer key"), "/https://other.invalid/v1/responses")
                 .unwrap()
                 .is_none()
-        );
-        let text = config.canonical_yaml().unwrap();
-        assert!(text.contains("api.invalid/v1"));
-        assert!(
-            Config::parse(&text)
-                .unwrap()
-                .resolve_url(Some("Bearer key"), "/https://api.invalid/v1/responses")
-                .unwrap()
-                .is_some()
         );
     }
 

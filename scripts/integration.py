@@ -6,7 +6,6 @@ import http.client
 import json
 import os
 import pathlib
-import re
 import socket
 import socketserver
 import subprocess
@@ -43,23 +42,28 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="coding-agent-proxy-test-") as temp:
             temp = pathlib.Path(temp)
-            auth = temp / "auth.json"
+            home = temp / "home"
+            home.mkdir()
+            auth = home / "auth.json"
             config = temp / "config.yaml"
             def login(account, token):
-                staged = temp / "auth.next"
+                staged = home / "auth.next"
                 staged.write_text(json.dumps({"tokens": {"account_id": account, "access_token": token}}))
                 staged.replace(auth)
             def configure(a_proxy):
                 value = f'''listen_port: {port}
-auth_file: "{auth.as_posix()}"
-upstream_base_url: "https://upstream.invalid/backend-api/codex"
 request_timeout_seconds: 3
 proxies:
   us: "http://127.0.0.1:{a_proxy}"
   jp: "http://127.0.0.1:{b.server_address[1]}"
-accounts:
-  account-a: us
-  account-b: jp
+codex:
+  homes: [{json.dumps(str(home))}]
+  base_url:
+    account: "https://upstream.invalid/backend-api"
+  routing:
+    account:
+      account-a: us
+      account-b: jp
 '''
                 staged = temp / "config.next"
                 staged.write_text(value)
@@ -162,19 +166,20 @@ accounts:
             for secret in ["token-a", "token-b", "token-c", "secret-query", "secret-body"]:
                 assert secret not in raw_log, "Sensitive request data must not appear in logs"
             assert all(r.get("path") != "/health" for r in records)
-            key_file = temp / "provider.key"
-            key_file.write_text("provider-key-one\n")
+            key_file = home / ".env"
+            key_file.write_text("API_PROVIDER_KEY=provider-key-one\n")
             config.write_text(f'''listen_port: {port}
-upstream_base_url: "https://api-provider.invalid/v1"
 request_timeout_seconds: 3
 proxies:
   chosen: "http://127.0.0.1:{a.server_address[1]}"
   unused: "http://127.0.0.1:{b.server_address[1]}"
-api_key_providers:
-- name: api-provider
-  upstream_base_url: "https://api-provider.invalid/v1"
-  proxy: chosen
-  api_key_file: "{key_file.as_posix()}"
+codex:
+  homes: [{json.dumps(str(home))}]
+  base_url:
+    api_key: "https://api-provider.invalid/v1"
+  routing:
+    api_key:
+      API_PROVIDER_KEY: chosen
 ''')
             restart()
             auth.unlink()  # API Key mode must not depend on ChatGPT credentials.
@@ -186,7 +191,7 @@ api_key_providers:
             assert len(a.requests) > previous_a and len(b.requests) == previous_b
             assert a.requests[-1].startswith(b"CONNECT api-provider.invalid:443 ")
             assert b"provider-key-one" not in a.requests[-1]
-            key_file.write_text("provider-key-two\n")
+            key_file.write_text("API_PROVIDER_KEY=provider-key-two\n")
             assert request(token="provider-key-one")[0] == 401
             assert request(token="provider-key-two")[0] == 502
             key_file.unlink()
@@ -196,33 +201,36 @@ api_key_providers:
             raw_log = log_path.read_text()
             assert "provider-key-one" not in raw_log and "provider-key-two" not in raw_log
             login("account-a", "chat-mixed-token")
-            key_file.write_text("provider-key-one")
-            key_b = temp / "provider-b.key"
-            key_b.write_text("provider-key-two")
-            config.write_text(f'''listen_port: {port}
-auth_file: "{auth.as_posix()}"
-upstream_base_url: "https://chatgpt-mixed.invalid/backend-api/codex"
+            (home / "config.toml").write_text("".join(
+                f'[model_providers.{name}]\nenv_key = "{env}"\nbase_url = "https://{host}/v1"\n'
+                for name, env, host in [("reverse", "REVERSE_TEST_KEY", "provider-a.invalid"),
+                                        ("provider-b", "PROVIDER_B_KEY", "provider-b.invalid"),
+                                        ("extra-a", "EXTRA_KEY_A", "provider-a.invalid"),
+                                        ("extra-b", "EXTRA_KEY_B", "provider-a.invalid")]))
+            key_b = home / ".env"
+            key_b.write_text("PROVIDER_B_KEY=provider-key-two\n")
+            def mixed(api_base=None, **fallbacks):
+                base = f"    api_key: {api_base}\n" if api_base else ""
+                extra = "".join(f"    {key}: {value}\n" for key, value in fallbacks.items())
+                config.write_text(f'''listen_port: {port}
 request_timeout_seconds: 3
 proxies:
   us: "http://127.0.0.1:{a.server_address[1]}"
   jp: "http://127.0.0.1:{b.server_address[1]}"
-accounts:
-  account-a: us
-api_key_providers:
-  - api_key_env: REVERSE_TEST_KEY
-    upstream_base_url: https://provider-a.invalid/v1
-    proxy: us
-  - name: provider-b
-    upstream_base_url: "https://provider-b.invalid/v1"
-    proxy: jp
-    api_key_file: "{key_b.as_posix()}"
-  - upstream_base_url: https://provider-a.invalid/v1
-    api_key_env: EXTRA_KEY_A
-    proxy: us
-  - upstream_base_url: https://provider-a.invalid/v1
-    api_key_env: EXTRA_KEY_B
-    proxy: jp
-''')
+codex:
+  homes: [{json.dumps(str(home))}]
+  base_url:
+    account: "https://chatgpt-mixed.invalid/backend-api"
+{base}  routing:
+    account:
+      account-a: us
+    api_key:
+      REVERSE_TEST_KEY: us
+      provider-b: jp
+      EXTRA_KEY_A: us
+      EXTRA_KEY_B: jp
+{extra}''')
+            mixed()
             restart()
             for token, probe, host in [("chat-mixed-token", a, "chatgpt-mixed.invalid"),
                                         ("provider-key-one", a, "provider-a.invalid"),
@@ -239,14 +247,14 @@ api_key_providers:
                 assert len(probe.requests) > before and len(other.requests) == other_before
                 assert probe.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
                 assert token.encode() not in probe.requests[-1]
-            config.write_text(config.read_text() + "\nmcp_fallback_proxy: jp\n")
+            mixed(mcp_fallback="jp")
             restart()
             for credential in [None, "unknown"]:
                 previous_a, previous_b = len(a.requests), len(b.requests)
                 assert request(token=credential, path="/mcp/openaiDeveloperDocs")[0] == 502
                 assert len(a.requests) == previous_a and len(b.requests) > previous_b
                 assert b.requests[-1].startswith(b"CONNECT developers.openai.com:443 ")
-            config.write_text(config.read_text().replace("mcp_fallback_proxy: jp", "mcp_fallback_proxy: us"))
+            mixed(mcp_fallback="us")
             restart()
             previous_a, previous_b = len(a.requests), len(b.requests)
             assert request(token=None, path="/mcp/openaiDeveloperDocs")[0] == 502
@@ -267,13 +275,13 @@ api_key_providers:
             print("PASS: account usage/profile/credits use matched ChatGPT proxy; API keys rejected before CONNECT")
             total = len(a.requests) + len(b.requests)
             assert request(token="unknown")[0] == 401
-            key_b.write_text("provider-key-one")
+            key_b.write_text("PROVIDER_B_KEY=provider-key-one\n")
             assert request(token="provider-key-one")[0] == 409
-            key_b.write_text("chat-mixed-token")
+            key_b.write_text("PROVIDER_B_KEY=chat-mixed-token\n")
             assert request(token="chat-mixed-token")[0] == 409
             assert len(a.requests) + len(b.requests) == total
             print("PASS: shared listener routes ChatGPT and two API providers; collisions rejected before CONNECT")
-            config.write_text(config.read_text() + "\nopenai_fallback_proxy: jp\n")
+            mixed(api_key_fallback="jp")
             restart()
             # Ambiguous known credentials must still be rejected with fallback enabled.
             assert request(token="chat-mixed-token")[0] == 409
@@ -291,42 +299,39 @@ api_key_providers:
             total = len(a.requests) + len(b.requests)
             assert request(token="unmatched-openai-key", path="/https://other.invalid/v1/responses")[0] == 502
             assert len(a.requests) + len(b.requests) == total
-            config.write_text(config.read_text() + "\napi_key_upstream_base_url: https://fallback-default.invalid/v1\n")
+            mixed("https://fallback-default.invalid/v1", api_key_fallback="jp")
             restart()
             previous_b = len(b.requests)
             assert request(token="unmatched-openai-key")[0] == 502
             assert len(b.requests) > previous_b
             assert b.requests[-1].startswith(b"CONNECT fallback-default.invalid:443 ")
             total = len(a.requests) + len(b.requests)
-            config.write_text(config.read_text().replace("openai_fallback_proxy: jp", "openai_fallback_proxy: missing"))
+            mixed("https://fallback-default.invalid/v1", api_key_fallback="missing")
             assert request(token="unmatched-openai-key")[0] == 502
             assert len(a.requests) + len(b.requests) > total, "Running process retains valid startup configuration"
             invalid = subprocess.run([BINARY, "--config", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             assert invalid.returncode != 0
             login("fallback-account", "fallback-account-token")
+            (home / "config.toml").write_text((codex_home / "config.toml").read_text())
+            key_b.unlink()
             config.write_text(f'''listen_port: {port}
 request_timeout_seconds: 3
-auth_file: "{auth.as_posix()}"
-base_url:
-  account: https://chatgpt-mixed.invalid/backend-api
-  api_key: https://fallback-default.invalid/v1
 proxies:
   us: http://127.0.0.1:{a.server_address[1]}
   jp: http://127.0.0.1:{b.server_address[1]}
-routing:
-  api_key:
-    reverse: us
-    EXTRA_KEY_B: jp
-  account_fallback: us
-  api_key_fallback: jp
-  mcp_fallback: us
+codex:
+  homes: [{json.dumps(str(home))}]
+  base_url:
+    account: https://chatgpt-mixed.invalid/backend-api
+    api_key: https://fallback-default.invalid/v1
+  routing:
+    api_key:
+      reverse: us
+      EXTRA_KEY_B: jp
+    account_fallback: us
+    api_key_fallback: jp
+    mcp_fallback: us
 ''')
-            migrated = temp / "migrated.yaml"
-            subprocess.run([BINARY, "--config", str(config), "--write-config", str(migrated)], check=True)
-            assert os.name == "nt" or migrated.stat().st_mode & 0o777 == 0o600
-            assert "base_url:" in migrated.read_text() and "routing:" in migrated.read_text()
-            migrated.replace(config)
-            config.write_text(re.sub(r"(?m)^  homes: .*?$", lambda _: f"  homes: [{json.dumps(str(codex_home))}]", config.read_text()))
             restart()
             for credential, path, probe, host in [
                 ("fallback-account-token", "/v1/responses", a, "chatgpt-mixed.invalid"),
@@ -340,7 +345,7 @@ routing:
                 assert request(token=credential, path=path)[0] == 502
                 assert len(probe.requests) > before
                 assert probe.requests[-1].startswith(f"CONNECT {host}:443 ".encode())
-            print("PASS: nested base_url/routing schema, independent account/API/MCP fallbacks and private migration")
+            print("PASS: nested base_url/routing schema, independent account/API/MCP fallbacks")
             # Provider auth selection mirrors Codex: env > explicit bearer > saved
             # OpenAI auth (only when requires_openai_auth is true). All synthetic.
             config.write_text(f'''listen_port: {port}

@@ -46,54 +46,18 @@ impl<'de> Deserialize<'de> for Claude {
         let map = value
             .as_mapping_mut()
             .ok_or_else(|| D::Error::custom("Claude settings must be a mapping."))?;
-        let has_routing = map.contains_key("routing");
-        let legacy_keys = ["api_key", "account_fallback", "api_key_fallback"];
-        let inline_proxy = map
-            .get("accounts")
-            .and_then(|v| v.as_mapping())
-            .is_some_and(|m| m.values().any(|v| v.get("proxy").is_some()));
-        if has_routing && (inline_proxy || legacy_keys.iter().any(|k| map.contains_key(*k))) {
+        // Routing lives under `routing`; the retired inline layout put it on
+        // the section itself and on each account.
+        if ["api_key", "account_fallback", "api_key_fallback"]
+            .iter()
+            .any(|key| map.contains_key(*key))
+        {
             return Err(D::Error::custom(
-                "Do not mix Claude routing with legacy inline proxy settings.",
+                "Claude routing settings belong under claude.routing.",
             ));
         }
-        if let Some(base) = map.get_mut("base_url") {
-            if base.is_mapping() {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct LegacyBases {
-                    #[serde(default = "default_base")]
-                    account: String,
-                    #[serde(default = "default_base")]
-                    api_key: String,
-                }
-                let old: LegacyBases =
-                    serde_yaml_ng::from_value(base.clone()).map_err(D::Error::custom)?;
-                if old.account != old.api_key {
-                    return Err(D::Error::custom(
-                        "Claude uses one base_url; differing legacy account/API Key bases require choosing one upstream.",
-                    ));
-                }
-                *base = old.account.into();
-            }
-        }
-        if !has_routing {
-            let mut routing = serde_yaml_ng::Mapping::new();
-            for key in legacy_keys {
-                if let Some(value) = map.remove(key) {
-                    routing.insert(key.into(), value);
-                }
-            }
-            let mut accounts = serde_yaml_ng::Mapping::new();
-            if let Some(sources) = map.get_mut("accounts").and_then(|v| v.as_mapping_mut()) {
-                for (label, source) in sources {
-                    if let Some(proxy) = source.as_mapping_mut().and_then(|v| v.remove("proxy")) {
-                        accounts.insert(label.clone(), proxy);
-                    }
-                }
-            }
-            routing.insert("account".into(), serde_yaml_ng::Value::Mapping(accounts));
-            map.insert("routing".into(), serde_yaml_ng::Value::Mapping(routing));
+        if map.get("base_url").is_some_and(|base| !base.is_string()) {
+            return Err(D::Error::custom("Claude base_url must be a single URL."));
         }
         normalize_auth(&mut value).map_err(D::Error::custom)?;
         #[derive(Deserialize)]
@@ -107,6 +71,7 @@ impl<'de> Deserialize<'de> for Claude {
             base_url: String,
             #[serde(default)]
             accounts: BTreeMap<String, AccountSource>,
+            #[serde(default)]
             routing: Routing,
         }
         let n: Normalized = serde_yaml_ng::from_value(value).map_err(D::Error::custom)?;
@@ -483,7 +448,7 @@ impl Claude {
             let proxy = self.routing.account_probe.as_ref()
                 .or(self.routing.account_fallback.as_ref())
                 .ok_or(Error::config(
-                    "Claude profile lookup requires routing.account_probe (or legacy routing.account_fallback).",
+                    "Claude profile lookup requires routing.account_probe or routing.account_fallback.",
                 ))?;
             ("claude-profile".into(), proxy.clone())
         } else if let Some(proxy) = if bearer {
@@ -761,9 +726,7 @@ mod tests {
             serde_json::to_string(&dir.path().join("a")).unwrap(),
             serde_json::to_string(&dir.path().join("b")).unwrap()
         )).unwrap();
-        let mut c = Config::parse(&config.canonical_yaml().unwrap())
-            .unwrap()
-            .claude;
+        let mut c = config.claude;
         c.check_credentials().await.unwrap();
         for label in ["a", "b"] {
             let mut headers = HeaderMap::new();
@@ -779,16 +742,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer token-b".parse().unwrap());
         assert!(c.resolve(&headers).await.is_err());
-        // Legacy named sources also resolve relative files in each listed directory.
-        c.accounts.clear();
-        c.accounts.insert(
-            "a".into(),
-            AccountSource {
-                auth_file: Some("nested/login.json".into()),
-                auth_env: None,
-            },
-        );
-        c.check_credentials().await.unwrap();
     }
 
     fn config(extra: &str) -> Config {
@@ -814,8 +767,7 @@ claude:
     account_fallback: payload
 "#,
         );
-        let encoded = config.canonical_yaml().unwrap();
-        let mut c = Config::parse(&encoded).unwrap().claude;
+        let mut c = config.claude;
         // A readable local login that differs from the request token, so the
         // result does not depend on the machine's own ~/.claude.
         let dir = tempfile::tempdir().unwrap();
@@ -967,7 +919,7 @@ claude:
 
     #[tokio::test]
     async fn fallbacks_require_valid_auth_and_preserve_header_type_and_betas() {
-        let c = config("claude:\n  account_auth_file_only: false\n  account_fallback: none\n  api_key_fallback: none\n").claude;
+        let c = config("claude:\n  account_auth_file_only: false\n  routing:\n    account_fallback: none\n    api_key_fallback: none\n").claude;
         for bearer in [false, true] {
             let mut h = HeaderMap::new();
             let name = if bearer { "authorization" } else { "x-api-key" };
@@ -1018,14 +970,14 @@ claude:
     }
 
     #[test]
-    fn configuration_validates_sources_and_preserves_migration() {
+    fn configuration_validates_sources() {
         for extra in [
-            "api_key:\n    BAD-NAME: none",
-            "account_fallback: []",
-            "api_key_fallback: absent",
-            "base_url: http://api.anthropic.com",
-            "accounts:\n    local:\n      auth_env: TOKEN\n      auth_file: file\n      proxy: none",
-            "accounts:\n    local:\n      auth_file: ''\n      proxy: none",
+            "codex:\n  routing:\n      api_key:\n        BAD-NAME: none",
+            "codex:\n  routing:\n      account_fallback: []",
+            "codex:\n  routing:\n      api_key_fallback: absent",
+            "codex:\n  base_url: http://api.anthropic.com",
+            "auth_env: TOKEN\n  auth_file: file\n  routing:\n    account: {default: none}",
+            "auth_file: ''\n  routing:\n    account: {default: none}",
         ] {
             assert!(
                 Config::parse(&format!(
@@ -1035,26 +987,10 @@ claude:
                 "{extra}"
             );
         }
-        let c = config(
-            "claude:\n  config_dirs: [~/.claude]\n  accounts:\n    local:\n      auth_file: .credentials.json\n      proxy: none\n  api_key:\n    ANTHROPIC_API_KEY: none\n  account_fallback: [none]\n",
-        );
-        let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
-        assert!(roundtrip.claude.accounts.contains_key("default"));
-        assert!(
-            roundtrip
-                .claude
-                .routing
-                .api_key
-                .contains_key("ANTHROPIC_API_KEY")
-        );
-        assert!(roundtrip.claude.routing.account_fallback.is_some());
-        assert_eq!(roundtrip.claude.routing.account["default"].label(), "none");
-        assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
-        assert_eq!(roundtrip.claude.base_url, "https://api.anthropic.com");
     }
 
     #[test]
-    fn claude_has_one_base_and_rejects_conflicting_legacy_bases() {
+    fn claude_has_one_base_and_rejects_split_bases() {
         let c = config("claude:\n  base_url: https://gateway.invalid/api\n  routing:\n    account_fallback: none\n    api_key_fallback: none\n").claude;
         assert_eq!(
             c.url("/v1/messages?beta=true").unwrap().as_str(),
@@ -1147,7 +1083,7 @@ claude:
         )
         .unwrap();
         std::fs::write(&metadata, r#"{"oauthAccount":{"accountUuid":"local-id","emailAddress":"local@example.invalid","displayName":"Local"}}"#).unwrap();
-        let mut c = config(&format!("claude:\n  auth_file: {}\n  routing:\n    account:\n      local-id: none\n      local@example.invalid: none\n    account_fallback: none\n", serde_json::to_string(&credentials.to_string_lossy()).unwrap())).claude;
+        let mut c = config(&format!("claude:\n  config_dirs: [{}]\n  auth_file: .credentials.json\n  routing:\n    account:\n      local-id: none\n      local@example.invalid: none\n    account_fallback: none\n", serde_json::to_string(&dir.path()).unwrap())).claude;
         c.routing
             .account
             .insert("local-id".into(), Choice::One("uuid-route".into()));

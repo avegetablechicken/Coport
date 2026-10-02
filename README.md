@@ -103,9 +103,8 @@ for a provider are accepted; a shared key resolving to different upstreams is
 rejected as ambiguous. Identical provider credentials with the same upstream are
 deduplicated within a route.
 
-Explicit absolute `auth_file` sources remain supported for older configurations.
-They are separately authorized file sources,
-not implicit directory discovery. `auth_env` is an alternative account source
+`auth_file` is a file name relative to each listed directory; absolute paths,
+`~` and `..` are rejected, so list another directory instead. `auth_env` is an alternative account source
 and cannot be combined with `auth_file`; Codex also checks `.env` in the listed
 homes for that variable. Different account-token values for the same variable
 across homes are rejected as ambiguous. Claude reads saved OAuth
@@ -115,11 +114,7 @@ read per request, so their rotation takes effect without restarting; `.env` chan
 also take effect on the next credential lookup. The clients handle login
 and token refresh; keychain-only credentials are not read by this service.
 
-Only configure `routing.api_key` when needed. Migration omits empty API Key maps
-and unused default Codex API Key base URLs. Existing configured API Key routes
-are retained. Older nested `accounts` remain readable for compatibility; do not
-mix them with direct `auth_file`/`auth_env`. Multiple or ambiguous legacy named
-sources remain nested when flattening would alter routing.
+Only configure `routing.api_key` when needed.
 
 ### Service-specific matching
 
@@ -250,8 +245,7 @@ all outbound selection happens in this service, independently of client proxy
 environment variables.
 
 Every routing value accepts a proxy name, `none`, or an ordered list.
-Proxy candidate lists are always written inline, for example `[jp_lab, jp]`;
-migration preserves their order and avoids multiline lists:
+Proxy candidate lists are tried in order, for example `[jp_lab, jp]`:
 
 ```yaml
 codex:
@@ -315,33 +309,18 @@ Replace lists as a whole, e.g. `-c 'codex.homes=["~/.codex"]'`.
 Overrides apply in command-line order (the last assignment wins), create missing
 mapping sections, and undergo the same validation as the configuration file.
 Paths cannot traverse existing scalar, null or list values. Unknown settings and
-invalid types are rejected. With legacy configurations, use the paths present in
-that file; the existing restrictions on mixing old and new layouts still apply.
-Overrides affect startup and `--check` without modifying the source file.
-To save the resulting configuration, add `--write-config config.new.yaml`.
+invalid types are rejected. Overrides affect startup and `--check` without
+modifying the source file.
 
-### Migrate older configurations
+### Older configurations
 
-Older top-level Codex `auth_file`, `account_auth_file_only`, `base_url` and `routing`
-are still accepted, along with the earlier legacy upstream/provider fields.
-Old Claude inline `accounts.<label>.proxy`, `api_key` and fallback fields are also
-accepted. A legacy split Claude base URL is accepted only when both URLs agree. Do not mix `codex` with top-level Codex fields,
-or Claude's new `routing` with its old inline routing fields: ambiguous settings
-are rejected, including explicit null legacy keys.
-
-The migration command writes the symmetric layout to a private file:
-
-```sh
-target/release/coding-agent-proxy --config config.yaml --write-config config.new.yaml
-target/release/coding-agent-proxy --config config.new.yaml --check
-```
-
-It flattens single saved-login files into each service section, preserves ID/email
-routing and proxy choices, and writes one Claude base URL. Claude source labels
-become `default` when flattened. Empty API Key maps are omitted. Both formats behave the same
-after migration. Legacy API Key entries with per-route upstream overrides, key
-files or unrepresentable duplicate selectors are refused instead of silently
-losing settings. Back up the active configuration before replacing it, then restart.
+Earlier layouts are no longer read. Top-level Codex settings (`auth_file`,
+`base_url`, `routing`, `accounts`, `api_key_providers`, `*_upstream_base_url`,
+`*_fallback_proxy`), nested `accounts` sources, absolute `auth_file` paths and
+Claude inline routing fields or split base URLs are rejected at startup. Move
+Codex settings under `codex:`, Claude routing under `claude.routing`, and
+replace absolute credential paths with `homes`/`config_dirs` plus a relative
+`auth_file`.
 
 ## Connect Codex
 
@@ -406,7 +385,7 @@ Set the Codex client base URL to
 `http://127.0.0.1:8787/codex/https://provider.example.com/v1`.
 URL routes require a Bearer token, which the upstream validates; they do not
 require a local provider credential source or a fallback. They preserve request
-paths, queries, bodies and streaming responses. `--check` and migration recognize
+paths, queries, bodies and streaming responses. `--check` recognizes
 URL selectors without looking them up as environment variables.
 
 In routing keys, both `https://` and the API path may be omitted. A key such as
@@ -461,7 +440,7 @@ connect:
 Values refer to names in `proxies`; `none` explicitly selects direct TCP.
 Unlisted destinations return 403. Hostnames are case-insensitive; ports must
 match. IPv6 literals use `[address]:port`. Configure any additional destinations
-needed by the client. This setting is preserved by configuration migration.
+needed by the client.
 
 Clients that support an HTTP proxy can then use
 `HTTPS_PROXY=http://127.0.0.1:8787` with their original HTTPS URLs. This also carries
@@ -903,7 +882,7 @@ cargo test --locked -p coding-agent-proxy-gui
 Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
 HTTP/HTTPS CONNECT, early SSE delivery, proxy selection, request framing, and
 MCP credential isolation. Python integration tests cover account/API Key routing,
-credential refresh, configuration snapshots, migration, fallback refusal and
+credential refresh, configuration snapshots, fallback refusal and
 HTTP/SOCKS5 authentication. They do not call a real model. CI runs these checks
 and builds release binaries for all three operating systems.
 
@@ -924,8 +903,8 @@ the release executable.
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | CLI, private config migration, startup and shutdown |
-| `src/config.rs` | YAML compatibility and validation |
+| `src/main.rs` | CLI, configuration overrides, startup and shutdown |
+| `src/config.rs` | YAML parsing and validation |
 | `src/identity.rs` | Account metadata, native TOML parsing, environment and shell credentials |
 | `src/routing.rs` | Credential matching, upstream URL mapping |
 | `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming |

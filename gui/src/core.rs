@@ -300,15 +300,6 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             &config.claude.routing,
             false,
         ),
-        legacy_providers: config
-            .codex
-            .providers
-            .iter()
-            .map(|p| RouteRow {
-                selector: p.label().to_owned(),
-                proxies: p.proxy.names().to_vec(),
-            })
-            .collect(),
     }
 }
 
@@ -439,7 +430,6 @@ struct ConfigDetails {
     proxies: Vec<ProxyDto>,
     codex: ServiceDto,
     claude: ServiceDto,
-    legacy_providers: Vec<RouteRow>,
 }
 
 #[derive(Serialize)]

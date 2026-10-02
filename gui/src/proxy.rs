@@ -86,7 +86,7 @@ impl Controller {
     }
 
     fn spawn(&mut self, config_path: &Path, log_path: PathBuf) -> Result<Phase, String> {
-        let config = Config::read(config_path, false).map_err(|e| e.message.to_string())?;
+        let config = Config::read(config_path).map_err(|e| e.message.to_string())?;
         let port = config.listen_port;
         let listener = self
             .rt
@@ -160,7 +160,7 @@ impl Controller {
             s.check = None;
         }
         self.rt.spawn(async move {
-            let result = match Config::read(&path, false) {
+            let result = match Config::read(&path) {
                 Ok(config) => config.check_credentials().await.map(|_| ()),
                 Err(e) => Err(e),
             };

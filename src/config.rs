@@ -120,50 +120,47 @@ impl Default for Codex {
         }
     }
 }
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A non-URL `codex.routing.api_key` selector: a Codex provider ID or an API Key
+/// environment variable name, with its proxy choice.
+#[derive(Clone)]
 pub struct Provider {
-    pub name: Option<String>,
-    pub api_key_env: Option<String>,
-    pub api_key_file: Option<String>,
-    pub upstream_base_url: Option<String>,
+    pub selector: String,
     pub proxy: Choice,
-    #[serde(skip)]
-    pub selector: Option<String>,
 }
 impl Provider {
     pub fn label(&self) -> &str {
-        self.selector
-            .as_deref()
-            .or(self.name.as_deref())
-            .or(self.api_key_env.as_deref())
-            .unwrap_or("")
+        &self.selector
     }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    codex: Option<Codex>,
+    #[serde(default)]
+    codex: Codex,
     #[serde(default)]
     claude: crate::claude::Claude,
     listen_port: u16,
     request_timeout_seconds: f64,
-    auth_file: Option<String>,
-    account_auth_file_only: Option<bool>,
     #[serde(default)]
     proxies: BTreeMap<String, String>,
     #[serde(default)]
     connect: BTreeMap<String, Choice>,
-    base_url: Option<Bases>,
-    routing: Option<Routing>,
-    account_upstream_base_url: Option<String>,
-    upstream_base_url: Option<String>,
-    api_key_upstream_base_url: Option<String>,
-    accounts: Option<BTreeMap<String, Choice>>,
-    api_key_providers: Option<Vec<Provider>>,
-    openai_fallback_proxy: Option<Choice>,
-    mcp_fallback_proxy: Option<Choice>,
 }
+/// Top-level keys of the retired configuration layout, now rejected with a
+/// pointer to the `codex` section instead of a generic unknown-field error.
+const RETIRED_TOP_LEVEL: [&str; 11] = [
+    "auth_file",
+    "account_auth_file_only",
+    "base_url",
+    "routing",
+    "account_upstream_base_url",
+    "upstream_base_url",
+    "api_key_upstream_base_url",
+    "accounts",
+    "api_key_providers",
+    "openai_fallback_proxy",
+    "mcp_fallback_proxy",
+];
 #[derive(Clone)]
 pub struct Config {
     pub codex: Codex,
@@ -177,121 +174,30 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let mut root: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)
             .map_err(|_| Error::config("Invalid YAML configuration."))?;
+        if RETIRED_TOP_LEVEL.iter().any(|key| root.get(*key).is_some()) {
+            return Err(Error::config(
+                "Top-level Codex settings are not supported; place them under codex.",
+            ));
+        }
         if let Some(codex) = root.get_mut("codex") {
             normalize_auth(codex)?;
         }
-        let raw: Raw = serde_yaml_ng::from_value(root.clone()).map_err(|_| {
+        let raw: Raw = serde_yaml_ng::from_value(root).map_err(|_| {
             Error::config(
                 "Invalid YAML configuration; check required fields against config.example.yaml.",
             )
         })?;
-        // Even explicitly null legacy keys conflict with the new namespace.
-        if root.get("codex").is_some()
-            && [
-                "auth_file",
-                "account_auth_file_only",
-                "base_url",
-                "routing",
-                "account_upstream_base_url",
-                "upstream_base_url",
-                "api_key_upstream_base_url",
-                "accounts",
-                "api_key_providers",
-                "openai_fallback_proxy",
-                "mcp_fallback_proxy",
-            ]
+        let mut codex = raw.codex;
+        codex.providers = codex
+            .routing
+            .api_key
             .iter()
-            .any(|key| root.get(*key).is_some())
-        {
-            return Err(Error::config(
-                "Do not mix codex with legacy top-level Codex settings.",
-            ));
-        }
-        if raw.base_url.is_some()
-            && (raw.account_upstream_base_url.is_some()
-                || raw.upstream_base_url.is_some()
-                || raw.api_key_upstream_base_url.is_some())
-            || raw.routing.is_some()
-                && (raw.accounts.is_some()
-                    || raw.api_key_providers.is_some()
-                    || raw.openai_fallback_proxy.is_some()
-                    || raw.mcp_fallback_proxy.is_some())
-            || raw.account_upstream_base_url.is_some() && raw.upstream_base_url.is_some()
-        {
-            return Err(Error::config(
-                "Do not mix new and legacy configuration fields.",
-            ));
-        }
-        let base_url = raw.base_url.unwrap_or(Bases {
-            account: raw
-                .account_upstream_base_url
-                .or(raw.upstream_base_url)
-                .unwrap_or_else(account_base),
-            api_key: raw.api_key_upstream_base_url.unwrap_or_else(api_base),
-        });
-        let routing = raw.routing.unwrap_or(Routing {
-            account: raw.accounts.unwrap_or_default(),
-            api_key_fallback: raw.openai_fallback_proxy,
-            mcp_fallback: raw.mcp_fallback_proxy,
-            ..Default::default()
-        });
-        let providers = raw.api_key_providers.unwrap_or_else(|| {
-            routing
-                .api_key
-                .iter()
-                .filter(|(key, _)| !crate::url_routing::is_url_selector(key))
-                .map(|(k, v)| Provider {
-                    selector: Some(k.clone()),
-                    proxy: v.clone(),
-                    name: None,
-                    api_key_env: None,
-                    api_key_file: None,
-                    upstream_base_url: None,
-                })
-                .collect()
-        });
-        // A migrated source label must not accidentally introduce a match that
-        // did not exist in the original ID/email-only routing map.
-        let mut legacy_label = "default".to_string();
-        while routing.account.contains_key(&legacy_label) {
-            legacy_label.push('_');
-        }
-        let mut codex = raw.codex.unwrap_or_else(|| Codex {
-            homes: default_codex_homes(),
-            accounts: raw
-                .auth_file
-                .filter(|s| !s.is_empty())
-                .map(|auth_file| {
-                    BTreeMap::from([(
-                        legacy_label,
-                        AccountSource {
-                            auth_file: Some(auth_file),
-                            auth_env: None,
-                        },
-                    )])
-                })
-                .unwrap_or_default(),
-            account_auth_file_only: raw.account_auth_file_only.unwrap_or(true),
-            base_url,
-            routing,
-            providers,
-        });
-        if codex.providers.is_empty() {
-            codex.providers = codex
-                .routing
-                .api_key
-                .iter()
-                .filter(|(key, _)| !crate::url_routing::is_url_selector(key))
-                .map(|(k, v)| Provider {
-                    selector: Some(k.clone()),
-                    proxy: v.clone(),
-                    name: None,
-                    api_key_env: None,
-                    api_key_file: None,
-                    upstream_base_url: None,
-                })
-                .collect();
-        }
+            .filter(|(key, _)| !crate::url_routing::is_url_selector(key))
+            .map(|(selector, proxy)| Provider {
+                selector: selector.clone(),
+                proxy: proxy.clone(),
+            })
+            .collect();
         let c = Self {
             codex,
             claude: raw.claude,
@@ -303,19 +209,15 @@ impl Config {
         c.validate()?;
         Ok(c)
     }
-    pub fn read(path: &std::path::Path, migrate: bool) -> Result<Self> {
-        Self::read_with_overrides(path, migrate, &[])
+    pub fn read(path: &std::path::Path) -> Result<Self> {
+        Self::read_with_overrides(path, &[])
     }
     /// Apply dotted YAML overrides in order before configuration validation.
     /// The source file is never modified.
-    pub fn read_with_overrides(
-        path: &std::path::Path,
-        migrate: bool,
-        overrides: &[String],
-    ) -> Result<Self> {
+    pub fn read_with_overrides(path: &std::path::Path, overrides: &[String]) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|_| Error::config("Cannot read configuration file."))?;
-        if !migrate && overrides.is_empty() {
+        if overrides.is_empty() {
             return Self::parse(&text);
         }
         let mut root: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
@@ -323,50 +225,9 @@ impl Config {
         for entry in overrides {
             apply_override(&mut root, entry)?;
         }
-        if let Some(entries) = root
-            .get("routing")
-            .and_then(|v| v.get("api_key"))
-            .and_then(|v| v.as_sequence())
-            .filter(|_| migrate)
-            .cloned()
-        {
-            let mut map = serde_yaml_ng::Mapping::new();
-            for entry in entries {
-                let m = entry
-                    .as_mapping()
-                    .ok_or(Error::config("Invalid legacy API Key mapping."))?;
-                if m.keys()
-                    .any(|k| !matches!(k.as_str(), Some("name" | "api_key_env" | "proxy")))
-                    || (entry.get("api_key_env").is_some()
-                        && entry
-                            .get("name")
-                            .is_some_and(|v| v.as_str() != Some("openai")))
-                {
-                    return Err(Error::config(
-                        "Cannot migrate API Key routes without losing configuration.",
-                    ));
-                }
-                let mut key = entry
-                    .get("api_key_env")
-                    .or(entry.get("name"))
-                    .and_then(|v| v.as_str())
-                    .ok_or(Error::config("Missing API Key identifier."))?;
-                if key == "openai" && entry.get("api_key_env").is_none() {
-                    key = "OPENAI_API_KEY";
-                }
-                let value = entry
-                    .get("proxy")
-                    .ok_or(Error::config("Missing proxy."))?
-                    .clone();
-                if map.insert(key.into(), value).is_some() {
-                    return Err(Error::config("Duplicate API Key mapping after migration."));
-                }
-            }
-            root["routing"]["api_key"] = serde_yaml_ng::Value::Mapping(map);
-        }
         Self::parse(
             &serde_yaml_ng::to_string(&root)
-                .map_err(|_| Error::config("Cannot migrate configuration."))?,
+                .map_err(|_| Error::config("Cannot apply configuration overrides."))?,
         )
     }
     fn validate(&self) -> Result<()> {
@@ -442,23 +303,6 @@ impl Config {
         {
             self.validate_choice(c)?;
         }
-        for p in &self.codex.providers {
-            if p.label().is_empty()
-                || p.api_key_env.is_some() && p.api_key_file.is_some()
-                || [&p.name, &p.api_key_env, &p.api_key_file]
-                    .into_iter()
-                    .flatten()
-                    .any(|s| s.is_empty())
-            {
-                return Err(Error::config(
-                    "Invalid API Key provider credential sources.",
-                ));
-            }
-            self.validate_choice(&p.proxy)?;
-            if let Some(u) = &p.upstream_base_url {
-                validate_upstream(u)?;
-            }
-        }
         Ok(())
     }
     pub(crate) fn validate_choice(&self, c: &Choice) -> Result<()> {
@@ -479,95 +323,6 @@ impl Config {
         } else {
             &self.proxies[name]
         }
-    }
-    pub fn canonical_yaml(&self) -> Result<String> {
-        #[derive(Serialize)]
-        struct Output<'a> {
-            listen_port: u16,
-            request_timeout_seconds: f64,
-            proxies: &'a BTreeMap<String, String>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            connect: &'a BTreeMap<String, Choice>,
-            codex: Codex,
-            claude: &'a crate::claude::Claude,
-        }
-        let mut routing = self.codex.routing.clone();
-        routing
-            .api_key
-            .retain(|key, _| crate::url_routing::is_url_selector(key));
-        for p in &self.codex.providers {
-            if p.api_key_file.is_some()
-                || p.upstream_base_url.is_some()
-                || (p.name.is_some()
-                    && p.api_key_env.is_some()
-                    && p.name.as_deref() != Some("openai"))
-            {
-                return Err(Error::config(
-                    "Cannot encode legacy API Key route without losing configuration.",
-                ));
-            }
-            let key = p
-                .selector
-                .as_deref()
-                .or(p.api_key_env.as_deref())
-                .or(p.name.as_deref())
-                .unwrap();
-            if routing
-                .api_key
-                .insert(key.into(), p.proxy.clone())
-                .is_some()
-            {
-                return Err(Error::config("Duplicate API Key mapping after migration."));
-            }
-        }
-        let mut bases = self.codex.base_url.clone();
-        if bases.account.ends_with("/backend-api/codex") {
-            bases.account.truncate(bases.account.len() - 6);
-        }
-        let mut codex = self.codex.clone();
-        codex.base_url = bases;
-        codex.routing = routing;
-        let mut output = serde_yaml_ng::to_value(&Output {
-            listen_port: self.listen_port,
-            request_timeout_seconds: self.request_timeout_seconds,
-            proxies: &self.proxies,
-            connect: &self.connect,
-            codex,
-            claude: &self.claude,
-        })
-        .map_err(|_| Error::config("Cannot serialize configuration."))?;
-        compact_auth(&mut output["codex"], false);
-        compact_auth(&mut output["claude"], true);
-        if self.codex.providers.is_empty()
-            && self.codex.routing.api_key_fallback.is_none()
-            && self.codex.base_url.api_key == api_base()
-        {
-            output["codex"]["base_url"]
-                .as_mapping_mut()
-                .unwrap()
-                .remove("api_key");
-        }
-        for name in ["codex", "claude"] {
-            let map = output[name].as_mapping_mut().unwrap();
-            let mut ordered = serde_yaml_ng::Mapping::new();
-            for key in [
-                "homes",
-                "config_dirs",
-                "base_url",
-                "auth_file",
-                "account_auth_file_only",
-                "routing",
-            ] {
-                if let Some(value) = map.remove(key) {
-                    ordered.insert(key.into(), value);
-                }
-            }
-            ordered.extend(std::mem::take(map));
-            *map = ordered;
-        }
-        let text = serde_yaml_ng::to_string(&output)
-            .map_err(|_| Error::config("Cannot serialize configuration."))?;
-        inline_proxy_lists(&text)
     }
 }
 
@@ -594,23 +349,26 @@ pub(crate) fn validate_directories(
     }
     for source in accounts.values() {
         if let Some(file) = &source.auth_file {
-            let path = expand(file);
-            if path.is_relative() {
-                if directories.is_empty() {
-                    return Err(Error::config(
-                        "Relative auth_file requires a configured credential directory.",
-                    ));
-                }
-                if path.components().any(|part| {
-                    !matches!(
-                        part,
-                        std::path::Component::Normal(_) | std::path::Component::CurDir
-                    )
-                }) {
-                    return Err(Error::config(
-                        "Relative auth_file must stay inside its credential directory.",
-                    ));
-                }
+            let path = std::path::Path::new(file);
+            if path.is_absolute() || file.starts_with('~') {
+                return Err(Error::config(
+                    "auth_file must be a file name relative to the credential directories.",
+                ));
+            }
+            if directories.is_empty() {
+                return Err(Error::config(
+                    "auth_file requires a configured credential directory.",
+                ));
+            }
+            if path.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) {
+                return Err(Error::config(
+                    "auth_file must stay inside its credential directory.",
+                ));
             }
         }
     }
@@ -639,11 +397,7 @@ pub(crate) fn directory_accounts(
     }
     let mut sources = Vec::new();
     for (label, source) in accounts {
-        if let Some(file) = source
-            .auth_file
-            .as_ref()
-            .filter(|file| expand(file).is_relative())
-        {
+        if let Some(file) = &source.auth_file {
             for directory in directories {
                 let directory = expand(directory);
                 let mut resolved = source.clone();
@@ -712,76 +466,19 @@ fn apply_override(root: &mut serde_yaml_ng::Value, entry: &str) -> Result<()> {
     Ok(())
 }
 
-// Canonical config sequences are ordered proxy choices. Render them on the
-// preceding mapping line, retaining YAML quoting for unusual proxy names.
-fn inline_proxy_lists(text: &str) -> Result<String> {
-    let lines: Vec<_> = text.lines().collect();
-    let mut output = Vec::<String>::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        let indent = line.len() - line.trim_start().len();
-        if line.trim_start().starts_with("- ") && output.last().is_some_and(|s| s.ends_with(':')) {
-            let start = index;
-            index += 1;
-            while index < lines.len() {
-                let next = lines[index];
-                let next_indent = next.len() - next.trim_start().len();
-                if next_indent < indent
-                    || next_indent == indent && !next.trim_start().starts_with("- ")
-                {
-                    break;
-                }
-                index += 1;
-            }
-            let names: Vec<String> = serde_yaml_ng::from_str(&lines[start..index].join("\n"))
-                .map_err(|_| Error::config("Cannot format proxy candidates."))?;
-            let names: Vec<String> = names
-                .into_iter()
-                .map(|name| {
-                    if name
-                        .bytes()
-                        .next()
-                        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-                        && name
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-                        && !matches!(
-                            name.to_ascii_lowercase().as_str(),
-                            "null" | "true" | "false" | "yes" | "no" | "on" | "off"
-                        )
-                    {
-                        name
-                    } else {
-                        serde_json::to_string(&name).unwrap()
-                    }
-                })
-                .collect();
-            output
-                .last_mut()
-                .unwrap()
-                .push_str(&format!(" [{}]", names.join(", ")));
-        } else {
-            output.push(line.into());
-            index += 1;
-        }
-    }
-    Ok(output.join("\n") + "\n")
-}
-
-/// Flat credentials are the normal single-login format. Keep named accounts
-/// readable for compatibility with existing multiple-source configurations.
+/// Turn a flat `auth_file`/`auth_env` into the single `default` account
+/// source used internally. Nested `accounts` maps are not accepted.
 pub(crate) fn normalize_auth(value: &mut serde_yaml_ng::Value) -> Result<()> {
     let Some(map) = value.as_mapping_mut() else {
         return Ok(());
     };
-    if !map.contains_key("auth_file") && !map.contains_key("auth_env") {
-        return Ok(());
-    }
     if map.contains_key("accounts") {
         return Err(Error::config(
-            "Do not mix auth_file/auth_env with nested accounts.",
+            "Nested accounts are not supported; use auth_file or auth_env.",
         ));
+    }
+    if !map.contains_key("auth_file") && !map.contains_key("auth_env") {
+        return Ok(());
     }
     let mut source = serde_yaml_ng::Mapping::new();
     for key in ["auth_file", "auth_env"] {
@@ -799,40 +496,6 @@ pub(crate) fn normalize_auth(value: &mut serde_yaml_ng::Value) -> Result<()> {
     Ok(())
 }
 
-fn compact_auth(service: &mut serde_yaml_ng::Value, claude: bool) {
-    let accounts = service["accounts"].as_mapping().unwrap();
-    if accounts.is_empty() {
-        service.as_mapping_mut().unwrap().remove("accounts");
-        return;
-    }
-    if accounts.len() != 1 {
-        return;
-    }
-    let (label, source) = accounts.iter().next().unwrap();
-    let label = label.clone();
-    let source = source.as_mapping().unwrap().clone();
-    let routes = service["routing"]["account"].as_mapping().unwrap();
-    // Codex keys also identify real account IDs: preserve ambiguous legacy
-    // source labels rather than silently changing ID/profile matching.
-    if !claude
-        && label.as_str() != Some("default")
-        && (routes.contains_key(&label) || routes.contains_key("default"))
-    {
-        return;
-    }
-    if source.is_empty() {
-        return;
-    }
-    if claude {
-        let routes = service["routing"]["account"].as_mapping_mut().unwrap();
-        if let Some(choice) = routes.remove(&label) {
-            routes.insert("default".into(), choice);
-        }
-    }
-    let map = service.as_mapping_mut().unwrap();
-    map.remove("accounts");
-    map.extend(source);
-}
 pub fn expand(path: &str) -> PathBuf {
     if path == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -967,46 +630,62 @@ pub fn redacted_endpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const BASE: &str = "listen_port: 8787\nrequest_timeout_seconds: 3\n";
+
     #[test]
     fn directory_lists_default_only_when_omitted_and_preserve_empty_lists() {
-        let base = "listen_port: 8787\nrequest_timeout_seconds: 3\n";
         for extra in [
             "",
             "codex: {}\nclaude: {}\n",
             "codex:\n  auth_file: auth.json\n  routing:\n    account: {default: none}\nclaude:\n  auth_file: .credentials.json\n  routing:\n    account: {default: none}\n",
         ] {
-            let c = Config::parse(&format!("{base}{extra}")).unwrap();
+            let c = Config::parse(&format!("{BASE}{extra}")).unwrap();
             assert_eq!(c.codex.homes, ["~/.codex"]);
             assert_eq!(c.claude.config_dirs, ["~/.claude"]);
-            let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
-            assert_eq!(roundtrip.codex.homes, c.codex.homes);
-            assert_eq!(roundtrip.claude.config_dirs, c.claude.config_dirs);
         }
         let c = Config::parse(&format!(
-            "{base}codex:\n  homes: []\nclaude:\n  config_dirs: []\n"
+            "{BASE}codex:\n  homes: []\nclaude:\n  config_dirs: []\n"
         ))
         .unwrap();
-        let roundtrip = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
-        assert!(roundtrip.codex.homes.is_empty());
-        assert!(roundtrip.claude.config_dirs.is_empty());
-        assert!(roundtrip.codex.account_sources().is_empty());
-        assert!(roundtrip.claude.account_sources().is_empty());
+        assert!(c.codex.homes.is_empty());
+        assert!(c.claude.config_dirs.is_empty());
+        assert!(c.codex.account_sources().is_empty());
+        assert!(c.claude.account_sources().is_empty());
     }
 
     #[test]
-    fn directory_settings_roundtrip_and_reject_unbound_or_escaping_files() {
+    fn auth_files_are_relative_to_each_credential_directory() {
         for (service, field) in [("codex", "homes"), ("claude", "config_dirs")] {
-            let base = format!("listen_port: 8787\nrequest_timeout_seconds: 3\n{service}:\n");
+            let base = format!("{BASE}{service}:\n");
             let valid = format!(
-                "{base}  {field}: [~/work]\n  accounts:\n    work: {{auth_file: nested/login.json}}\n  routing:\n    account: {{work: none}}\n"
+                "{base}  {field}: [~/work, ~/other]\n  auth_file: nested/login.json\n  routing:\n    account: {{default: none}}\n"
             );
             let c = Config::parse(&valid).unwrap();
-            let output = c.canonical_yaml().unwrap();
-            assert!(output.contains("nested/login.json"));
-            assert!(output.contains("~/work"));
+            let sources = if service == "codex" {
+                c.codex.account_sources()
+            } else {
+                c.claude.account_sources()
+            };
+            let files: Vec<_> = sources
+                .iter()
+                .map(|(label, source, _)| (label.as_str(), source.auth_file.clone().unwrap()))
+                .collect();
             assert_eq!(
-                Config::parse(&output).unwrap().canonical_yaml().unwrap(),
-                output
+                files,
+                [
+                    (
+                        "default",
+                        expand("~/work/nested/login.json")
+                            .to_string_lossy()
+                            .into_owned()
+                    ),
+                    (
+                        "default",
+                        expand("~/other/nested/login.json")
+                            .to_string_lossy()
+                            .into_owned()
+                    ),
+                ]
             );
             for invalid in [
                 format!("{base}  {field}: [relative/path]\n"),
@@ -1015,6 +694,8 @@ mod tests {
                     "{base}  {field}: []\n  auth_file: login.json\n  routing:\n    account: {{default: none}}\n"
                 ),
                 valid.replace("nested/login.json", "../login.json"),
+                valid.replace("nested/login.json", "/absolute/login.json"),
+                valid.replace("nested/login.json", "~/login.json"),
                 format!("{base}  {field}: {{work: ~/work}}\n"),
             ] {
                 assert!(Config::parse(&invalid).is_err(), "{invalid}");
@@ -1023,31 +704,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_layouts_and_proxy_choices() {
-        let base = "listen_port: 7889\nrequest_timeout_seconds: 3\n";
+    fn rejects_retired_layouts() {
+        for key in RETIRED_TOP_LEVEL {
+            let text = format!("{BASE}{key}: {{}}\n");
+            assert!(
+                Config::parse(&text).is_err_and(|e| e.message.contains("under codex")),
+                "{key}"
+            );
+        }
         for invalid in [
-            "unknown: value\n",
-            "routing:\n  api_key_fallback: []\n",
-            "routing:\n  api_key_fallback: missing\n",
-            "routing:\n  unknown: none\n",
-            "base_url: {}\nupstream_base_url: https://api.openai.com/v1\n",
-            "routing: {}\naccounts: {}\n",
-            "codex:\n  homes: []\n  routing:\n    account: {test: none}\n",
-            "routing:\n  api_key:\n    TEST:\n      proxy: none\n",
+            "codex:\n  accounts:\n    a: {auth_file: auth.json}\n  routing:\n    account: {a: none}\n",
+            "claude:\n  accounts:\n    a: {auth_file: .credentials.json}\n  routing:\n    account: {a: none}\n",
+            "claude:\n  accounts:\n    a: {auth_file: .credentials.json, proxy: none}\n",
+            "claude:\n  api_key: {ANTHROPIC_API_KEY: none}\n",
+            "claude:\n  account_fallback: none\n",
+            "claude:\n  api_key_fallback: none\n",
+            "claude:\n  base_url: {account: https://api.anthropic.com, api_key: https://api.anthropic.com}\n",
         ] {
             assert!(
-                Config::parse(&format!("{base}{invalid}")).is_err(),
+                Config::parse(&format!("{BASE}{invalid}")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_layouts_and_proxy_choices() {
+        for invalid in [
+            "unknown: value\n",
+            "codex:\n  routing:\n    api_key_fallback: []\n",
+            "codex:\n  routing:\n    api_key_fallback: missing\n",
+            "codex:\n  routing:\n    unknown: none\n",
+            "codex:\n  typo: true\n",
+            "codex:\n  homes: []\n  routing:\n    account: {test: none}\n",
+            "codex:\n  routing:\n    api_key:\n      TEST:\n        proxy: none\n",
+            "codex:\n  auth_file: auth.json\n  auth_env: TOKEN\n  routing:\n    account: {default: none}\n",
+            "claude:\n  config_dirs: []\n  routing:\n    account: {absent: none}\n",
+            "claude:\n  routing:\n    mcp_fallback: none\n",
+        ] {
+            assert!(
+                Config::parse(&format!("{BASE}{invalid}")).is_err(),
                 "{invalid}"
             );
         }
         assert!(
             Config::parse(&format!(
-                "{base}account_auth_file_only: false\nrouting:\n  account_fallback: none\n"
+                "{BASE}codex:\n  account_auth_file_only: false\n  routing:\n    account_fallback: none\n"
             ))
             .is_ok()
         );
         assert!(Config::parse("listen_port: 0\nrequest_timeout_seconds: .nan\n").is_err());
     }
+
     #[test]
     fn proxy_credentials_ports_and_upstream_validation() {
         for p in [
@@ -1115,142 +823,67 @@ mod tests {
         );
     }
     #[test]
-    fn canonical_migration_roundtrip_and_loss_refusal() {
-        let old = "listen_port: 7889\nrequest_timeout_seconds: 3\nauth_file: ~/auth.json\nupstream_base_url: https://chatgpt.com/backend-api/codex\naccounts:\n  a: none\napi_key_providers:\n  - api_key_env: TEST_KEY\n    proxy: none\n";
-        let c = Config::parse(old).unwrap();
-        let text = c.canonical_yaml().unwrap();
-        let migrated = Config::parse(&text).unwrap();
-        assert_eq!(
-            migrated.codex.base_url.account,
-            "https://chatgpt.com/backend-api"
-        );
-        assert_eq!(migrated.codex.providers[0].label(), "TEST_KEY");
-        let lossy = old.replace(
-            "api_key_env: TEST_KEY",
-            "name: custom\n    api_key_file: ~/key",
-        );
-        assert!(Config::parse(&lossy).unwrap().canonical_yaml().is_err());
-    }
-
-    #[test]
-    fn symmetric_sections_roundtrip_and_reject_conflicting_layouts() {
+    fn sections_parse_flat_credentials_and_api_key_selectors() {
         let text = r#"
 listen_port: 8787
 request_timeout_seconds: 30
 proxies:
   selected: http://127.0.0.1:7893
 codex:
-  accounts:
-    personal: {auth_file: ~/codex-auth.json}
+  auth_file: auth.json
   routing:
-    account: {personal: selected}
-    api_key: {OPENAI_API_KEY: selected}
+    account: {default: selected}
+    api_key: {OPENAI_API_KEY: selected, 'provider.invalid/v1': none}
 claude:
-  accounts:
-    personal: {auth_file: ~/claude-auth.json}
+  auth_env: CLAUDE_TOKEN
   routing:
-    account: {personal: selected}
+    account: {default: selected}
     api_key: {ANTHROPIC_API_KEY: selected}
 "#;
         let c = Config::parse(text).unwrap();
+        // URL selectors route explicit upstreams; only the others are providers.
+        assert_eq!(c.codex.providers.len(), 1);
         assert_eq!(c.codex.providers[0].label(), "OPENAI_API_KEY");
+        assert_eq!(
+            c.codex.accounts["default"].auth_file.as_deref(),
+            Some("auth.json")
+        );
+        assert_eq!(
+            c.claude.accounts["default"].auth_env.as_deref(),
+            Some("CLAUDE_TOKEN")
+        );
         assert_eq!(c.claude.base_url, "https://api.anthropic.com");
-        let serialized = c.canonical_yaml().unwrap();
-        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(&serialized).unwrap();
-        assert_eq!(root.as_mapping().unwrap().len(), 5);
-        assert_eq!(
-            root["codex"]["routing"]["account"]["personal"].as_str(),
-            Some("selected")
-        );
-        assert_eq!(
-            root["claude"]["routing"]["account"]["default"].as_str(),
-            Some("selected")
-        );
-        assert_eq!(
-            root["claude"]["auth_file"].as_str(),
-            Some("~/claude-auth.json")
-        );
-        assert!(root["claude"]["base_url"].is_string());
-        assert_eq!(
-            Config::parse(&serialized)
-                .unwrap()
-                .canonical_yaml()
-                .unwrap(),
-            serialized
-        );
-        let prefix = "listen_port: 8787\nrequest_timeout_seconds: 30\n";
-        for invalid in [
-            "codex: {}\nauth_file: null\n",
-            "codex: {}\nrouting: {}\n",
-            "codex:\n  typo: true\n",
-            "codex:\n  accounts:\n    a: {auth_file: file, auth_env: TOKEN}\n  routing:\n    account: {a: none}\n",
-            "claude:\n  routing: {}\n  api_key: {}\n",
-            "claude:\n  accounts:\n    a: {auth_file: file, proxy: none}\n  routing:\n    account: {a: none}\n",
-            "claude:\n  config_dirs: []\n  routing:\n    account: {absent: none}\n",
-            "claude:\n  routing:\n    mcp_fallback: none\n",
-        ] {
-            assert!(
-                Config::parse(&format!("{prefix}{invalid}")).is_err(),
-                "{invalid}"
-            );
-        }
     }
 
     #[test]
-    fn flat_credentials_and_omitted_api_keys_roundtrip() {
+    fn proxy_candidate_lists_keep_their_order() {
         let text = r#"
 listen_port: 8787
 request_timeout_seconds: 30
+proxies:
+  jp_lab: http://127.0.0.1:7893
+  jp: http://127.0.0.1:7892
 codex:
-  auth_file: ~/.codex/auth.json
   routing:
-    account: {default: none}
-claude:
-  auth_file: ~/.claude/.credentials.json
-  base_url: https://api.anthropic.com
-  routing:
-    account: {default: none}
+    api_key: {TOKEN: [jp_lab, jp]}
+    api_key_fallback: [jp, none]
 "#;
-        let config = Config::parse(text).unwrap();
-        let output = config.canonical_yaml().unwrap();
-        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(&output).unwrap();
-        for name in ["codex", "claude"] {
-            assert!(root[name]["auth_file"].is_string());
-            assert!(root[name].get("accounts").is_none());
-            assert!(root[name]["routing"].get("api_key").is_none());
-        }
-        assert!(root["codex"]["base_url"].get("api_key").is_none());
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.codex.routing.api_key["TOKEN"].names(), ["jp_lab", "jp"]);
         assert_eq!(
-            root["claude"]["base_url"].as_str(),
-            Some("https://api.anthropic.com")
+            c.codex.routing.api_key_fallback.unwrap().names(),
+            ["jp", "none"]
         );
-        assert_eq!(
-            Config::parse(&output).unwrap().canonical_yaml().unwrap(),
-            output
-        );
-        for name in ["codex", "claude"] {
-            let invalid = format!(
-                "listen_port: 8787\nrequest_timeout_seconds: 3\n{name}:\n  auth_file: file\n  accounts: {{}}\n"
-            );
-            assert!(Config::parse(&invalid).is_err());
-        }
-        let with_keys = text.replace(
-            "account: {default: none}",
-            "account: {default: none}\n    api_key: {TEST_KEY: none}",
-        );
-        let output = Config::parse(&with_keys).unwrap().canonical_yaml().unwrap();
-        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(&output).unwrap();
-        assert!(root["codex"]["routing"].get("api_key").is_some());
-        assert!(root["claude"]["routing"].get("api_key").is_some());
     }
 
     #[tokio::test]
     async fn namespaced_codex_url_routes_are_not_credential_sources() {
-        let c = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  routing:\n    api_key:\n      'provider.invalid/v1': none\n").unwrap();
+        let c = Config::parse(&format!(
+            "{BASE}codex:\n  routing:\n    api_key:\n      'provider.invalid/v1': none\n"
+        ))
+        .unwrap();
         assert!(c.codex.providers.is_empty());
         c.check_credentials().await.unwrap();
-        let output = c.canonical_yaml().unwrap();
-        let c = Config::parse(&output).unwrap();
         assert!(
             c.resolve_url(
                 Some("Bearer key"),
@@ -1258,45 +891,6 @@ claude:
             )
             .unwrap()
             .is_some()
-        );
-    }
-
-    #[test]
-    fn proxy_candidates_are_inline_and_preserve_order_and_quoted_names() {
-        let text = r#"
-listen_port: 8787
-request_timeout_seconds: 30
-proxies:
-  jp_lab: http://127.0.0.1:7893
-  jp: http://127.0.0.1:7892
-  'false': none
-  'comma,name': none
-codex:
-  routing:
-    api_key: {TOKEN: [jp_lab, jp]}
-    api_key_fallback: [jp, none]
-    mcp_fallback: ['false', 'comma,name']
-claude:
-  auth_file: ~/.claude/.credentials.json
-  routing:
-    account: {default: [jp_lab, jp]}
-    account_fallback: [jp_lab]
-"#;
-        let c = Config::parse(text).unwrap();
-        let output = c.canonical_yaml().unwrap();
-        assert!(output.contains("TOKEN: [jp_lab, jp]"));
-        assert!(output.contains("default: [jp_lab, jp]"));
-        assert!(output.contains("api_key_fallback: [jp, none]"));
-        assert!(output.contains("account_fallback: [jp_lab]"));
-        assert!(output.contains("mcp_fallback: [\"false\", \"comma,name\"]"));
-        assert!(
-            !output
-                .lines()
-                .any(|line| line.trim_start().starts_with("- "))
-        );
-        assert_eq!(
-            Config::parse(&output).unwrap().canonical_yaml().unwrap(),
-            output
         );
     }
 }

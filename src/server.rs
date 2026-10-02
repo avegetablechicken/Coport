@@ -67,7 +67,7 @@ impl Server {
         let identity = if let Some(identity) = cached {
             identity
         } else {
-            // Before the token's identity is known, account_probe (or the legacy
+            // Before the token's identity is known, account_probe (defaulting to
             // account_fallback) provides the configured lookup transport.
             // Never use a direct
             // or cross-account proxy inferred from an unverified identity.

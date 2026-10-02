@@ -179,7 +179,7 @@ impl Provider {
         shell: bool,
         codex: &Codex,
     ) -> Result<Vec<ProviderCredential>> {
-        if codex.homes.is_empty() || self.api_key_file.is_some() {
+        if codex.homes.is_empty() {
             return self
                 .credential(default, shell, None, None)
                 .await
@@ -219,26 +219,12 @@ impl Provider {
         home: Option<&Path>,
         environment: Option<&crate::codex_env::Environment>,
     ) -> Result<ProviderCredential> {
-        if let Some(path) = &self.api_key_file {
-            let raw = std::fs::read_to_string(expand(path))
-                .map_err(|_| Error::config("Cannot read API Key file."))?;
-            let upstream = unwrap_upstream(self.upstream_base_url.as_deref().unwrap_or(default))?;
-            return Ok(ProviderCredential {
-                token: key(&raw)?,
-                upstream,
-                account_id: None,
-            });
-        }
         let defs = definitions(home)?;
-        let selected_id = self
-            .name
-            .as_deref()
-            .or(self.selector.as_deref().filter(|s| defs.contains_key(*s)));
-        let selected_env = self.api_key_env.as_deref().or(if selected_id.is_none() {
-            self.selector.as_deref()
-        } else {
-            None
-        });
+        // A selector is a Codex provider ID when one is defined, otherwise an
+        // API Key environment variable name.
+        let selector = self.selector.as_str();
+        let selected_id = defs.contains_key(selector).then_some(selector);
+        let selected_env = selected_id.is_none().then_some(selector);
         let named = if let Some(id) = selected_id {
             Some((
                 id,
@@ -294,12 +280,9 @@ impl Provider {
                 "Codex provider has no configured Bearer credential.",
             ));
         };
-        let upstream = self
-            .upstream_base_url
-            .as_deref()
-            .or(definition
-                .filter(|(id, _)| *id != "openai")
-                .and_then(|(_, d)| d.base_url.as_deref()))
+        let upstream = definition
+            .filter(|(id, _)| *id != "openai")
+            .and_then(|(_, d)| d.base_url.as_deref())
             .unwrap_or(default);
         Ok(ProviderCredential {
             token,
@@ -595,7 +578,6 @@ mod tests {
             serde_json::to_string(&dir.path().join("a")).unwrap(),
             serde_json::to_string(&dir.path().join("b")).unwrap()
         )).unwrap();
-        let c = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
         c.check_credentials().await.unwrap();
         for label in ["a", "b"] {
             assert_eq!(
@@ -622,7 +604,7 @@ mod tests {
         );
         let i = Identity::from_token(&token).unwrap();
         assert_eq!(i.usernames, vec!["profile@example.com"]);
-        let config=Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\naccount_auth_file_only: false\nrouting:\n  account:\n    account-1: none\n    profile@example.com: other\nproxies:\n  other: http://localhost:8080\n").unwrap();
+        let config=Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\nproxies:\n  other: http://localhost:8080\ncodex:\n  account_auth_file_only: false\n  routing:\n    account:\n      account-1: none\n      profile@example.com: other\n").unwrap();
         let route = config
             .resolve(Some(&format!("Bearer {token}")), true)
             .await
@@ -652,14 +634,13 @@ mod tests {
     async fn saved_identity_rotates_and_duplicate_keys_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let auth = dir.path().join("auth.json");
-        let keyfile = dir.path().join("api.key");
+        let env = dir.path().join(".env");
         let write = |id: &str, token: &str| {
             std::fs::write(&auth,json!({"tokens":{"account_id":id,"access_token":token,"id_token":jwt(json!({"email":"id@example.com"}))}}).to_string()).unwrap()
         };
         write("a", "token-a");
-        std::fs::write(&keyfile, "other-key").unwrap();
-        let quoted = |p: &std::path::Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
-        let c=Config::parse(&format!("listen_port: 7889\nrequest_timeout_seconds: 3\nauth_file: {}\naccounts:\n  a: none\n  b: none\napi_key_providers:\n  - name: test\n    api_key_file: {}\n    proxy: none\n",quoted(&auth),quoted(&keyfile))).unwrap();
+        std::fs::write(&env, "SAVED_IDENTITY_TEST_KEY_5170=other-key\n").unwrap();
+        let c=Config::parse(&format!("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    account: {{a: none, b: none}}\n    api_key: {{SAVED_IDENTITY_TEST_KEY_5170: none}}\n",serde_json::to_string(&dir.path()).unwrap())).unwrap();
         assert_eq!(
             Identity::read(auth.to_str().unwrap()).unwrap().usernames,
             vec!["id@example.com"]
@@ -675,7 +656,7 @@ mod tests {
                 .as_deref(),
             Some("b")
         );
-        std::fs::write(&keyfile, "token-b").unwrap();
+        std::fs::write(&env, "SAVED_IDENTITY_TEST_KEY_5170=token-b\n").unwrap();
         assert_eq!(
             c.resolve(Some("Bearer token-b"), true)
                 .await
@@ -688,40 +669,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn symmetric_codex_sources_route_by_label_and_preserve_identity_priority() {
+    async fn codex_homes_route_by_identity_and_reject_shared_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.json");
-        let b = dir.path().join("b.json");
-        for (path, id, token) in [(&a, "id-a", "secret-a"), (&b, "id-b", "secret-b")] {
+        let homes = [dir.path().join("a"), dir.path().join("b")];
+        let write = |home: &Path, id: &str, token: &str| {
             std::fs::write(
-                path,
+                home.join("auth.json"),
                 json!({"tokens":{"account_id":id,"access_token":token}}).to_string(),
             )
-            .unwrap();
+            .unwrap()
+        };
+        for (home, id, token) in [
+            (&homes[0], "id-a", "secret-a"),
+            (&homes[1], "id-b", "secret-b"),
+        ] {
+            std::fs::create_dir(home).unwrap();
+            write(home, id, token);
         }
         let text = format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:7893\ncodex:\n  accounts:\n    personal:\n      auth_file: {}\n    work:\n      auth_file: {}\n  routing:\n    account:\n      personal: selected\n      work: none\n",
-            serde_json::to_string(&a.to_string_lossy()).unwrap(),
-            serde_json::to_string(&b.to_string_lossy()).unwrap()
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:7893\ncodex:\n  homes: [{}, {}]\n  routing:\n    account:\n      id-a: selected\n      id-b: none\n",
+            serde_json::to_string(&homes[0]).unwrap(),
+            serde_json::to_string(&homes[1]).unwrap()
         );
         let mut c = Config::parse(&text).unwrap();
         c.check_credentials().await.unwrap();
-        assert_eq!(
-            c.resolve(Some("Bearer secret-a"), true)
-                .await
-                .unwrap()
-                .proxy
-                .label(),
-            "selected"
-        );
-        assert_eq!(
-            c.resolve(Some("Bearer secret-b"), true)
-                .await
-                .unwrap()
-                .proxy
-                .label(),
-            "none"
-        );
+        for (token, label) in [("secret-a", "selected"), ("secret-b", "none")] {
+            assert_eq!(
+                c.resolve(Some(&format!("Bearer {token}")), true)
+                    .await
+                    .unwrap()
+                    .proxy
+                    .label(),
+                label
+            );
+        }
         c.codex
             .routing
             .account
@@ -734,9 +715,7 @@ mod tests {
                 .label(),
             "none"
         );
-        c.codex
-            .accounts
-            .insert("duplicate".into(), c.codex.accounts["personal"].clone());
+        write(&homes[1], "id-a", "secret-a");
         assert_eq!(
             c.resolve(Some("Bearer secret-a"), true)
                 .await
@@ -746,24 +725,5 @@ mod tests {
             409
         );
         assert!(c.check_credentials().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn legacy_source_label_cannot_create_an_account_route() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("auth.json");
-        std::fs::write(
-            &file,
-            json!({"tokens":{"account_id":"unmapped","access_token":"secret"}}).to_string(),
-        )
-        .unwrap();
-        let old = format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 3\nauth_file: {}\nrouting:\n  account:\n    default: none\n",
-            serde_json::to_string(&file.to_string_lossy()).unwrap()
-        );
-        let c = Config::parse(&old).unwrap();
-        assert!(c.resolve(Some("Bearer secret"), true).await.is_err());
-        let migrated = Config::parse(&c.canonical_yaml().unwrap()).unwrap();
-        assert!(migrated.resolve(Some("Bearer secret"), true).await.is_err());
     }
 }
