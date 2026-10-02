@@ -21,9 +21,26 @@ pub enum Phase {
 #[derive(Clone)]
 pub enum Probe {
     Pending,
-    Reachable(Duration),
+    Reachable {
+        latency: Duration,
+        /// Looked up for proxies on this machine only.
+        exit: Option<Exit>,
+    },
     Unreachable(String),
 }
+
+/// Where traffic through a proxy leaves for the internet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Exit {
+    pub ip: String,
+    /// ISO 3166-1 alpha-2 country or region code.
+    pub country: Option<String>,
+}
+
+/// Cloudflare's diagnostics endpoint: no key needed, answers with the
+/// caller's address (`ip=`) and country or region (`loc=`). The IPv4 literal
+/// makes dual-stack exits report their (shorter, more familiar) IPv4 address.
+const TRACE_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
 
 #[derive(Clone)]
 pub struct CheckResult {
@@ -36,7 +53,7 @@ struct Shared {
     phase: Option<Phase>,
     check: Option<CheckResult>,
     checking: bool,
-    probes: BTreeMap<String, Probe>,
+    probes: BTreeMap<String, (Probe, Instant)>,
 }
 
 struct Running {
@@ -187,36 +204,62 @@ impl Controller {
         (s.checking, s.check.clone())
     }
 
-    /// TCP reachability of an outbound proxy endpoint.
+    /// Tests an outbound proxy. Proxies on this machine (typically local
+    /// clients that switch nodes) get a request through them to learn the
+    /// exit address; other proxies get a TCP connection check.
     pub fn probe(&self, name: &str, endpoint: &str) {
         let Some(addr) = host_port(endpoint) else {
-            self.lock().probes.insert(
-                name.to_owned(),
-                Probe::Unreachable("Invalid proxy URL".into()),
-            );
+            self.set_probe(name, Probe::Unreachable("Invalid proxy URL".into()));
             return;
         };
-        self.lock().probes.insert(name.to_owned(), Probe::Pending);
+        self.set_probe(name, Probe::Pending);
         let shared = self.shared.clone();
         let notify = self.notify.clone();
         let name = name.to_owned();
+        let endpoint = endpoint.to_owned();
         self.rt.spawn(async move {
-            let started = Instant::now();
-            let result =
-                tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
-                    .await;
-            let probe = match result {
-                Ok(Ok(_)) => Probe::Reachable(started.elapsed()),
-                Ok(Err(e)) => Probe::Unreachable(e.kind().to_string()),
-                Err(_) => Probe::Unreachable("timed out".into()),
+            let probe = if is_local(&endpoint) {
+                trace(&endpoint).await
+            } else {
+                connect(addr).await
             };
-            shared.lock().unwrap().probes.insert(name, probe);
+            shared
+                .lock()
+                .unwrap()
+                .probes
+                .insert(name, (probe, Instant::now()));
             notify();
         });
     }
 
+    /// Probes proxies without a result newer than `max_age`.
+    pub fn probe_stale<'a>(
+        &self,
+        proxies: impl IntoIterator<Item = (&'a String, &'a String)>,
+        max_age: Duration,
+    ) {
+        for (name, endpoint) in proxies {
+            let stale = self.lock().probes.get(name).is_none_or(|(probe, at)| {
+                !matches!(probe, Probe::Pending) && at.elapsed() > max_age
+            });
+            if stale {
+                self.probe(name, endpoint);
+            }
+        }
+    }
+
+    fn set_probe(&self, name: &str, probe: Probe) {
+        self.lock()
+            .probes
+            .insert(name.to_owned(), (probe, Instant::now()));
+    }
+
     pub fn probes(&self) -> BTreeMap<String, Probe> {
-        self.lock().probes.clone()
+        self.lock()
+            .probes
+            .iter()
+            .map(|(name, (probe, _))| (name.clone(), probe.clone()))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
@@ -230,6 +273,70 @@ impl Drop for Controller {
     }
 }
 
+async fn connect(addr: (String, u16)) -> Probe {
+    let started = Instant::now();
+    match tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Probe::Reachable {
+            latency: started.elapsed(),
+            exit: None,
+        },
+        Ok(Err(e)) => Probe::Unreachable(e.kind().to_string()),
+        Err(_) => Probe::Unreachable("timed out".into()),
+    }
+}
+
+/// Fetches the trace endpoint through the proxy; the latency covers the whole
+/// request, so it reflects the proxy's real path rather than a local connect.
+async fn trace(endpoint: &str) -> Probe {
+    let client = reqwest::Proxy::all(endpoint).and_then(|proxy| {
+        reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(8))
+            .build()
+    });
+    let Ok(client) = client else {
+        return Probe::Unreachable("Invalid proxy URL".into());
+    };
+    let started = Instant::now();
+    let response = match client.get(TRACE_URL).send().await {
+        Ok(response) => response,
+        Err(e) if e.is_timeout() => return Probe::Unreachable("timed out".into()),
+        Err(e) if e.is_connect() => return Probe::Unreachable("cannot connect".into()),
+        Err(_) => return Probe::Unreachable("request failed".into()),
+    };
+    if !response.status().is_success() {
+        return Probe::Unreachable(format!("HTTP {}", response.status().as_u16()));
+    }
+    let text = response.text().await.unwrap_or_default();
+    Probe::Reachable {
+        latency: started.elapsed(),
+        exit: parse_trace(&text),
+    }
+}
+
+fn parse_trace(text: &str) -> Option<Exit> {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    let ip = field("ip")?.parse::<std::net::IpAddr>().ok()?.to_string();
+    let country = field("loc")
+        .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()) && *c != "XX")
+        .map(str::to_owned);
+    Some(Exit { ip, country })
+}
+
+/// A proxy listening on this machine.
+pub fn is_local(endpoint: &str) -> bool {
+    host_port(endpoint).is_some_and(|(host, _)| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 fn host_port(endpoint: &str) -> Option<(String, u16)> {
     let rest = endpoint.split_once("://")?.1;
     let authority = rest.split('/').next()?;
@@ -241,7 +348,7 @@ fn host_port(endpoint: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, Phase, host_port};
+    use super::{Controller, Exit, Phase, host_port, is_local, parse_trace};
     use std::sync::Arc;
 
     #[test]
@@ -267,6 +374,32 @@ mod tests {
         assert_eq!(controller.phase(), Phase::Stopped);
         // The port is free again once stop returns.
         std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    }
+
+    #[test]
+    fn parses_trace_responses() {
+        let text = "fl=1\nh=www.cloudflare.com\nip=203.0.113.5\nts=1\nloc=JP\ncolo=NRT\n";
+        assert_eq!(
+            parse_trace(text),
+            Some(Exit {
+                ip: "203.0.113.5".into(),
+                country: Some("JP".into())
+            })
+        );
+        let v6 = parse_trace("ip=2001:db8::1\nloc=XX\n").unwrap();
+        assert_eq!((v6.ip.as_str(), v6.country), ("2001:db8::1", None));
+        assert_eq!(parse_trace("ip=1.2.3.4\nloc=T1\n").unwrap().country, None);
+        assert_eq!(parse_trace("ip=not-an-ip\nloc=JP\n"), None);
+        assert_eq!(parse_trace("<html>blocked</html>"), None);
+    }
+
+    #[test]
+    fn recognizes_local_proxies() {
+        assert!(is_local("http://127.0.0.1:7890"));
+        assert!(is_local("socks5://user:pw@localhost:1080"));
+        assert!(is_local("http://[::1]:8080"));
+        assert!(!is_local("http://10.156.232.107:10810"));
+        assert!(!is_local("https://proxy.example.com:443"));
     }
 
     #[test]

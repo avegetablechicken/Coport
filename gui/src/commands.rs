@@ -48,10 +48,17 @@ pub fn check_credentials(state: State<AppState>) {
     core.controller.check(&core.config_path());
 }
 
-/// Tests one proxy, or all of them when `name` is absent.
+/// Tests one proxy, or all of them when `name` is absent. With `stale_only`,
+/// only proxies without a recent result are tested (used when the panel opens).
 #[tauri::command]
-pub fn probe_proxy(state: State<AppState>, name: Option<String>) {
-    state.core.lock().unwrap().probe(name.as_deref());
+pub fn probe_proxy(state: State<AppState>, name: Option<String>, stale_only: Option<bool>) {
+    let mut core = state.core.lock().unwrap();
+    if stale_only == Some(true) {
+        core.refresh_config();
+        core.probe_stale(std::time::Duration::from_secs(120));
+    } else {
+        core.probe(name.as_deref());
+    }
 }
 
 #[derive(Deserialize)]

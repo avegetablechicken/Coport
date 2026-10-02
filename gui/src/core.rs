@@ -2,6 +2,7 @@
 //! snapshot the web frontend renders.
 
 use crate::{
+    describe,
     logs::{Entry, LogFeed},
     platform,
     proxy::{Controller, Notify, Phase, Probe},
@@ -75,7 +76,7 @@ impl Core {
     }
 
     /// Re-reads the config file when it changes on disk (checked at most 1/s).
-    fn refresh_config(&mut self) {
+    pub(crate) fn refresh_config(&mut self) {
         let path = self.config_path();
         let cache = &mut self.config;
         let due = cache
@@ -130,6 +131,13 @@ impl Core {
         let result = platform::set_launch_at_login(enable).map_err(|e| e.to_string());
         self.launch_at_login = platform::launch_at_login();
         result
+    }
+
+    /// Probes proxies whose last result is missing or older than `max_age`.
+    pub fn probe_stale(&self, max_age: Duration) {
+        if let Some(config) = self.loaded_config() {
+            self.controller.probe_stale(&config.proxies, max_age);
+        }
     }
 
     pub fn probe(&self, name: Option<&str>) {
@@ -264,21 +272,23 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             .map(|(name, endpoint)| ProxyDto {
                 name: name.clone(),
                 endpoint: redacted_endpoint(endpoint),
+                local: crate::proxy::is_local(endpoint),
                 probe: probes.get(name).map(|p| match p {
                     Probe::Pending => ProbeDto {
                         state: "pending",
-                        ms: None,
-                        error: None,
+                        ..Default::default()
                     },
-                    Probe::Reachable(d) => ProbeDto {
+                    Probe::Reachable { latency, exit } => ProbeDto {
                         state: "ok",
-                        ms: Some(d.as_millis() as u64),
-                        error: None,
+                        ms: Some(latency.as_millis() as u64),
+                        exit_ip: exit.as_ref().map(|e| e.ip.clone()),
+                        country: exit.as_ref().and_then(|e| e.country.clone()),
+                        ..Default::default()
                     },
                     Probe::Unreachable(e) => ProbeDto {
                         state: "error",
-                        ms: None,
                         error: Some(e.clone()),
+                        ..Default::default()
                     },
                 }),
             })
@@ -292,6 +302,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             &config.codex.accounts,
             &config.codex.routing,
             true,
+            |selector| describe::codex_api_key(config, selector),
         ),
         claude: service(
             vec![("upstream", config.claude.base_url.clone())],
@@ -299,6 +310,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             &config.claude.accounts,
             &config.claude.routing,
             false,
+            |selector| describe::claude_api_key(config, selector),
         ),
     }
 }
@@ -309,13 +321,15 @@ fn service(
     accounts: &BTreeMap<String, AccountSource>,
     routing: &Routing,
     codex: bool,
+    api_key_detail: impl Fn(&str) -> Option<String>,
 ) -> ServiceDto {
-    let rows = |routes: &BTreeMap<String, Choice>| {
+    let rows = |routes: &BTreeMap<String, Choice>, detail: &dyn Fn(&str) -> Option<String>| {
         routes
             .iter()
             .map(|(selector, choice)| RouteRow {
                 selector: selector.clone(),
                 proxies: choice.names().to_vec(),
+                detail: detail(selector),
             })
             .collect()
     };
@@ -355,8 +369,8 @@ fn service(
             })
             .collect(),
         file_only,
-        account_routes: rows(&routing.account),
-        api_key_routes: rows(&routing.api_key),
+        account_routes: rows(&routing.account, &|_| None),
+        api_key_routes: rows(&routing.api_key, &api_key_detail),
         fallbacks,
     }
 }
@@ -436,14 +450,19 @@ struct ConfigDetails {
 struct ProxyDto {
     name: String,
     endpoint: String,
+    /// Listens on this machine; its exit address is looked up when probed.
+    local: bool,
     probe: Option<ProbeDto>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct ProbeDto {
     state: &'static str,
     ms: Option<u64>,
     error: Option<String>,
+    exit_ip: Option<String>,
+    country: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -468,6 +487,8 @@ struct KeyValue {
 struct RouteRow {
     selector: String,
     proxies: Vec<String>,
+    /// Hover text: the base URL an API key selector resolves to.
+    detail: Option<String>,
 }
 
 #[derive(Serialize)]

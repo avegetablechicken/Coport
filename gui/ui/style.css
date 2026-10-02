@@ -20,6 +20,11 @@
   --orange: #ff9500;
   --blue: #007aff;
   --text-red: #d70015;
+  --purple: #af52de;
+  --pink: #ff2d55;
+  --teal: #30b0c7;
+  --indigo: #5856d6;
+  --brown: #a2845e;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
@@ -42,6 +47,11 @@
     --orange: #ff9f0a;
     --blue: #0a84ff;
     --text-red: #ff6961;
+    --purple: #bf5af2;
+    --pink: #ff375f;
+    --teal: #40c8e0;
+    --indigo: #5e5ce6;
+    --brown: #ac8e68;
   }
 }
 
@@ -56,6 +66,38 @@
     --red: -apple-system-red;
     --orange: -apple-system-orange;
     --blue: -apple-system-blue;
+  }
+}
+
+/* Not every WebKit knows every system color keyword; an unknown one would
+   invalidate the tag styles, so each falls back to its static value. */
+@supports (color: -apple-system-purple) {
+  :root {
+    --purple: -apple-system-purple;
+  }
+}
+
+@supports (color: -apple-system-pink) {
+  :root {
+    --pink: -apple-system-pink;
+  }
+}
+
+@supports (color: -apple-system-teal) {
+  :root {
+    --teal: -apple-system-teal;
+  }
+}
+
+@supports (color: -apple-system-indigo) {
+  :root {
+    --indigo: -apple-system-indigo;
+  }
+}
+
+@supports (color: -apple-system-brown) {
+  :root {
+    --brown: -apple-system-brown;
   }
 }
 
@@ -333,6 +375,17 @@ select:focus-visible {
 
 .row-name {
   color: var(--label);
+}
+
+/* Special-purpose rules (docs MCP fallback, account probe). */
+.row.minor {
+  min-height: 16px;
+  font-size: 10px;
+}
+
+.row.minor .row-label,
+.row.minor .row-value {
+  color: var(--tertiary);
 }
 
 .row-sub {
@@ -835,8 +888,127 @@ details.disclosure[open] summary svg {
   animation: tip-in 1ms linear 500ms both;
 }
 
+/* Multi-line configuration details, anchored to the label's leading edge. */
+.tip-wide[data-tip]:hover::after {
+  left: 0;
+  right: auto;
+  width: max-content;
+  max-width: 300px;
+  padding: 4px 7px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 @keyframes tip-in {
   from {
     opacity: 0;
   }
 }
+
+/* ------------------------------------------------------------- proxy tags */
+
+/* Each proxy's color label, used wherever the proxy is named. */
+.tag {
+  --tag: var(--secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--tag) 15%, transparent);
+  color: color-mix(in srgb, var(--tag) 82%, var(--label));
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag.c0 {
+  --tag: var(--blue);
+}
+
+.tag.c1 {
+  --tag: var(--purple);
+}
+
+.tag.c2 {
+  --tag: var(--pink);
+}
+
+.tag.c3 {
+  --tag: var(--orange);
+}
+
+.tag.c4 {
+  --tag: var(--teal);
+}
+
+.tag.c5 {
+  --tag: var(--green);
+}
+
+.tag.c6 {
+  --tag: var(--indigo);
+}
+
+.tag.c7 {
+  --tag: var(--brown);
+}
+
+.tag.direct {
+  --tag: var(--secondary);
+  font-weight: 400;
+}
+
+.flag {
+  font-size: 10.5px;
+  line-height: 1;
+}
+
+.chain {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.chain .arrow {
+  color: var(--tertiary);
+  font-size: 10px;
+}
+
+.row.minor .tag {
+  height: 15px;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+/* Proxy rows: status dot, then label over endpoint and exit address. */
+.row.proxy {
+  min-height: 38px;
+}
+
+.row.proxy .row-label {
+  gap: 2px;
+}
+
+.row.proxy .tag {
+  align-self: flex-start;
+}
+
+.row.proxy .dot {
+  flex: none;
+  align-self: flex-start;
+  margin-top: 11px;
+}
+
+.row.proxy .row-sub {
+  font-variant-numeric: tabular-nums;
+}
+

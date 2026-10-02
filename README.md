@@ -602,7 +602,9 @@ The panel follows the layout of native menu bar utilities such as eul: on macOS
 it uses the system popover material, AppKit semantic colors and system fonts.
 The main page stacks blocks for the proxy (switch, address, uptime, config
 state), 30-minute traffic, client base URLs with setup snippets, recent requests,
-outbound proxies with reachability tests, and routing. The header links open:
+outbound proxies (each with a color label used in the routing view, a
+reachability status and, for proxies on this machine, the exit address and its
+country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routing. The header links open:
 
 | Page | Content |
 | --- | --- |

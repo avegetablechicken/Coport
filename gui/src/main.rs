@@ -5,6 +5,7 @@
 
 mod commands;
 mod core;
+mod describe;
 mod icon;
 mod logs;
 mod panel;

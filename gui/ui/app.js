@@ -64,9 +64,40 @@ function statusClass(status) {
   return `s${Math.min(5, Math.max(2, Math.floor(status / 100)))}`;
 }
 
-/// Proxy candidates as plain text, e.g. "us → jp"; `none` means direct.
+/// Regional-indicator flag for an ISO country or region code.
+function flag(code) {
+  return /^[A-Z]{2}$/.test(code ?? "") ? String.fromCodePoint(...[...code].map((c) => 0x1f1a5 + c.charCodeAt(0))) : "";
+}
+
+const TAG_COLORS = 8;
+
+/// Gives each proxy a color that stays put as others are added or removed:
+/// the name's hash picks a slot, and collisions move to the next free one.
+function tagColors(names) {
+  const taken = new Set();
+  const colors = {};
+  for (const name of [...names].sort()) {
+    let hash = 0;
+    for (const ch of name) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+    let slot = hash % TAG_COLORS;
+    while (taken.has(slot) && taken.size < TAG_COLORS) slot = (slot + 1) % TAG_COLORS;
+    taken.add(slot);
+    colors[name] = slot;
+  }
+  return colors;
+}
+
+/// A proxy's colored label, its identity wherever it is named; `none` is
+/// direct. Exit countries are not identities (proxies can share one), so
+/// flags only annotate exit addresses.
+function tag(name) {
+  if (name === "none") return `<span class="tag direct">direct</span>`;
+  return `<span class="tag c${ui.tagColors[name] ?? 0}">${esc(name)}</span>`;
+}
+
+/// Proxy candidates in order, e.g. [jp_lab] → [jp].
 function chain(names) {
-  return names.map((n) => (n === "none" ? "direct" : esc(n))).join(' <span class="faint">→</span> ');
+  return `<span class="chain">${names.map(tag).join('<span class="arrow">→</span>')}</span>`;
 }
 
 let toastTimer;
@@ -91,6 +122,8 @@ const ui = {
   expanded: new Set(),
   builtPage: null,
   choosePath: false,
+  proxies: {},
+  tagColors: {},
 };
 
 async function refresh() {
@@ -100,6 +133,9 @@ async function refresh() {
   ]);
   ui.snap = snap;
   ui.recent = recent.slice(0, 5);
+  const proxies = snap.config.details?.proxies ?? [];
+  ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
+  ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
   if (ui.page === "activity") await loadActivity(false);
   render();
@@ -121,6 +157,8 @@ function uptime() {
 }
 
 // ---------------------------------------------------------------- render
+
+const BACK_KEYS = /Mac/.test(navigator.platform) ? "Meta+[" : "Control+[";
 
 function render() {
   if (!ui.snap) return;
@@ -149,7 +187,7 @@ function renderTop() {
         </nav>`
       : "";
   $("top").innerHTML = `
-    <button class="text-link back" data-action="page" data-page="main">${ICON.back}Back</button>
+    <button class="text-link back" data-action="page" data-page="main" aria-keyshortcuts="${BACK_KEYS}">${ICON.back}Back</button>
     <span class="page-title">${title}</span>${tools}`;
 }
 
@@ -301,14 +339,25 @@ function proxiesBlock() {
   const body = d.proxies.length
     ? d.proxies
         .map((p) => {
-          let result = `<span class="row-value faint">—</span>`;
-          if (p.probe?.state === "pending") result = `<span class="row-value"><span class="spinner"></span></span>`;
-          else if (p.probe?.state === "ok") result = `<span class="row-value">${p.probe.ms} ms</span>`;
-          else if (p.probe?.state === "error")
-            result = `<span class="row-value bad" data-tip="${esc(p.probe.error)}">Unreachable</span>`;
-          return `<div class="row">
-            <span class="row-label"><span class="row-name">${esc(p.name)}</span><span class="row-sub">${esc(p.endpoint)}</span></span>
-            ${result}
+          const probe = p.probe;
+          const state = probe?.state ?? "idle";
+          const dot = { ok: "running", error: "failed" }[state] ?? "";
+          let value = `<span class="faint">—</span>`;
+          if (state === "pending") value = `<span class="spinner"></span>`;
+          else if (state === "ok") value = `${probe.ms} ms`;
+          else if (state === "error") value = `<span class="bad">Unreachable</span>`;
+          // Plain HTTP is the common case; other schemes stay visible.
+          const shown = p.endpoint.replace(/^http:\/\//, "");
+          const full = p.local && probe?.exitIp ? `${p.endpoint} → ${probe.exitIp}` : p.endpoint;
+          const mark = flag(probe?.country);
+          const exit =
+            p.local && probe?.exitIp
+              ? ` → ${mark ? `<span class="flag" data-tip="${esc(probe.country)}">${mark}</span> ` : ""}${esc(probe.exitIp)}`
+              : "";
+          return `<div class="row proxy">
+            <span class="dot ${dot}" ${probe?.error ? `data-tip="${esc(probe.error)}"` : ""}></span>
+            <span class="row-label">${tag(p.name)}<span class="row-sub" title="${esc(full)}">${esc(shown)}${exit}</span></span>
+            <span class="row-value">${value}</span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
           </div>`;
         })
@@ -316,6 +365,9 @@ function proxiesBlock() {
     : `<div class="placeholder">No proxies defined; every route connects directly.</div>`;
   return block("Outbound Proxies", aside, body);
 }
+
+/// Special-purpose rules, shown de-emphasized below the regular routes.
+const MINOR_FALLBACKS = new Set(["mcpFallback", "accountProbe"]);
 
 const FALLBACK_LABEL = {
   accountFallback: "Account fallback",
@@ -336,11 +388,15 @@ function routingBlock() {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
     }
     const rows = [...svc.accountRoutes, ...svc.apiKeyRoutes]
-      .map((x) => `<div class="row compact"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
+      .map((x) => `<div class="row compact${x.detail ? ` tip-wide" data-tip="${esc(x.detail)}` : ""}"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
       .join("");
     const fallbacks = svc.fallbacks
       .filter((f) => f.proxies)
-      .map((f) => `<div class="row compact"><span class="row-label">${FALLBACK_LABEL[f.key]}</span><span class="row-value">${chain(f.proxies)}</span></div>`)
+      .sort((a, b) => MINOR_FALLBACKS.has(a.key) - MINOR_FALLBACKS.has(b.key))
+      .map(
+        (f) =>
+          `<div class="row compact${MINOR_FALLBACKS.has(f.key) ? " minor" : ""}"><span class="row-label">${FALLBACK_LABEL[f.key]}</span><span class="row-value">${chain(f.proxies)}</span></div>`
+      )
       .join("");
     return `<div class="subhead"><span>${name}</span>${badge}</div>${rows}${fallbacks}`;
   };
@@ -607,6 +663,10 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (ui.page !== "main") act("page", { dataset: { page: "main" } });
     else invoke("hide_panel");
+  } else if (mod && event.key === "[") {
+    // Same as the Back button, on every page that has one.
+    event.preventDefault();
+    if (ui.page !== "main") act("page", { dataset: { page: "main" } });
   } else if (mod && event.key === "q") {
     invoke("quit_app");
   } else if (mod && event.key === ",") {
@@ -626,6 +686,9 @@ setInterval(() => {
   if (el && ui.snap?.phase.state === "running") el.textContent = fmtUptime(uptime());
 }, 1000);
 
+// Exit addresses and reachability go stale; recheck old results on open.
+const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
+
 listen("state-changed", scheduleRefresh);
-listen("panel-shown", () => refresh());
-refresh();
+listen("panel-shown", () => refresh().then(probeStale));
+refresh().then(probeStale);
