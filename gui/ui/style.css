@@ -377,6 +377,15 @@ select:focus-visible {
   color: var(--label);
 }
 
+.setting-description {
+  margin-top: 3px;
+  color: var(--tertiary);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.45;
+  white-space: normal;
+}
+
 /* Special-purpose rules (docs MCP fallback, account probe). */
 .row.minor {
   min-height: 16px;
@@ -1017,4 +1026,3 @@ details.disclosure[open] summary svg {
 .row.proxy .row-sub {
   font-variant-numeric: tabular-nums;
 }
-

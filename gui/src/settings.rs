@@ -16,6 +16,7 @@ pub struct Settings {
     pub config_path: String,
     pub appearance: Appearance,
     pub start_proxy_on_launch: bool,
+    pub keep_proxy_running_on_quit: bool,
 }
 
 impl Default for Settings {
@@ -24,6 +25,7 @@ impl Default for Settings {
             config_path: default_config_path().to_string_lossy().into_owned(),
             appearance: Appearance::System,
             start_proxy_on_launch: true,
+            keep_proxy_running_on_quit: false,
         }
     }
 }
@@ -94,4 +96,23 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_preferences_keep_existing_quit_behavior() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"appearance":"Dark","start_proxy_on_launch":false}"#).unwrap();
+        assert!(!settings.keep_proxy_running_on_quit);
+        let enabled = Settings {
+            keep_proxy_running_on_quit: true,
+            ..settings
+        };
+        let restored: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&enabled).unwrap()).unwrap();
+        assert!(restored.keep_proxy_running_on_quit);
+    }
 }

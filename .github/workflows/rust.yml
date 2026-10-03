@@ -70,5 +70,7 @@ jobs:
           path: |
             target/release/agent-router-gui
             target/release/agent-router-gui.exe
+            target/release/agent-router-daemon
+            target/release/agent-router-daemon.exe
             target/Agent Router.app
           if-no-files-found: error

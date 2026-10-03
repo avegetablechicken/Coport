@@ -11,11 +11,10 @@ mod logs;
 mod panel;
 mod placement;
 mod platform;
-mod proxy;
-mod settings;
 mod single_instance;
 mod tray;
 
+use agent_router_gui::{proxy, settings};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -42,10 +41,12 @@ fn main() {
     let mut settings = settings::Settings::load();
     // Opening the app by hand shows the panel; login items start quietly.
     let mut open = true;
+    let mut config_requested = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
+                config_requested = true;
                 let Some(path) = args.next() else {
                     return usage_error();
                 };
@@ -119,7 +120,11 @@ fn main() {
             let mut core = core::Core::new(settings.clone(), notify);
             let start = settings.start_proxy_on_launch && core.config_exists();
             open |= !core.config_exists();
-            if start {
+            if config_requested && core.settings.config_path != settings.config_path {
+                core.settings.config_path = settings.config_path.clone();
+                core.settings.save();
+                core.start();
+            } else if start && !core.controller.is_running() {
                 core.start();
             }
             app.manage(AppState {
@@ -162,8 +167,30 @@ fn main() {
         }
     };
     app.run(|app, event| {
-        if let RunEvent::Exit = event {
-            app.state::<AppState>().core.lock().unwrap().stop();
+        match event {
+            RunEvent::ExitRequested { api, .. } => {
+                let result = {
+                    let state = app.state::<AppState>();
+                    let mut core = state.core.lock().unwrap();
+                    let keep = core.settings.keep_proxy_running_on_quit;
+                    core.controller.on_app_exit(keep)
+                };
+                if let Err(error) = result {
+                    // A failed stop must remain visible and retryable.
+                    eprintln!("{error}");
+                    api.prevent_exit();
+                    panel::show(app, None);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => panel::show(app, None),
+            RunEvent::Exit => {
+                let state = app.state::<AppState>();
+                let mut core = state.core.lock().unwrap();
+                let keep = core.settings.keep_proxy_running_on_quit;
+                let _ = core.controller.on_app_exit(keep);
+            }
+            _ => {}
         }
     });
 }

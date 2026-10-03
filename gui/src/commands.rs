@@ -24,16 +24,17 @@ pub fn get_activity(state: State<AppState>, filter: String, search: String) -> V
 }
 
 #[tauri::command]
-pub fn set_running(app: AppHandle, state: State<AppState>, running: bool) {
+pub fn set_running(app: AppHandle, state: State<AppState>, running: bool) -> Result {
     {
         let mut core = state.core.lock().unwrap();
         if running {
             core.start();
         } else {
-            core.stop();
+            core.stop()?;
         }
     }
     tray::sync(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -66,6 +67,7 @@ pub fn probe_proxy(state: State<AppState>, name: Option<String>, stale_only: Opt
 pub struct SettingsPatch {
     appearance: Option<Appearance>,
     start_proxy_on_launch: Option<bool>,
+    keep_proxy_running_on_quit: Option<bool>,
 }
 
 #[tauri::command]
@@ -78,6 +80,9 @@ pub fn update_settings(app: AppHandle, state: State<AppState>, patch: SettingsPa
         }
         if let Some(start) = patch.start_proxy_on_launch {
             core.settings.start_proxy_on_launch = start;
+        }
+        if let Some(keep_running) = patch.keep_proxy_running_on_quit {
+            core.settings.keep_proxy_running_on_quit = keep_running;
         }
         core.settings.save();
     }

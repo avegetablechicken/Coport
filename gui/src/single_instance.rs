@@ -95,10 +95,7 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::mpsc;
 
     #[test]
     fn second_launch_signals_the_first() {
@@ -106,17 +103,18 @@ mod tests {
         let Instance::Primary(mut guard) = acquire(dir.path().into()) else {
             panic!("first launch must be primary");
         };
-        let shown = Arc::new(AtomicBool::new(false));
-        let flag = shown.clone();
-        guard.listen(move || flag.store(true, Ordering::SeqCst));
+        assert!(
+            guard.listener.is_some(),
+            "first launch must bind its control listener"
+        );
+        let (shown, received) = mpsc::channel();
+        guard.listen(move || {
+            let _ = shown.send(());
+        });
         assert!(matches!(acquire(dir.path().into()), Instance::Secondary));
-        for _ in 0..50 {
-            if shown.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(shown.load(Ordering::SeqCst));
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second launch must show the panel");
         drop(guard);
         assert!(matches!(acquire(dir.path().into()), Instance::Primary(_)));
     }

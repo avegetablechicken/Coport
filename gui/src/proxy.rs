@@ -1,13 +1,14 @@
-//! Runs the proxy server in-process on a background Tokio runtime.
+//! Controls the independent proxy daemon; GUI-only probes use a Tokio runtime.
 
-use agent_router::{config::Config, logger::Logger, server::Server};
+use crate::daemon;
+use agent_router::config::Config;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{runtime::Runtime, sync::oneshot, task::JoinHandle};
+use tokio::{runtime::Runtime, task::JoinHandle};
 
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -51,14 +52,15 @@ pub struct CheckResult {
 #[derive(Default)]
 struct Shared {
     phase: Option<Phase>,
+    generation: u64,
     check: Option<CheckResult>,
     checking: bool,
     probes: BTreeMap<String, (Probe, Instant)>,
 }
 
 struct Running {
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    client: daemon::Client,
+    monitor: JoinHandle<()>,
 }
 
 pub struct Controller {
@@ -66,22 +68,40 @@ pub struct Controller {
     shared: Arc<Mutex<Shared>>,
     running: Option<Running>,
     notify: Notify,
+    daemon_dir: PathBuf,
+    daemon_binary: PathBuf,
+    attached: Option<daemon::Status>,
 }
 
 impl Controller {
     pub fn new(notify: Notify) -> Self {
+        Self::with_daemon(
+            notify,
+            crate::settings::app_dir(),
+            daemon::binary_path().unwrap_or_default(),
+        )
+    }
+
+    pub fn with_daemon(notify: Notify, daemon_dir: PathBuf, daemon_binary: PathBuf) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("proxy")
             .build()
             .expect("Tokio runtime");
-        Self {
+        let mut controller = Self {
             rt,
             shared: Default::default(),
             running: None,
             notify,
+            daemon_dir,
+            daemon_binary,
+            attached: None,
+        };
+        if let Some((client, status)) = daemon::Client::discover(&controller.daemon_dir) {
+            controller.attach(client, status);
         }
+        controller
     }
 
     pub fn phase(&self) -> Phase {
@@ -92,77 +112,106 @@ impl Controller {
         matches!(self.phase(), Phase::Running { .. })
     }
 
+    pub fn daemon_status(&self) -> Option<&daemon::Status> {
+        self.attached.as_ref()
+    }
+
     pub fn start(&mut self, config_path: &Path, log_path: PathBuf) {
-        self.stop();
-        let phase = match self.spawn(config_path, log_path) {
-            Ok(phase) => phase,
-            Err(message) => Phase::Failed(message),
-        };
-        self.lock().phase = Some(phase);
+        // Never launch a replacement unless the old listener has stopped.
+        if self.stop().is_err() {
+            return;
+        }
+        let result = Config::read(config_path)
+            .map_err(|e| e.message.to_string())
+            .and_then(|_| {
+                daemon::start(
+                    &self.daemon_binary,
+                    &self.daemon_dir,
+                    config_path,
+                    &log_path,
+                )
+                .map_err(|e| e.to_string())
+            });
+        match result {
+            Ok((client, status)) => self.attach(client, status),
+            Err(message) => self.lock().phase = Some(Phase::Failed(message)),
+        }
         (self.notify)();
     }
 
-    fn spawn(&mut self, config_path: &Path, log_path: PathBuf) -> Result<Phase, String> {
-        let config = Config::read(config_path).map_err(|e| e.message.to_string())?;
-        let port = config.listen_port;
-        let listener = self
-            .rt
-            .block_on(tokio::net::TcpListener::bind((
-                std::net::Ipv4Addr::LOCALHOST,
-                port,
-            )))
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::AddrInUse => {
-                    format!("Port {port} is already in use.")
-                }
-                _ => format!("Cannot listen on 127.0.0.1:{port}: {e}"),
-            })?;
-        let logger = Arc::new(Logger::new(log_path));
-        logger.write("server_started", Default::default());
-        let server = Arc::new(Server::new(config, logger.clone()));
-        let (shutdown, stop) = oneshot::channel::<()>();
+    fn attach(&mut self, client: daemon::Client, status: daemon::Status) {
+        let mut shared = self.lock();
+        shared.generation += 1;
+        let generation = shared.generation;
+        shared.phase = Some(Phase::Running {
+            port: status.port,
+            since: Instant::now()
+                .checked_sub(Duration::from_millis(status.uptime_ms))
+                .unwrap_or_else(Instant::now),
+        });
+        drop(shared);
+        self.attached = Some(status);
         let shared = self.shared.clone();
         let notify = self.notify.clone();
-        let task = self.rt.spawn(async move {
-            // Startup route reporting can read credentials or a login shell;
-            // accept connections meanwhile instead of delaying them.
-            let startup = tokio::spawn({
-                let server = server.clone();
-                async move { server.startup_log().await }
-            });
-            let result = server
-                .serve(listener, async {
-                    let _ = stop.await;
-                })
-                .await;
-            startup.abort();
-            logger.write("server_stopped", Default::default());
-            if let Err(e) = result {
-                shared.lock().unwrap().phase = Some(Phase::Failed(format!("Listener failed: {e}")));
-                notify();
+        let monitor_client = client.clone();
+        let monitor = self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let client = monitor_client.clone();
+                let result = tokio::task::spawn_blocking(move || client.status()).await;
+                if !matches!(result, Ok(Ok(_))) {
+                    let mut shared = shared.lock().unwrap();
+                    if shared.generation != generation {
+                        break;
+                    }
+                    shared.phase = Some(Phase::Failed(
+                        "Lost contact with the proxy daemon. Restart to reconnect.".into(),
+                    ));
+                    drop(shared);
+                    notify();
+                    break;
+                }
             }
         });
-        self.running = Some(Running { shutdown, task });
-        Ok(Phase::Running {
-            port,
-            since: Instant::now(),
-        })
+        self.running = Some(Running { client, monitor });
     }
 
-    pub fn stop(&mut self) {
-        if let Some(running) = self.running.take() {
-            let _ = running.shutdown.send(());
-            // Wait so the port is free before a restart binds it again.
-            // The timer must be created inside the runtime, not just awaited there.
-            let _ = self.rt.block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), running.task).await
-            });
-            let mut shared = self.lock();
-            if matches!(shared.phase, Some(Phase::Running { .. })) {
-                shared.phase = Some(Phase::Stopped);
+    pub fn stop(&mut self) -> Result<(), String> {
+        if let Some(running) = self.running.as_ref() {
+            if let Err(error) = running.client.stop() {
+                let message = format!("Cannot stop proxy daemon: {error}");
+                self.lock().phase = Some(Phase::Failed(message.clone()));
+                (self.notify)();
+                return Err(message);
             }
+            if let Some(running) = self.running.take() {
+                running.monitor.abort();
+            }
+            self.attached = None;
+            let mut shared = self.lock();
+            shared.generation += 1;
+            shared.phase = Some(Phase::Stopped);
             drop(shared);
             (self.notify)();
+        }
+        Ok(())
+    }
+
+    /// Release the GUI's control connection without stopping the independent process.
+    fn detach(&mut self) {
+        self.lock().generation += 1;
+        if let Some(running) = self.running.take() {
+            running.monitor.abort();
+        }
+        self.attached = None;
+    }
+
+    pub fn on_app_exit(&mut self, keep_running: bool) -> Result<(), String> {
+        if keep_running {
+            self.detach();
+            Ok(())
+        } else {
+            self.stop()
         }
     }
 
@@ -269,7 +318,7 @@ impl Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -352,28 +401,19 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn starts_and_stops_outside_any_runtime() {
+    fn missing_helper_reports_failure_without_starting_in_process() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.yaml");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let example = include_str!("../../config.example.yaml")
-            .replace("listen_port: 8787", &format!("listen_port: {port}"));
-        std::fs::write(&config, example).unwrap();
-        let mut controller = Controller::new(Arc::new(|| {}));
+        std::fs::write(&config, include_str!("../../config.example.yaml")).unwrap();
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("missing-daemon"),
+        );
         controller.start(&config, dir.path().join("proxy.log"));
         assert!(
-            matches!(controller.phase(), Phase::Running { .. }),
-            "{:?}",
-            controller.phase()
+            matches!(controller.phase(), Phase::Failed(message) if message.contains("Cannot start"))
         );
-        controller.stop();
-        assert_eq!(controller.phase(), Phase::Stopped);
-        // The port is free again once stop returns.
-        std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     }
 
     #[test]

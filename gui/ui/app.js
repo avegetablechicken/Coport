@@ -488,6 +488,8 @@ function settings() {
          <button class="switch" role="switch" aria-checked="${set.launchAtLogin}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
        <div class="row"><span class="row-label">Start proxy when the app opens</span>
          <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy when the app opens"></button></div>
+       <div class="row"><span class="row-label">Keep proxy running after quit<span class="setting-description" id="keep-running-description">Quit exits the app; the proxy keeps running.<br>Reopen to manage or stop the proxy.</span></span>
+         <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" aria-describedby="keep-running-description"></button></div>
        <div class="row"><span class="row-label">Appearance</span>
          <select class="select" data-setting="appearance">${option("System", "System")}${option("Light", "Light")}${option("Dark", "Dark")}</select></div>`
     )}
@@ -551,7 +553,11 @@ async function act(action, el) {
       $("content").scrollTop = 0;
       break;
     case "power":
-      await invoke("set_running", { running: s.phase.state !== "running" });
+      try {
+        await invoke("set_running", { running: s.phase.state !== "running" });
+      } catch (e) {
+        toast(String(e));
+      }
       await refresh();
       break;
     case "restart":
@@ -607,6 +613,10 @@ async function act(action, el) {
       break;
     case "auto-start":
       await invoke("update_settings", { patch: { startProxyOnLaunch: el.getAttribute("aria-checked") !== "true" } });
+      await refresh();
+      break;
+    case "keep-running":
+      await invoke("update_settings", { patch: { keepProxyRunningOnQuit: el.getAttribute("aria-checked") !== "true" } });
       await refresh();
       break;
     case "create-config":

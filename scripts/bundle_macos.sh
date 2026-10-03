@@ -14,6 +14,7 @@ app="$stage/Agent Router.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/agent-router-gui "$app/Contents/MacOS/"
+cp target/release/agent-router-daemon "$app/Contents/MacOS/"
 
 # iconutil can reject valid PNGs in a sandbox. Write the standard ICNS PNG
 # chunks directly with Python's standard library; no GUI services are needed.

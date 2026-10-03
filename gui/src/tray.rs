@@ -75,7 +75,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 let state = app.state::<AppState>();
                 let mut core = state.core.lock().unwrap();
                 if core.controller.is_running() {
-                    core.stop();
+                    let _ = core.stop();
                 } else {
                     core.start();
                 }

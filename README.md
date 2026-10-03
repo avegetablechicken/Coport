@@ -629,7 +629,7 @@ require a C toolchain, make and Perl; no system libssl runtime is needed. No set
 
 ## Desktop app (menu bar / tray)
 
-`agent-router-gui` runs the same proxy in-process behind a status icon in
+`agent-router-gui` controls a separate `agent-router-daemon` process from a status icon in
 the macOS menu bar (no Dock icon), the Windows notification area, or a Linux
 AppIndicator. Clicking the icon drops a panel below it, like a menu bar extra;
 clicking elsewhere or pressing Esc closes it. The panel is built with Tauri 2:
@@ -654,7 +654,22 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 | Page | Content |
 | --- | --- |
 | Activity | Live, searchable request log from `logs/proxy.log`; click a request for all fields |
-| Settings | Launch at Login, auto-start, appearance, config file status and `--check` equivalent, log folder |
+| Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
+
+Enable **Settings → General → Keep proxy running after quit** to leave the
+independent proxy daemon running when choosing Quit (including the tray menu and
+keyboard shortcut). The GUI process actually exits: its WebView, tray icon, and
+GUI instance lock are released. The daemon has its own PID and detached process
+session, so quitting or force-killing the GUI does not interrupt proxy connections.
+Launching the GUI again discovers and authenticates to the existing daemon,
+restores its status and logs, and can stop or restart it without a port conflict.
+Auto-start does not restart an already-running daemon, even when disabled.
+With the option off (the default), normal Quit stops the daemon before exiting.
+Closing only the panel still leaves the GUI running in the tray.
+The helper must be next to the GUI executable (included in the macOS app bundle).
+Its control endpoint and private authentication token are stored in `daemon.json`
+in the GUI's application directory; stale discovery data is replaced after a crash.
+This does not install a login service or provide automatic crash recovery.
 
 The configuration is edited in your text editor; the panel validates it whenever
 the file changes and offers a restart when the running proxy is out of date. The

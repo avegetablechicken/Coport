@@ -55,14 +55,23 @@ fn file_stamp(path: &Path) -> Option<SystemTime> {
 }
 
 impl Core {
-    pub fn new(settings: Settings, notify: Notify) -> Self {
+    pub fn new(mut settings: Settings, notify: Notify) -> Self {
+        let controller = Controller::new(notify.clone());
+        let attached = controller.daemon_status();
+        let started_stamp = attached.map(|status| status.config_modified);
+        let log_path = attached.map(|status| status.log_path.clone());
+        if let Some(status) = attached {
+            // The live daemon is authoritative, even if auto-start is disabled.
+            settings.config_path = status.config_path.to_string_lossy().into_owned();
+            settings.save();
+        }
         Self {
-            logs: LogFeed::new(settings.log_path(), notify.clone()),
-            controller: Controller::new(notify),
+            logs: LogFeed::new(log_path.unwrap_or_else(|| settings.log_path()), notify),
+            controller,
             launch_at_login: platform::launch_at_login(),
             settings,
             config: ConfigCache::default(),
-            started_stamp: None,
+            started_stamp,
         }
     }
 
@@ -123,8 +132,8 @@ impl Core {
         self.invalidate_config();
     }
 
-    pub fn stop(&mut self) {
-        self.controller.stop();
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.controller.stop()
     }
 
     pub fn set_launch_at_login(&mut self, enable: bool) -> Result<(), String> {
@@ -232,6 +241,7 @@ impl Core {
             settings: SettingsDto {
                 appearance: self.settings.appearance,
                 start_proxy_on_launch: self.settings.start_proxy_on_launch,
+                keep_proxy_running_on_quit: self.settings.keep_proxy_running_on_quit,
                 launch_at_login: self.launch_at_login,
                 log_path: self.settings.log_path().display().to_string(),
             },
@@ -509,6 +519,7 @@ struct CheckDto {
 struct SettingsDto {
     appearance: crate::settings::Appearance,
     start_proxy_on_launch: bool,
+    keep_proxy_running_on_quit: bool,
     launch_at_login: bool,
     log_path: String,
 }

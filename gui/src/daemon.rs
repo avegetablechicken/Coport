@@ -1,0 +1,348 @@
+//! A detached, GUI-free proxy process. Discovery is per-user; control requests
+//! use a random capability stored in an owner-only file, never on the proxy port.
+
+use agent_router::{config::Config, logger::Logger, server::Server};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
+    net::{Ipv4Addr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+
+const ENDPOINT: &str = "daemon.json";
+const MAX_MESSAGE: usize = 64 * 1024;
+const STATUS_TIMEOUT: Duration = Duration::from_millis(750);
+const STOP_TIMEOUT: Duration = Duration::from_secs(7);
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Endpoint {
+    port: u16,
+    token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Status {
+    pub pid: u32,
+    pub port: u16,
+    pub uptime_ms: u64,
+    pub config_path: PathBuf,
+    pub log_path: PathBuf,
+    pub config_modified: Option<SystemTime>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Action {
+    Status,
+    Stop,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Request {
+    token: String,
+    action: Action,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Response {
+    Status(Status),
+    Stopped,
+    Error(String),
+}
+
+#[derive(Clone)]
+pub struct Client {
+    endpoint: Endpoint,
+}
+
+impl Client {
+    pub fn discover(dir: &Path) -> Option<(Self, Status)> {
+        let endpoint = serde_json::from_slice(&std::fs::read(dir.join(ENDPOINT)).ok()?).ok()?;
+        let client = Self { endpoint };
+        let status = client.status().ok()?;
+        Some((client, status))
+    }
+
+    pub fn status(&self) -> io::Result<Status> {
+        match self.request(Action::Status, STATUS_TIMEOUT)? {
+            Response::Status(status) => Ok(status),
+            _ => Err(io::Error::other("Unexpected daemon status response")),
+        }
+    }
+
+    /// The daemon acknowledges only after the proxy has released its listener.
+    pub fn stop(&self) -> io::Result<()> {
+        match self.request(Action::Stop, STOP_TIMEOUT) {
+            Ok(Response::Stopped) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+            Err(e) => Err(e),
+            _ => Err(io::Error::other("Unexpected daemon stop response")),
+        }
+    }
+
+    fn request(&self, action: Action, timeout: Duration) -> io::Result<Response> {
+        let mut stream = TcpStream::connect_timeout(
+            &(Ipv4Addr::LOCALHOST, self.endpoint.port).into(),
+            STATUS_TIMEOUT,
+        )?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        let bytes = serde_json::to_vec(&Request {
+            token: self.endpoint.token.clone(),
+            action,
+        })?;
+        stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        stream.write_all(&bytes)?;
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length > MAX_MESSAGE {
+            return Err(io::Error::other("Daemon response too large"));
+        }
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes)?;
+        match serde_json::from_slice(&bytes)? {
+            Response::Error(error) => Err(io::Error::other(error)),
+            response => Ok(response),
+        }
+    }
+}
+
+pub fn binary_path() -> io::Result<PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name(if cfg!(windows) {
+        "agent-router-daemon.exe"
+    } else {
+        "agent-router-daemon"
+    }))
+}
+
+fn private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Detaches at spawn, not at GUI exit. No pipes or runtime tasks owned by the
+/// GUI are required to keep the listener or in-flight requests alive.
+pub fn start(binary: &Path, dir: &Path, config: &Path, log: &Path) -> io::Result<(Client, Status)> {
+    std::fs::create_dir_all(dir)?;
+    let stderr = private_file(&dir.join("daemon.stderr.log"))?;
+    let mut command = Command::new(binary);
+    command
+        .arg(dir)
+        .arg(config)
+        .arg(log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and does not access Rust state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    }
+    let mut child = command.spawn().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "Cannot start {}: {e}. Keep the daemon executable beside the GUI.",
+                binary.display()
+            ),
+        )
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(code) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "Proxy daemon exited ({code}); see {}",
+                dir.join("daemon.stderr.log").display()
+            )));
+        }
+        if let Some((client, status)) = Client::discover(dir)
+            && status.pid == child.id()
+        {
+            // Reap while the GUI is alive; dropping this thread on GUI exit has
+            // no effect on the independently running child.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok((client, status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Proxy daemon did not become ready",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+struct Registration {
+    path: PathBuf,
+    _lock: File,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> io::Result<Request> {
+    let length = stream.read_u32().await? as usize;
+    if length > MAX_MESSAGE {
+        return Err(io::Error::other("Control request too large"));
+    }
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn respond(stream: &mut tokio::net::TcpStream, response: Response) -> io::Result<()> {
+    let bytes = serde_json::to_vec(&response)?;
+    stream.write_u32(bytes.len() as u32).await?;
+    stream.write_all(&bytes).await
+}
+
+async fn termination() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Runs without Tauri, a WebView, a tray icon, or any GUI lifecycle hooks.
+pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let lock = private_file(&dir.join("daemon.lock"))?;
+    lock.try_lock()
+        .map_err(|_| io::Error::other("A proxy daemon is already running"))?;
+    let registration = Registration {
+        path: dir.join(ENDPOINT),
+        _lock: lock,
+    };
+    let config_path = std::path::absolute(config)?;
+    let log_path = std::path::absolute(log)?;
+    let config_modified = std::fs::metadata(&config_path)?.modified().ok();
+    let config = Config::read(&config_path).map_err(|e| io::Error::other(e.message))?;
+    let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, config.listen_port)).await?;
+    let port = proxy.local_addr()?.port();
+    let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let endpoint = Endpoint {
+        port: control.local_addr()?.port(),
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+    let logger = Arc::new(Logger::new(log_path.clone()));
+    let server = Arc::new(Server::new(config, logger.clone()));
+    let started = Instant::now();
+    let (shutdown, stop) = tokio::sync::oneshot::channel::<()>();
+    let startup = tokio::spawn({
+        let server = server.clone();
+        async move { server.startup_log().await }
+    });
+    let mut serving = tokio::spawn(async move {
+        server
+            .serve(proxy, async {
+                let _ = stop.await;
+            })
+            .await
+    });
+    logger.write("server_started", Default::default());
+    // Atomic, owner-only discovery file. Publish only after both listeners bind.
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(&serde_json::to_vec(&endpoint)?)?;
+    temp.as_file().sync_all()?;
+    temp.persist(&registration.path).map_err(|e| e.error)?;
+
+    let signal = termination();
+    tokio::pin!(signal);
+    let mut stop_client = None;
+    let result = loop {
+        tokio::select! {
+            _ = &mut signal => break Ok(()),
+            result = &mut serving => {
+                // Do not poll the completed JoinHandle again during cleanup.
+                startup.abort();
+                logger.write("server_stopped", Default::default());
+                return result.map_err(io::Error::other)?;
+            }
+            accepted = control.accept() => {
+                let (mut stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
+                let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
+                let Ok(Ok(request)) = request else { continue; };
+                if request.token != endpoint.token {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, Response::Error("Unauthorized".into()))).await;
+                    continue;
+                }
+                match request.action {
+                    Action::Status => {
+                        let status = Status { pid: std::process::id(), port,
+                            uptime_ms: started.elapsed().as_millis() as u64,
+                            config_path: config_path.clone(), log_path: log_path.clone(), config_modified };
+                        let _ = tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, Response::Status(status))).await;
+                    }
+                    Action::Stop => { stop_client = Some(stream); break Ok(()); }
+                }
+            }
+        }
+    };
+    let _ = shutdown.send(());
+    let stopped = match tokio::time::timeout(Duration::from_secs(5), &mut serving).await {
+        Ok(result) => result.map_err(io::Error::other).and_then(|result| result),
+        Err(_) => {
+            serving.abort();
+            let _ = serving.await;
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Proxy shutdown timed out",
+            ))
+        }
+    };
+    startup.abort();
+    logger.write("server_stopped", Default::default());
+    // Remove discovery and unlock before acknowledging, so an immediate restart works.
+    drop(control);
+    drop(registration);
+    if let Some(mut stream) = stop_client {
+        let response = match &stopped {
+            Ok(()) => Response::Stopped,
+            Err(e) => Response::Error(e.to_string()),
+        };
+        let _ =
+            tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, response)).await;
+    }
+    result.and(stopped)
+}
