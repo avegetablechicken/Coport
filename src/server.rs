@@ -37,7 +37,51 @@ struct ProbeKey {
     origin: String,
     native_tls: bool,
 }
-type ProbeState = Arc<tokio::sync::Mutex<Option<bool>>>;
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProbeResult {
+    Healthy,
+    Transient,
+    HardFailure,
+}
+#[derive(Default)]
+struct ProbeHealth {
+    initialized: bool,
+    failures: u32,
+    unavailable: bool,
+    next_check: Option<Instant>,
+    revision: u64,
+}
+impl ProbeHealth {
+    fn observe(&mut self, result: ProbeResult) {
+        self.initialized = true;
+        self.revision += 1;
+        match result {
+            ProbeResult::Healthy => {
+                self.failures = 0;
+                self.unavailable = false;
+            }
+            ProbeResult::Transient => {
+                self.failures = self.failures.saturating_add(1);
+                self.unavailable |= self.failures >= 3;
+            }
+            ProbeResult::HardFailure => {
+                self.failures = self.failures.saturating_add(1);
+                self.unavailable = true;
+            }
+        }
+        let interval = if self.failures == 0 {
+            PROBE_INTERVAL
+        } else if !self.unavailable {
+            Duration::from_secs(1)
+        } else if self.failures < 10 {
+            Duration::from_secs(3)
+        } else {
+            PROBE_INTERVAL
+        };
+        self.next_check = Some(Instant::now() + interval);
+    }
+}
+type ProbeState = Arc<tokio::sync::Mutex<ProbeHealth>>;
 
 pub struct Server {
     pub config: Config,
@@ -246,14 +290,10 @@ impl Server {
             };
             // Only cold lookups wait for a probe. Concurrent cold requests share it.
             let mut cached = state.lock().await;
-            let available = match *cached {
-                Some(available) => available,
-                None => {
-                    let available = self.probe(&key).await;
-                    *cached = Some(available);
-                    available
-                }
-            };
+            if !cached.initialized {
+                cached.observe(self.probe(&key).await);
+            }
+            let available = !cached.unavailable;
             drop(cached);
             log.field("proxy", name);
             log.field("proxy_endpoint", redacted_endpoint(endpoint));
@@ -268,8 +308,10 @@ impl Server {
             "No available outbound proxy in the configured list.",
         ))
     }
-    async fn probe(&self, key: &ProbeKey) -> bool {
-        let available = match self.client_transport(&key.endpoint, key.native_tls) {
+    async fn probe(&self, key: &ProbeKey) -> ProbeResult {
+        let mut reason = "http_response";
+        let mut status = None;
+        let result = match self.client_transport(&key.endpoint, key.native_tls) {
             Ok(client) => match client
                 .head(&key.origin)
                 .timeout(Duration::from_secs_f64(
@@ -278,23 +320,93 @@ impl Server {
                 .send()
                 .await
             {
-                Ok(r) => (200..500).contains(&r.status().as_u16()) && r.status().as_u16() != 407,
-                Err(_) => false,
+                Ok(response) => {
+                    status = Some(response.status().as_u16());
+                    if response.status() == 407 {
+                        reason = "proxy_authentication";
+                        ProbeResult::HardFailure
+                    } else {
+                        // Even a target 5xx proves that the route carried an HTTP response.
+                        ProbeResult::Healthy
+                    }
+                }
+                Err(error) => {
+                    let hard = hard_probe_failure(&error);
+                    reason = if let Some(reason) = hard {
+                        reason
+                    } else if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    };
+                    if hard.is_some() {
+                        ProbeResult::HardFailure
+                    } else {
+                        ProbeResult::Transient
+                    }
+                }
             },
-            Err(_) => false,
+            Err(_) => {
+                reason = "transport_configuration";
+                ProbeResult::HardFailure
+            }
+        };
+        // A HEAD failure alone cannot establish that an exit is down. Confirm
+        // transport reachability without sending an API request or credentials.
+        let result = if result == ProbeResult::Transient {
+            let url = Url::parse(&key.origin).expect("validated probe origin");
+            let host = url
+                .host_str()
+                .unwrap()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if matches!(
+                tokio::time::timeout(
+                    Duration::from_secs_f64(self.config.request_timeout_seconds.min(2.0)),
+                    crate::tunnel::open(host, url.port_or_known_default().unwrap(), &key.endpoint)
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                reason = "tunnel_connected";
+                ProbeResult::Healthy
+            } else {
+                result
+            }
+        } else {
+            result
         };
         self.logger.write(
             "proxy_probe",
             json!({
                 "proxy_endpoint": redacted_endpoint(&key.endpoint),
                 "origin": key.origin,
-                "available": available.to_string()
+                "available": (result == ProbeResult::Healthy).to_string(),
+                "probe_result": format!("{result:?}"),
+                "reason": reason,
+                "upstream_status": status,
             })
             .as_object()
             .unwrap()
             .clone(),
         );
-        available
+        result
+    }
+
+    async fn record_route_success(&self, endpoint: &str, destination: &Url, native_tls: bool) {
+        let mut origin = destination.clone();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        let key = ProbeKey {
+            endpoint: endpoint.into(),
+            origin: origin.to_string(),
+            native_tls,
+        };
+        let state = self.probes.lock().unwrap().get(&key).cloned();
+        if let Some(state) = state {
+            state.lock().await.observe(ProbeResult::Healthy);
+        }
     }
 
     async fn refresh_probes(&self) {
@@ -307,21 +419,28 @@ impl Server {
             .collect();
         futures_util::stream::iter(entries)
             .for_each_concurrent(8, |(key, state)| async move {
-                // A cold lookup already owns its initial probe; do not duplicate it.
-                match state.try_lock() {
-                    Ok(cached) if cached.is_some() => {}
+                let revision = match state.try_lock() {
+                    Ok(cached)
+                        if cached.initialized
+                            && cached.next_check.is_some_and(|t| t <= Instant::now()) =>
+                    {
+                        cached.revision
+                    }
                     _ => return,
+                };
+                let result = self.probe(&key).await;
+                let mut cached = state.lock().await;
+                // A real request may have succeeded during this probe.
+                if cached.revision == revision {
+                    cached.observe(result);
                 }
-                // Leave the previous value readable while the background check runs.
-                let available = self.probe(&key).await;
-                *state.lock().await = Some(available);
             })
             .await;
     }
 
     async fn monitor_probes(&self) {
         loop {
-            tokio::time::sleep(PROBE_INTERVAL).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             self.refresh_probes().await;
         }
     }
@@ -817,7 +936,12 @@ impl Server {
                 .send()
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if response.status() != 407 {
+                        self.record_route_success(endpoint, &url, native_tls).await;
+                    }
+                    return Ok(response);
+                }
                 Err(error) => {
                     // Never log raw reqwest errors: they can contain query secrets.
                     let kind = if error.is_timeout() {
@@ -995,6 +1119,23 @@ impl Server {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
+}
+
+fn hard_probe_failure(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return Some("connection_refused");
+        }
+        if error.to_string() == "proxy authorization required" {
+            return Some("proxy_authentication");
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {

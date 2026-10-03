@@ -1500,7 +1500,7 @@ async fn unavailable_proxy_recovers_while_idle() {
             assert!(request.starts_with("HEAD http://example.invalid/ HTTP"));
             assert!(!request.contains("secret"));
             c.fetch_add(1, Ordering::SeqCst);
-            let status = if h.load(Ordering::SeqCst) { 200 } else { 503 };
+            let status = if h.load(Ordering::SeqCst) { 200 } else { 407 };
             io.write_all(
                 format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     .as_bytes(),
@@ -1543,7 +1543,7 @@ async fn unavailable_proxy_recovers_while_idle() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     healthy.store(true, Ordering::SeqCst);
     // No client requests: the serve-owned timer must discover recovery itself.
-    tokio::time::timeout(Duration::from_secs(36), async {
+    tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let state = running
                 .server
@@ -1554,7 +1554,7 @@ async fn unavailable_proxy_recovers_while_idle() {
                 .next()
                 .unwrap()
                 .clone();
-            if *state.lock().await == Some(true) {
+            if !state.lock().await.unavailable {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1732,4 +1732,153 @@ async fn safe_get_retries_share_the_original_timeout_budget() {
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert_eq!(raw.matches("\"event\":\"upstream_retry\"").count(), 1);
     assert!(raw.contains("\"transport_error\":\"timeout\""));
+}
+
+#[test]
+fn transient_health_failures_need_confirmation_and_recovery_is_immediate() {
+    let mut state = ProbeHealth::default();
+    state.observe(ProbeResult::Healthy);
+    for _ in 0..2 {
+        state.observe(ProbeResult::Transient);
+        assert!(
+            !state.unavailable,
+            "one brief outage must not suppress API requests"
+        );
+        assert!(state.next_check.unwrap() <= Instant::now() + Duration::from_secs(1));
+    }
+    state.observe(ProbeResult::Transient);
+    assert!(state.unavailable);
+    assert!(state.next_check.unwrap() <= Instant::now() + Duration::from_secs(3));
+    state.observe(ProbeResult::Healthy);
+    assert!(!state.unavailable);
+    assert_eq!(state.failures, 0);
+    state.observe(ProbeResult::HardFailure);
+    assert!(state.unavailable);
+    for _ in 0..9 {
+        state.observe(ProbeResult::Transient);
+    }
+    assert!(state.next_check.unwrap() > Instant::now() + Duration::from_secs(20));
+}
+
+#[tokio::test]
+async fn api_response_clears_only_its_own_exit_failures() {
+    let fixture = fixture("direct", "redirect").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: [none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let key = ProbeKey {
+        endpoint: "none".into(),
+        origin: "https://upstream.invalid/".into(),
+        native_tls: false,
+    };
+    let mut suspect = ProbeHealth::default();
+    suspect.observe(ProbeResult::Transient);
+    suspect.observe(ProbeResult::Transient);
+    let state = Arc::new(tokio::sync::Mutex::new(suspect));
+    let mut failed = ProbeHealth::default();
+    failed.observe(ProbeResult::HardFailure);
+    let other = Arc::new(tokio::sync::Mutex::new(failed));
+    {
+        let mut cache = running.server.probes.lock().unwrap();
+        cache.insert(key.clone(), state.clone());
+        cache.insert(
+            ProbeKey {
+                endpoint: "http://other.invalid:8080".into(),
+                ..key
+            },
+            other.clone(),
+        );
+    }
+    let response = http()
+        .post(format!("{}/responses", running.url))
+        .bearer_auth("model-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    assert_eq!(state.lock().await.failures, 0);
+    assert!(other.lock().await.unavailable);
+}
+
+#[tokio::test]
+async fn homepage_failure_does_not_disable_a_working_tunnel() {
+    for drop_head in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_response_head(&mut socket).await;
+            assert!(head.starts_with("HEAD "));
+            if drop_head {
+                drop(socket);
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let head = read_response_head(&mut socket).await;
+                assert!(head.starts_with("CONNECT example.invalid:80 "));
+                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+            } else {
+                socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+        });
+        let running = running("").await;
+        let result = running
+            .server
+            .probe(&ProbeKey {
+                endpoint,
+                origin: "http://example.invalid/".into(),
+                native_tls: false,
+            })
+            .await;
+        assert_eq!(result, ProbeResult::Healthy);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stale_failed_probe_cannot_override_a_successful_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_response_head(&mut socket).await;
+        started_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 407 Auth Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let running = running("").await;
+    let mut health = ProbeHealth::default();
+    health.observe(ProbeResult::Transient);
+    health.next_check = Some(Instant::now());
+    let state = Arc::new(tokio::sync::Mutex::new(health));
+    running.server.probes.lock().unwrap().insert(
+        ProbeKey {
+            endpoint: endpoint.clone(),
+            origin: "http://example.invalid/".into(),
+            native_tls: false,
+        },
+        state.clone(),
+    );
+    let server = running.server.clone();
+    let refresh = tokio::spawn(async move {
+        server.refresh_probes().await;
+    });
+    started_rx.await.unwrap();
+    running
+        .server
+        .record_route_success(
+            &endpoint,
+            &Url::parse("http://example.invalid/api?q=secret").unwrap(),
+            false,
+        )
+        .await;
+    release_tx.send(()).unwrap();
+    refresh.await.unwrap();
+    assert!(!state.lock().await.unavailable);
+    assert_eq!(state.lock().await.failures, 0);
+    task.await.unwrap();
 }

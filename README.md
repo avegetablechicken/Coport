@@ -299,18 +299,27 @@ claude:
 
 Merge those entries into the appropriate service sections, with proxy names
 defined under `proxies`. Scalar routes send directly through the selected proxy.
-Lists probe candidates sequentially with unauthenticated `HEAD /` requests to
-the actual upstream HTTPS origin, without model tokens, account headers, bodies
-or query parameters. HTTP 200–499 other than 407 establishes reachability;
-redirects are not followed. Each probe is limited to 5 seconds or the request
-timeout, whichever is lower. Results are cached by proxy endpoint, upstream
-origin, and TLS mode (up to 256 entries); concurrent initial lookups share a probe.
-Requests select the first available candidate in configured order using the cache.
-Every 30 seconds, the running server starts a background refresh of previously
-probed candidates, including unavailable ones, even without incoming requests.
-Refreshes use at most eight concurrent probes and leave cached results readable;
-the next refresh starts 30 seconds after the previous batch finishes. Recovery
-restores the preferred candidate automatically. Single-proxy routes do not probe.
+Lists probe candidates with unauthenticated `HEAD /` requests to the upstream
+origin, without model tokens, account headers, bodies or query parameters.
+Any HTTP response except proxy authentication failure (407) proves reachability;
+a target 5xx does not mark the exit down. Redirects are not followed. HEAD checks
+are limited to 5 seconds (or the shorter request timeout). After a transient HEAD
+failure, a TCP/CONNECT/SOCKS tunnel check gets up to 2 seconds to confirm transport
+reachability without relying on the website homepage.
+
+Results are isolated by proxy endpoint, upstream origin and TLS mode (up to 256
+entries); concurrent initial lookups share a probe. One or two transient failures
+leave the exit eligible and schedule rechecks after 1 second. Three consecutive
+failures disable it; connection refusal and proxy authentication failure disable
+it immediately. Disabled exits are rechecked after 3 seconds, slowing to 30 seconds
+after ten failures. Healthy exits are checked after 30 seconds. The background
+scheduler runs every second with at most eight concurrent probes; checks can take
+longer under load. One successful check restores the exit immediately.
+
+Actual API response headers (other than 407) also clear cached failures. A late
+probe cannot overwrite a newer successful request. Logs record the probe result,
+failure category and HTTP status without credentials. Requests use the first
+eligible candidate in configured order; single-proxy routes do not probe.
 Empty lists and
 unknown names are rejected at startup. All failed candidates return 502.
 The payload is sent once; API/streaming failures never replay it on another proxy.
