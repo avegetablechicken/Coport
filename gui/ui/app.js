@@ -389,7 +389,6 @@ function proxiesBlock() {
           else if (state === "error") value = `<span class="bad">Unreachable</span>`;
           // Plain HTTP is the common case; other schemes stay visible.
           const shown = p.endpoint.replace(/^http:\/\//, "");
-          const full = p.local && probe?.exitIp ? `${p.endpoint} → ${probe.exitIp}` : p.endpoint;
           const mark = flag(probe?.country);
           const exit =
             p.local && probe?.exitIp
@@ -397,7 +396,7 @@ function proxiesBlock() {
               : "";
           return `<div class="row proxy">
             <span class="dot ${dot}" ${probe?.error ? `data-tip="${esc(probe.error)}"` : ""}></span>
-            <span class="row-label">${tag(p.name)}<span class="row-sub" title="${esc(full)}">${esc(shown)}${exit}</span></span>
+            <span class="row-label">${tag(p.name)}<span class="row-sub">${esc(shown)}${exit}</span></span>
             <span class="row-value">${value}</span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
           </div>`;
