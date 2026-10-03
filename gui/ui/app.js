@@ -111,6 +111,12 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
 }
 
+// Original provider SVGs copied from OpenQuota; CSS masks apply the GUI theme color.
+function serviceMark(service) {
+  const name = { Claude: "claude", Codex: "codex" }[service];
+  return name ? `<span class="service-mark ${name}-mark" aria-hidden="true"></span>` : "";
+}
+
 // ---------------------------------------------------------------- state
 
 const ui = {
@@ -121,6 +127,14 @@ const ui = {
   search: "",
   rows: [],
   recent: [],
+  trafficMinutes: 30,
+  homeTraffic: null,
+  homeTrafficError: "",
+  homeTrafficFetchedAt: 0,
+  homeTrafficLoading: false,
+  traffic: null,
+  trafficError: "",
+  trafficRequest: 0,
   expanded: new Set(),
   builtPage: null,
   choosePath: false,
@@ -140,6 +154,7 @@ async function refresh() {
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
   if (ui.page === "activity") await loadActivity(false);
+  else if (ui.page === "main" && Date.now() - ui.homeTrafficFetchedAt >= 15000) loadHomeTraffic();
   render();
 }
 
@@ -199,6 +214,7 @@ function renderPage() {
     if (ui.builtPage !== "activity") {
       content.innerHTML = activityShell();
       ui.builtPage = "activity";
+      renderActivityTraffic();
     }
     renderActivityList();
     return;
@@ -280,8 +296,25 @@ function chart(values, errors) {
   return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
 }
 
+async function loadHomeTraffic() {
+  if (ui.homeTrafficLoading) return;
+  ui.homeTrafficLoading = true;
+  try {
+    const traffic = await invoke("get_traffic", { minutes: 30 });
+    ui.homeTraffic = traffic.summary;
+    ui.homeTrafficError = "";
+    ui.homeTrafficFetchedAt = Date.now();
+  } catch (error) {
+    ui.homeTrafficError = String(error);
+  } finally {
+    ui.homeTrafficLoading = false;
+  }
+  if (ui.page === "main") render();
+}
+
 function trafficBlock() {
-  const st = ui.snap.stats;
+  const st = ui.homeTraffic;
+  if (ui.homeTrafficError || !st) return block("Traffic", "Last 30 minutes", `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
   let rate = "—";
   let rateClass = "";
   if (st.requests) {
@@ -292,7 +325,7 @@ function trafficBlock() {
   return block(
     "Traffic",
     "Last 30 minutes",
-    `${chart(st.perMinute, st.errorsPerMinute)}
+    `${chart(st.counts, st.errorCounts)}
      <div class="strip">
        ${stat("Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
@@ -407,12 +440,53 @@ function routingBlock() {
 
 // ---------------------------------------------------------------- activity
 
+const TRAFFIC_RANGES = [[30, "30 minutes"], [360, "6 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "7 days"], [43200, "30 days"]];
+
+async function loadTraffic() {
+  const request = ++ui.trafficRequest;
+  try {
+    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes });
+    if (request !== ui.trafficRequest) return;
+    ui.traffic = traffic;
+    ui.trafficError = "";
+  } catch (error) {
+    if (request !== ui.trafficRequest) return;
+    ui.trafficError = String(error);
+  }
+  if (ui.page === "activity") renderActivityTraffic();
+}
+
+function renderActivityTraffic() {
+  const el = $("activity-traffic");
+  if (!el) return;
+  const traffic = ui.traffic;
+  const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const rows = traffic?.credentials.map((c) => {
+    const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
+    return `<div class="credential-traffic">
+      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
+      ${chart(c.counts, c.errorCounts)}
+      <div class="strip">${stat("Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>
+    </div>`;
+  }).join("");
+  el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
+    <select id="traffic-range" class="select" aria-label="Traffic time range">${TRAFFIC_RANGES.map(([minutes, label]) => `<option value="${minutes}" ${minutes === ui.trafficMinutes ? "selected" : ""}>Last ${label}</option>`).join("")}</select></div>
+    <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
+    ${ui.trafficError ? `<div class="placeholder bad">${esc(ui.trafficError)}</div>` : !traffic ? '<div class="placeholder">Loading traffic…</div>' : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
+    <p class="traffic-note">Based on retained logs, including rotated history. Older data may be unavailable. Unidentified requests have no logged credential.</p>`;
+  queueFit();
+}
+
 function activityShell() {
   return `<div class="page">
-    <label class="search">${ICON.search}
-      <input class="field" id="search" type="search" spellcheck="false" placeholder="Filter by path, proxy or status" value="${esc(ui.search)}" /></label>
-    <div class="segmented" id="filters"></div>
-    <section class="block flush" id="activity-list"></section>
+    <section class="block" id="activity-traffic"></section>
+    <section class="block">
+      <div class="block-head"><span class="block-title">Activity Log</span></div>
+      <label class="search">${ICON.search}
+        <input class="field" id="search" type="search" spellcheck="false" placeholder="Filter by path, proxy or status" value="${esc(ui.search)}" /></label>
+      <div class="segmented" id="filters"></div>
+      <div id="activity-list"></div>
+    </section>
   </div>`;
 }
 
@@ -547,7 +621,11 @@ async function act(action, el) {
   switch (action) {
     case "page":
       ui.page = el.dataset.page;
-      if (ui.page === "activity") await loadActivity(false);
+      if (ui.page === "activity") {
+        loadTraffic();
+        await loadActivity(false);
+      }
+      if (ui.page === "main") loadHomeTraffic();
       if (ui.page !== "settings") ui.choosePath = false;
       render();
       $("content").scrollTop = 0;
@@ -656,6 +734,14 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "traffic-range") {
+    ui.trafficMinutes = Number(event.target.value);
+    ui.traffic = null;
+    ui.trafficError = "";
+    renderActivityTraffic();
+    await loadTraffic();
+    return;
+  }
   const key = event.target.dataset?.setting;
   if (!key) return;
   await invoke("update_settings", { patch: { [key]: event.target.value } });
@@ -704,3 +790,10 @@ const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 listen("state-changed", scheduleRefresh);
 listen("panel-shown", () => refresh().then(probeStale));
 refresh().then(probeStale);
+
+// Refresh even when no new requests arrive, so the rolling window advances.
+setInterval(() => {
+  if (document.hidden) return;
+  if (ui.page === "activity") loadTraffic();
+  else if (ui.page === "main") loadHomeTraffic();
+}, 15000);

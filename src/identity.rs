@@ -442,6 +442,77 @@ async fn shell_value(_: &str) -> Result<String> {
 }
 
 impl Config {
+    /// Safe display names for recorded account IDs, using routing's selector precedence.
+    pub async fn traffic_credential_labels(&self) -> BTreeMap<(String, String), String> {
+        let mut labels = BTreeMap::new();
+        for (source, account, _) in self.codex.account_sources() {
+            if let Ok(identity) = self.codex.account_identity(&account).await {
+                if let Some(selector) = routing_account_label(
+                    &self.codex.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                ) {
+                    labels.insert(("Codex".into(), identity.account_id), selector);
+                }
+            }
+        }
+        // Additional saved logins supply display metadata only. They never become
+        // accepted credential sources or participate in proxy routing.
+        for home in &self.codex.homes {
+            let Ok(files) = std::fs::read_dir(expand(home)) else {
+                continue;
+            };
+            let mut paths: Vec<_> = files
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("auth-") && name.ends_with(".json")
+                })
+                .map(|entry| entry.path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                let Ok(identity) = Identity::read(&path.to_string_lossy()) else {
+                    continue;
+                };
+                // Only an explicit ID/email/name match is evidence of a label;
+                // default and fallback routes cannot identify an archived login.
+                if let Some(selector) = std::iter::once(&identity.account_id)
+                    .chain(identity.usernames.iter())
+                    .find(|name| self.codex.routing.account.contains_key(*name))
+                {
+                    labels
+                        .entry(("Codex".into(), identity.account_id.clone()))
+                        .or_insert_with(|| selector.clone());
+                }
+            }
+        }
+        for (source, account, directory) in self.claude.account_sources() {
+            if let Some(identity) = account.claude_identity(directory.as_deref()) {
+                if let Some(selector) = routing_account_label(
+                    &self.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                ) {
+                    labels.insert(("Claude".into(), identity.account_id), selector);
+                }
+            }
+        }
+        for (service, routing) in [
+            ("Codex", &self.codex.routing),
+            ("Claude", &self.claude.routing),
+        ] {
+            for name in routing.api_key.keys() {
+                labels.insert((service.into(), name.clone()), name.clone());
+            }
+        }
+        labels
+    }
+
     pub fn account_choice(
         &self,
         identity: &Identity,
@@ -607,6 +678,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn traffic_names_include_saved_logins_without_authorizing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, id, email) in [
+            ("auth-hmm.json", "123", "one@example.test"),
+            ("auth-suzhi.json", "456", "two@example.test"),
+            ("auth-unmatched.json", "789", "other@example.test"),
+            ("unrelated.json", "999", "one@example.test"),
+        ] {
+            std::fs::write(
+                dir.path().join(file),
+                json!({"tokens": {
+                    "account_id": id, "access_token": "archived-token",
+                    "id_token": jwt(json!({"email": email}))
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("auth-invalid.json"), "invalid").unwrap();
+        let config = Config::parse(&format!(
+            "listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    account: {{'one@example.test': none, 'two@example.test': none, default: none}}\n    account_fallback: none\n",
+            serde_json::to_string(dir.path()).unwrap()
+        )).unwrap();
+        let labels = config.traffic_credential_labels().await;
+        assert_eq!(labels[&("Codex".into(), "123".into())], "one@example.test");
+        assert_eq!(labels[&("Codex".into(), "456".into())], "two@example.test");
+        assert!(!labels.contains_key(&("Codex".into(), "789".into())));
+        assert!(!labels.contains_key(&("Codex".into(), "999".into())));
+        assert!(
+            config
+                .resolve(Some("Bearer archived-token"), true)
+                .await
+                .is_err()
+        );
+    }
+
     fn jwt(value: Value) -> String {
         format!(
             "e30.{}.signature",
@@ -626,6 +734,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(route.proxy.label(), "none");
+        assert_eq!(route.account_label.as_deref(), Some("account-1"));
+        let mut email_config = config.clone();
+        email_config.codex.routing.account.remove("account-1");
+        let route = email_config
+            .resolve(Some(&format!("Bearer {token}")), true)
+            .await
+            .unwrap();
+        assert_eq!(route.account_label.as_deref(), Some("profile@example.com"));
+        assert_eq!(route.account_id.as_deref(), Some("account-1"));
+        assert_eq!(route.proxy.label(), "other");
+        email_config.codex.account_auth_file_only = true;
+        assert!(
+            email_config
+                .resolve(Some(&format!("Bearer {token}")), true)
+                .await
+                .is_err()
+        );
         assert!(
             config
                 .resolve(Some("Bearer arbitrary"), true)
@@ -742,4 +867,23 @@ mod tests {
         );
         assert!(c.check_credentials().await.is_err());
     }
+}
+
+pub(crate) fn routing_account_label(
+    routing: &crate::config::Routing,
+    id: &str,
+    usernames: &[String],
+    source: &str,
+) -> Option<String> {
+    std::iter::once(id)
+        .chain(usernames.iter().map(String::as_str))
+        .chain(std::iter::once(source))
+        .find(|name| routing.account.contains_key(*name))
+        .map(str::to_owned)
+        .or_else(|| {
+            routing
+                .account_fallback
+                .as_ref()
+                .map(|_| "account_fallback".into())
+        })
 }

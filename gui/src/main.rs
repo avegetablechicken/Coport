@@ -13,6 +13,7 @@ mod placement;
 mod platform;
 mod single_instance;
 mod tray;
+mod traffic;
 
 use agent_router_gui::{proxy, settings};
 use std::{
@@ -94,6 +95,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::get_activity,
+            commands::get_traffic,
             commands::set_running,
             commands::restart_proxy,
             commands::check_credentials,

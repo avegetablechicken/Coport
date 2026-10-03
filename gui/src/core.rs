@@ -112,7 +112,7 @@ impl Core {
         self.config = ConfigCache::default();
     }
 
-    fn loaded_config(&self) -> Option<&Config> {
+    pub(crate) fn loaded_config(&self) -> Option<&Config> {
         self.config.parsed.as_ref()?.as_ref().ok()
     }
 

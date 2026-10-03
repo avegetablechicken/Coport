@@ -93,7 +93,10 @@ impl AccountSource {
                 "Claude account requires an explicit credential source.",
             ))
     }
-    fn claude_identity(&self, directory: Option<&std::path::Path>) -> Option<ClaudeIdentity> {
+    pub(crate) fn claude_identity(
+        &self,
+        directory: Option<&std::path::Path>,
+    ) -> Option<ClaudeIdentity> {
         // An environment token is not evidence that it belongs to the local
         // CLI metadata. Such configured sources retain label/fallback routing.
         if self.auth_env.is_some() {

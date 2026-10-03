@@ -24,6 +24,25 @@ pub fn get_activity(state: State<AppState>, filter: String, search: String) -> V
 }
 
 #[tauri::command]
+pub async fn get_traffic(
+    state: State<'_, AppState>,
+    minutes: u64,
+) -> Result<crate::traffic::Traffic> {
+    let (path, config) = {
+        let mut core = state.core.lock().unwrap();
+        core.refresh_config();
+        (core.logs.path(), core.loaded_config().cloned())
+    };
+    let labels = match config {
+        Some(config) => config.traffic_credential_labels().await,
+        None => Default::default(),
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::traffic::read(&path, minutes, &labels))
+        .await
+        .map_err(|_| "Cannot load traffic history".to_owned())?
+}
+
+#[tauri::command]
 pub fn set_running(app: AppHandle, state: State<AppState>, running: bool) -> Result {
     {
         let mut core = state.core.lock().unwrap();

@@ -8,6 +8,7 @@ use url::Url;
 pub struct Route {
     pub token: String,
     pub account_id: Option<String>,
+    pub account_label: Option<String>,
     pub provider: Option<String>,
     pub proxy: Choice,
     pub upstream: String,
@@ -33,6 +34,7 @@ impl Config {
         Ok(Some(Route {
             token: token.into(),
             account_id: None,
+            account_label: None,
             provider: Some(base.into()),
             proxy: proxy.clone(),
             upstream: crate::url_routing::validate_upstream(base)?.into(),
@@ -79,6 +81,7 @@ impl Config {
                         matches.push(Route {
                             token: credential.token,
                             account_id: credential.account_id,
+                            account_label: None,
                             provider: Some(p.label().into()),
                             proxy: p.proxy.clone(),
                             upstream: credential.upstream,
@@ -97,9 +100,16 @@ impl Config {
         }
         if let Some((i, source)) = identities.pop() {
             let proxy = self.account_choice(&i, source)?;
+            let account_label = crate::identity::routing_account_label(
+                &self.codex.routing,
+                &i.account_id,
+                &i.usernames,
+                source.unwrap_or(""),
+            );
             return Ok(Route {
                 token: i.token,
                 account_id: Some(i.account_id),
+                account_label,
                 provider: None,
                 proxy,
                 upstream: self.codex.base_url.account.clone(),
@@ -114,6 +124,7 @@ impl Config {
                 return Ok(Route {
                     token: token.into(),
                     account_id: None,
+                    account_label: None,
                     provider: Some("openai-fallback".into()),
                     proxy: proxy.clone(),
                     upstream: self.codex.base_url.api_key.clone(),

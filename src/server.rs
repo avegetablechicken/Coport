@@ -463,6 +463,14 @@ impl Server {
             log.field("provider", &r.label);
             if let Some(identity) = &r.identity {
                 log.field("account_id", &identity.account_id);
+                if let Some(label) = crate::identity::routing_account_label(
+                    &self.config.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &r.label,
+                ) {
+                    log.field("account_label", label);
+                }
             }
             (None, r.proxy.clone())
         } else if docs {
@@ -498,6 +506,9 @@ impl Server {
             (Some(r), p)
         };
         if let Some(r) = &route {
+            if let Some(label) = &r.account_label {
+                log.field("account_label", label);
+            }
             if let Some(id) = &r.account_id {
                 log.field("account_id", id);
             }

@@ -1,0 +1,399 @@
+//! Activity traffic is read from retained logs, independently of the capped UI list.
+use crate::logs::Entry;
+use chrono::{DateTime, Local};
+use serde::Serialize;
+use serde_json::Value;
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::Path,
+};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Traffic {
+    start: i64,
+    end: i64,
+    bucket_minutes: u64,
+    credentials: Vec<CredentialTraffic>,
+    summary: CredentialTraffic,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialTraffic {
+    service: String,
+    credential: String,
+    requests: u64,
+    errors: u64,
+    bytes: u64,
+    avg_ms: Option<u64>,
+    counts: Vec<u64>,
+    error_counts: Vec<u64>,
+    #[serde(skip)]
+    latency_total: u64,
+    #[serde(skip)]
+    latency_count: u64,
+}
+
+pub fn read(
+    path: &Path,
+    minutes: u64,
+    labels: &BTreeMap<(String, String), String>,
+) -> Result<Traffic, String> {
+    let bucket_minutes = match minutes {
+        30 => 1,
+        360 => 12,
+        720 => 24,
+        1440 => 48,
+        10080 => 336,
+        43200 => 1440,
+        _ => return Err("Unsupported traffic range".into()),
+    };
+    let end = Local::now().timestamp_millis();
+    let start = end - minutes as i64 * 60_000;
+    let mut groups = BTreeMap::new();
+    let mut entries = Vec::new();
+    let mut labels = labels.clone();
+    let backup = path.with_file_name(format!(
+        "{}.1",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    // Open handles before reading so appends and rotations do not restart a scan.
+    let files = [path, backup.as_path()].map(|p| match File::open(p) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("Cannot read traffic history".to_owned()),
+    });
+    #[cfg(unix)]
+    let mut identities = std::collections::HashSet::new();
+    for file in files {
+        let Some(file) = file? else { continue };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file
+                .metadata()
+                .map_err(|_| "Cannot read traffic history".to_owned())?;
+            // Rotation between the two opens can return the same file twice.
+            if !identities.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+        }
+        for line in BufReader::new(file).split(b'\n') {
+            let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
+            let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
+                continue;
+            };
+            let Some(Value::String(event)) = fields.remove("event") else {
+                continue;
+            };
+            let time = fields
+                .remove("timestamp")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                })
+                .map(|t| t.with_timezone(&Local));
+            let entry = Entry {
+                seq: 0,
+                event,
+                time,
+                fields,
+            };
+            // Retain safe identity evidence even when the corresponding request is
+            // outside the selected window. Current configuration mappings win.
+            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label")) {
+                if !id.is_empty() && !label.is_empty() {
+                    let service = entry
+                        .service()
+                        .or_else(|| entry.get("service"))
+                        .unwrap_or("Unknown");
+                    labels
+                        .entry((service.to_owned(), id.to_owned()))
+                        .or_insert_with(|| label.to_owned());
+                }
+            }
+            if entry.is_request_end() {
+                entries.push(entry);
+            }
+        }
+    }
+    for entry in &entries {
+        aggregate(&mut groups, entry, start, end, bucket_minutes, &labels);
+    }
+    let mut summary = CredentialTraffic {
+        counts: vec![0; 30],
+        error_counts: vec![0; 30],
+        ..Default::default()
+    };
+    for group in groups.values() {
+        summary.requests += group.requests;
+        summary.errors += group.errors;
+        summary.bytes += group.bytes;
+        summary.latency_total += group.latency_total;
+        summary.latency_count += group.latency_count;
+        for i in 0..30 {
+            summary.counts[i] += group.counts[i];
+            summary.error_counts[i] += group.error_counts[i];
+        }
+    }
+    summary.avg_ms =
+        (summary.latency_count > 0).then(|| summary.latency_total / summary.latency_count);
+    let mut credentials: Vec<_> = groups.into_values().collect();
+    credentials.sort_by_key(|group| {
+        (
+            group.credential == "Unidentified",
+            std::cmp::Reverse(group.bytes),
+        )
+    });
+    Ok(Traffic {
+        start,
+        end,
+        bucket_minutes,
+        credentials,
+        summary,
+    })
+}
+
+fn aggregate(
+    groups: &mut BTreeMap<(String, String), CredentialTraffic>,
+    e: &Entry,
+    start: i64,
+    end: i64,
+    bucket_minutes: u64,
+    labels: &BTreeMap<(String, String), String>,
+) {
+    if !e.is_request_end() {
+        return;
+    }
+    let Some(time) = e.time.map(|t| t.timestamp_millis()) else {
+        return;
+    };
+    if time < start || time >= end {
+        return;
+    }
+    let service = e
+        .service()
+        .or_else(|| e.get("service"))
+        .unwrap_or("Unknown")
+        .to_owned();
+    // Resolve account IDs to the exact selector used in routing, without exposing tokens.
+    let credential = e
+        .get("provider")
+        .and_then(|name| labels.get(&(service.clone(), name.to_owned())).cloned())
+        .or_else(|| {
+            e.get("account_id")
+                .and_then(|id| labels.get(&(service.clone(), id.to_owned())).cloned())
+        })
+        .or_else(|| {
+            e.get("account_label")
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            e.get("provider").filter(|s| !s.is_empty()).map(|name| {
+                match name {
+                    "openai-fallback" | "claude-api-key-fallback" => "api_key_fallback",
+                    "claude-account-fallback" => "account_fallback",
+                    _ => name,
+                }
+                .to_owned()
+            })
+        })
+        .or_else(|| {
+            e.get("account_id")
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "Unidentified".into());
+    let group = groups
+        .entry((service.clone(), credential.clone()))
+        .or_insert_with(|| CredentialTraffic {
+            service,
+            credential,
+            counts: vec![0; 30],
+            error_counts: vec![0; 30],
+            ..Default::default()
+        });
+    let slot = ((time - start) / (bucket_minutes as i64 * 60_000)) as usize;
+    group.counts[slot] += 1;
+    group.requests += 1;
+    if e.is_error() {
+        group.errors += 1;
+        group.error_counts[slot] += 1;
+    }
+    group.bytes += e.bytes();
+    if let Some(ms) = e.duration_ms() {
+        group.latency_total += ms;
+        group.latency_count += 1;
+        group.avg_ms = Some(group.latency_total / group.latency_count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reads_rotated_history_groups_credentials_and_excludes_outside_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let line = |age, account: &str, status| {
+            serde_json::json!({
+            "event": "request_finished", "timestamp": (Local::now() - chrono::Duration::minutes(age)).to_rfc3339(),
+            "service": "codex", "account_id": account, "status": status,
+            "duration_ms": "20", "received_bytes": "100"
+        }).to_string() + "\n"
+        };
+        std::fs::write(
+            &path,
+            line(1, "a", "200") + &line(1, "b", "500") + &line(-10, "a", "200"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("proxy.log.1"),
+            line(100, "a", "200") + &line(43201, "a", "200") + "invalid\n",
+        )
+        .unwrap();
+        for range in [30, 360, 720, 1440, 10080, 43200] {
+            let traffic = read(&path, range, &BTreeMap::new()).unwrap();
+            assert_eq!(traffic.credentials.len(), 2);
+            assert_eq!(traffic.summary.requests, if range == 30 { 2 } else { 3 });
+            assert_eq!(traffic.summary.errors, 1);
+            assert_eq!(traffic.summary.avg_ms, Some(20));
+            let a = &traffic.credentials[0];
+            assert_eq!(a.requests, if range == 30 { 1 } else { 2 });
+            assert_eq!(a.counts.iter().sum::<u64>(), a.requests);
+            assert_eq!(a.bytes, a.requests * 100);
+            assert_eq!(a.avg_ms, Some(20));
+            assert_eq!(traffic.credentials[1].errors, 1);
+        }
+        assert!(read(&path, 31, &BTreeMap::new()).is_err());
+        assert!(
+            read(&dir.path().join("missing"), 30, &BTreeMap::new())
+                .unwrap()
+                .credentials
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn shows_routing_selectors_for_saved_accounts_and_api_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"account_id":"opaque-id","access_token":"test-token"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"claude-id","emailAddress":"user@example.test"}}"#,
+        )
+        .unwrap();
+        let config = agent_router::config::Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{0}]\n  auth_file: auth.json\n  routing:\n    account: {{default: none}}\n    api_key: {{MY_API_KEY: none}}\nclaude:\n  config_dirs: [{0}]\n  auth_file: .credentials.json\n  routing:\n    account: {{'user@example.test': none, default: none}}\n",
+            serde_json::to_string(dir.path()).unwrap()
+        )).unwrap();
+        let labels = config.traffic_credential_labels().await;
+        assert_eq!(labels[&("Codex".into(), "opaque-id".into())], "default");
+        assert_eq!(
+            labels[&("Claude".into(), "claude-id".into())],
+            "user@example.test"
+        );
+        let mut groups = BTreeMap::new();
+        for (service, account, provider) in [
+            ("codex", "opaque-id", ""),
+            ("claude", "claude-id", "personal"),
+            ("codex", "opaque-id", "MY_API_KEY"),
+        ] {
+            let e = Entry { seq: 0, time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)), event: "request_finished".into(), fields: serde_json::from_value(serde_json::json!({"service": service, "account_id": account, "provider": provider})).unwrap() };
+            aggregate(&mut groups, &e, 0, 1_800_000, 1, &labels);
+        }
+        assert!(groups.contains_key(&("Codex".into(), "default".into())));
+        assert!(groups.contains_key(&("Codex".into(), "MY_API_KEY".into())));
+        assert!(groups.contains_key(&("Claude".into(), "user@example.test".into())));
+    }
+
+    #[test]
+    fn restores_old_ids_from_logged_routing_names_across_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let line = |age, service, id, label| {
+            serde_json::json!({
+                "event": "request_finished",
+                "timestamp": (Local::now() - chrono::Duration::minutes(age)).to_rfc3339(),
+                "service": service, "account_id": id, "account_label": label, "status": "200"
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(
+            &path,
+            line(40, "codex", "123456", "user@example.test") + &line(1, "codex", "123456", ""),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("proxy.log.1"),
+            line(2, "codex", "123456", "") + &line(2, "claude", "123456", ""),
+        )
+        .unwrap();
+        let traffic = read(&path, 30, &BTreeMap::new()).unwrap();
+        let codex = traffic
+            .credentials
+            .iter()
+            .find(|g| g.service == "Codex")
+            .unwrap();
+        assert_eq!(codex.credential, "user@example.test");
+        assert_eq!(codex.requests, 2);
+        assert_eq!(
+            traffic
+                .credentials
+                .iter()
+                .find(|g| g.service == "Claude")
+                .unwrap()
+                .credential,
+            "123456"
+        );
+        let labels = BTreeMap::from([(("Codex".into(), "123456".into()), "current-name".into())]);
+        let traffic = read(&path, 30, &labels).unwrap();
+        assert_eq!(
+            traffic
+                .credentials
+                .iter()
+                .find(|g| g.service == "Codex")
+                .unwrap()
+                .credential,
+            "current-name"
+        );
+    }
+
+    #[test]
+    fn buckets_boundaries_and_keeps_services_separate() {
+        let mut groups = BTreeMap::new();
+        for (time, service) in [
+            (0, "codex"),
+            (59_999, "codex"),
+            (60_000, "claude"),
+            (1_799_999, "codex"),
+            (1_800_000, "codex"),
+            (-1, "codex"),
+        ] {
+            let e = Entry {
+                seq: 0,
+                time: DateTime::from_timestamp_millis(time).map(|t| t.with_timezone(&Local)),
+                event: "request_failed".into(),
+                fields: serde_json::from_value(
+                    serde_json::json!({"service": service, "provider": "key"}),
+                )
+                .unwrap(),
+            };
+            aggregate(&mut groups, &e, 0, 1_800_000, 1, &BTreeMap::new());
+        }
+        assert_eq!(groups.len(), 2);
+        let codex = &groups[&("Codex".into(), "key".into())];
+        assert_eq!(codex.counts[0], 2);
+        assert_eq!(codex.counts[29], 1);
+        assert_eq!(codex.errors, 3);
+    }
+}

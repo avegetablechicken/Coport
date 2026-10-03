@@ -1026,3 +1026,27 @@ details.disclosure[open] summary svg {
 .row.proxy .row-sub {
   font-variant-numeric: tabular-nums;
 }
+
+/* Per-credential activity history. */
+#traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
+.credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }
+.traffic-identity { display: flex; gap: 8px; align-items: baseline; margin-bottom: 8px; font-size: 11px; }
+.traffic-identity span { color: var(--secondary); flex-shrink: 0; }
+.traffic-identity strong { overflow-wrap: anywhere; font-weight: 500; }
+.credential-traffic .chart { height: 48px; }
+.traffic-note { color: var(--secondary); font-size: 10px; line-height: 1.5; margin: 6px 0 0; }
+.traffic-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
+
+.traffic-service { display: inline-flex; align-items: center; gap: 4px; }
+.service-mark {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  align-self: center;
+  background-color: var(--label);
+  -webkit-mask: var(--service-icon) center / contain no-repeat;
+  mask: var(--service-icon) center / contain no-repeat;
+}
+.claude-mark { --service-icon: url("icons/claude.svg"); }
+.codex-mark { --service-icon: url("icons/codex.svg"); }
