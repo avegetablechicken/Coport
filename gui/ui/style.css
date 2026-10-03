@@ -161,7 +161,7 @@ select:focus-visible {
 
 .top {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
   padding: 10px 15px 2px;
   min-height: 34px;
@@ -179,6 +179,7 @@ select:focus-visible {
 .page-title {
   font-size: 12px;
   font-weight: 600;
+  line-height: 20px;
 }
 
 .links {
@@ -200,8 +201,11 @@ select:focus-visible {
 .text-link.back {
   display: inline-flex;
   align-items: center;
-  gap: 1px;
+  gap: 2px;
   margin-left: -3px;
+  font-size: 12px;
+  line-height: 20px;
+  min-height: 20px;
 }
 
 .text-link.back svg {
@@ -1030,14 +1034,32 @@ details.disclosure[open] summary svg {
 /* Per-credential activity history. */
 #traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
 .credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }
-.traffic-identity { display: flex; gap: 8px; align-items: baseline; margin-bottom: 8px; font-size: 11px; }
-.traffic-identity span { color: var(--secondary); flex-shrink: 0; }
-.traffic-identity strong { overflow-wrap: anywhere; font-weight: 500; }
+.traffic-identity {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  line-height: 18px;
+}
+.traffic-identity strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
 .credential-traffic .chart { height: 48px; }
 .traffic-note { color: var(--secondary); font-size: 10px; line-height: 1.5; margin: 6px 0 0; }
 .traffic-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
 
-.traffic-service { display: inline-flex; align-items: center; gap: 4px; }
+.traffic-service {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 18px;
+  color: var(--secondary);
+  white-space: nowrap;
+}
 .service-mark {
   display: inline-block;
   width: 16px;
