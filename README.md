@@ -702,9 +702,16 @@ The configuration is edited in your text editor; the panel validates it whenever
 the file changes and offers a restart when the running proxy is out of date. The
 right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 
-`--config` is remembered; without it the app uses its saved choice, then
-`./config.yaml`, then `config.yaml` in the per-user configuration directory, where
-it offers to create one from `config.example.yaml`. Logs go to `logs/proxy.log`
+The GUI supports YAML configuration files (`.yaml` and `.yml`). `--config` and
+files explicitly selected in Settings are remembered. Without a saved choice,
+the only default is `agent-router/config.yaml` in the user's application cache
+directory: `~/Library/Caches/agent-router/config.yaml` on macOS,
+`$XDG_CACHE_HOME/agent-router/config.yaml` (normally `~/.cache/agent-router/config.yaml`)
+on Linux, or `%LOCALAPPDATA%/agent-router/config.yaml` on Windows. The GUI never
+searches the working directory for configuration. It offers to create a missing
+configuration from `config.example.yaml`. Existing saved paths are retained;
+GUI preferences and daemon discovery stay in the per-user configuration directory.
+The CLI's default remains `./config.yaml`. Logs go to `logs/proxy.log`
 next to the configuration, exactly as with the CLI. Opening the app shows the
 panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the

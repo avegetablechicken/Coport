@@ -71,16 +71,12 @@ fn settings_file() -> PathBuf {
     app_dir().join("gui.json")
 }
 
-/// A `config.yaml` in the working directory wins, matching the CLI default;
-/// otherwise the per-user application directory is used.
+/// The GUI has one default location, independent of its working directory.
+/// Explicit paths chosen in Settings or through --config still take precedence.
 fn default_config_path() -> PathBuf {
-    let local = PathBuf::from("config.yaml");
-    if local.is_file()
-        && let Ok(abs) = std::path::absolute(&local)
-    {
-        return abs;
-    }
-    app_dir().join("config.yaml")
+    dirs::cache_dir()
+        .expect("Cannot locate the current user's application cache directory")
+        .join("agent-router/config.yaml")
 }
 
 /// Atomically replaces `path`, creating it with owner-only permissions.
@@ -101,6 +97,27 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_uses_only_the_application_cache() {
+        let expected = dirs::cache_dir().unwrap().join("agent-router/config.yaml");
+        assert_eq!(Settings::default().config_path(), expected);
+        let missing_path: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing_path.config_path(), expected);
+    }
+
+    #[test]
+    fn explicitly_selected_yaml_paths_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["custom.yaml", "custom.yml"] {
+            let path = dir.path().join(name);
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "config_path": path,
+            }))
+            .unwrap();
+            assert_eq!(settings.config_path(), path);
+        }
+    }
 
     #[test]
     fn old_preferences_keep_existing_quit_behavior() {

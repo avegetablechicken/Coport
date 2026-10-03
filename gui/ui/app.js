@@ -570,7 +570,7 @@ function settings() {
     )}
     ${block(
       "Configuration",
-      "",
+      "YAML (.yaml / .yml)",
       `<div class="path selectable">${esc(s.config.path)}</div>
        ${status}${check}
        <div class="actions">
@@ -580,7 +580,7 @@ function settings() {
            data-tip="Validates credential sources like --check">Check Credentials</button>
        </div>
        <details class="disclosure" ${ui.choosePath ? "open" : ""}><summary>${ICON.chevron}Use another file</summary>
-         <div class="inline-form"><input class="field" id="config-path" spellcheck="false" value="${esc(s.config.path)}" />
+         <div class="inline-form"><input class="field" id="config-path" spellcheck="false" aria-label="YAML configuration path" placeholder="Path to config.yaml or config.yml" value="${esc(s.config.path)}" />
            <button class="btn" data-action="apply-path">Apply</button></div>
        </details>`
     )}

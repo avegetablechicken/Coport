@@ -574,4 +574,16 @@ mod tests {
         assert!(parse_config(EXAMPLE).is_ok());
         assert!(parse_config("listen_port: [").is_err_and(|e| e.contains("line")));
     }
+
+    #[test]
+    fn yaml_and_yml_files_support_the_same_proxy_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["config.yaml", "config.yml"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, EXAMPLE).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(parse_config(&text).is_ok());
+            assert!(agent_router::config::Config::read(&path).is_ok());
+        }
+    }
 }
