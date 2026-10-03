@@ -27,6 +27,7 @@ pub fn get_activity(state: State<AppState>, filter: String, search: String) -> V
 pub async fn get_traffic(
     state: State<'_, AppState>,
     minutes: u64,
+    scope: Option<crate::traffic::TrafficScope>,
 ) -> Result<crate::traffic::Traffic> {
     let (path, config) = {
         let mut core = state.core.lock().unwrap();
@@ -37,9 +38,11 @@ pub async fn get_traffic(
         Some(config) => config.traffic_credential_labels().await,
         None => Default::default(),
     };
-    tauri::async_runtime::spawn_blocking(move || crate::traffic::read(&path, minutes, &labels))
-        .await
-        .map_err(|_| "Cannot load traffic history".to_owned())?
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::traffic::read(&path, minutes, &labels, scope.unwrap_or_default())
+    })
+    .await
+    .map_err(|_| "Cannot load traffic history".to_owned())?
 }
 
 #[tauri::command]

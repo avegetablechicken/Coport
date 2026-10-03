@@ -1,7 +1,7 @@
 //! Activity traffic is read from retained logs, independently of the capped UI list.
 use crate::logs::Entry;
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -10,9 +10,57 @@ use std::{
     path::Path,
 };
 
+/// Endpoint category, not an assertion that the upstream actually charged quota.
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrafficScope {
+    #[default]
+    All,
+    Model,
+}
+
+fn is_model_request(entry: &Entry) -> bool {
+    let raw = entry
+        .get("path")
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let path = raw
+        .strip_prefix("/codex/")
+        .or_else(|| raw.strip_prefix("/anthropic/"))
+        .or_else(|| raw.strip_prefix("/claude/"))
+        .unwrap_or(raw)
+        .trim_start_matches('/');
+    let parsed = if path.starts_with("https://") || path.starts_with("http://") {
+        reqwest::Url::parse(path).ok()
+    } else {
+        None
+    };
+    let path = parsed
+        .as_ref()
+        .map(|u| u.path())
+        .unwrap_or(path)
+        .trim_matches('/');
+    let ends = |suffix: &str| path == suffix || path.ends_with(&format!("/{suffix}"));
+    match entry.get("method") {
+        Some("POST") => {
+            ends("responses")
+                || ends("responses/compact")
+                || ends("messages")
+                || ends("chat/completions")
+                || ends("completions")
+        }
+        // Codex's streaming WebSocket upgrade uses GET on the model endpoint.
+        Some("GET") => ends("responses"),
+        _ => false,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Traffic {
+    scope: TrafficScope,
     start: i64,
     end: i64,
     bucket_minutes: u64,
@@ -41,6 +89,7 @@ pub fn read(
     path: &Path,
     minutes: u64,
     labels: &BTreeMap<(String, String), String>,
+    scope: TrafficScope,
 ) -> Result<Traffic, String> {
     let bucket_minutes = match minutes {
         30 => 1,
@@ -155,6 +204,9 @@ pub fn read(
         }
     }
     for entry in &entries {
+        if scope == TrafficScope::Model && !is_model_request(entry) {
+            continue;
+        }
         aggregate(&mut groups, entry, start, end, bucket_minutes, &labels);
     }
     let mut summary = CredentialTraffic {
@@ -183,6 +235,7 @@ pub fn read(
         )
     });
     Ok(Traffic {
+        scope,
         start,
         end,
         bucket_minutes,
@@ -271,6 +324,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_category_matches_inference_not_management_endpoints() {
+        for (method, path, expected) in [
+            ("POST", "/v1/responses", true),
+            ("POST", "/backend-api/codex/responses/compact", true),
+            (
+                "GET",
+                "/codex/https://example.invalid/v1/responses?model=x",
+                true,
+            ),
+            ("POST", "/anthropic/v1/messages", true),
+            (
+                "POST",
+                "/claude/https://example.invalid/api/v1/messages",
+                true,
+            ),
+            ("POST", "/v1/chat/completions", true),
+            ("POST", "/v1/completions", true),
+            ("POST", "/anthropic/v1/messages/count_tokens", false),
+            ("GET", "/v1/responses/response-id", false),
+            ("GET", "/backend-api/wham/usage", false),
+            ("GET", "/anthropic/api/oauth/usage", false),
+            ("POST", "/anthropic/v1/oauth/token", false),
+            ("POST", "/backend-api/codex/analytics-events/events", false),
+            ("POST", "/mcp/openaiDeveloperDocs", false),
+            ("GET", "/v1/models", false),
+            ("CONNECT", "api.anthropic.com:443", false),
+            ("POST", "/v1/not-responses", false),
+        ] {
+            let entry = Entry {
+                seq: 0,
+                time: None,
+                event: "request_finished".into(),
+                fields: serde_json::from_value(serde_json::json!({"method":method,"path":path}))
+                    .unwrap(),
+            };
+            assert_eq!(is_model_request(&entry), expected, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn scope_filters_both_summary_and_credential_buckets_across_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let row = |event, method, path, status, bytes, duration, provider| {
+            serde_json::json!({
+                "timestamp":timestamp, "event":event, "method":method, "path":path,
+                "status":status, "received_bytes":bytes, "duration_ms":duration,
+                "provider":provider, "service":"codex",
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(
+            &path,
+            row(
+                "request_finished",
+                "POST",
+                "/v1/responses",
+                "200",
+                "100",
+                "10",
+                "model",
+            ) + &row(
+                "request_finished",
+                "GET",
+                "/backend-api/wham/usage",
+                "200",
+                "500",
+                "100",
+                "management",
+            ) + &row(
+                "request_failed",
+                "POST",
+                "/v1/responses",
+                "502",
+                "0",
+                "40",
+                "model",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("proxy.log.1"),
+            row(
+                "request_finished",
+                "GET",
+                "/v1/responses",
+                "101",
+                "50",
+                "20",
+                "model",
+            ) + &row(
+                "request_cancelled",
+                "POST",
+                "/v1/responses",
+                "200",
+                "10",
+                "30",
+                "model",
+            ) + &row(
+                "request_finished",
+                "POST",
+                "/oauth/token",
+                "200",
+                "300",
+                "100",
+                "management",
+            ),
+        )
+        .unwrap();
+        let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
+        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        assert_eq!(all.summary.requests, 6);
+        assert_eq!(all.credentials.len(), 2);
+        assert_eq!(model.summary.requests, 4);
+        assert_eq!(model.summary.errors, 1);
+        assert_eq!(model.summary.bytes, 160);
+        assert_eq!(model.summary.avg_ms, Some(25));
+        assert_eq!(model.summary.counts.iter().sum::<u64>(), 4);
+        assert_eq!(model.summary.error_counts.iter().sum::<u64>(), 1);
+        assert_eq!(model.credentials.len(), 1);
+        assert_eq!(model.credentials[0].credential, "model");
+        assert_eq!(model.credentials[0].counts, model.summary.counts);
+    }
+
+    #[test]
     fn codex_docs_and_mcp_requests_share_codex_without_inventing_an_account() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
@@ -291,7 +471,7 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let result = read(&path, 30, &BTreeMap::new()).unwrap();
+        let result = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
         assert_eq!(result.summary.requests, 3);
         assert_eq!(result.credentials.len(), 2);
         assert!(
@@ -331,11 +511,14 @@ mod tests {
             recent + &row(29, "history") + &row(31, "expired"),
         )
         .unwrap();
-        let monthly = read(&path, 43200, &BTreeMap::new()).unwrap();
+        let monthly = read(&path, 43200, &BTreeMap::new(), TrafficScope::All).unwrap();
         assert_eq!(monthly.summary.requests, 2);
         assert_eq!(monthly.credentials[0].service, "Claude");
         assert_eq!(
-            read(&path, 30, &BTreeMap::new()).unwrap().summary.requests,
+            read(&path, 30, &BTreeMap::new(), TrafficScope::All)
+                .unwrap()
+                .summary
+                .requests,
             1
         );
     }
@@ -361,7 +544,7 @@ mod tests {
         )
         .unwrap();
         for range in [30, 360, 720, 1440, 10080, 43200] {
-            let traffic = read(&path, range, &BTreeMap::new()).unwrap();
+            let traffic = read(&path, range, &BTreeMap::new(), TrafficScope::All).unwrap();
             assert_eq!(traffic.credentials.len(), 2);
             assert_eq!(traffic.summary.requests, if range == 30 { 2 } else { 3 });
             assert_eq!(traffic.summary.errors, 1);
@@ -373,12 +556,17 @@ mod tests {
             assert_eq!(a.avg_ms, Some(20));
             assert_eq!(traffic.credentials[1].errors, 1);
         }
-        assert!(read(&path, 31, &BTreeMap::new()).is_err());
+        assert!(read(&path, 31, &BTreeMap::new(), TrafficScope::All).is_err());
         assert!(
-            read(&dir.path().join("missing"), 30, &BTreeMap::new(),)
-                .unwrap()
-                .credentials
-                .is_empty()
+            read(
+                &dir.path().join("missing"),
+                30,
+                &BTreeMap::new(),
+                TrafficScope::All
+            )
+            .unwrap()
+            .credentials
+            .is_empty()
         );
     }
 
@@ -442,7 +630,7 @@ mod tests {
             line(2, "codex", "123456", "") + &line(2, "claude", "123456", ""),
         )
         .unwrap();
-        let traffic = read(&path, 30, &BTreeMap::new()).unwrap();
+        let traffic = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
         let codex = traffic
             .credentials
             .iter()
@@ -460,7 +648,7 @@ mod tests {
             "123456"
         );
         let labels = BTreeMap::from([(("Codex".into(), "123456".into()), "current-name".into())]);
-        let traffic = read(&path, 30, &labels).unwrap();
+        let traffic = read(&path, 30, &labels, TrafficScope::All).unwrap();
         assert_eq!(
             traffic
                 .credentials

@@ -128,6 +128,7 @@ const ui = {
   rows: [],
   recent: [],
   trafficMinutes: 30,
+  trafficScope: "all",
   homeTraffic: null,
   homeTrafficMinutes: 30,
   homeTrafficRequest: 0,
@@ -303,7 +304,7 @@ async function loadHomeTraffic(force = false) {
   const request = ++ui.homeTrafficRequest;
   ui.homeTrafficLoading = true;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes });
+    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes, scope: ui.trafficScope });
     if (request !== ui.homeTrafficRequest) return;
     ui.homeTraffic = traffic.summary;
     ui.homeTrafficError = "";
@@ -319,7 +320,7 @@ async function loadHomeTraffic(force = false) {
 
 function trafficBlock() {
   const st = ui.homeTraffic;
-  const range = trafficRangeSelect("home-traffic-range", ui.homeTrafficMinutes, "Home traffic time range");
+  const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
   if (ui.homeTrafficError || !st) return block("Traffic", range, `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
   let rate = "—";
   let rateClass = "";
@@ -505,10 +506,17 @@ function trafficRangeSelect(id, selected, label) {
   return `<select id="${id}" class="select traffic-range" aria-label="${label}">${TRAFFIC_RANGES.map(([minutes, text]) => `<option value="${minutes}" ${minutes === selected ? "selected" : ""}>Last ${text}</option>`).join("")}</select>`;
 }
 
+function trafficControls(prefix, minutes, label) {
+  return `<span class="traffic-controls"><select id="${prefix}-scope" class="select traffic-scope" aria-label="Traffic request category" title="Quota requests: model inference endpoints, including errors and cancellations. Actual charges are not recorded; CONNECT contents cannot be classified.">
+    <option value="all" ${ui.trafficScope === "all" ? "selected" : ""}>All</option>
+    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Quota</option>
+  </select>${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
+}
+
 async function loadTraffic() {
   const request = ++ui.trafficRequest;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes });
+    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes, scope: ui.trafficScope });
     if (request !== ui.trafficRequest) return;
     ui.traffic = traffic;
     ui.trafficError = "";
@@ -533,7 +541,7 @@ function renderActivityTraffic() {
     </div>`;
   }).join("");
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
-    ${trafficRangeSelect("traffic-range", ui.trafficMinutes, "Traffic time range")}</div>
+    ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
     ${ui.trafficError ? `<div class="placeholder bad">${esc(ui.trafficError)}</div>` : !traffic ? '<div class="placeholder">Loading traffic…</div>' : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
     <p class="traffic-note">Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.</p>`;
@@ -802,6 +810,27 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {
+    ui.trafficScope = event.target.value;
+    // Both views share the category. In-flight results from the old category
+    // must not repopulate either cache after a switch.
+    ++ui.trafficRequest;
+    ++ui.homeTrafficRequest;
+    ui.traffic = ui.homeTraffic = null;
+    ui.trafficError = ui.homeTrafficError = "";
+    ui.homeTrafficFetchedAt = 0;
+    ui.homeTrafficLoading = false;
+    if (ui.page === "main") {
+      const loading = loadHomeTraffic(true);
+      render();
+      await loading;
+    } else {
+      renderActivityTraffic();
+      await loadTraffic();
+    }
+    return;
+  }
+
   if (event.target.id === "home-traffic-range") {
     ui.homeTrafficMinutes = Number(event.target.value);
     ui.homeTraffic = null;
