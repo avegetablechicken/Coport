@@ -981,7 +981,10 @@ impl Server {
                         }
                     };
                     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
-                    let _=http1::Builder::new().keep_alive(false).max_buf_size(65536).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30))
+                    // Keep Hyper's upgrade handshake intact. Disabling keep-alive
+                    // overwrites Connection: Upgrade with Connection: close.
+                    // Ordinary HTTP responses explicitly send Connection: close.
+                    let _=http1::Builder::new().max_buf_size(65536).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30))
                         .serve_connection(TokioIo::new(PrefixedSocket { prefix, socket }),service_fn(move |r|server.clone().handle(r, relay_tx.clone()))).with_upgrades().await;
                     if let Ok(relay) = relay_rx.try_recv() { relay.await; }
                     });

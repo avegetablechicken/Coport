@@ -1187,6 +1187,17 @@ async fn websocket_upgrade_preserves_auth_protocol_and_early_frames() {
         socket.write_all(format!("GET /{scope}/https://upstream.invalid/v1/socket?model=test HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: test\r\n\r\n").as_bytes()).await.unwrap();
         let head = read_response_head(&mut socket).await;
         assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("\r\nconnection: upgrade\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("\r\nupgrade: websocket\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{head}");
         assert!(head.to_lowercase().contains("sec-websocket-protocol: test"));
         let mut early = [0; 4];
         socket.read_exact(&mut early).await.unwrap();
