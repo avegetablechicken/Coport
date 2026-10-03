@@ -1039,7 +1039,7 @@ details.disclosure[open] summary svg {
 }
 
 /* Per-credential activity history. */
-#traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
+.traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
 .credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }
 .traffic-identity {
   display: grid;

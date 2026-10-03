@@ -129,6 +129,8 @@ const ui = {
   recent: [],
   trafficMinutes: 30,
   homeTraffic: null,
+  homeTrafficMinutes: 30,
+  homeTrafficRequest: 0,
   homeTrafficError: "",
   homeTrafficFetchedAt: 0,
   homeTrafficLoading: false,
@@ -296,25 +298,29 @@ function chart(values, errors) {
   return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
 }
 
-async function loadHomeTraffic() {
-  if (ui.homeTrafficLoading) return;
+async function loadHomeTraffic(force = false) {
+  if (ui.homeTrafficLoading && !force) return;
+  const request = ++ui.homeTrafficRequest;
   ui.homeTrafficLoading = true;
   try {
-    const traffic = await invoke("get_traffic", { minutes: 30 });
+    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes });
+    if (request !== ui.homeTrafficRequest) return;
     ui.homeTraffic = traffic.summary;
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
   } catch (error) {
+    if (request !== ui.homeTrafficRequest) return;
     ui.homeTrafficError = String(error);
   } finally {
-    ui.homeTrafficLoading = false;
+    if (request === ui.homeTrafficRequest) ui.homeTrafficLoading = false;
   }
   if (ui.page === "main") render();
 }
 
 function trafficBlock() {
   const st = ui.homeTraffic;
-  if (ui.homeTrafficError || !st) return block("Traffic", "Last 30 minutes", `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
+  const range = trafficRangeSelect("home-traffic-range", ui.homeTrafficMinutes, "Home traffic time range");
+  if (ui.homeTrafficError || !st) return block("Traffic", range, `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
   let rate = "—";
   let rateClass = "";
   if (st.requests) {
@@ -324,7 +330,7 @@ function trafficBlock() {
   }
   return block(
     "Traffic",
-    "Last 30 minutes",
+    range,
     `${chart(st.counts, st.errorCounts)}
      <div class="strip">
        ${stat("Requests", st.requests)}
@@ -442,6 +448,10 @@ function routingBlock() {
 
 const TRAFFIC_RANGES = [[30, "30 minutes"], [360, "6 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "7 days"], [43200, "30 days"]];
 
+function trafficRangeSelect(id, selected, label) {
+  return `<select id="${id}" class="select traffic-range" aria-label="${label}">${TRAFFIC_RANGES.map(([minutes, text]) => `<option value="${minutes}" ${minutes === selected ? "selected" : ""}>Last ${text}</option>`).join("")}</select>`;
+}
+
 async function loadTraffic() {
   const request = ++ui.trafficRequest;
   try {
@@ -470,7 +480,7 @@ function renderActivityTraffic() {
     </div>`;
   }).join("");
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
-    <select id="traffic-range" class="select" aria-label="Traffic time range">${TRAFFIC_RANGES.map(([minutes, label]) => `<option value="${minutes}" ${minutes === ui.trafficMinutes ? "selected" : ""}>Last ${label}</option>`).join("")}</select></div>
+    ${trafficRangeSelect("traffic-range", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
     ${ui.trafficError ? `<div class="placeholder bad">${esc(ui.trafficError)}</div>` : !traffic ? '<div class="placeholder">Loading traffic…</div>' : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
     <p class="traffic-note">Based on retained logs, including rotated history. Older data may be unavailable. Unidentified requests have no logged credential.</p>`;
@@ -735,6 +745,16 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "home-traffic-range") {
+    ui.homeTrafficMinutes = Number(event.target.value);
+    ui.homeTraffic = null;
+    ui.homeTrafficError = "";
+    // Launch immediately so concurrent refreshes cannot start an older range.
+    const loading = loadHomeTraffic(true);
+    render();
+    await loading;
+    return;
+  }
   if (event.target.id === "traffic-range") {
     ui.trafficMinutes = Number(event.target.value);
     ui.traffic = null;
