@@ -51,12 +51,21 @@ mod tests {
         std::fs::write(dir.path().join("api.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://custom.invalid","ANTHROPIC_API_KEY":"secret"}}"#).unwrap();
         let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key: {{api: none}}\n", serde_json::to_string(dir.path()).unwrap())).unwrap();
         for name in ["api", "api.json"] {
+            assert_eq!(config.claude.api_key_kind(name).unwrap(), "profile");
             assert_eq!(
                 claude_api_key(&config, name).as_deref(),
                 Some("https://custom.invalid")
             );
         }
         assert_eq!(claude_api_key(&config, "api.example.com"), None);
+        assert_eq!(
+            config.claude.api_key_kind("api.example.com").unwrap(),
+            "gateway"
+        );
+        assert_eq!(
+            config.claude.api_key_kind("ANTHROPIC_API_KEY").unwrap(),
+            "api_key"
+        );
     }
 
     #[test]
@@ -77,6 +86,17 @@ experimental_bearer_token = "bearer-secret"
             serde_json::to_string(home.path()).unwrap()
         ))
         .unwrap();
+        assert_eq!(config.codex.api_key_kind("custom").unwrap(), "provider");
+        assert_eq!(config.codex.api_key_kind("CUSTOM_KEY").unwrap(), "provider");
+        assert_eq!(config.codex.api_key_kind("OTHER_KEY").unwrap(), "api_key");
+        assert_eq!(
+            config.codex.api_key_kind("OPENAI_API_KEY").unwrap(),
+            "api_key"
+        );
+        assert_eq!(
+            config.codex.api_key_kind("api.invalid/v1").unwrap(),
+            "gateway"
+        );
         let custom = Some("https://custom.invalid/v1".to_owned());
         assert_eq!(codex_api_key(&config, "custom"), custom);
         assert_eq!(codex_api_key(&config, "CUSTOM_KEY"), custom);

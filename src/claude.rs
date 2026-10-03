@@ -287,6 +287,20 @@ impl Claude {
             .collect()
     }
 
+    /// Display classification follows named-settings precedence, not spelling.
+    pub fn api_key_kind(&self, selector: &str) -> Result<&'static str> {
+        if crate::claude_settings::is_url(selector) {
+            return Ok("gateway");
+        }
+        Ok(
+            if crate::claude_settings::load(&self.config_dirs, selector)?.is_some() {
+                "profile"
+            } else {
+                "api_key"
+            },
+        )
+    }
+
     /// The same named settings lookup used for forwarding, without exposing credentials.
     pub fn api_key_upstream(&self, selector: &str) -> Result<Option<String>> {
         if crate::claude_settings::is_url(selector) {

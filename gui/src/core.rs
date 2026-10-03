@@ -313,6 +313,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             &config.codex.routing,
             true,
             |selector| describe::codex_api_key(config, selector),
+            |selector| config.codex.api_key_kind(selector).unwrap_or("unknown"),
         ),
         claude: service(
             vec![("upstream", config.claude.base_url.clone())],
@@ -321,6 +322,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
             &config.claude.routing,
             false,
             |selector| describe::claude_api_key(config, selector),
+            |selector| config.claude.api_key_kind(selector).unwrap_or("unknown"),
         ),
     }
 }
@@ -332,12 +334,16 @@ fn service(
     routing: &Routing,
     codex: bool,
     api_key_detail: impl Fn(&str) -> Option<String>,
+    api_key_kind: impl Fn(&str) -> &'static str,
 ) -> ServiceDto {
-    let rows = |routes: &BTreeMap<String, Choice>, detail: &dyn Fn(&str) -> Option<String>| {
+    let rows = |routes: &BTreeMap<String, Choice>,
+                detail: &dyn Fn(&str) -> Option<String>,
+                kind: &dyn Fn(&str) -> &'static str| {
         routes
             .iter()
             .map(|(selector, choice)| RouteRow {
                 selector: selector.clone(),
+                kind: kind(selector),
                 proxies: choice.names().to_vec(),
                 detail: detail(selector),
             })
@@ -379,8 +385,8 @@ fn service(
             })
             .collect(),
         file_only,
-        account_routes: rows(&routing.account, &|_| None),
-        api_key_routes: rows(&routing.api_key, &api_key_detail),
+        account_routes: rows(&routing.account, &|_| None, &|_| "account"),
+        api_key_routes: rows(&routing.api_key, &api_key_detail, &api_key_kind),
         fallbacks,
     }
 }
@@ -496,6 +502,7 @@ struct KeyValue {
 #[derive(Serialize)]
 struct RouteRow {
     selector: String,
+    kind: &'static str,
     proxies: Vec<String>,
     /// Hover text: the base URL an API key selector resolves to.
     detail: Option<String>,

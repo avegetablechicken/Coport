@@ -172,6 +172,31 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
         )),
     }
 }
+impl Codex {
+    /// Display classification uses the same provider definitions as credential routing.
+    pub fn api_key_kind(&self, selector: &str) -> Result<&'static str> {
+        if crate::url_routing::is_url_selector(selector) {
+            return Ok("gateway");
+        }
+        let provider = Provider {
+            selector: selector.into(),
+            proxy: crate::config::Choice::direct(),
+        };
+        for home in &self.homes {
+            let defs = definitions(Some(&expand(home)))?;
+            // The built-in OpenAI definition is the ordinary API-key route.
+            // Custom provider IDs and their env_key selectors share a type.
+            if provider
+                .definition(&defs)?
+                .is_some_and(|(id, _)| id != "openai")
+            {
+                return Ok("provider");
+            }
+        }
+        Ok("api_key")
+    }
+}
+
 impl Provider {
     /// Upstream base URLs this route forwards to, one per configured home,
     /// resolved like requests are but without reading any credential.
