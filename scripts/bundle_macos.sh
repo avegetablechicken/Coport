@@ -3,16 +3,21 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+command -v python3 >/dev/null
 cargo build --locked --release -p agent-router-gui
 
-app="target/Agent Router.app"
+output="target/Agent Router.app"
+stage=$(mktemp -d target/.bundle-macos.XXXXXX)
+trap 'rm -rf "$stage"' EXIT
+trap 'exit 1' HUP INT TERM
+app="$stage/Agent Router.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
-rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/agent-router-gui "$app/Contents/MacOS/"
 
-# The icon is drawn by the app itself; iconutil packs the standard sizes.
-iconset=$(mktemp -d)/AppIcon.iconset
+# iconutil can reject valid PNGs in a sandbox. Write the standard ICNS PNG
+# chunks directly with Python's standard library; no GUI services are needed.
+iconset="$stage/AppIcon.iconset"
 mkdir -p "$iconset"
 target/release/agent-router-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
 for size in 16 32 128 256 512; do
@@ -20,7 +25,25 @@ for size in 16 32 128 256 512; do
     double=$((size * 2))
     sips -z $double $double "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+python3 - "$iconset" "$app/Contents/Resources/AppIcon.icns" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+iconset = Path(sys.argv[1])
+entries = [
+    (b"icp4", "16x16"), (b"icp5", "32x32"), (b"icp6", "32x32@2x"),
+    (b"ic07", "128x128"), (b"ic08", "256x256"), (b"ic09", "512x512"),
+    (b"ic10", "512x512@2x"), (b"ic11", "16x16@2x"),
+    (b"ic12", "32x32@2x"), (b"ic13", "128x128@2x"), (b"ic14", "256x256@2x"),
+]
+chunks = []
+for kind, name in entries:
+    png = (iconset / f"icon_{name}.png").read_bytes()
+    chunks.append(kind + struct.pack(">I", len(png) + 8) + png)
+payload = b"".join(chunks)
+Path(sys.argv[2]).write_bytes(b"icns" + struct.pack(">I", len(payload) + 8) + payload)
+PY
 
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +65,10 @@ cat > "$app/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Ad-hoc signature so Gatekeeper accepts the locally built bundle.
-codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
-echo "Built $app"
+# Do not publish an incomplete bundle or hide signing failures.
+plutil -lint "$app/Contents/Info.plist"
+codesign --force --deep --sign - "$app"
+codesign --verify --deep --strict "$app"
+rm -rf "$output"
+mv "$app" "$output"
+echo "Built $output"

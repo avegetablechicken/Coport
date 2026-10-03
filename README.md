@@ -669,7 +669,10 @@ user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
 
 - macOS: `scripts/bundle_macos.sh` builds `target/Agent Router.app`
-  (`LSUIElement`, ad-hoc signed). A full menu bar hides status items behind the
+  (`LSUIElement`, ad-hoc signed). Packaging requires Python 3 (standard library
+  only); ICNS icons are assembled without `iconutil` so packaging also works in
+  a sandbox. The previous app is retained until packaging and signature checks
+  succeed. A full menu bar hides status items behind the
   notch while apps with long menus are frontmost; the panel then opens at the
   top-right corner when launched or reopened.
 - Windows: requires the WebView2 runtime (included with Windows 10 21H2+ and 11).
