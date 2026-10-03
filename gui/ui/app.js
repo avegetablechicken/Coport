@@ -279,8 +279,9 @@ function proxyBlock() {
   return block("Proxy", head, strip + messages);
 }
 
-function chart(values, errors) {
+function chart(values, errors, showPeak = false) {
   const n = values.length;
+  if (!n) return "";
   const max = Math.max(1, ...values);
   const gap = 2;
   const w = 300;
@@ -296,7 +297,18 @@ function chart(values, errors) {
       bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
     }
   });
-  return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
+  const plot = `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
+  if (!showPeak) return plot;
+  const peak = Math.max(0, ...values);
+  const index = values.indexOf(peak);
+  const position = ((index * (bar + gap) + bar / 2) / w) * 100;
+  // Align edge labels inward so the first/last bucket cannot clip the value.
+  const shift = position < 20 ? "0" : position > 80 ? "-100%" : "-50%";
+  return `<div class="traffic-chart">
+    <span class="chart-peak" style="left:${position}%;transform:translateX(${shift})" title="Peak: ${peak.toLocaleString("en-US")} requests per bar">${peak.toLocaleString("en-US")}</span>
+    ${peak ? `<span class="chart-peak-stem" style="left:${position}%" aria-hidden="true"></span>` : ""}
+    ${plot}
+  </div>`;
 }
 
 async function loadHomeTraffic(force = false) {
@@ -536,7 +548,7 @@ function renderActivityTraffic() {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
-      ${chart(c.counts, c.errorCounts)}
+      ${chart(c.counts, c.errorCounts, true)}
       <div class="strip">${stat("Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>
     </div>`;
   }).join("");
