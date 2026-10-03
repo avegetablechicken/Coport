@@ -30,58 +30,9 @@ use url::Url;
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
-const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct ProbeKey {
-    endpoint: String,
-    origin: String,
-    native_tls: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ProbeResult {
-    Healthy,
-    Transient,
-    HardFailure,
-}
-#[derive(Default)]
-struct ProbeHealth {
-    initialized: bool,
-    failures: u32,
-    unavailable: bool,
-    next_check: Option<Instant>,
-    revision: u64,
-}
-impl ProbeHealth {
-    fn observe(&mut self, result: ProbeResult) {
-        self.initialized = true;
-        self.revision += 1;
-        match result {
-            ProbeResult::Healthy => {
-                self.failures = 0;
-                self.unavailable = false;
-            }
-            ProbeResult::Transient => {
-                self.failures = self.failures.saturating_add(1);
-                self.unavailable |= self.failures >= 3;
-            }
-            ProbeResult::HardFailure => {
-                self.failures = self.failures.saturating_add(1);
-                self.unavailable = true;
-            }
-        }
-        let interval = if self.failures == 0 {
-            PROBE_INTERVAL
-        } else if !self.unavailable {
-            Duration::from_secs(1)
-        } else if self.failures < 10 {
-            Duration::from_secs(3)
-        } else {
-            PROBE_INTERVAL
-        };
-        self.next_check = Some(Instant::now() + interval);
-    }
-}
-type ProbeState = Arc<tokio::sync::Mutex<ProbeHealth>>;
+#[path = "server_transport.rs"]
+mod transport;
+use transport::*;
 
 pub struct Server {
     pub config: Config,
@@ -127,24 +78,31 @@ impl Server {
             // Never use a direct
             // or cross-account proxy inferred from an unverified identity.
             let url = self.config.claude.url("/api/oauth/profile")?;
-            let selected = self.select(&route.proxy, &url, log).await?;
-            let endpoint = self.config.endpoint(&selected);
             log.field("service", "claude");
-            log.field("profile_proxy", &selected);
-            log.field("profile_proxy_endpoint", redacted_endpoint(endpoint));
-            let mut response = self
-                .client(endpoint)?
+            let request = self
+                .client("none")?
                 .get(url)
                 .bearer_auth(&route.token)
                 .header("accept", "application/json")
                 .header("accept-encoding", "identity")
                 .header("anthropic-beta", "oauth-2025-04-20")
-                .timeout(Duration::from_secs_f64(
-                    self.config.request_timeout_seconds.min(10.0),
-                ))
-                .send()
-                .await
-                .map_err(|_| Error::config("Claude profile transport failed."))?;
+                .build()
+                .map_err(|_| Error::config("Invalid Claude profile request."))?;
+            let mut response = self
+                .send_via(
+                    &route.proxy,
+                    request,
+                    false,
+                    Deadline::new(self.config.request_timeout_seconds.min(10.0)),
+                    log,
+                )
+                .await?;
+            if let Some(proxy) = log.fields.get("proxy").cloned() {
+                log.fields.insert("profile_proxy".into(), proxy);
+            }
+            if let Some(endpoint) = log.fields.get("proxy_endpoint").cloned() {
+                log.fields.insert("profile_proxy_endpoint".into(), endpoint);
+            }
             let status = response.status();
             if !status.is_success() {
                 return Err(Error::new(
@@ -197,254 +155,6 @@ impl Server {
         cache.insert(token, (Instant::now(), identity));
         Ok(())
     }
-    fn client(&self, endpoint: &str) -> Result<reqwest::Client> {
-        self.client_transport(endpoint, false)
-    }
-    fn client_transport(&self, endpoint: &str, native_tls: bool) -> Result<reqwest::Client> {
-        let key = if native_tls {
-            format!("native-tls:{endpoint}")
-        } else {
-            endpoint.into()
-        };
-        let mut clients = self
-            .clients
-            .lock()
-            .map_err(|_| Error::config("Transport unavailable."))?;
-        if let Some(c) = clients.get(&key) {
-            return Ok(c.clone());
-        }
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
-            .connect_timeout(Duration::from_secs_f64(self.config.request_timeout_seconds))
-            .pool_max_idle_per_host(8);
-        // Explicit API gateways can use certificates accepted by Node/OpenSSL
-        // but rejected by rustls (e.g. self-signed CA certificates as leaves).
-        // Both backends retain chain and hostname/IP verification.
-        builder = if native_tls {
-            builder.use_native_tls()
-        } else {
-            builder.use_rustls_tls()
-        };
-        if endpoint != "none" {
-            // Remote DNS keeps destination resolution inside the selected SOCKS tunnel.
-            let proxy = if let Some(rest) = endpoint.strip_prefix("socks5://") {
-                format!("socks5h://{rest}")
-            } else {
-                endpoint.into()
-            };
-            builder = builder.proxy(
-                reqwest::Proxy::all(proxy)
-                    .map_err(|_| Error::config("Cannot configure outbound proxy."))?,
-            );
-        }
-        let client = builder
-            .build()
-            .map_err(|_| Error::config("Cannot initialize outbound transport."))?;
-        if clients.len() >= 32 {
-            clients.clear();
-        }
-        clients.insert(key, client.clone());
-        Ok(client)
-    }
-    async fn select(
-        &self,
-        choice: &Choice,
-        destination: &Url,
-        log: &mut RequestLog,
-    ) -> Result<String> {
-        self.select_transport(choice, destination, log, false).await
-    }
-    async fn select_transport(
-        &self,
-        choice: &Choice,
-        destination: &Url,
-        log: &mut RequestLog,
-        native_tls: bool,
-    ) -> Result<String> {
-        if let Choice::One(n) = choice {
-            return Ok(n.clone());
-        }
-        let mut origin = destination.clone();
-        origin.set_path("/");
-        origin.set_query(None);
-        origin.set_fragment(None);
-        for name in choice.names() {
-            let endpoint = self.config.endpoint(name);
-            let key = ProbeKey {
-                endpoint: endpoint.to_owned(),
-                origin: origin.to_string(),
-                native_tls,
-            };
-            let state = {
-                let mut probes = self.probes.lock().unwrap();
-                // Bound memory for configurations accepting arbitrary upstream origins.
-                if probes.len() >= 256 && !probes.contains_key(&key) {
-                    if let Some(old) = probes.keys().next().cloned() {
-                        probes.remove(&old);
-                    }
-                }
-                probes.entry(key.clone()).or_default().clone()
-            };
-            // Only cold lookups wait for a probe. Concurrent cold requests share it.
-            let mut cached = state.lock().await;
-            if !cached.initialized {
-                cached.observe(self.probe(&key).await);
-            }
-            let available = !cached.unavailable;
-            drop(cached);
-            log.field("proxy", name);
-            log.field("proxy_endpoint", redacted_endpoint(endpoint));
-            log.field("available", available);
-            // Probe events are emitted only for actual network checks.
-            if available {
-                log.fields.remove("available");
-                return Ok(name.clone());
-            }
-        }
-        Err(Error::config(
-            "No available outbound proxy in the configured list.",
-        ))
-    }
-    async fn probe(&self, key: &ProbeKey) -> ProbeResult {
-        let mut reason = "http_response";
-        let mut status = None;
-        let result = match self.client_transport(&key.endpoint, key.native_tls) {
-            Ok(client) => match client
-                .head(&key.origin)
-                .timeout(Duration::from_secs_f64(
-                    self.config.request_timeout_seconds.min(5.0),
-                ))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    status = Some(response.status().as_u16());
-                    if response.status() == 407 {
-                        reason = "proxy_authentication";
-                        ProbeResult::HardFailure
-                    } else {
-                        // Even a target 5xx proves that the route carried an HTTP response.
-                        ProbeResult::Healthy
-                    }
-                }
-                Err(error) => {
-                    let hard = hard_probe_failure(&error);
-                    reason = if let Some(reason) = hard {
-                        reason
-                    } else if error.is_timeout() {
-                        "timeout"
-                    } else {
-                        "transport_error"
-                    };
-                    if hard.is_some() {
-                        ProbeResult::HardFailure
-                    } else {
-                        ProbeResult::Transient
-                    }
-                }
-            },
-            Err(_) => {
-                reason = "transport_configuration";
-                ProbeResult::HardFailure
-            }
-        };
-        // A HEAD failure alone cannot establish that an exit is down. Confirm
-        // transport reachability without sending an API request or credentials.
-        let result = if result == ProbeResult::Transient {
-            let url = Url::parse(&key.origin).expect("validated probe origin");
-            let host = url
-                .host_str()
-                .unwrap()
-                .trim_start_matches('[')
-                .trim_end_matches(']');
-            if matches!(
-                tokio::time::timeout(
-                    Duration::from_secs_f64(self.config.request_timeout_seconds.min(2.0)),
-                    crate::tunnel::open(host, url.port_or_known_default().unwrap(), &key.endpoint)
-                )
-                .await,
-                Ok(Ok(_))
-            ) {
-                reason = "tunnel_connected";
-                ProbeResult::Healthy
-            } else {
-                result
-            }
-        } else {
-            result
-        };
-        self.logger.write(
-            "proxy_probe",
-            json!({
-                "proxy_endpoint": redacted_endpoint(&key.endpoint),
-                "origin": key.origin,
-                "available": (result == ProbeResult::Healthy).to_string(),
-                "probe_result": format!("{result:?}"),
-                "reason": reason,
-                "upstream_status": status,
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-        result
-    }
-
-    async fn record_route_success(&self, endpoint: &str, destination: &Url, native_tls: bool) {
-        let mut origin = destination.clone();
-        origin.set_path("/");
-        origin.set_query(None);
-        origin.set_fragment(None);
-        let key = ProbeKey {
-            endpoint: endpoint.into(),
-            origin: origin.to_string(),
-            native_tls,
-        };
-        let state = self.probes.lock().unwrap().get(&key).cloned();
-        if let Some(state) = state {
-            state.lock().await.observe(ProbeResult::Healthy);
-        }
-    }
-
-    async fn refresh_probes(&self) {
-        let entries: Vec<_> = self
-            .probes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(key, state)| (key.clone(), state.clone()))
-            .collect();
-        futures_util::stream::iter(entries)
-            .for_each_concurrent(8, |(key, state)| async move {
-                let revision = match state.try_lock() {
-                    Ok(cached)
-                        if cached.initialized
-                            && cached.next_check.is_some_and(|t| t <= Instant::now()) =>
-                    {
-                        cached.revision
-                    }
-                    _ => return,
-                };
-                let result = self.probe(&key).await;
-                let mut cached = state.lock().await;
-                // A real request may have succeeded during this probe.
-                if cached.revision == revision {
-                    cached.observe(result);
-                }
-            })
-            .await;
-    }
-
-    async fn monitor_probes(&self) {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            self.refresh_probes().await;
-        }
-    }
-
     pub async fn startup_log(&self) {
         for (label, source, _) in &self.config.codex.account_sources() {
             match self
@@ -864,13 +574,6 @@ impl Server {
         let bytes = read_body(body).await?;
         let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
             || route.as_ref().is_some_and(|r| r.custom_upstream);
-        let selected = self
-            .select_transport(&choice, &url, log, native_tls)
-            .await?;
-        let endpoint = self.config.endpoint(&selected);
-        log.field("proxy", selected);
-        log.field("proxy_endpoint", redacted_endpoint(endpoint));
-        log.event("route_selected");
         let mut headers = filtered_headers(&parts.headers);
         if docs {
             let allowed = [
@@ -915,68 +618,19 @@ impl Server {
             }
         }
         headers.insert("accept-encoding", "identity".parse().unwrap());
-        // Replay only bodyless GETs before receiving response headers. Keep the
-        // selected route and one timeout budget, including backoff and body reads.
-        let retryable = parts.method == hyper::Method::GET && bytes.is_empty() && !websocket;
-        let client = self.client_transport(endpoint, native_tls)?;
-        let started = Instant::now();
-        let budget = Duration::from_secs_f64(self.config.request_timeout_seconds);
-        for attempt in 1..=3 {
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                log.field("transport_error", "timeout");
-                break;
-            }
-            log.field("upstream_attempts", attempt);
-            match client
-                .request(parts.method.clone(), url.clone())
-                .headers(headers.clone())
-                .body(bytes.clone())
-                .timeout(remaining)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if response.status() != 407 {
-                        self.record_route_success(endpoint, &url, native_tls).await;
-                    }
-                    return Ok(response);
-                }
-                Err(error) => {
-                    // Never log raw reqwest errors: they can contain query secrets.
-                    let kind = if error.is_timeout() {
-                        "timeout"
-                    } else if error.is_connect() {
-                        "connect"
-                    } else if error.is_request() {
-                        "request"
-                    } else {
-                        "other"
-                    };
-                    let delay = Duration::from_millis(200 * attempt);
-                    if !retryable
-                        || attempt == 3
-                        || kind == "other"
-                        || budget.saturating_sub(started.elapsed()) <= delay
-                    {
-                        log.field("transport_error", kind);
-                        break;
-                    }
-                    let mut fields = log.fields.clone();
-                    fields.insert("transport_error".into(), json!(kind));
-                    fields.insert(
-                        "retry_delay_ms".into(),
-                        json!(delay.as_millis().to_string()),
-                    );
-                    self.logger.write("upstream_retry", fields);
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-        Err(Error::config(
-            "Upstream transport failed; no direct fallback was attempted.",
-        ))
+        let mut request = reqwest::Request::new(parts.method, url);
+        *request.headers_mut() = headers;
+        *request.body_mut() = Some(bytes.into());
+        self.send_via(
+            &choice,
+            request,
+            native_tls,
+            Deadline::new(self.config.request_timeout_seconds),
+            log,
+        )
+        .await
     }
+
     async fn connect(
         &self,
         incoming: &Request<Incoming>,
@@ -1008,23 +662,20 @@ impl Server {
             })
             .ok_or(Error::new(403, "CONNECT destination is not configured."))?;
         log.field("destination", format!("{host}:{port}"));
-        for name in choice.names() {
-            let endpoint = self.config.endpoint(name);
-            log.field("proxy", name);
-            log.field("proxy_endpoint", redacted_endpoint(endpoint));
-            let socket = tokio::time::timeout(
-                Duration::from_secs_f64(self.config.request_timeout_seconds),
-                crate::tunnel::open(&host, port, endpoint),
-            )
-            .await;
-            if let Ok(Ok(socket)) = socket {
-                log.event("route_selected");
-                return Ok(socket);
-            }
-        }
-        Err(Error::config(
-            "No configured CONNECT route could establish a tunnel.",
-        ))
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let destination = Url::parse(&format!("https://{authority}/"))
+            .map_err(|_| Error::new(400, "Invalid CONNECT destination."))?;
+        self.connect_via(
+            choice,
+            &destination,
+            Deadline::new(self.config.request_timeout_seconds),
+            log,
+        )
+        .await
     }
 
     async fn forward_token_refresh(
@@ -1055,23 +706,22 @@ impl Server {
             TOKEN_REFRESH_UPSTREAM
         })
         .unwrap();
-        let selected = self.select(&choice, &url, log).await?;
-        let endpoint = self.config.endpoint(&selected);
-        log.field("proxy", selected);
-        log.field("proxy_endpoint", redacted_endpoint(endpoint));
-        log.event("route_selected");
-        let mut headers = filtered_headers(&parts.headers);
-        headers.insert("accept-encoding", "identity".parse().unwrap());
-        self.client(endpoint)?
-            .post(url)
-            .headers(headers)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| {
-                Error::config("Upstream transport failed; no direct fallback was attempted.")
-            })
+        let mut request = reqwest::Request::new(parts.method, url);
+        *request.headers_mut() = filtered_headers(&parts.headers);
+        request
+            .headers_mut()
+            .insert("accept-encoding", "identity".parse().unwrap());
+        *request.body_mut() = Some(bytes.into());
+        self.send_via(
+            &choice,
+            request,
+            false,
+            Deadline::new(self.config.request_timeout_seconds),
+            log,
+        )
+        .await
     }
+
     pub async fn serve(
         self: Arc<Self>,
         listener: TcpListener,
@@ -1119,23 +769,6 @@ impl Server {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
-}
-
-fn hard_probe_failure(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
-        {
-            return Some("connection_refused");
-        }
-        if error.to_string() == "proxy authorization required" {
-            return Some("proxy_authentication");
-        }
-        current = error.source();
-    }
-    None
 }
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {

@@ -33,8 +33,16 @@ pub(crate) fn authority(value: &str) -> Result<(String, u16)> {
     Ok((host.to_ascii_lowercase(), port))
 }
 
-fn io_error(_: impl std::fmt::Debug) -> Error {
-    Error::config("CONNECT transport failed.")
+fn io_error(error: impl std::error::Error + 'static) -> Error {
+    let error: &dyn std::error::Error = &error;
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+    {
+        Error::config("CONNECT connection refused.")
+    } else {
+        Error::config("CONNECT transport failed.")
+    }
 }
 
 pub(crate) async fn open(host: &str, port: u16, endpoint: &str) -> Result<Socket> {
@@ -129,6 +137,9 @@ async fn http_connect(socket: &mut Socket, proxy: &Url, host: &str, port: u16) -
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut response = httparse::Response::new(&mut headers);
     response.parse(&head).map_err(io_error)?;
+    if response.code == Some(407) {
+        return Err(Error::new(407, "Proxy authentication failed."));
+    }
     if !response
         .code
         .is_some_and(|status| (200..300).contains(&status))
@@ -147,7 +158,7 @@ async fn socks(socket: &mut Socket, proxy: &Url, host: &str, port: u16) -> Resul
     let mut reply = [0; 2];
     socket.read_exact(&mut reply).await.map_err(io_error)?;
     if reply != [5, if auth { 2 } else { 0 }] {
-        return Err(Error::config("SOCKS5 authentication negotiation failed."));
+        return Err(Error::new(407, "SOCKS5 authentication negotiation failed."));
     }
     if auth {
         let (user, password) = credentials(proxy)?;
@@ -158,7 +169,7 @@ async fn socks(socket: &mut Socket, proxy: &Url, host: &str, port: u16) -> Resul
         socket.write_all(&login).await.map_err(io_error)?;
         socket.read_exact(&mut reply).await.map_err(io_error)?;
         if reply != [1, 0] {
-            return Err(Error::config("SOCKS5 authentication failed."));
+            return Err(Error::new(407, "SOCKS5 authentication failed."));
         }
     }
     let mut request = vec![5, 1, 0];

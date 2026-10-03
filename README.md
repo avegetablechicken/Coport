@@ -305,9 +305,12 @@ Any HTTP response except proxy authentication failure (407) proves reachability;
 a target 5xx does not mark the exit down. Redirects are not followed. HEAD checks
 are limited to 5 seconds (or the shorter request timeout). After a transient HEAD
 failure, a TCP/CONNECT/SOCKS tunnel check gets up to 2 seconds to confirm transport
-reachability without relying on the website homepage.
+reachability without relying on the website homepage. The combined check shares
+one budget of at most 7 seconds, capped by `request_timeout_seconds` and, for
+a cold lookup, by the remaining request budget.
 
-Results are isolated by proxy endpoint, upstream origin and TLS mode (up to 256
+Results are isolated by proxy endpoint, upstream origin, TLS mode and transport
+(HTTP versus CONNECT, since a tunnel does not verify TLS/HTTP behavior; up to 256
 entries); concurrent initial lookups share a probe. One or two transient failures
 leave the exit eligible and schedule rechecks after 1 second. Three consecutive
 failures disable it; connection refusal and proxy authentication failure disable
@@ -316,13 +319,24 @@ after ten failures. Healthy exits are checked after 30 seconds. The background
 scheduler runs every second with at most eight concurrent probes; checks can take
 longer under load. One successful check restores the exit immediately.
 
-Actual API response headers (other than 407) also clear cached failures. A late
-probe cannot overwrite a newer successful request. Logs record the probe result,
+Regular API, Claude profile and OAuth refresh requests use the same outbound
+sender. Each logical operation contributes one final health result: response
+headers other than 407 clear failures; an exhausted transport failure adds one
+failure, regardless of how many attempts were made. CONNECT establishment also
+updates health using the same state machine. A late background probe cannot
+overwrite newer request feedback. Scalar routes still use their configured exit
+without health filtering or background probes.
+
+`proxy_probe.probe_success` describes the latest network check;
+`route_health.available` describes whether the route remains eligible, with
+`health` set to `healthy`, `suspect` or `unavailable`. Logs include the sanitized
 failure category and HTTP status without credentials. Requests use the first
-eligible candidate in configured order; single-proxy routes do not probe.
+eligible candidate in configured order.
 Empty lists and
 unknown names are rejected at startup. All failed candidates return 502.
-The payload is sent once; API/streaming failures never replay it on another proxy.
+Payloads never replay on another proxy. Bodyless GETs, including profile lookups,
+may retry the same proxy before receiving response headers; POSTs (including
+OAuth refresh) and WebSocket upgrades are sent only once.
 
 YAML is loaded at startup. Restart after changing routes, upstreams, proxies or
 timeouts. Codex provider metadata and account credential files refresh per request.
@@ -508,6 +522,10 @@ supports optional username/password authentication and resolves destination
 hostnames remotely. HTTPS proxy certificates are verified using native system
 trust. Ordered route lists attempt tunnel establishment in order and retain the
 first successful connection; payloads are never replayed after establishment.
+All CONNECT candidates share one establishment timeout budget. Candidate lists
+use the same health state machine and background recovery schedule as HTTP; a
+real connection attempt serves as the initial check, so successful sockets are
+reused rather than opened twice.
 
 CONNECT and upgraded WebSocket connections count toward the 128-connection
 limit, close on service shutdown, and have a maximum relay lifetime of
@@ -922,10 +940,15 @@ Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB and retain one
 | `request_received` | Request method, path without query, and unique request ID. |
 | `route_selected` | Account and proxy actually selected for this request. |
 | `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
+| `route_health` | Effective route eligibility, consecutive failures and feedback source (`probe`, `request` or `connect`). |
 | `upstream_retry` | A bodyless GET transport failure before response headers; includes `upstream_attempts`, redacted `transport_error` category, and `retry_delay_ms`. |
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
 | `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
 | `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
+
+The GUI's exit-IP lookup and proxy-port diagnostic are display-only checks.
+They do not feed the daemon's per-destination route-health cache; a reachable
+proxy or successful IP lookup does not prove that a specific API origin is reachable.
 
 Logs contain **full account IDs and proxy endpoints**. They do not record tokens, authentication headers, query parameters, or request/response bodies. Keep logs private. `/health` requests are excluded from request logs.
 
@@ -936,7 +959,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
-- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share the configured request timeout, including backoff and response streaming. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
+- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. CONNECT candidates likewise share one establishment deadline; the relay lifetime starts separately after connection establishment. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.

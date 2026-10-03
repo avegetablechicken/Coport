@@ -92,7 +92,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     }
                     return;
                 }
-                if head || response_mode == "drop_twice" {
+                if head || (response_mode == "drop_twice" && !profile) {
                     io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
                 }
                 else if let Some(status) = response_mode.strip_prefix("status_") {
@@ -1769,6 +1769,7 @@ async fn api_response_clears_only_its_own_exit_failures() {
         endpoint: "none".into(),
         origin: "https://upstream.invalid/".into(),
         native_tls: false,
+        tunnel: false,
     };
     let mut suspect = ProbeHealth::default();
     suspect.observe(ProbeResult::Transient);
@@ -1825,6 +1826,7 @@ async fn homepage_failure_does_not_disable_a_working_tunnel() {
                 endpoint,
                 origin: "http://example.invalid/".into(),
                 native_tls: false,
+                tunnel: false,
             })
             .await;
         assert_eq!(result, ProbeResult::Healthy);
@@ -1854,12 +1856,14 @@ async fn stale_failed_probe_cannot_override_a_successful_request() {
     let mut health = ProbeHealth::default();
     health.observe(ProbeResult::Transient);
     health.next_check = Some(Instant::now());
+    health.monitored = true;
     let state = Arc::new(tokio::sync::Mutex::new(health));
     running.server.probes.lock().unwrap().insert(
         ProbeKey {
             endpoint: endpoint.clone(),
             origin: "http://example.invalid/".into(),
             native_tls: false,
+            tunnel: false,
         },
         state.clone(),
     );
@@ -1881,4 +1885,231 @@ async fn stale_failed_probe_cannot_override_a_successful_request() {
     assert!(!state.lock().await.unavailable);
     assert_eq!(state.lock().await.failures, 0);
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_uses_shared_safe_get_retry_and_health_feedback() {
+    let mut lookup = fixture("http", "drop_twice").await;
+    let payload = fixture("http", "redirect").await;
+    let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
+    trust(&running, &lookup, &lookup_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+    let response = http()
+        .post(format!("{}/anthropic/v1/messages", running.url))
+        .bearer_auth("profile-token")
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 302);
+    for _ in 0..3 {
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /api/oauth/profile ")
+        );
+    }
+    assert!(lookup.requests.try_recv().is_err());
+    let key = ProbeKey::http(
+        &lookup_endpoint,
+        &Url::parse("https://upstream.invalid/").unwrap(),
+        false,
+    );
+    let state = running.server.probes.lock().unwrap()[&key].clone();
+    assert_eq!(state.lock().await.failures, 0);
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert_eq!(log.matches("\"event\":\"upstream_retry\"").count(), 2);
+    assert!(!log.contains("profile-token"));
+}
+
+#[tokio::test]
+async fn refresh_failure_is_not_replayed_and_counts_once() {
+    let mut fixture = fixture("http", "drop_always").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: []\n  account_auth_file_only: false\n  routing:\n    account_fallback: selected\n")).await;
+    trust(&running, &fixture, &endpoint);
+    let response = http()
+        .post(format!("{}/anthropic/v1/oauth/token", running.url))
+        .header("content-type", "application/json")
+        .body(r#"{"grant_type":"refresh_token","refresh_token":"refresh-secret"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/oauth/token ")
+    );
+    assert!(fixture.requests.try_recv().is_err());
+    let key = ProbeKey::http(
+        &endpoint,
+        &Url::parse(crate::claude::TOKEN_REFRESH_UPSTREAM).unwrap(),
+        false,
+    );
+    let state = running.server.probes.lock().unwrap()[&key].clone();
+    assert_eq!(state.lock().await.failures, 1);
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(!log.contains("upstream_retry"));
+    assert!(!log.contains("refresh-secret"));
+}
+
+#[tokio::test]
+async fn connect_candidates_share_one_deadline_and_recover_from_cached_failure() {
+    let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", slow.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = slow.accept().await.unwrap();
+        let _ = read_response_head(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("https://{}/", destination.local_addr().unwrap())).unwrap();
+    let running = running(&format!("proxies:\n  slow: {endpoint}\n")).await;
+    let mut log = RequestLog {
+        logger: running.server.logger.clone(),
+        fields: Default::default(),
+        started: Instant::now(),
+        status: 502,
+        bytes: 0,
+        outcome: "test_finished",
+    };
+    let result = running
+        .server
+        .connect_via(
+            &Choice::List(vec!["slow".into(), "none".into()]),
+            &url,
+            Deadline::new(0.05),
+            &mut log,
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), destination.accept())
+            .await
+            .is_err(),
+        "second candidate must not receive a fresh timeout budget"
+    );
+    task.abort();
+
+    let key = ProbeKey::tunnel("none", &url);
+    let mut cached = ProbeHealth::default();
+    cached.observe(ProbeResult::HardFailure);
+    cached.monitored = true;
+    cached.next_check = Some(Instant::now());
+    let state = Arc::new(tokio::sync::Mutex::new(cached));
+    running
+        .server
+        .probes
+        .lock()
+        .unwrap()
+        .insert(key.clone(), state.clone());
+    running.server.refresh_probes().await;
+    assert!(!state.lock().await.unavailable);
+    let _ = destination.accept().await.unwrap(); // Background probe connection.
+    let socket = running
+        .server
+        .connect_via(
+            &Choice::List(vec!["none".into()]),
+            &url,
+            Deadline::new(1.0),
+            &mut log,
+        )
+        .await
+        .unwrap();
+    let _ = destination.accept().await.unwrap();
+    assert_eq!(state.lock().await.failures, 0);
+    assert!(
+        key != ProbeKey::http("none", &url, false),
+        "CONNECT cannot prove HTTP/TLS handshake health"
+    );
+    drop(socket);
+}
+
+#[tokio::test]
+async fn cold_selection_consumes_the_request_budget_and_logs_eligibility_separately() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_response_head(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    let running = running(&format!("proxies:\n  slow: {endpoint}\n")).await;
+    let mut log = RequestLog {
+        logger: running.server.logger.clone(),
+        fields: Default::default(),
+        started: Instant::now(),
+        status: 502,
+        bytes: 0,
+        outcome: "test_finished",
+    };
+    let request = reqwest::Request::new(
+        hyper::Method::GET,
+        Url::parse("http://example.invalid/api").unwrap(),
+    );
+    let result = running
+        .server
+        .send_via(
+            &Choice::List(vec!["slow".into()]),
+            request,
+            false,
+            Deadline::new(0.05),
+            &mut log,
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !log.fields.contains_key("upstream_attempts"),
+        "expired probe budget must not start a payload attempt"
+    );
+    task.abort();
+    let mut cached = ProbeHealth::default();
+    cached.observe(ProbeResult::Transient);
+    let key = ProbeKey::http(
+        "none",
+        &Url::parse("https://example.invalid/").unwrap(),
+        false,
+    );
+    running
+        .server
+        .probes
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(cached)));
+    let _ = running
+        .server
+        .record_route_success(
+            "none",
+            &Url::parse("https://example.invalid/").unwrap(),
+            false,
+        )
+        .await;
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(raw.contains("\"event\":\"route_health\""));
+    assert!(raw.contains("\"available\":\"true\""));
 }
