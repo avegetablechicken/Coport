@@ -507,14 +507,15 @@ function renderActivityList() {
 }
 
 function requestRow(e, expandable) {
-  const code = e.event === "request_cancelled" ? "CANCEL" : e.status ?? (e.error ? "ERR" : "—");
+  const cancelled = e.event === "request_cancelled";
+  const code = cancelled ? "CXL" : e.status ?? (e.error ? "ERR" : "—");
   const meta = [fmtTime(e.time), e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
     .join(" · ");
   const tag = expandable ? "button" : "div";
   const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
   return `<${tag} class="req" ${attrs}>
-    <span class="status ${statusClass(e.status)}">${esc(code)}</span>
+    <span class="status ${cancelled ? "cancelled" : statusClass(e.status)}"${cancelled ? ' title="Cancelled" aria-label="Cancelled"' : ""}>${esc(code)}</span>
     <span class="req-main">
       <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(e.path ?? e.event)}</span>
       ${expandable && meta ? `<span class="req-meta">${esc(meta)}</span>` : ""}

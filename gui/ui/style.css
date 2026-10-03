@@ -18,6 +18,7 @@
   --green: #28cd41;
   --red: #ff3b30;
   --orange: #ff9500;
+  --yellow: #e5b800;
   --blue: #007aff;
   --text-red: #d70015;
   --purple: #af52de;
@@ -45,6 +46,7 @@
     --green: #32d74b;
     --red: #ff453a;
     --orange: #ff9f0a;
+    --yellow: #ffd60a;
     --blue: #0a84ff;
     --text-red: #ff6961;
     --purple: #bf5af2;
@@ -722,6 +724,7 @@ button.req:hover .req-path {
 
 .status::before {
   content: "";
+  flex: none;
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -742,6 +745,10 @@ button.req:hover .req-path {
 
 .status.s5::before {
   background: var(--red);
+}
+
+.status.cancelled::before {
+  background: var(--yellow);
 }
 
 .detail {
