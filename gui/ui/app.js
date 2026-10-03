@@ -417,6 +417,64 @@ const FALLBACK_LABEL = {
   accountProbe: "Account probe",
 };
 
+const ROUTE_ICON = {
+  account: svg('<circle cx="12" cy="8" r="3"/><path d="M5 20v-2a7 7 0 0 1 14 0v2"/>'),
+  key: svg('<circle cx="8" cy="9" r="4"/><path d="m11 12 9 9m-3-3 3-3m-6 0 3-3"/>'),
+  gateway: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a19 19 0 0 1 0 18 19 19 0 0 1 0-18"/>'),
+  proxy: svg('<rect x="8" y="4" width="8" height="16" rx="2"/><path d="M2 9h9m-3-3 3 3-3 3M13 15h9m-3-3 3 3-3 3"/>'),
+  file: svg('<path d="M14 3H6v18h12V7zM14 3v5h4M9 12h6M9 16h6"/>'),
+};
+
+// Presentation only: full selectors remain intact in configuration and tooltips.
+function routeIdentity(selector, source) {
+  if (source === "account") {
+    const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(selector);
+    return { name: uuid ? `${selector.slice(0, 8)}…${selector.slice(-4)}` : selector, kind: "account", type: "Account" };
+  }
+  if (source === "provider" || source === "profile") {
+    return { name: selector, kind: "proxy", type: source === "provider" ? "Provider configuration" : "Profile configuration" };
+  }
+  if (source === "gateway") {
+    try {
+      const url = new URL(selector.startsWith("//") ? `https:${selector}` : /^[a-z]+:\/\//i.test(selector) ? selector : `https://${selector}`);
+      return { name: url.host, kind: "gateway", type: "Gateway" };
+    } catch (_) { /* Preserve an unrecognized selector verbatim. */ }
+  }
+  return source === "api_key"
+    ? { name: selector, kind: "key", type: "API key" }
+    : { name: selector, kind: "file", type: "Configuration (unresolved)" };
+}
+
+function routingChain(names) {
+  return `<span class="chain">${names.map((name) => `<span class="route-proxy${name.length > 14 ? " route-proxy-long" : ""}" title="${esc(name === "none" ? "direct" : name)}">${tag(name)}</span>`).join('<span class="arrow">→</span>')}</span>`;
+}
+
+function routingRow(route, account) {
+  const identity = routeIdentity(route.selector, route.kind || (account ? "account" : "unknown"));
+  if (account || route.kind === "api_key") {
+    return `<div class="route-summary route-static">
+      <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(route.selector)}">${esc(identity.name)}</span></span>
+      <span class="route-destination">${routingChain(route.proxies)}</span>
+    </div>`;
+  }
+  const extra = route.detail && route.detail !== route.selector ? route.detail : "";
+  const title = `${identity.type}: ${route.selector}${extra ? `\n${extra}` : ""}`;
+  return `<div class="route-summary" title="${esc(title)}">
+    <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name">${esc(identity.name)}</span></span>
+    <span class="route-destination">${routingChain(route.proxies)}</span>
+  </div>`;
+}
+
+document.addEventListener("pointerover", (event) => {
+  const name = event.target.closest?.(".route-static .route-name");
+  if (!name) return;
+  if (name.scrollWidth > name.clientWidth || name.textContent !== name.dataset.fullName) {
+    name.title = name.dataset.fullName;
+  } else {
+    name.removeAttribute("title");
+  }
+});
+
 function routingBlock() {
   const s = ui.snap;
   const d = s.config.details;
@@ -425,21 +483,17 @@ function routingBlock() {
   const section = (name, svc) => {
     const r = report[name.toLowerCase()];
     const badge = r ? (r.ok ? "" : `<span class="bad" data-tip="${esc(r.reason ?? "")}">Unavailable</span>`) : "";
-    if (!svc.configured) {
+    const configured = svc.configured || svc.fallbacks.some((f) => f.proxies);
+    if (!configured) {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
     }
-    const rows = [...svc.accountRoutes, ...svc.apiKeyRoutes]
-      .map((x) => `<div class="row compact${x.detail ? ` tip-wide" data-tip="${esc(x.detail)}` : ""}"><span class="row-label">${esc(x.selector)}</span><span class="row-value">${chain(x.proxies)}</span></div>`)
-      .join("");
-    const fallbacks = svc.fallbacks
-      .filter((f) => f.proxies)
+    const rows = svc.accountRoutes.map((route) => routingRow(route, true)).join("")
+      + svc.apiKeyRoutes.map((route) => routingRow(route, false)).join("");
+    const fallbacks = svc.fallbacks.filter((f) => f.proxies)
       .sort((a, b) => MINOR_FALLBACKS.has(a.key) - MINOR_FALLBACKS.has(b.key))
-      .map(
-        (f) =>
-          `<div class="row compact${MINOR_FALLBACKS.has(f.key) ? " minor" : ""}"><span class="row-label">${FALLBACK_LABEL[f.key]}</span><span class="row-value">${chain(f.proxies)}</span></div>`
-      )
-      .join("");
-    return `<div class="subhead"><span>${name}</span>${badge}</div>${rows}${fallbacks}`;
+      .map((f) => `<div class="route-default"><span class="route-default-name">${FALLBACK_LABEL[f.key]}</span><span class="route-destination">${routingChain(f.proxies)}</span></div>`).join("");
+    return `<div class="routing-service"><div class="subhead"><span>${name}</span>${badge}</div>${rows}
+      ${fallbacks ? `<div class="route-defaults"><div class="route-defaults-title">Defaults &amp; helpers</div>${fallbacks}</div>` : ""}</div>`;
   };
   return block("Routing", `Timeout ${d.timeoutSecs} s`, section("Codex", d.codex) + section("Claude", d.claude));
 }

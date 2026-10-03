@@ -1079,3 +1079,28 @@ details.disclosure[open] summary svg {
 }
 .claude-mark { --service-icon: url("icons/claude.svg"); }
 .codex-mark { --service-icon: url("icons/codex.svg"); }
+
+/* Routing shares available width; compact long proxy labels before identities. */
+.routing-service + .routing-service { margin-top: 8px; }
+.route-summary, .route-default {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 28px;
+}
+.route-summary { cursor: default; }
+.route-identity { display: flex; flex: 1 1 0; align-items: center; gap: 7px; min-width: 0; }
+.route-icon { width: 13px; height: 13px; flex: none; color: var(--secondary); }
+.route-icon svg { width: 100%; height: 100%; }
+.route-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-destination { flex: 0 1 auto; min-width: 0; max-width: 55%; text-align: right; }
+.route-destination .chain { display: flex; flex-wrap: wrap; gap: 3px; padding: 3px 0; }
+.route-destination .tag { display: block; line-height: 17px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-defaults { border-top: 1px solid var(--separator); margin-top: 4px; padding-top: 5px; }
+.route-defaults-title { font-size: 9px; color: var(--tertiary); margin-bottom: 2px; }
+.route-default { min-height: 22px; font-size: 10px; }
+.route-default-name { flex: 1 1 0; min-width: 0; color: var(--secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+
+.route-proxy { display: inline-flex; min-width: 0; max-width: 100%; }
+.route-proxy-long .tag { font-size: 10px; max-width: 16ch; }
