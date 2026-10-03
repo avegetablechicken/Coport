@@ -895,6 +895,7 @@ Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB and retain one
 | `request_received` | Request method, path without query, and unique request ID. |
 | `route_selected` | Account and proxy actually selected for this request. |
 | `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
+| `upstream_retry` | A bodyless GET transport failure before response headers; includes `upstream_attempts`, redacted `transport_error` category, and `retry_delay_ms`. |
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
 | `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
 | `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
@@ -908,6 +909,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
+- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share the configured request timeout, including backoff and response streaming. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.

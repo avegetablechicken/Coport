@@ -61,6 +61,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
     let (tx, requests) = mpsc::unbounded_channel();
     let release = Arc::new(Notify::new());
     let ready = release.clone();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let task = tokio::spawn(async move {
         let mut children = tokio::task::JoinSet::new();
         loop {
@@ -68,6 +69,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
             let acceptor = acceptor.clone();
             let tx = tx.clone();
             let ready = ready.clone();
+            let attempts = attempts.clone();
             children.spawn(async move {
                 let mut io:TestIo=Box::new(socket);
                 if mode=="https" { io=Box::new(acceptor.accept(io).await.unwrap()); }
@@ -78,7 +80,24 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                 }
                 let Ok(tls)=acceptor.accept(io).await else { return; }; let mut io:TestIo=Box::new(tls);
                 let request=read_request(&mut io).await.unwrap(); let head=request.starts_with("HEAD "); let profile=request.starts_with("GET /api/oauth/profile "); tx.send(request.clone()).unwrap();
-                if head { io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap(); }
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if response_mode == "drop_always" || (response_mode == "drop_twice" && attempt < 2) {
+                    return;
+                }
+                if response_mode == "slow_drop_then_delay" {
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    } else {
+                        let _ = io.read_u8().await;
+                    }
+                    return;
+                }
+                if head || response_mode == "drop_twice" {
+                    io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+                else if let Some(status) = response_mode.strip_prefix("status_") {
+                    io.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 4\r\nRetry-After: 120\r\nConnection: close\r\n\r\noops").as_bytes()).await.unwrap();
+                }
                 else if profile {
                     let (status, body) = match response_mode {
                         "profile_unauthorized" => (401, "{}"),
@@ -1002,19 +1021,31 @@ async fn request_limits_duplicates_and_chunked_upload() {
 
 #[tokio::test]
 async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
-    for disconnect in [true, false] {
+    for (disconnect, method) in [
+        (true, hyper::Method::POST),
+        (false, hyper::Method::POST),
+        (true, hyper::Method::GET),
+        (false, hyper::Method::GET),
+    ] {
         let mut fixture = fixture("direct", "sse").await;
         let running=running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
         trust(&running, &fixture, "none");
         let response = http()
-            .post(format!("{}/responses", running.url))
+            .request(method.clone(), format!("{}/responses", running.url))
             .bearer_auth("model-secret")
             .send()
             .await
             .unwrap();
         let mut stream = response.bytes_stream();
         assert_eq!(stream.next().await.unwrap().unwrap(), "data: first\n\n");
-        assert!(fixture.requests.recv().await.unwrap().starts_with("POST "));
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with(method.as_str())
+        );
         if disconnect {
             drop(stream);
         } else {
@@ -1562,4 +1593,132 @@ async fn disconnect_before_headers_does_not_invent_a_502() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn safe_get_retries_transport_failures_on_the_same_route_and_stops_at_three() {
+    for mode in ["direct", "http"] {
+        for (response_mode, status) in [("drop_twice", 204), ("drop_always", 502)] {
+            let mut fixture = fixture(mode, response_mode).await;
+            let endpoint = if mode == "direct" {
+                "none".to_owned()
+            } else {
+                format!("http://{}", fixture.addr)
+            };
+            let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key_fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
+            trust(&running, &fixture, &endpoint);
+            let response = http()
+                .get(format!("{}/models?secret=private-query", running.url))
+                .bearer_auth("model-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            response.bytes().await.unwrap();
+            for _ in 0..3 {
+                if mode == "http" {
+                    assert!(
+                        fixture
+                            .requests
+                            .recv()
+                            .await
+                            .unwrap()
+                            .starts_with("CONNECT upstream.invalid:443 ")
+                    );
+                }
+                let request = fixture.requests.recv().await.unwrap();
+                assert!(request.starts_with("GET /v1/models?secret=private-query "));
+                assert!(
+                    request
+                        .to_lowercase()
+                        .contains("authorization: bearer model-secret")
+                );
+            }
+            assert!(fixture.requests.try_recv().is_err());
+            let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+            let events: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let retries: Vec<_> = events
+                .iter()
+                .filter(|e| e["event"] == "upstream_retry")
+                .collect();
+            assert_eq!(retries.len(), 2);
+            assert_eq!(retries[0]["retry_delay_ms"], "200");
+            assert_eq!(retries[1]["retry_delay_ms"], "400");
+            let end = events
+                .iter()
+                .find(|e| e["event"] == "request_finished" || e["event"] == "request_failed")
+                .unwrap();
+            assert_eq!(end["upstream_attempts"], "3");
+            assert!(!raw.contains("private-query"));
+            assert!(!raw.contains("model-secret"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsafe_requests_and_http_errors_are_not_retried() {
+    for (method, body, websocket, response_mode, status) in [
+        (hyper::Method::POST, "", false, "drop_always", 502),
+        (hyper::Method::GET, "payload", false, "drop_always", 502),
+        (hyper::Method::GET, "", true, "drop_always", 502),
+        (hyper::Method::GET, "", false, "status_401", 401),
+        (hyper::Method::GET, "", false, "status_429", 429),
+        (hyper::Method::GET, "", false, "status_503", 503),
+    ] {
+        let mut fixture = fixture("direct", response_mode).await;
+        let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+        trust(&running, &fixture, "none");
+        let mut request = http()
+            .request(method, format!("{}/models", running.url))
+            .bearer_auth("model-secret")
+            .body(body);
+        if websocket {
+            request = request
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), status);
+        if status != 502 {
+            assert_eq!(response.headers()["retry-after"], "120");
+            assert_eq!(response.text().await.unwrap(), "oops");
+        } else {
+            response.bytes().await.unwrap();
+        }
+        fixture.requests.recv().await.unwrap();
+        assert!(fixture.requests.try_recv().is_err());
+        let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        assert!(!raw.contains("upstream_retry"));
+    }
+}
+
+#[tokio::test]
+async fn safe_get_retries_share_the_original_timeout_budget() {
+    let mut fixture = fixture("direct", "slow_drop_then_delay").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let response = tokio::time::timeout(
+        Duration::from_millis(3800),
+        http()
+            .get(format!("{}/models", running.url))
+            .bearer_auth("model-secret")
+            .send(),
+    )
+    .await
+    .expect("retries must share the three-second budget")
+    .unwrap();
+    assert_eq!(response.status(), 502);
+    response.bytes().await.unwrap();
+    for _ in 0..2 {
+        assert!(fixture.requests.recv().await.unwrap().starts_with("GET "));
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert_eq!(raw.matches("\"event\":\"upstream_retry\"").count(), 1);
+    assert!(raw.contains("\"transport_error\":\"timeout\""));
 }

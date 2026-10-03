@@ -796,15 +796,62 @@ impl Server {
             }
         }
         headers.insert("accept-encoding", "identity".parse().unwrap());
-        self.client_transport(endpoint, native_tls)?
-            .request(parts.method, url)
-            .headers(headers)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| {
-                Error::config("Upstream transport failed; no direct fallback was attempted.")
-            })
+        // Replay only bodyless GETs before receiving response headers. Keep the
+        // selected route and one timeout budget, including backoff and body reads.
+        let retryable = parts.method == hyper::Method::GET && bytes.is_empty() && !websocket;
+        let client = self.client_transport(endpoint, native_tls)?;
+        let started = Instant::now();
+        let budget = Duration::from_secs_f64(self.config.request_timeout_seconds);
+        for attempt in 1..=3 {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                log.field("transport_error", "timeout");
+                break;
+            }
+            log.field("upstream_attempts", attempt);
+            match client
+                .request(parts.method.clone(), url.clone())
+                .headers(headers.clone())
+                .body(bytes.clone())
+                .timeout(remaining)
+                .send()
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    // Never log raw reqwest errors: they can contain query secrets.
+                    let kind = if error.is_timeout() {
+                        "timeout"
+                    } else if error.is_connect() {
+                        "connect"
+                    } else if error.is_request() {
+                        "request"
+                    } else {
+                        "other"
+                    };
+                    let delay = Duration::from_millis(200 * attempt);
+                    if !retryable
+                        || attempt == 3
+                        || kind == "other"
+                        || budget.saturating_sub(started.elapsed()) <= delay
+                    {
+                        log.field("transport_error", kind);
+                        break;
+                    }
+                    let mut fields = log.fields.clone();
+                    fields.insert("transport_error".into(), json!(kind));
+                    fields.insert(
+                        "retry_delay_ms".into(),
+                        json!(delay.as_millis().to_string()),
+                    );
+                    self.logger.write("upstream_retry", fields);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        Err(Error::config(
+            "Upstream transport failed; no direct fallback was attempted.",
+        ))
     }
     async fn connect(
         &self,
