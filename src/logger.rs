@@ -272,15 +272,13 @@ mod tests {
         let path = dir.path().join("proxy.log");
         std::fs::write(dir.path().join("proxy.log.1"), "previous log").unwrap();
         std::fs::write(dir.path().join("history"), "blocks directory creation").unwrap();
-        let logger = Logger::new(path.clone());
-        logger
-            .file
-            .lock()
-            .unwrap()
-            .as_ref()
+        // Windows append-only handles do not permit set_len. Prepare the large
+        // file with write access before Logger opens its normal append handle.
+        File::create(&path)
             .unwrap()
             .set_len(5 * 1024 * 1024)
             .unwrap();
+        let logger = Logger::new(path.clone());
         logger.write("still_logged", Map::new());
         assert!(std::fs::metadata(path).unwrap().len() > 5 * 1024 * 1024);
         assert_eq!(
