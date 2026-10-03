@@ -114,19 +114,10 @@ pub fn set_launch_at_login(state: State<AppState>, enabled: bool) -> Result {
 }
 
 #[tauri::command]
-pub fn set_config_path(app: AppHandle, state: State<AppState>, path: String) {
-    {
-        let mut core = state.core.lock().unwrap();
-        core.settings.config_path = path.trim().to_owned();
-        core.settings.save();
-        core.invalidate_config();
-        let log = core.settings.log_path();
-        core.logs.set_path(log);
-        if core.controller.is_running() {
-            core.start();
-        }
-    }
+pub fn set_config_path(app: AppHandle, state: State<AppState>, path: String) -> Result {
+    let result = state.core.lock().unwrap().apply_config_path(&path);
     tray::sync(&app);
+    result
 }
 
 const EXAMPLE: &str = include_str!("../../config.example.yaml");

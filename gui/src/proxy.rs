@@ -117,26 +117,38 @@ impl Controller {
     }
 
     pub fn start(&mut self, config_path: &Path, log_path: PathBuf) {
-        // Never launch a replacement unless the old listener has stopped.
-        if self.stop().is_err() {
-            return;
+        let _ = self.try_start(config_path, log_path);
+    }
+
+    pub fn try_start(&mut self, config_path: &Path, log_path: PathBuf) -> Result<(), String> {
+        // Validate before stopping the working listener.
+        if let Err(error) = Config::read(config_path) {
+            let message = error.message.to_string();
+            if !self.is_running() {
+                self.lock().phase = Some(Phase::Failed(message.clone()));
+                (self.notify)();
+            }
+            return Err(message);
         }
-        let result = Config::read(config_path)
-            .map_err(|e| e.message.to_string())
-            .and_then(|_| {
-                daemon::start(
-                    &self.daemon_binary,
-                    &self.daemon_dir,
-                    config_path,
-                    &log_path,
-                )
-                .map_err(|e| e.to_string())
-            });
+        // Never launch a replacement unless the old listener has stopped.
+        self.stop()?;
+        let result = daemon::start(
+            &self.daemon_binary,
+            &self.daemon_dir,
+            config_path,
+            &log_path,
+        )
+        .map_err(|e| e.to_string());
         match result {
             Ok((client, status)) => self.attach(client, status),
-            Err(message) => self.lock().phase = Some(Phase::Failed(message)),
+            Err(message) => {
+                self.lock().phase = Some(Phase::Failed(message.clone()));
+                (self.notify)();
+                return Err(message);
+            }
         }
         (self.notify)();
+        Ok(())
     }
 
     fn attach(&mut self, client: daemon::Client, status: daemon::Status) {

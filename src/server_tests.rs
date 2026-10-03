@@ -977,6 +977,13 @@ async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
     for s in ["authorization", "cookie", "x-private", "model-secret"] {
         assert!(!request.contains(s));
     }
+    let logs = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let route = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| entry["event"] == "route_selected")
+        .unwrap();
+    assert_eq!(route["service"], "codex");
 }
 
 #[tokio::test]

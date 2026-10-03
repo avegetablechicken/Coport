@@ -546,7 +546,7 @@ impl Server {
             if target.contains('#') {
                 return Err(Error::config("Invalid MCP request target."));
             }
-            log.field("service", "openaiDeveloperDocs");
+            log.field("service", "codex");
             log.field(
                 "routing",
                 if route.is_some() {

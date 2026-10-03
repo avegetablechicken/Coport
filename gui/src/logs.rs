@@ -66,8 +66,6 @@ impl Entry {
             || path.starts_with("/api/oauth")
         {
             Some("Claude")
-        } else if path.starts_with("/mcp") {
-            Some("MCP")
         } else {
             Some("Codex")
         }

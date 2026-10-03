@@ -704,15 +704,18 @@ right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 
 The GUI supports YAML configuration files (`.yaml` and `.yml`). `--config` and
 files explicitly selected in Settings are remembered. Without a saved choice,
-the only default is `agent-router/config.yaml` in the user's application cache
-directory: `~/Library/Caches/agent-router/config.yaml` on macOS,
-`$XDG_CACHE_HOME/agent-router/config.yaml` (normally `~/.cache/agent-router/config.yaml`)
-on Linux, or `%LOCALAPPDATA%/agent-router/config.yaml` on Windows. The GUI never
+the only default is `io.github.agent-router.gui/config.yaml` in the user's application cache
+directory: `~/Library/Caches/io.github.agent-router.gui/config.yaml` on macOS,
+`$XDG_CACHE_HOME/io.github.agent-router.gui/config.yaml` (normally `~/.cache/io.github.agent-router.gui/config.yaml`)
+on Linux, or `%LOCALAPPDATA%/io.github.agent-router.gui/config.yaml` on Windows. The GUI never
 searches the working directory for configuration. It offers to create a missing
 configuration from `config.example.yaml`. Existing saved paths are retained;
 GUI preferences and daemon discovery stay in the per-user configuration directory.
-The CLI's default remains `./config.yaml`. Logs go to `logs/proxy.log`
-next to the configuration, exactly as with the CLI. Opening the app shows the
+The CLI's default remains `./config.yaml`. GUI logs default to
+`io.github.agent-router.gui/logs/proxy.log` in the same application cache directory, independent
+of the selected YAML file. The `log_path` field in `gui.json` can override this
+location. The CLI continues to log beside its configuration unless `--log-file`
+is supplied. Opening the app shows the
 panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
@@ -938,7 +941,16 @@ Logs are written to stderr and to `logs/proxy.log` beside the application config
 tail -F logs/proxy.log
 ```
 
-Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB and retain one backup as `proxy.log.1`. Unix files use mode `0600`; Windows files inherit directory ACLs, so keep them in your private user directory. If file logging fails, the service reports it on stderr and continues console logging.
+Each line is JSON with a UTC timestamp. Log files rotate at 5 MiB, keeping the
+latest backup as `proxy.log.1` and moving older backups into `logs/history/` as
+timestamped JSONL archives. Archives are kept for at least 30 days after creation;
+cleanup runs at startup and rotation, and retains files modified within the last
+30 days. Retention is based on age, with no file-count cap that could discard busy
+days early. Traffic reads the active file, latest backup, and historical archives,
+deduplicating imported request records. History from before this policy can only
+be shown if the source logs still exist. Unix files use mode `0600`; Windows files
+inherit directory ACLs, so keep them in your private user directory. If archiving
+fails, logging continues in the current file; failures are also reported on stderr.
 
 | Event | Meaning |
 | --- | --- |

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+const BUNDLE_IDENTIFIER: &str = "io.github.agent-router.gui";
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Appearance {
     #[default]
@@ -14,6 +16,7 @@ pub enum Appearance {
 #[serde(default)]
 pub struct Settings {
     pub config_path: String,
+    pub log_path: String,
     pub appearance: Appearance,
     pub start_proxy_on_launch: bool,
     pub keep_proxy_running_on_quit: bool,
@@ -23,6 +26,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             config_path: default_config_path().to_string_lossy().into_owned(),
+            log_path: cache_dir()
+                .join("logs/proxy.log")
+                .to_string_lossy()
+                .into_owned(),
             appearance: Appearance::System,
             start_proxy_on_launch: true,
             keep_proxy_running_on_quit: false,
@@ -39,25 +46,20 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let path = settings_file();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
-            let _ = write_private(&path, &bytes);
-        }
+        let _ = self.try_save();
+    }
+
+    pub fn try_save(&self) -> std::io::Result<()> {
+        write_private(&settings_file(), &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn config_path(&self) -> PathBuf {
         agent_router::config::expand(&self.config_path)
     }
 
-    /// Same location the CLI uses: `logs/proxy.log` next to the config file.
+    /// GUI logs have their own location, independent of the proxy configuration.
     pub fn log_path(&self) -> PathBuf {
-        self.config_path()
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("logs/proxy.log")
+        agent_router::config::expand(&self.log_path)
     }
 }
 
@@ -74,9 +76,13 @@ fn settings_file() -> PathBuf {
 /// The GUI has one default location, independent of its working directory.
 /// Explicit paths chosen in Settings or through --config still take precedence.
 fn default_config_path() -> PathBuf {
+    cache_dir().join("config.yaml")
+}
+
+fn cache_dir() -> PathBuf {
     dirs::cache_dir()
         .expect("Cannot locate the current user's application cache directory")
-        .join("agent-router/config.yaml")
+        .join(BUNDLE_IDENTIFIER)
 }
 
 /// Atomically replaces `path`, creating it with owner-only permissions.
@@ -99,8 +105,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_namespace_matches_the_application_bundle_identifier() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["identifier"], BUNDLE_IDENTIFIER);
+        assert_eq!(
+            cache_dir(),
+            dirs::cache_dir().unwrap().join(BUNDLE_IDENTIFIER)
+        );
+    }
+
+    #[test]
+    fn log_path_defaults_to_cache_and_can_be_overridden_independently() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"config_path":"/custom/config.yaml"}"#).unwrap();
+        assert_eq!(
+            settings.log_path(),
+            dirs::cache_dir()
+                .unwrap()
+                .join("io.github.agent-router.gui/logs/proxy.log")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.log");
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({"log_path":path})).unwrap();
+        assert_eq!(settings.log_path(), path);
+        let restored: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.log_path(), path);
+    }
+
+    #[test]
     fn default_config_uses_only_the_application_cache() {
-        let expected = dirs::cache_dir().unwrap().join("agent-router/config.yaml");
+        let expected = dirs::cache_dir()
+            .unwrap()
+            .join("io.github.agent-router.gui/config.yaml");
         assert_eq!(Settings::default().config_path(), expected);
         let missing_path: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing_path.config_path(), expected);

@@ -4,7 +4,7 @@ use chrono::{DateTime, Local};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
@@ -61,11 +61,25 @@ pub fn read(
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
     // Open handles before reading so appends and rotations do not restart a scan.
-    let files = [path, backup.as_path()].map(|p| match File::open(p) {
+    let open = |p: &Path| match File::open(p) {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err("Cannot read traffic history".to_owned()),
+    };
+    let current = [path, backup.as_path()].map(open);
+    let archives = agent_router::logger::history_paths(path)
+        .map_err(|_| "Cannot read traffic archives".to_owned())?;
+    // Archived files are immutable. Skip files last written before the selected
+    // window, and open one at a time to avoid exhausting file descriptors.
+    let archives = archives.into_iter().filter(|p| {
+        p.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_none_or(|t| t.as_millis() as i64 >= start)
     });
+    let files = current.into_iter().chain(archives.map(|p| open(&p)));
+    let mut seen_requests = HashSet::new();
     #[cfg(unix)]
     let mut identities = std::collections::HashSet::new();
     for file in files {
@@ -104,19 +118,39 @@ pub fn read(
             };
             // Retain safe identity evidence even when the corresponding request is
             // outside the selected window. Current configuration mappings win.
-            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label")) {
-                if !id.is_empty() && !label.is_empty() {
-                    let service = entry
-                        .service()
-                        .or_else(|| entry.get("service"))
-                        .unwrap_or("Unknown");
-                    labels
-                        .entry((service.to_owned(), id.to_owned()))
-                        .or_insert_with(|| label.to_owned());
-                }
+            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
+                && !id.is_empty()
+                && !label.is_empty()
+            {
+                let service = entry
+                    .service()
+                    .or_else(|| entry.get("service"))
+                    .unwrap_or("Unknown");
+                labels
+                    .entry((service.to_owned(), id.to_owned()))
+                    .or_insert_with(|| label.to_owned());
             }
-            if entry.is_request_end() {
-                entries.push(entry);
+            if entry.is_request_end()
+                && entry
+                    .time
+                    .is_some_and(|t| t.timestamp_millis() >= start && t.timestamp_millis() < end)
+            {
+                // Imported stderr history may overlap the live/rotated logs.
+                let identity = entry
+                    .get("request_id")
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("{}:{id}", entry.event))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}:{:?}:{}",
+                            entry.event,
+                            entry.time,
+                            serde_json::to_string(&entry.fields).unwrap_or_default()
+                        )
+                    });
+                if seen_requests.insert(identity) {
+                    entries.push(entry);
+                }
             }
         }
     }
@@ -235,6 +269,76 @@ fn aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_docs_and_mcp_requests_share_codex_without_inventing_an_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let records = [
+            serde_json::json!({"event":"request_finished", "timestamp":timestamp,
+                "service":"codex", "account_id":"account", "path":"/v1/responses"}),
+            serde_json::json!({"event":"request_finished", "timestamp":timestamp,
+                "service":"codex", "path":"/mcp/openaiDeveloperDocs"}),
+            serde_json::json!({"event":"request_rejected", "timestamp":timestamp,
+                "path":"/mcp/openaiDeveloperDocs/.well-known/openid-configuration"}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|r| r.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let result = read(&path, 30, &BTreeMap::new()).unwrap();
+        assert_eq!(result.summary.requests, 3);
+        assert_eq!(result.credentials.len(), 2);
+        assert!(
+            result
+                .credentials
+                .iter()
+                .all(|group| group.service == "Codex")
+        );
+        assert_eq!(
+            result
+                .credentials
+                .iter()
+                .find(|group| group.credential == "Unidentified")
+                .unwrap()
+                .requests,
+            2
+        );
+    }
+
+    #[test]
+    fn thirty_day_traffic_reads_archives_without_counting_imported_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let row = |days: i64, id: &str| {
+            serde_json::json!({
+            "timestamp": (Local::now() - chrono::Duration::days(days) - chrono::Duration::minutes(1)).to_rfc3339(),
+            "event":"request_finished", "service":"claude", "request_id":id,
+            "account_id":"retained-account", "status":"200", "received_bytes":"100"
+        }).to_string() + "\n"
+        };
+        let recent = row(0, "recent");
+        std::fs::write(&path, &recent).unwrap();
+        std::fs::write(
+            history.join("proxy.log.1.imported.jsonl"),
+            recent + &row(29, "history") + &row(31, "expired"),
+        )
+        .unwrap();
+        let monthly = read(&path, 43200, &BTreeMap::new()).unwrap();
+        assert_eq!(monthly.summary.requests, 2);
+        assert_eq!(monthly.credentials[0].service, "Claude");
+        assert_eq!(
+            read(&path, 30, &BTreeMap::new()).unwrap().summary.requests,
+            1
+        );
+    }
     #[test]
     fn reads_rotated_history_groups_credentials_and_excludes_outside_range() {
         let dir = tempfile::tempdir().unwrap();
@@ -271,7 +375,7 @@ mod tests {
         }
         assert!(read(&path, 31, &BTreeMap::new()).is_err());
         assert!(
-            read(&dir.path().join("missing"), 30, &BTreeMap::new())
+            read(&dir.path().join("missing"), 30, &BTreeMap::new(),)
                 .unwrap()
                 .credentials
                 .is_empty()

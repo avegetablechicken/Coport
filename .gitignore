@@ -3,7 +3,7 @@
 config.yaml
 *.log
 .DS_Store
-logs/
+/logs
 *.log.1
 nohup.out
 __pycache__/

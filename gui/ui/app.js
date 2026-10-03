@@ -536,7 +536,7 @@ function renderActivityTraffic() {
     ${trafficRangeSelect("traffic-range", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
     ${ui.trafficError ? `<div class="placeholder bad">${esc(ui.trafficError)}</div>` : !traffic ? '<div class="placeholder">Loading traffic…</div>' : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
-    <p class="traffic-note">Based on retained logs, including rotated history. Older data may be unavailable. Unidentified requests have no logged credential.</p>`;
+    <p class="traffic-note">Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.</p>`;
   queueFit();
 }
 
@@ -779,9 +779,13 @@ async function act(action, el) {
     case "apply-path": {
       const path = $("config-path").value.trim();
       if (path) {
-        await invoke("set_config_path", { path });
-        ui.choosePath = false;
-        toast("Configuration file changed");
+        try {
+          await invoke("set_config_path", { path });
+          ui.choosePath = false;
+          toast("Configuration file changed");
+        } catch (error) {
+          toast(String(error));
+        }
         await refresh();
       }
       break;

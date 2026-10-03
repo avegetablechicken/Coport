@@ -12,8 +12,8 @@ mod panel;
 mod placement;
 mod platform;
 mod single_instance;
-mod tray;
 mod traffic;
+mod tray;
 
 use agent_router_gui::{proxy, settings};
 use std::{

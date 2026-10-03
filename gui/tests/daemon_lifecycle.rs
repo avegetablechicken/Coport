@@ -179,6 +179,40 @@ fn disabled_option_stops_daemon_on_gui_exit() {
 }
 
 #[test]
+fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_stopping() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    fixture(dir.path(), None);
+    let mut gui = controller(dir.path());
+    gui.try_start(
+        &dir.path().join("config.yaml"),
+        dir.path().join("proxy.log"),
+    )
+    .unwrap();
+    let initial = gui.daemon_status().unwrap().clone();
+    let invalid = dir.path().join("invalid.yaml");
+    std::fs::write(&invalid, "listen_port: [").unwrap();
+    assert!(
+        gui.try_start(&invalid, dir.path().join("other.log"))
+            .is_err()
+    );
+    assert!(gui.is_running());
+    assert_eq!(gui.daemon_status().unwrap().pid, initial.pid);
+    let new_dir = dir.path().join("new");
+    std::fs::create_dir(&new_dir).unwrap();
+    let new_port = fixture(&new_dir, None);
+    let config = new_dir.join("config.yaml").canonicalize().unwrap();
+    let log = new_dir.canonicalize().unwrap().join("proxy.log");
+    gui.try_start(&config, log.clone()).unwrap();
+    let (_, live) = daemon::Client::discover(dir.path()).unwrap();
+    assert_ne!(live.pid, initial.pid);
+    assert_eq!(live.port, new_port);
+    assert_eq!(live.config_path, config);
+    assert_eq!(live.log_path, log);
+    gui.stop().unwrap();
+}
+
+#[test]
 fn daemon_crash_is_reported_and_restart_recovers_stale_registration() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());

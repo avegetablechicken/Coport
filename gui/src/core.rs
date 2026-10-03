@@ -62,7 +62,13 @@ impl Core {
         let log_path = attached.map(|status| status.log_path.clone());
         if let Some(status) = attached {
             // The live daemon is authoritative, even if auto-start is disabled.
-            settings.config_path = status.config_path.to_string_lossy().into_owned();
+            // Resolve compatibility links left by configuration migrations.
+            settings.config_path = status
+                .config_path
+                .canonicalize()
+                .unwrap_or_else(|_| status.config_path.clone())
+                .to_string_lossy()
+                .into_owned();
             settings.save();
         }
         Self {
@@ -134,6 +140,46 @@ impl Core {
 
     pub fn stop(&mut self) -> Result<(), String> {
         self.controller.stop()
+    }
+
+    pub fn apply_config_path(&mut self, path: &str) -> Result<(), String> {
+        if path.trim().is_empty() {
+            return Err("Choose a YAML configuration file.".into());
+        }
+        let path = agent_router::config::expand(path.trim())
+            .canonicalize()
+            .map_err(|e| format!("Cannot open configuration: {e}"))?;
+        Config::read(&path).map_err(|e| e.message.to_string())?;
+        let mut next = self.settings.clone();
+        next.config_path = path.to_string_lossy().into_owned();
+        // Check persistence before touching the running daemon.
+        next.try_save()
+            .map_err(|e| format!("Cannot save settings: {e}"))?;
+        if let Some(previous) = self.controller.daemon_status().cloned() {
+            if let Err(mut error) = self.controller.try_start(&path, next.log_path()) {
+                if let Err(save_error) = self.settings.try_save() {
+                    error.push_str(&format!("; cannot restore saved settings: {save_error}"));
+                }
+                if self.controller.daemon_status().is_none() {
+                    match self
+                        .controller
+                        .try_start(&previous.config_path, previous.log_path)
+                    {
+                        Ok(()) => error.push_str("; previous configuration restored"),
+                        Err(restore_error) => error.push_str(&format!(
+                            "; previous configuration could not restart: {restore_error}"
+                        )),
+                    }
+                }
+                self.invalidate_config();
+                return Err(error);
+            }
+            self.started_stamp = Some(file_stamp(&path));
+        }
+        self.settings = next;
+        self.logs.set_path(self.settings.log_path());
+        self.invalidate_config();
+        Ok(())
     }
 
     pub fn set_launch_at_login(&mut self, enable: bool) -> Result<(), String> {
