@@ -137,6 +137,7 @@ const ui = {
   homeTrafficLoading: false,
   traffic: null,
   trafficError: "",
+  trafficLoading: false,
   trafficRequest: 0,
   expanded: new Set(),
   builtPage: null,
@@ -333,7 +334,7 @@ async function loadHomeTraffic(force = false) {
 function trafficBlock() {
   const st = ui.homeTraffic;
   const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
-  if (ui.homeTrafficError || !st) return block("Traffic", range, `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
+  if (!st) return block("Traffic", range, `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
   let rate = "—";
   let rateClass = "";
   if (st.requests) {
@@ -344,13 +345,15 @@ function trafficBlock() {
   return block(
     "Traffic",
     range,
-    `${chart(st.counts, st.errorCounts)}
+    `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
+     ${ui.homeTrafficError ? `<span class="traffic-update-error" title="${esc(ui.homeTrafficError)}">Update failed</span>` : ""}
+     ${chart(st.counts, st.errorCounts)}
      <div class="strip">
        ${stat("Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(st.avgMs))}
        ${stat("Received", fmtBytes(st.bytes))}
-     </div>`
+     </div></div>`
   );
 }
 
@@ -527,6 +530,8 @@ function trafficControls(prefix, minutes, label) {
 
 async function loadTraffic() {
   const request = ++ui.trafficRequest;
+  ui.trafficLoading = true;
+  $("activity-traffic")?.setAttribute("aria-busy", "true");
   try {
     const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes, scope: ui.trafficScope });
     if (request !== ui.trafficRequest) return;
@@ -535,6 +540,8 @@ async function loadTraffic() {
   } catch (error) {
     if (request !== ui.trafficRequest) return;
     ui.trafficError = String(error);
+  } finally {
+    if (request === ui.trafficRequest) ui.trafficLoading = false;
   }
   if (ui.page === "activity") renderActivityTraffic();
 }
@@ -543,6 +550,7 @@ function renderActivityTraffic() {
   const el = $("activity-traffic");
   if (!el) return;
   const traffic = ui.traffic;
+  el.setAttribute("aria-busy", String(ui.trafficLoading));
   const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const rows = traffic?.credentials.map((c) => {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
@@ -555,7 +563,8 @@ function renderActivityTraffic() {
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
-    ${ui.trafficError ? `<div class="placeholder bad">${esc(ui.trafficError)}</div>` : !traffic ? '<div class="placeholder">Loading traffic…</div>' : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
+    ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
+    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
     <p class="traffic-note">Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.</p>`;
   queueFit();
 }
@@ -828,7 +837,7 @@ document.addEventListener("change", async (event) => {
     // must not repopulate either cache after a switch.
     ++ui.trafficRequest;
     ++ui.homeTrafficRequest;
-    ui.traffic = ui.homeTraffic = null;
+    // Keep the previous charts mounted until the replacement data is ready.
     ui.trafficError = ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = 0;
     ui.homeTrafficLoading = false;
@@ -845,7 +854,6 @@ document.addEventListener("change", async (event) => {
 
   if (event.target.id === "home-traffic-range") {
     ui.homeTrafficMinutes = Number(event.target.value);
-    ui.homeTraffic = null;
     ui.homeTrafficError = "";
     // Launch immediately so concurrent refreshes cannot start an older range.
     const loading = loadHomeTraffic(true);
@@ -855,7 +863,6 @@ document.addEventListener("change", async (event) => {
   }
   if (event.target.id === "traffic-range") {
     ui.trafficMinutes = Number(event.target.value);
-    ui.traffic = null;
     ui.trafficError = "";
     renderActivityTraffic();
     await loadTraffic();

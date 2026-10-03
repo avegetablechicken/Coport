@@ -1113,3 +1113,7 @@ details.disclosure[open] summary svg {
 .traffic-chart { position: relative; padding-top: 16px; }
 .chart-peak { position: absolute; top: 0; color: var(--secondary); font-size: 10px; line-height: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .chart-peak-stem { position: absolute; top: 13px; height: 5px; border-left: 1px solid var(--tertiary); }
+
+/* Refreshes retain the previous chart geometry, including on failure. */
+.traffic-content, #activity-traffic { position: relative; }
+.traffic-update-error { position: absolute; right: 4px; bottom: 0; font-size: 9px; color: var(--orange); background: var(--window); padding: 1px 4px; border-radius: 3px; }
