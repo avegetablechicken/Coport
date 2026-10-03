@@ -586,6 +586,25 @@ impl Config {
     }
 }
 
+pub(crate) fn routing_account_label(
+    routing: &crate::config::Routing,
+    id: &str,
+    usernames: &[String],
+    source: &str,
+) -> Option<String> {
+    std::iter::once(id)
+        .chain(usernames.iter().map(String::as_str))
+        .chain(std::iter::once(source))
+        .find(|name| routing.account.contains_key(*name))
+        .map(str::to_owned)
+        .or_else(|| {
+            routing
+                .account_fallback
+                .as_ref()
+                .map(|_| "account_fallback".into())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,23 +911,4 @@ mod tests {
         );
         assert!(c.check_credentials().await.is_err());
     }
-}
-
-pub(crate) fn routing_account_label(
-    routing: &crate::config::Routing,
-    id: &str,
-    usernames: &[String],
-    source: &str,
-) -> Option<String> {
-    std::iter::once(id)
-        .chain(usernames.iter().map(String::as_str))
-        .chain(std::iter::once(source))
-        .find(|name| routing.account.contains_key(*name))
-        .map(str::to_owned)
-        .or_else(|| {
-            routing
-                .account_fallback
-                .as_ref()
-                .map(|_| "account_fallback".into())
-        })
 }
