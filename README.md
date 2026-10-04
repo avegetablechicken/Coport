@@ -456,6 +456,14 @@ security verify-cert -c ~/Library/Caches/io.github.coport.gui/tls/ca.pem
 The serving certificate is valid for one year from each start, within Apple's
 825-day limit. Recreating `tls/` requires trusting the new CA again.
 
+Each serving certificate carries a single name, chosen by SNI: `localhost`, or
+`127.0.0.1` when the client sends none. BoringSSL clients, including Claude Code,
+reject an IP name under the CA's IP constraint, so give them `localhost`, e.g.
+`ANTHROPIC_BASE_URL=https://localhost:7889/anthropic`. Plain HTTP needs no CA.
+Running Claude Code sessions apply `settings.json` changes immediately but keep the
+CA list they loaded at startup, so restart sessions started before the CA was
+trusted before switching them to HTTPS.
+
 For matched ChatGPT credentials, `/responses`, `/v1/responses` and
 `/backend-api/codex/responses` map to the same model endpoint. Official
 `/backend-api/...` paths retain their full path, including plugin listing at

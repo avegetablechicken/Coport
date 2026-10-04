@@ -18,6 +18,8 @@ use tokio_rustls::{
     rustls::{
         self,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        server::{ClientHello, ResolvesServerCert},
+        sign::CertifiedKey,
     },
 };
 
@@ -35,8 +37,41 @@ pub fn acceptor(dir: &Path) -> Result<TlsAcceptor> {
     // Only the name, key identifier method and key usages are taken from the
     // issuer, so rebuilding the parameters matches the stored certificate.
     let issuer = Issuer::new(ca_params(), &ca_key);
-    let mut params =
-        CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).map_err(failed)?;
+    // BoringSSL (Bun, used by Claude Code) rejects a certificate carrying an IP
+    // name under a CA with IP name constraints. Each certificate holds one
+    // name and is chosen by SNI: localhost by name, 127.0.0.1 (no SNI) by IP.
+    let certs = Arc::new(LoopbackCerts {
+        localhost: leaf("localhost", &issuer)?,
+        ip: leaf("127.0.0.1", &issuer)?,
+    });
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(failed)?
+    .with_no_client_auth()
+    .with_cert_resolver(certs);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[derive(Debug)]
+struct LoopbackCerts {
+    localhost: Arc<CertifiedKey>,
+    ip: Arc<CertifiedKey>,
+}
+impl ResolvesServerCert for LoopbackCerts {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(if hello.server_name() == Some("localhost") {
+            self.localhost.clone()
+        } else {
+            self.ip.clone()
+        })
+    }
+}
+
+fn leaf(name: &str, issuer: &Issuer<'_, &KeyPair>) -> Result<Arc<CertifiedKey>> {
+    let mut params = CertificateParams::new(vec![name.into()]).map_err(failed)?;
     params
         .distinguished_name
         .push(DnType::CommonName, "coport loopback");
@@ -49,20 +84,15 @@ pub fn acceptor(dir: &Path) -> Result<TlsAcceptor> {
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(365);
     let key = KeyPair::generate().map_err(failed)?;
-    let cert = params.signed_by(&key, &issuer).map_err(failed)?;
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+    let cert = params.signed_by(&key, issuer).map_err(failed)?;
+    let signing = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
+        PrivatePkcs8KeyDer::from(key.serialize_der()),
     ))
-    .with_safe_default_protocol_versions()
-    .and_then(|b| {
-        b.with_no_client_auth().with_single_cert(
-            vec![CertificateDer::from(cert.der().to_vec())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )
-    })
     .map_err(failed)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(Arc::new(CertifiedKey::new(
+        vec![CertificateDer::from(cert.der().to_vec())],
+        signing,
+    )))
 }
 
 fn failed<E>(_: E) -> Error {
