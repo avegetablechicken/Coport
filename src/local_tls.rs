@@ -93,10 +93,11 @@ fn ca_params() -> CertificateParams {
 
 fn load_or_create_ca(dir: &Path) -> std::io::Result<KeyPair> {
     let (cert_path, key_path) = (dir.join(CA_FILE), dir.join(CA_KEY_FILE));
-    if cert_path.is_file()
-        && let Ok(text) = std::fs::read_to_string(&key_path)
-        && let Ok(key) = KeyPair::from_pem(&text)
-    {
+    let stored = std::fs::read_to_string(&key_path)
+        .ok()
+        .filter(|_| cert_path.is_file())
+        .and_then(|text| KeyPair::from_pem(&text).ok());
+    if let Some(key) = stored {
         return Ok(key);
     }
     std::fs::create_dir_all(dir)?;
