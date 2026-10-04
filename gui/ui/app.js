@@ -184,6 +184,7 @@ const BACK_KEYS = /Mac/.test(navigator.platform) ? "Meta+[" : "Control+[";
 
 function render() {
   if (!ui.snap) return;
+  if (openSelect) { selectRenderPending = true; return; }
   renderTop();
   renderPage();
   queueFit();
@@ -217,6 +218,7 @@ function renderPage() {
   const content = $("content");
   if (ui.page === "activity") {
     if (ui.builtPage !== "activity") {
+      closeSelect();
       content.innerHTML = activityShell();
       ui.builtPage = "activity";
       renderActivityTraffic();
@@ -224,6 +226,7 @@ function renderPage() {
     renderActivityList();
     return;
   }
+  closeSelect();
   ui.builtPage = ui.page;
   content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : main()}</div>`;
 }
@@ -519,15 +522,88 @@ function routingBlock() {
 
 const TRAFFIC_RANGES = [[30, "30 minutes"], [360, "6 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "7 days"], [43200, "30 days"]];
 
+// Native select popups can take OS focus away from the tray window, which
+// dismisses the panel. Keep every selector's options inside the WebView.
+function panelSelect(id, options, selected, label, cls = "", attrs = "") {
+  const value = String(selected);
+  const text = options.find(([v]) => String(v) === value)?.[1] ?? "";
+  return `<button type="button" id="${id}" class="select ${cls}" value="${esc(value)}"
+    data-options="${esc(JSON.stringify(options))}" aria-label="${esc(label)}"
+    aria-haspopup="listbox" aria-expanded="false" ${attrs}>${esc(text)}</button>`;
+}
+
+let openSelect = null;
+let selectRenderPending = false;
+
+function closeSelect(restoreFocus = false) {
+  if (!openSelect) return;
+  const { trigger, menu } = openSelect;
+  openSelect = null;
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.removeAttribute("aria-controls");
+  menu.remove();
+  if (restoreFocus && trigger.isConnected) trigger.focus();
+  // Live traffic can refresh while a choice is being made. Replace controls
+  // only after the menu closes, so its trigger and options stay mounted.
+  if (selectRenderPending) {
+    selectRenderPending = false;
+    queueMicrotask(() => {
+      render();
+      if (ui.page === "activity") renderActivityTraffic();
+    });
+  }
+}
+
+function showSelect(trigger, last = false) {
+  const wasOpen = openSelect?.trigger === trigger;
+  closeSelect();
+  if (wasOpen) return;
+  const options = JSON.parse(trigger.dataset.options);
+  const menu = document.createElement("div");
+  menu.id = "panel-select-options";
+  menu.className = "select-menu";
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
+  menu.innerHTML = options.map(([value, label]) => `<button type="button" role="option"
+    tabindex="-1" value="${esc(value)}" aria-selected="${String(value) === trigger.value}">${esc(label)}</button>`).join("");
+  openSelect = { trigger, menu };
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.setAttribute("aria-controls", menu.id);
+  document.body.append(menu);
+  const rect = trigger.getBoundingClientRect();
+  menu.style.minWidth = `${rect.width}px`;
+  menu.style.maxHeight = `${Math.max(0, window.innerHeight - 8)}px`;
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(rect.right - bounds.width, window.innerWidth - bounds.width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(rect.bottom + 3, window.innerHeight - bounds.height - 4))}px`;
+  const items = [...menu.children];
+  (last ? items.at(-1) : items.find((el) => el.value === trigger.value) ?? items[0]).focus();
+  menu.addEventListener("click", (event) => {
+    const option = event.target.closest('[role="option"]');
+    if (!option) return;
+    const changed = trigger.value !== option.value;
+    trigger.value = option.value;
+    trigger.textContent = option.textContent;
+    closeSelect(true);
+    if (changed) trigger.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (openSelect && !openSelect.menu.contains(event.target) && !openSelect.trigger.contains(event.target)) closeSelect();
+});
+document.addEventListener("scroll", (event) => {
+  if (openSelect && !openSelect.menu.contains(event.target)) closeSelect();
+}, true);
+window.addEventListener("resize", () => closeSelect());
+
 function trafficRangeSelect(id, selected, label) {
-  return `<select id="${id}" class="select traffic-range" aria-label="${label}">${TRAFFIC_RANGES.map(([minutes, text]) => `<option value="${minutes}" ${minutes === selected ? "selected" : ""}>Last ${text}</option>`).join("")}</select>`;
+  return panelSelect(id, TRAFFIC_RANGES.map(([minutes, text]) => [minutes, `Last ${text}`]), selected, label, "traffic-range");
 }
 
 function trafficControls(prefix, minutes, label) {
-  return `<span class="traffic-controls"><select id="${prefix}-scope" class="select traffic-scope" aria-label="Traffic request category" title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls. CONNECT contents cannot be classified.">
-    <option value="all" ${ui.trafficScope === "all" ? "selected" : ""}>All</option>
-    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Models</option>
-  </select>${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
+  return `<span class="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], ui.trafficScope,
+    "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls. CONNECT contents cannot be classified."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
 async function loadTraffic() {
@@ -555,6 +631,8 @@ function modelTokenStats(stats) {
 }
 
 function renderActivityTraffic() {
+  if (openSelect) { selectRenderPending = true; return; }
+  closeSelect();
   const el = $("activity-traffic");
   if (!el) return;
   const traffic = ui.traffic;
@@ -654,7 +732,6 @@ function detail(e) {
 function settings() {
   const s = ui.snap;
   const set = s.settings;
-  const option = (value, label) => `<option value="${value}" ${value === set.appearance ? "selected" : ""}>${label}</option>`;
   let status;
   if (!s.config.exists) status = message("warn", "The file does not exist yet.");
   else if (s.config.error) status = message("bad", esc(s.config.error));
@@ -675,7 +752,7 @@ function settings() {
        <div class="row"><span class="row-label">Keep proxy running after quit<span class="setting-description" id="keep-running-description">Quit exits the app; the proxy keeps running.<br>Reopen to manage or stop the proxy.</span></span>
          <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" aria-describedby="keep-running-description"></button></div>
        <div class="row"><span class="row-label">Appearance</span>
-         <select class="select" data-setting="appearance">${option("System", "System")}${option("Light", "Light")}${option("Dark", "Dark")}</select></div>`
+         ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
     )}
     ${block(
       "Configuration",
@@ -843,6 +920,8 @@ async function act(action, el) {
 }
 
 document.addEventListener("click", (event) => {
+  const select = event.target.closest("[data-options]");
+  if (select) { showSelect(select); return; }
   const el = event.target.closest("[data-action]");
   if (el && !el.disabled) act(el.dataset.action, el);
 });
@@ -900,6 +979,27 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (openSelect) {
+    const { menu } = openSelect;
+    const items = [...menu.children];
+    const index = items.indexOf(document.activeElement);
+    if (event.key === "Escape" || event.key === "Tab") {
+      closeSelect(true);
+      if (event.key === "Escape") event.preventDefault();
+      return;
+    }
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+        : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      items[next].focus();
+      return;
+    }
+  } else if (event.target.matches("[data-options]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+    event.preventDefault();
+    showSelect(event.target, event.key === "ArrowUp");
+    return;
+  }
   const mod = event.metaKey || event.ctrlKey;
   if (event.key === "Escape") {
     if (ui.page !== "main") act("page", { dataset: { page: "main" } });
@@ -932,6 +1032,7 @@ const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 
 listen("state-changed", scheduleRefresh);
 listen("panel-shown", () => refresh().then(probeStale));
+listen("panel-hidden", () => closeSelect());
 refresh().then(probeStale);
 
 // Refresh even when no new requests arrive, so the rolling window advances.
