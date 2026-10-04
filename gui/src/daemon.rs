@@ -134,6 +134,19 @@ fn private_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+fn lock_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    // Windows cannot lock an append-only handle. Keep write access without
+    // truncating the file, since another daemon may already hold its lock.
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// Detaches at spawn, not at GUI exit. No pipes or runtime tasks owned by the
 /// GUI are required to keep the listener or in-flight requests alive.
 pub fn start(binary: &Path, dir: &Path, config: &Path, log: &Path) -> io::Result<(Client, Status)> {
@@ -247,9 +260,11 @@ async fn termination() {
 /// Runs without Tauri, a WebView, a tray icon, or any GUI lifecycle hooks.
 pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let lock = private_file(&dir.join("daemon.lock"))?;
-    lock.try_lock()
-        .map_err(|_| io::Error::other("A proxy daemon is already running"))?;
+    let lock = lock_file(&dir.join("daemon.lock"))?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => io::Error::other("A proxy daemon is already running"),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
     let registration = Registration {
         path: dir.join(ENDPOINT),
         _lock: lock,
@@ -345,4 +360,24 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
             tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, response)).await;
     }
     result.and(stopped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_lock_excludes_another_handle_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let first = lock_file(&path).unwrap();
+        first.try_lock().unwrap();
+        let second = lock_file(&path).unwrap();
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(first);
+        second.try_lock().unwrap();
+    }
 }
