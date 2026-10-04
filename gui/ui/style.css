@@ -1056,6 +1056,20 @@ details.disclosure[open] summary svg {
   font-weight: 500;
 }
 .credential-traffic .chart { height: 48px; }
+/* Explanatory notes kept out of the layout; opens downward so the first block is not clipped. */
+.info-tip { display: inline-grid; place-items: center; width: 16px; height: 16px; margin-left: -4px; color: var(--tertiary); cursor: default; }
+.info-tip:hover { color: var(--secondary); }
+.info-tip svg { width: 12px; height: 12px; }
+.info-tip[data-tip]:hover::after {
+  top: calc(100% + 4px);
+  bottom: auto;
+  left: -40px;
+  right: auto;
+  width: 250px;
+  padding: 5px 8px;
+  white-space: pre-line;
+  line-height: 1.45;
+}
 .traffic-note { color: var(--secondary); font-size: 10px; line-height: 1.5; margin: 6px 0 0; }
 .traffic-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
 

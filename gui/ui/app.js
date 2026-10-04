@@ -18,6 +18,7 @@ const ICON = {
   chevron: svg('<path d="m9 6 6 6-6 6"/>', 'stroke-width="2.4"'),
   search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
   trash: svg('<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>'),
+  info: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.75v.01"/>'),
   folder: svg('<path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9.5a2 2 0 0 0-2-2h-7l-2-2.5H5a2 2 0 0 0-2 2.5z"/>'),
 };
 
@@ -566,13 +567,16 @@ function renderActivityTraffic() {
       <div class="strip">${stat(ui.trafficScope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c)}
     </div>`;
   }).join("");
+  const notes = [
+    "Sorted by received traffic, largest first. Red indicates errors; each chart uses its own scale.",
+    `${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
+    "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
+  ].join("\n\n");
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic</span>
+    <span class="info-tip" data-tip="${esc(notes)}" aria-label="${esc(notes)}">${ICON.info}</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
-    <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
-    <p class="traffic-note">${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.</p>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
-    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
-    <p class="traffic-note">Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.</p>`;
+    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}`;
   queueFit();
 }
 
