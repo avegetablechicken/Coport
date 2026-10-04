@@ -8,6 +8,7 @@ pub mod logger;
 pub mod model_calls;
 pub mod routing;
 pub mod server;
+pub mod service;
 mod tunnel;
 pub mod url_routing;
 

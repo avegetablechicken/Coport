@@ -25,16 +25,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --locked --all-targets
       - run: cargo build --locked
-      - run: python scripts/integration.py
-      - run: python scripts/test_proxy_auth.py
-      - run: python scripts/test_service_rust.py
       - run: cargo build --locked --release
       - uses: actions/upload-artifact@v4
         with:

@@ -15,8 +15,7 @@ cp config.example.yaml config.yaml
 ```
 
 On Windows PowerShell, use `Copy-Item` and `coport.exe`.
-The executable has no Python runtime dependency; Python 3.10+ is needed only
-for the optional service manager and integration tests.
+The executable, service manager, tests, and packaging tools do not require Python.
 
 The top level contains shared server settings and named proxies. **Codex and
 Claude each have their own `auth_file`, `base_url`, and `routing` settings**:
@@ -723,9 +722,8 @@ user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
 
 - macOS: `scripts/bundle_macos.sh` builds `target/Coport.app`
-  (`LSUIElement`, ad-hoc signed). Packaging requires Python 3 (standard library
-  only); ICNS icons are assembled without `iconutil` so packaging also works in
-  a sandbox. The previous app is retained until packaging and signature checks
+  (`LSUIElement`, ad-hoc signed). A Rust helper assembles ICNS icons without
+  `iconutil` or Python. The previous app is retained until packaging and signature checks
   succeed. A full menu bar hides status items behind the
   notch while apps with long menus are frontmost; the panel then opens at the
   top-right corner when launched or reopened.
@@ -741,13 +739,13 @@ background service on the same port at the same time.
 Build the Rust release executable, prepare `config.yaml`, and run:
 
 ```sh
-python3 scripts/service_rust.py install
-python3 scripts/service_rust.py status
+target/release/coport service install
+target/release/coport service status
 ```
 
-Use `python` instead of `python3` on Windows if needed. The installer copies the
-executable and initial configuration into a per-user runtime directory. It runs
-the native executable directly, without a Python supervisor:
+On Windows, use `target/release/coport.exe`. The built-in service manager copies
+the executable and initial configuration into a per-user runtime directory.
+The service runs the native executable directly; Python is not required.
 
 | Platform | Background runner | Runtime directory |
 | --- | --- | --- |
@@ -758,15 +756,16 @@ the native executable directly, without a Python supervisor:
 The Windows task runs in the logged-in user's session; it is not a system service
 that runs before login. Linux requires an available systemd user manager. On all
 platforms, manage mihomo/Clash separately; the Rust service manager does not start
-an external proxy core. The complete Linux service lifecycle has been verified
-on Ubuntu 20.04 with systemd 245. Windows task registration still needs native
-verification.
+an external proxy core. The Linux registration retains systemd 245-compatible
+path quoting. An opt-in Linux test covers the complete service lifecycle;
+Windows task registration still needs native verification.
 
 The service/task name is `local.coport.rust`. Stop any existing
-listener on the configured port before installing. The script manages only its
+listener on the configured port before installing. The service command manages only its
 own service registration and runtime directory.
 Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
-from other locations.
+from other locations. By default, installation uses the executable running
+the command and `config.yaml` in the current directory.
 
 Edit the runtime copy of `config.yaml`, then restart to apply changes. Updates
 preserve that copy. Configure allowed directories and relative `auth_file` names
@@ -776,8 +775,8 @@ also be stored in `.env` in a configured home on all platforms.
 
 ```sh
 cargo build --locked --release
-python3 scripts/service_rust.py update
-python3 scripts/service_rust.py restart
+target/release/coport service update
+target/release/coport service restart
 ```
 
 On Windows, run `stop` before `update` because Windows locks running executables,
@@ -1026,18 +1025,15 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo test --locked --all-targets
 cargo build --locked
-python3 scripts/integration.py
-python3 scripts/test_proxy_auth.py
-python3 scripts/test_service_rust.py
 cargo clippy --locked -p coport-gui --all-targets -- -D warnings
 cargo test --locked -p coport-gui
 ```
 
 Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
 HTTP/HTTPS CONNECT, early SSE delivery, proxy selection, request framing, and
-MCP credential isolation. Python integration tests cover account/API Key routing,
+MCP credential isolation. Rust process integration tests cover account/API Key routing,
 credential refresh, configuration snapshots, fallback refusal and
 HTTP/SOCKS5 authentication. They do not call a real model. CI runs these checks
 and builds release binaries for all three operating systems.
@@ -1045,17 +1041,19 @@ and builds release binaries for all three operating systems.
 On Linux with a working systemd user session, also run:
 
 ```sh
-cargo build --locked --release
-python3 scripts/test_systemd.py
+cargo test --locked --test systemd -- --ignored
 ```
 
 This test uses a temporary runtime directory, a unique service name, and an
 ephemeral loopback port. It verifies installation, configuration-preserving
 updates, restart, stop, and uninstall without changing the normal service.
 
-The Python transport tests default to `target/debug/coport` (with
-`.exe` on Windows). Set `COPORT_BINARY` to test another build, such as
-the release executable.
+Cargo builds the proxy binary used by the process integration tests. Set
+`COPORT_BINARY` to test another build, such as the release executable. The
+systemd lifecycle test is ignored by default because it requires a Linux user
+service manager; all other tests run in the normal Cargo test suite.
+
+Development, service management, and macOS packaging require no Python installation.
 
 | File | Responsibility |
 | --- | --- |
@@ -1065,7 +1063,7 @@ the release executable.
 | `src/routing.rs` | Credential matching, upstream URL mapping |
 | `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming |
 | `src/logger.rs` | Redacted structured logs and rotation |
-| `scripts/service_rust.py` | Per-user platform service management |
+| `src/service.rs` | Built-in per-user platform service management (`coport service`) |
 | `gui/src/main.rs` | Desktop app startup, Tauri commands registration |
 | `gui/src/core.rs` | Shared state and the snapshot sent to the panel |
 | `gui/src/panel.rs`, `gui/src/tray.rs` | Panel placement and dismissal, status icon and menu |

@@ -3,7 +3,6 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-command -v python3 >/dev/null
 cargo build --locked --release -p coport-gui
 
 output="target/Coport.app"
@@ -16,8 +15,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/coport-gui "$app/Contents/MacOS/"
 cp target/release/coportd "$app/Contents/MacOS/"
 
-# iconutil can reject valid PNGs in a sandbox. Write the standard ICNS PNG
-# chunks directly with Python's standard library; no GUI services are needed.
+# Assemble standard ICNS PNG chunks with the Rust packer.
 iconset="$stage/AppIcon.iconset"
 mkdir -p "$iconset"
 target/release/coport-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
@@ -26,25 +24,7 @@ for size in 16 32 128 256 512; do
     double=$((size * 2))
     sips -z $double $double "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
-python3 - "$iconset" "$app/Contents/Resources/AppIcon.icns" <<'PY'
-from pathlib import Path
-import struct
-import sys
-
-iconset = Path(sys.argv[1])
-entries = [
-    (b"icp4", "16x16"), (b"icp5", "32x32"), (b"icp6", "32x32@2x"),
-    (b"ic07", "128x128"), (b"ic08", "256x256"), (b"ic09", "512x512"),
-    (b"ic10", "512x512@2x"), (b"ic11", "16x16@2x"),
-    (b"ic12", "32x32@2x"), (b"ic13", "128x128@2x"), (b"ic14", "256x256@2x"),
-]
-chunks = []
-for kind, name in entries:
-    png = (iconset / f"icon_{name}.png").read_bytes()
-    chunks.append(kind + struct.pack(">I", len(png) + 8) + png)
-payload = b"".join(chunks)
-Path(sys.argv[2]).write_bytes(b"icns" + struct.pack(">I", len(payload) + 8) + payload)
-PY
+cargo run --locked --example pack_icns -- "$iconset" "$app/Contents/Resources/AppIcon.icns"
 
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

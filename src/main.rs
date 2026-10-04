@@ -10,9 +10,12 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(
     version,
+    args_conflicts_with_subcommands = true,
     about = "Loopback HTTP/SSE proxy. Configuration is loaded at startup; credentials refresh per request."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Subcommand>,
     #[arg(long, default_value = "config.yaml")]
     config: String,
     #[arg(long)]
@@ -25,9 +28,28 @@ struct Args {
     #[arg(short = 'c', value_name = "PATH=VALUE")]
     overrides: Vec<String>,
 }
+#[derive(clap::Subcommand)]
+enum Subcommand {
+    /// Install or manage the per-user background service.
+    Service(coport::service::ServiceArgs),
+}
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run(Args::parse()).await {
+    let mut args = Args::parse();
+    if let Some(Subcommand::Service(service)) = args.command.take() {
+        let result = (|| -> std::result::Result<i32, Box<dyn std::error::Error>> {
+            let binary = service.binary.unwrap_or(std::env::current_exe()?);
+            coport::service::Service::current()?.manage(service.action, &binary, &service.config)
+        })();
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("Service error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Err(e) = run(args).await {
         eprintln!("{e}");
         std::process::exit(1);
     }
@@ -80,5 +102,52 @@ async fn shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn service_options_belong_to_service_command() {
+        let args = Args::try_parse_from([
+            "coport",
+            "service",
+            "install",
+            "--binary",
+            "build/coport",
+            "--config",
+            "private.yaml",
+        ])
+        .unwrap();
+        let Some(Subcommand::Service(service)) = args.command else {
+            panic!("missing service command")
+        };
+        assert_eq!(service.action, coport::service::Action::Install);
+        assert_eq!(
+            service.binary.unwrap(),
+            std::path::PathBuf::from("build/coport")
+        );
+        assert_eq!(service.config, std::path::PathBuf::from("private.yaml"));
+        assert!(
+            Args::try_parse_from(["coport", "--config", "ignored.yaml", "service", "install"])
+                .is_err()
+        );
+    }
+    #[test]
+    fn proxy_options_remain_compatible() {
+        let args = Args::try_parse_from([
+            "coport",
+            "--config",
+            "private.yaml",
+            "--check",
+            "-c",
+            "listen_port=8787",
+        ])
+        .unwrap();
+        assert!(args.command.is_none());
+        assert!(args.check);
+        assert_eq!(args.config, "private.yaml");
+        assert_eq!(args.overrides, ["listen_port=8787"]);
     }
 }
