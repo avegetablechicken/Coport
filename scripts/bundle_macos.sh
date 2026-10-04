@@ -14,7 +14,7 @@ app="$stage/Coport.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/coport-gui "$app/Contents/MacOS/"
-cp target/release/coport-daemon "$app/Contents/MacOS/"
+cp target/release/coportd "$app/Contents/MacOS/"
 
 # iconutil can reject valid PNGs in a sandbox. Write the standard ICNS PNG
 # chunks directly with Python's standard library; no GUI services are needed.

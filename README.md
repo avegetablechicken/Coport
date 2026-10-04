@@ -656,7 +656,7 @@ require a C toolchain, make and Perl; no system libssl runtime is needed. No set
 
 ## Desktop app (menu bar / tray)
 
-`coport-gui` controls a separate `coport-daemon` process from a status icon in
+`coport-gui` controls a separate `coportd` process from a status icon in
 the macOS menu bar (no Dock icon), the Windows notification area, or a Linux
 AppIndicator. Clicking the icon drops a panel below it, like a menu bar extra;
 clicking elsewhere or pressing Esc closes it. The panel is built with Tauri 2:

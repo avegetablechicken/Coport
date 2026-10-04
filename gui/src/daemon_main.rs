@@ -3,7 +3,7 @@
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 3 {
-        eprintln!("Usage: coport-daemon <state-dir> <config-path> <log-path>");
+        eprintln!("Usage: coportd <state-dir> <config-path> <log-path>");
         std::process::exit(2);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()

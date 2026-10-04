@@ -9,7 +9,7 @@ use std::{
 };
 
 fn helper() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_coport-daemon"))
+    PathBuf::from(env!("CARGO_BIN_EXE_coportd"))
 }
 
 fn controller(dir: &Path) -> Controller {

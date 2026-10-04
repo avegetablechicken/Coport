@@ -12,7 +12,7 @@ name = "coport-gui"
 path = "src/main.rs"
 
 [[bin]]
-name = "coport-daemon"
+name = "coportd"
 path = "src/daemon_main.rs"
 
 [build-dependencies]

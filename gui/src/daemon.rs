@@ -128,9 +128,9 @@ impl Client {
 
 pub fn binary_path() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "coport-daemon.exe"
+        "coportd.exe"
     } else {
-        "coport-daemon"
+        "coportd"
     }))
 }
 

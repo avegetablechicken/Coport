@@ -70,7 +70,7 @@ jobs:
           path: |
             target/release/coport-gui
             target/release/coport-gui.exe
-            target/release/coport-daemon
-            target/release/coport-daemon.exe
+            target/release/coportd
+            target/release/coportd.exe
             target/Coport.app
           if-no-files-found: error
