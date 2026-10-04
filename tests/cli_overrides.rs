@@ -1,10 +1,10 @@
-use agent_router::config::Config;
+use coport::config::Config;
 use std::process::{Command, Output};
 
 const BASE: &str = "listen_port: 8787\nrequest_timeout_seconds: 30\n";
 
 fn run(config: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agent-router"))
+    Command::new(env!("CARGO_BIN_EXE_coport"))
         .arg("--config")
         .arg(config)
         .args(args)

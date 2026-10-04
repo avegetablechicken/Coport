@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agent Router",
+  "productName": "Coport",
   "version": "0.1.0",
-  "identifier": "io.github.agent-router.gui",
+  "identifier": "io.github.coport.gui",
   "build": {
     "frontendDist": "ui"
   },
@@ -12,7 +12,7 @@
     "windows": [
       {
         "label": "panel",
-        "title": "Agent Router",
+        "title": "Coport",
         "url": "index.html",
         "width": 360,
         "height": 560,

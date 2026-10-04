@@ -38,10 +38,10 @@ jobs:
       - run: cargo build --locked --release
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-router-${{ matrix.os }}
+          name: coport-${{ matrix.os }}
           path: |
-            target/release/agent-router
-            target/release/agent-router.exe
+            target/release/coport
+            target/release/coport.exe
           if-no-files-found: error
 
   gui:
@@ -59,18 +59,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - run: cargo clippy --locked -p agent-router-gui --all-targets -- -D warnings
-      - run: cargo test --locked -p agent-router-gui
-      - run: cargo build --locked --release -p agent-router-gui
+      - run: cargo clippy --locked -p coport-gui --all-targets -- -D warnings
+      - run: cargo test --locked -p coport-gui
+      - run: cargo build --locked --release -p coport-gui
       - if: runner.os == 'macOS'
         run: ./scripts/bundle_macos.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-router-gui-${{ matrix.os }}
+          name: coport-gui-${{ matrix.os }}
           path: |
-            target/release/agent-router-gui
-            target/release/agent-router-gui.exe
-            target/release/agent-router-daemon
-            target/release/agent-router-daemon.exe
-            target/Agent Router.app
+            target/release/coport-gui
+            target/release/coport-gui.exe
+            target/release/coport-daemon
+            target/release/coport-daemon.exe
+            target/Coport.app
           if-no-files-found: error

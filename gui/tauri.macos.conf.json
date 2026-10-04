@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "panel",
-        "title": "Agent Router",
+        "title": "Coport",
         "url": "index.html",
         "width": 360,
         "height": 560,

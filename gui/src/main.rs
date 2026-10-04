@@ -1,4 +1,4 @@
-//! Menu bar (macOS) / system tray (Windows, Linux) app for agent-router.
+//! Menu bar (macOS) / system tray (Windows, Linux) app for coport.
 //! The panel UI is HTML/CSS in `../ui`, rendered by the system WebView.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -15,7 +15,7 @@ mod single_instance;
 mod traffic;
 mod tray;
 
-use agent_router_gui::{proxy, settings};
+use coport_gui::{proxy, settings};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -27,7 +27,7 @@ pub struct AppState {
 }
 
 const USAGE: &str = "\
-Usage: agent-router-gui [--config <path>] [--background]
+Usage: coport-gui [--config <path>] [--background]
 
   --config <path>              Use and remember this configuration file
   --background                 Start in the menu bar / tray without the panel
@@ -51,7 +51,7 @@ fn main() {
                 let Some(path) = args.next() else {
                     return usage_error();
                 };
-                let path = agent_router::config::expand(&path);
+                let path = coport::config::expand(&path);
                 let path = std::path::absolute(&path).unwrap_or(path);
                 settings.config_path = path.to_string_lossy().into_owned();
                 settings.save();
@@ -71,7 +71,7 @@ fn main() {
                 return;
             }
             "-V" | "--version" => {
-                println!("agent-router-gui {}", env!("CARGO_PKG_VERSION"));
+                println!("coport-gui {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "-h" | "--help" => {
@@ -85,7 +85,7 @@ fn main() {
     let instance = match single_instance::acquire(settings::app_dir()) {
         single_instance::Instance::Primary(guard) => guard,
         single_instance::Instance::Secondary => {
-            eprintln!("Agent Router is already running; showing its panel.");
+            eprintln!("Coport is already running; showing its panel.");
             return;
         }
     };

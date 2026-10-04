@@ -1,4 +1,4 @@
-# Agent Router
+# Coport
 
 A cross-platform Rust loopback reverse proxy for Codex, Claude Code, ChatGPT account APIs and
 OpenAI documentation MCP. It selects an outbound proxy by matching account or
@@ -14,7 +14,7 @@ cargo build --locked --release
 cp config.example.yaml config.yaml
 ```
 
-On Windows PowerShell, use `Copy-Item` and `agent-router.exe`.
+On Windows PowerShell, use `Copy-Item` and `coport.exe`.
 The executable has no Python runtime dependency; Python 3.10+ is needed only
 for the optional service manager and integration tests.
 
@@ -347,8 +347,8 @@ Shell startup must not require terminal interaction. Saved Codex account matches
 do not launch a shell to resolve unrelated API Key providers.
 
 ```sh
-target/release/agent-router --config config.yaml --check
-target/release/agent-router --config config.yaml
+target/release/coport --config config.yaml --check
+target/release/coport --config config.yaml
 ```
 
 `--check` validates configuration and enabled credential sources, not network
@@ -360,7 +360,7 @@ Use repeatable `-c PATH=VALUE` arguments to override YAML settings. Dots
 separate nested mapping keys; names match the YAML fields, including underscores.
 
 ```sh
-target/release/agent-router --config config.yaml \
+target/release/coport --config config.yaml \
   -c listen_port=8888 \
   -c request_timeout_seconds=120 \
   -c codex.account_auth_file_only=false \
@@ -656,7 +656,7 @@ require a C toolchain, make and Perl; no system libssl runtime is needed. No set
 
 ## Desktop app (menu bar / tray)
 
-`agent-router-gui` controls a separate `agent-router-daemon` process from a status icon in
+`coport-gui` controls a separate `coport-daemon` process from a status icon in
 the macOS menu bar (no Dock icon), the Windows notification area, or a Linux
 AppIndicator. Clicking the icon drops a panel below it, like a menu bar extra;
 clicking elsewhere or pressing Esc closes it. The panel is built with Tauri 2:
@@ -666,8 +666,8 @@ Node.js toolchain is needed; `cargo build` embeds the UI. Rust 1.89+ is required
 the command-line proxy keeps its own minimum.
 
 ```sh
-cargo build --locked --release -p agent-router-gui
-target/release/agent-router-gui --config config.yaml
+cargo build --locked --release -p coport-gui
+target/release/coport-gui --config config.yaml
 ```
 
 The panel follows the layout of native menu bar utilities such as eul: on macOS
@@ -704,15 +704,15 @@ right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 
 The GUI supports YAML configuration files (`.yaml` and `.yml`). `--config` and
 files explicitly selected in Settings are remembered. Without a saved choice,
-the only default is `io.github.agent-router.gui/config.yaml` in the user's application cache
-directory: `~/Library/Caches/io.github.agent-router.gui/config.yaml` on macOS,
-`$XDG_CACHE_HOME/io.github.agent-router.gui/config.yaml` (normally `~/.cache/io.github.agent-router.gui/config.yaml`)
-on Linux, or `%LOCALAPPDATA%/io.github.agent-router.gui/config.yaml` on Windows. The GUI never
+the only default is `io.github.coport.gui/config.yaml` in the user's application cache
+directory: `~/Library/Caches/io.github.coport.gui/config.yaml` on macOS,
+`$XDG_CACHE_HOME/io.github.coport.gui/config.yaml` (normally `~/.cache/io.github.coport.gui/config.yaml`)
+on Linux, or `%LOCALAPPDATA%/io.github.coport.gui/config.yaml` on Windows. The GUI never
 searches the working directory for configuration. It offers to create a missing
 configuration from `config.example.yaml`. Existing saved paths are retained;
 GUI preferences and daemon discovery stay in the per-user configuration directory.
 The CLI's default remains `./config.yaml`. GUI logs default to
-`io.github.agent-router.gui/logs/proxy.log` in the same application cache directory, independent
+`io.github.coport.gui/logs/proxy.log` in the same application cache directory, independent
 of the selected YAML file. The `log_path` field in `gui.json` can override this
 location. The CLI continues to log beside its configuration unless `--log-file`
 is supplied. Opening the app shows the
@@ -720,7 +720,7 @@ panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
 
-- macOS: `scripts/bundle_macos.sh` builds `target/Agent Router.app`
+- macOS: `scripts/bundle_macos.sh` builds `target/Coport.app`
   (`LSUIElement`, ad-hoc signed). Packaging requires Python 3 (standard library
   only); ICNS icons are assembled without `iconutil` so packaging also works in
   a sandbox. The previous app is retained until packaging and signature checks
@@ -749,9 +749,9 @@ the native executable directly, without a Python supervisor:
 
 | Platform | Background runner | Runtime directory |
 | --- | --- | --- |
-| macOS | launchd user agent | `~/Library/Application Support/agent-router-rust` |
-| Linux | systemd user service | `$XDG_DATA_HOME/agent-router-rust`, default `~/.local/share/agent-router-rust` |
-| Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/agent-router-rust` |
+| macOS | launchd user agent | `~/Library/Application Support/coport-rust` |
+| Linux | systemd user service | `$XDG_DATA_HOME/coport-rust`, default `~/.local/share/coport-rust` |
+| Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/coport-rust` |
 
 The Windows task runs in the logged-in user's session; it is not a system service
 that runs before login. Linux requires an available systemd user manager. On all
@@ -760,7 +760,7 @@ an external proxy core. The complete Linux service lifecycle has been verified
 on Ubuntu 20.04 with systemd 245. Windows task registration still needs native
 verification.
 
-The service/task name is `local.agent-router.rust`. Stop any existing
+The service/task name is `local.coport.rust`. Stop any existing
 listener on the configured port before installing. The script manages only its
 own service registration and runtime directory.
 Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
@@ -994,8 +994,8 @@ cargo build --locked
 python3 scripts/integration.py
 python3 scripts/test_proxy_auth.py
 python3 scripts/test_service_rust.py
-cargo clippy --locked -p agent-router-gui --all-targets -- -D warnings
-cargo test --locked -p agent-router-gui
+cargo clippy --locked -p coport-gui --all-targets -- -D warnings
+cargo test --locked -p coport-gui
 ```
 
 Tests use synthetic credentials and loopback sockets. Rust tests cover TLS and
@@ -1016,8 +1016,8 @@ This test uses a temporary runtime directory, a unique service name, and an
 ephemeral loopback port. It verifies installation, configuration-preserving
 updates, restart, stop, and uninstall without changing the normal service.
 
-The Python transport tests default to `target/debug/agent-router` (with
-`.exe` on Windows). Set `AGENT_ROUTER_BINARY` to test another build, such as
+The Python transport tests default to `target/debug/coport` (with
+`.exe` on Windows). Set `COPORT_BINARY` to test another build, such as
 the release executable.
 
 | File | Responsibility |

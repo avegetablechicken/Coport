@@ -20,7 +20,7 @@ class RustServiceTests(unittest.TestCase):
             config.write_text("different settings")
             service.stage(runtime, binary, config, "linux")
             self.assertEqual((runtime / "config.yaml").read_text(), "existing private settings")
-            self.assertEqual((runtime / "agent-router").read_bytes(), b"new executable")
+            self.assertEqual((runtime / "coport").read_bytes(), b"new executable")
 
     def test_registration_escapes_paths_and_uses_native_binary(self):
         path = PurePosixPath('/home/test user/100% "quoted"/proxy')
@@ -31,12 +31,12 @@ class RustServiceTests(unittest.TestCase):
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("python", unit)
         plist = plistlib.loads(service.launchd_plist(path))
-        self.assertEqual(plist["ProgramArguments"], [str(path / "agent-router"), "--config", str(path / "config.yaml")])
+        self.assertEqual(plist["ProgramArguments"], [str(path / "coport"), "--config", str(path / "config.yaml")])
         self.assertEqual(plist["Umask"], 0o077)
         script = service.windows_script("install", Path("C:/Users/O'Brien/Proxy App"))
         self.assertIn("O''Brien", script)
         self.assertIn("-LogonType Interactive -RunLevel Limited", script)
-        self.assertIn("agent-router.exe", script)
+        self.assertIn("coport.exe", script)
         self.assertIn("[TimeSpan]::Zero", script)
 
     def test_uninstall_removes_registered_but_unloaded_linux_unit(self):

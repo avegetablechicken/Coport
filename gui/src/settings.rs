@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const BUNDLE_IDENTIFIER: &str = "io.github.agent-router.gui";
+const BUNDLE_IDENTIFIER: &str = "io.github.coport.gui";
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Appearance {
@@ -54,19 +54,19 @@ impl Settings {
     }
 
     pub fn config_path(&self) -> PathBuf {
-        agent_router::config::expand(&self.config_path)
+        coport::config::expand(&self.config_path)
     }
 
     /// GUI logs have their own location, independent of the proxy configuration.
     pub fn log_path(&self) -> PathBuf {
-        agent_router::config::expand(&self.log_path)
+        coport::config::expand(&self.log_path)
     }
 }
 
 pub fn app_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("agent-router")
+        .join("coport")
 }
 
 fn settings_file() -> PathBuf {
@@ -123,7 +123,7 @@ mod tests {
             settings.log_path(),
             dirs::cache_dir()
                 .unwrap()
-                .join("io.github.agent-router.gui/logs/proxy.log")
+                .join("io.github.coport.gui/logs/proxy.log")
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom.log");
@@ -139,7 +139,7 @@ mod tests {
     fn default_config_uses_only_the_application_cache() {
         let expected = dirs::cache_dir()
             .unwrap()
-            .join("io.github.agent-router.gui/config.yaml");
+            .join("io.github.coport.gui/config.yaml");
         assert_eq!(Settings::default().config_path(), expected);
         let missing_path: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing_path.config_path(), expected);

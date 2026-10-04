@@ -1,7 +1,7 @@
 //! Controls the independent proxy daemon; GUI-only probes use a Tokio runtime.
 
 use crate::daemon;
-use agent_router::config::Config;
+use coport::config::Config;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

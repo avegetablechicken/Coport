@@ -1,7 +1,7 @@
 //! A detached, GUI-free proxy process. Discovery is per-user; control requests
 //! use a random capability stored in an owner-only file, never on the proxy port.
 
-use agent_router::{config::Config, logger::Logger, server::Server};
+use coport::{config::Config, logger::Logger, server::Server};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -128,9 +128,9 @@ impl Client {
 
 pub fn binary_path() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "agent-router-daemon.exe"
+        "coport-daemon.exe"
     } else {
-        "agent-router-daemon"
+        "coport-daemon"
     }))
 }
 

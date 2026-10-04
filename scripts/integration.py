@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline integration: real listener, HTTP CONNECT, startup configuration, fail-closed routing.
-Uses only synthetic credentials and loopback sockets. Run after cargo build; AGENT_ROUTER_BINARY can select another executable.
+Uses only synthetic credentials and loopback sockets. Run after cargo build; COPORT_BINARY can select another executable.
 """
 import http.client
 import json
@@ -14,7 +14,7 @@ import threading
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BINARY = os.environ.get("AGENT_ROUTER_BINARY", str(ROOT / "target/debug" / ("agent-router.exe" if os.name == "nt" else "agent-router")))
+BINARY = os.environ.get("COPORT_BINARY", str(ROOT / "target/debug" / ("coport.exe" if os.name == "nt" else "coport")))
 
 class Probe(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -40,7 +40,7 @@ def main():
         port = sock.getsockname()[1]
     process = None
     try:
-        with tempfile.TemporaryDirectory(prefix="agent-router-test-") as temp:
+        with tempfile.TemporaryDirectory(prefix="coport-test-") as temp:
             temp = pathlib.Path(temp)
             home = temp / "home"
             home.mkdir()

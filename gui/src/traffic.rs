@@ -116,7 +116,7 @@ pub fn read(
         Err(_) => Err("Cannot read traffic history".to_owned()),
     };
     let current = [path, backup.as_path()].map(open);
-    let archives = agent_router::logger::history_paths(path)
+    let archives = coport::logger::history_paths(path)
         .map_err(|_| "Cannot read traffic archives".to_owned())?;
     // Archived files are immutable. Skip files last written before the selected
     // window, and open one at a time to avoid exhausting file descriptors.
@@ -583,7 +583,7 @@ mod tests {
             r#"{"oauthAccount":{"accountUuid":"claude-id","emailAddress":"user@example.test"}}"#,
         )
         .unwrap();
-        let config = agent_router::config::Config::parse(&format!(
+        let config = coport::config::Config::parse(&format!(
             "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{0}]\n  auth_file: auth.json\n  routing:\n    account: {{default: none}}\n    api_key: {{MY_API_KEY: none}}\nclaude:\n  config_dirs: [{0}]\n  auth_file: .credentials.json\n  routing:\n    account: {{'user@example.test': none, default: none}}\n",
             serde_json::to_string(dir.path()).unwrap()
         )).unwrap();

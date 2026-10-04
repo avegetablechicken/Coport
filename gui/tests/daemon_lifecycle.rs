@@ -1,4 +1,4 @@
-use agent_router_gui::{daemon, proxy::Controller};
+use coport_gui::{daemon, proxy::Controller};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -9,7 +9,7 @@ use std::{
 };
 
 fn helper() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_agent-router-daemon"))
+    PathBuf::from(env!("CARGO_BIN_EXE_coport-daemon"))
 }
 
 fn controller(dir: &Path) -> Controller {
@@ -47,7 +47,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool) {
 // controller and exit policy called by the GUI, without requiring a display.
 #[test]
 fn short_lived_gui_controller() {
-    let Some(dir) = std::env::var_os("AGENT_ROUTER_TEST_PARENT_DIR") else {
+    let Some(dir) = std::env::var_os("COPORT_TEST_PARENT_DIR") else {
         return;
     };
     let dir = PathBuf::from(dir);
@@ -56,7 +56,7 @@ fn short_lived_gui_controller() {
     assert!(gui.is_running(), "{:?}", gui.phase());
     std::fs::write(dir.join("ready"), "").unwrap();
     wait_for(|| dir.join("exit").exists());
-    let keep = std::env::var("AGENT_ROUTER_TEST_KEEP").unwrap() == "true";
+    let keep = std::env::var("COPORT_TEST_KEEP").unwrap() == "true";
     gui.on_app_exit(keep).unwrap();
 }
 
@@ -72,8 +72,8 @@ impl Drop for Cleanup {
 fn parent(dir: &Path, keep: bool) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "short_lived_gui_controller", "--nocapture"])
-        .env("AGENT_ROUTER_TEST_PARENT_DIR", dir)
-        .env("AGENT_ROUTER_TEST_KEEP", keep.to_string())
+        .env("COPORT_TEST_PARENT_DIR", dir)
+        .env("COPORT_TEST_KEEP", keep.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

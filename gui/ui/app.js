@@ -191,7 +191,7 @@ function render() {
 function renderTop() {
   if (ui.page === "main") {
     $("top").innerHTML = `
-      <span class="app-name">Agent Router</span><span class="version">v${esc(ui.snap.version)}</span>
+      <span class="app-name">Coport</span><span class="version">v${esc(ui.snap.version)}</span>
       <nav class="links">
         <button class="text-link" data-action="page" data-page="activity">Activity</button>
         <button class="text-link" data-action="page" data-page="settings">Settings</button>

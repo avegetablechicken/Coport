@@ -14,21 +14,21 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-LABEL = "local.agent-router.rust"
+LABEL = "local.coport.rust"
 
 
 def runtime_dir(platform=sys.platform):
     if platform == "darwin":
-        return Path.home() / "Library/Application Support/agent-router-rust"
+        return Path.home() / "Library/Application Support/coport-rust"
     if platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "agent-router-rust"
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "coport-rust"
     if platform.startswith("linux"):
-        return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "agent-router-rust"
+        return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "coport-rust"
     raise RuntimeError("Supported platforms: macOS, Linux and Windows.")
 
 
 def executable(platform=sys.platform):
-    return "agent-router.exe" if platform == "win32" else "agent-router"
+    return "coport.exe" if platform == "win32" else "coport"
 
 
 def private_write(path, data):
@@ -85,7 +85,7 @@ def systemd_unit(runtime):
         raise RuntimeError("The systemd runtime directory cannot contain newlines.")
     binary = runtime / executable("linux")
     args = [binary, "--config", runtime / "config.yaml"]
-    return ("[Unit]\nDescription=Agent Router (Rust)\nAfter=network.target\n\n"
+    return ("[Unit]\nDescription=Coport (Rust)\nAfter=network.target\n\n"
             "[Service]\nType=simple\n"
             f"WorkingDirectory={working_directory}/\n"
             f"ExecStart={' '.join(systemd_quote(x, command=True) for x in args)}\n"

@@ -8,7 +8,7 @@ use crate::{
     proxy::{Controller, Notify, Phase, Probe},
     settings::Settings,
 };
-use agent_router::config::{AccountSource, Choice, Config, Routing, redacted_endpoint};
+use coport::config::{AccountSource, Choice, Config, Routing, redacted_endpoint};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -146,7 +146,7 @@ impl Core {
         if path.trim().is_empty() {
             return Err("Choose a YAML configuration file.".into());
         }
-        let path = agent_router::config::expand(path.trim())
+        let path = coport::config::expand(path.trim())
             .canonicalize()
             .map_err(|e| format!("Cannot open configuration: {e}"))?;
         Config::read(&path).map_err(|e| e.message.to_string())?;
@@ -636,7 +636,7 @@ mod tests {
             std::fs::write(&path, EXAMPLE).unwrap();
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(parse_config(&text).is_ok());
-            assert!(agent_router::config::Config::read(&path).is_ok());
+            assert!(coport::config::Config::read(&path).is_ok());
         }
     }
 }

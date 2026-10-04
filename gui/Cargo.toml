@@ -1,25 +1,25 @@
 [package]
-name = "agent-router-gui"
+name = "coport-gui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Menu bar / system tray panel for agent-router"
+description = "Menu bar / system tray panel for coport"
 publish = false
-default-run = "agent-router-gui"
+default-run = "coport-gui"
 
 [[bin]]
-name = "agent-router-gui"
+name = "coport-gui"
 path = "src/main.rs"
 
 [[bin]]
-name = "agent-router-daemon"
+name = "coport-daemon"
 path = "src/daemon_main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-agent-router = { path = ".." }
+coport = { path = ".." }
 arboard = { version = "3", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"

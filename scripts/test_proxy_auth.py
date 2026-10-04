@@ -14,7 +14,7 @@ import time
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = os.environ.get("AGENT_ROUTER_BINARY", str(ROOT / "target/debug" / ("agent-router.exe" if os.name == "nt" else "agent-router")))
+BINARY = os.environ.get("COPORT_BINARY", str(ROOT / "target/debug" / ("coport.exe" if os.name == "nt" else "coport")))
 USER, PASSWORD = 'test@user', 'p:ss@word'
 
 

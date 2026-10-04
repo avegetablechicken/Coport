@@ -1,26 +1,26 @@
 #!/bin/sh
-# Builds "Agent Router.app", a menu bar app (no Dock icon), into target/.
+# Builds "Coport.app", a menu bar app (no Dock icon), into target/.
 set -eu
 
 cd "$(dirname "$0")/.."
 command -v python3 >/dev/null
-cargo build --locked --release -p agent-router-gui
+cargo build --locked --release -p coport-gui
 
-output="target/Agent Router.app"
+output="target/Coport.app"
 stage=$(mktemp -d target/.bundle-macos.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 trap 'exit 1' HUP INT TERM
-app="$stage/Agent Router.app"
+app="$stage/Coport.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -n 1)
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/agent-router-gui "$app/Contents/MacOS/"
-cp target/release/agent-router-daemon "$app/Contents/MacOS/"
+cp target/release/coport-gui "$app/Contents/MacOS/"
+cp target/release/coport-daemon "$app/Contents/MacOS/"
 
 # iconutil can reject valid PNGs in a sandbox. Write the standard ICNS PNG
 # chunks directly with Python's standard library; no GUI services are needed.
 iconset="$stage/AppIcon.iconset"
 mkdir -p "$iconset"
-target/release/agent-router-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
+target/release/coport-gui --export-icon "$iconset/icon_512x512@2x.png" 1024
 for size in 16 32 128 256 512; do
     sips -z $size $size "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
@@ -51,10 +51,10 @@ cat > "$app/Contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Agent Router</string>
-  <key>CFBundleDisplayName</key><string>Agent Router</string>
-  <key>CFBundleIdentifier</key><string>io.github.agent-router.gui</string>
-  <key>CFBundleExecutable</key><string>agent-router-gui</string>
+  <key>CFBundleName</key><string>Coport</string>
+  <key>CFBundleDisplayName</key><string>Coport</string>
+  <key>CFBundleIdentifier</key><string>io.github.coport.gui</string>
+  <key>CFBundleExecutable</key><string>coport-gui</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

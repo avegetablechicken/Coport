@@ -1,10 +1,10 @@
-use agent_router::{
+use clap::Parser;
+use coport::{
     Error, Result,
     config::{Config, expand},
     logger::Logger,
     server::Server,
 };
-use clap::Parser;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -57,7 +57,7 @@ async fn run(args: Args) -> Result<()> {
             .await
             .map_err(|_| Error::config("Cannot bind loopback listener; check the port."))?;
     println!(
-        "agent-router listening on http://127.0.0.1:{}",
+        "coport listening on http://127.0.0.1:{}",
         config.listen_port
     );
     logger.write("server_started", serde_json::Map::new());

@@ -9,61 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-router"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "base64 0.22.1",
- "bytes",
- "clap",
- "dirs",
- "dotenvy",
- "futures-util",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "libc",
- "native-tls",
- "percent-encoding",
- "rcgen",
- "reqwest 0.12.28",
- "ring",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "time",
- "tokio",
- "tokio-native-tls",
- "tokio-rustls",
- "toml 0.9.12+spec-1.1.0",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "agent-router-gui"
-version = "0.1.0"
-dependencies = [
- "agent-router",
- "arboard",
- "chrono",
- "dirs",
- "libc",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tauri",
- "tauri-build",
- "tempfile",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -598,6 +543,61 @@ checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
 dependencies = [
  "time",
  "version_check",
+]
+
+[[package]]
+name = "coport"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "dirs",
+ "dotenvy",
+ "futures-util",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "native-tls",
+ "percent-encoding",
+ "rcgen",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-rustls",
+ "toml 0.9.12+spec-1.1.0",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "coport-gui"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "coport",
+ "dirs",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
