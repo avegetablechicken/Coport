@@ -202,9 +202,21 @@ pub fn start(binary: &Path, dir: &Path, config: &Path, log: &Path) -> io::Result
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(code) = child.try_wait()? {
+            let path = dir.join("daemon.stderr.log");
+            // The log is appended across starts; its last line is this exit's reason.
+            let reason = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default();
             return Err(io::Error::other(format!(
-                "Proxy daemon exited ({code}); see {}",
-                dir.join("daemon.stderr.log").display()
+                "Proxy daemon exited ({code}){reason}; see {}",
+                path.display()
             )));
         }
         if let Some((client, status)) = Client::discover(dir)
