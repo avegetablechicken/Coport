@@ -40,6 +40,7 @@ impl Entry {
         matches!(
             self.event.as_str(),
             "model_call_finished"
+                | "model_call_incomplete"
                 | "model_call_failed"
                 | "model_call_cancelled"
                 | "model_call_unknown"

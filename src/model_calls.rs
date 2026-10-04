@@ -60,6 +60,11 @@ struct Metadata {
     model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_usage")]
     usage: Option<Usage>,
+    incomplete_details: Option<IncompleteDetails>,
+}
+#[derive(Default, Deserialize)]
+struct IncompleteDetails {
+    reason: Option<String>,
 }
 #[derive(Default, Deserialize)]
 struct Usage {
@@ -116,6 +121,13 @@ impl Envelope {
         {
             field(fields, "response_id", id);
         }
+        if let Some(reason) = meta
+            .and_then(|m| m.incomplete_details.as_ref())
+            .and_then(|d| d.reason.as_deref())
+            .filter(|s| safe_label(s))
+        {
+            field(fields, "incomplete_reason", reason);
+        }
         if let Some(usage) = meta.and_then(|r| r.usage.as_ref()).or(self.usage.as_ref()) {
             for (key, value) in [
                 ("input_tokens", usage.input_tokens),
@@ -145,7 +157,9 @@ impl Envelope {
 fn terminal(kind: &str) -> Option<&'static str> {
     match kind {
         "response.completed" | "response.done" | "message_stop" => Some("finished"),
-        "response.failed" | "response.incomplete" | "error" => Some("failed"),
+        "response.failed" | "error" => Some("failed"),
+        // Truncated by the model (for example max_output_tokens), not a transport or API error.
+        "response.incomplete" => Some("incomplete"),
         "response.cancelled" | "response.canceled" => Some("cancelled"),
         _ => None,
     }
@@ -164,6 +178,8 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
                 "model_call_failed"
             } else if outcome == Some("finished") {
                 "model_call_finished"
+            } else if outcome == Some("incomplete") {
+                "model_call_incomplete"
             } else if outcome == Some("cancelled") || event == "request_cancelled" {
                 "model_call_cancelled"
             } else if event == "request_finished" && outcome == Some("running") {
@@ -1114,6 +1130,30 @@ mod tests {
             &mut log,
         );
         assert_eq!(log.fields["model_outcome"], "failed");
+    }
+    #[test]
+    fn http_incomplete_response_is_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        {
+            let mut log = log_at(&path);
+            log.status = 200;
+            log.field("model_call_id", "http");
+            let mut observer = HttpObserver::new(true);
+            observer.feed(
+                b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"cut\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+                &mut log,
+            );
+            observer.finish(&mut log);
+        }
+        let rows = records(&path);
+        let done: Vec<_> = rows
+            .iter()
+            .filter(|r| r["event"].as_str().unwrap().starts_with("model_call_"))
+            .collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["event"], "model_call_incomplete");
+        assert_eq!(done[0]["incomplete_reason"], "max_output_tokens");
     }
     #[tokio::test]
     async fn observation_preserves_wire_bytes_and_records_turn_before_connection_closes() {

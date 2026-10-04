@@ -610,14 +610,16 @@ function requestRow(e, expandable) {
   const cancelled = e.event === "request_cancelled" || e.event === "model_call_cancelled";
   const modelCall = e.event.startsWith("model_call_");
   const unknown = e.event === "model_call_unknown";
-  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : e.event === "model_call_finished" ? "OK" : "RUN") : e.status ?? (e.error ? "ERR" : "—");
+  const incomplete = e.event === "model_call_incomplete";
+  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : incomplete ? "INC" : e.event === "model_call_finished" ? "OK" : "RUN") : e.status ?? (e.error ? "ERR" : "—");
+  const tip = cancelled ? "Cancelled" : unknown ? "Outcome unavailable" : incomplete ? `Incomplete${e.fields?.incomplete_reason ? `: ${e.fields.incomplete_reason}` : ""}` : "";
   const meta = [fmtTime(e.time), modelCall && e.fields?.model, e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
     .join(" · ");
   const tag = expandable ? "button" : "div";
   const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
   return `<${tag} class="req" ${attrs}>
-    <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : modelCall ? (e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${cancelled ? ' title="Cancelled" aria-label="Cancelled"' : unknown ? ' title="Outcome unavailable" aria-label="Outcome unavailable"' : ""}>${esc(code)}</span>
+    <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : modelCall ? (incomplete ? "s4" : e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${tip ? ` title="${esc(tip)}" aria-label="${esc(tip)}"` : ""}>${esc(code)}</span>
     <span class="req-main">
       <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(e.path ?? e.event)}</span>
       ${expandable && meta ? `<span class="req-meta">${esc(meta)}</span>` : ""}

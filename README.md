@@ -968,6 +968,7 @@ fails, logging continues in the current file; failures are also reported on stde
 | `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
 | `model_call_started` / `model_call_updated` | One HTTP model request or WebSocket `response.create`, identified by `model_call_id` separately from its connection's `request_id`. |
 | `model_call_finished` / `model_call_failed` / `model_call_cancelled` | Per-call outcome, model, response ID, duration, and reported input/output/cache token usage when available. WebSocket success requires a model terminal event delivered to the client. |
+| `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |
 | `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
 
 The GUI's **Model Calls** scope counts each HTTP generation/compaction request and
