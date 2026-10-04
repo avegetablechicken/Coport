@@ -929,12 +929,24 @@ mod tests {
         let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
         let mut raw = String::new();
         for (service, call, path, usage) in [
-            ("claude", "claude-call", "/v1/messages", serde_json::json!({"input_tokens":"10", "cached_input_tokens":"30", "cache_creation_input_tokens":"10"})),
-            ("codex", "codex-call", "/v1/responses", serde_json::json!({"input_tokens":"40", "cached_input_tokens":"10"})),
+            (
+                "claude",
+                "claude-call",
+                "/v1/messages",
+                serde_json::json!({"input_tokens":"10", "cached_input_tokens":"30", "cache_creation_input_tokens":"10"}),
+            ),
+            (
+                "codex",
+                "codex-call",
+                "/v1/responses",
+                serde_json::json!({"input_tokens":"40", "cached_input_tokens":"10"}),
+            ),
             ("codex", "no-usage", "/v1/responses", serde_json::json!({})),
         ] {
             let mut row = serde_json::json!({"timestamp":timestamp, "event":"model_call_finished", "request_id":call, "model_call_id":call, "service":service, "provider":"account", "method":"POST", "path":path, "status":"200"});
-            row.as_object_mut().unwrap().extend(usage.as_object().unwrap().clone());
+            row.as_object_mut()
+                .unwrap()
+                .extend(usage.as_object().unwrap().clone());
             raw.push_str(&format!("{row}\n"));
         }
         std::fs::write(&path, raw).unwrap();
