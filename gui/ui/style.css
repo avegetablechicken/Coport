@@ -748,7 +748,7 @@ button.req:hover .req-path {
 }
 
 .status.cancelled::before {
-  background: var(--yellow);
+  background: var(--tertiary);
 }
 
 .detail {
