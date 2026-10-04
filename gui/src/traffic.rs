@@ -83,6 +83,7 @@ pub struct CredentialTraffic {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    cache_hit_rate: Option<f64>,
     avg_ms: Option<u64>,
     counts: Vec<u64>,
     error_counts: Vec<u64>,
@@ -90,6 +91,10 @@ pub struct CredentialTraffic {
     latency_total: u64,
     #[serde(skip)]
     latency_count: u64,
+    #[serde(skip)]
+    cache_read: u64,
+    #[serde(skip)]
+    cache_prompt: u64,
 }
 
 pub fn read(
@@ -262,6 +267,8 @@ pub fn read(
         add_tokens(&mut summary.cached_input_tokens, group.cached_input_tokens);
         summary.latency_total += group.latency_total;
         summary.latency_count += group.latency_count;
+        summary.cache_read += group.cache_read;
+        summary.cache_prompt += group.cache_prompt;
         for i in 0..30 {
             summary.counts[i] += group.counts[i];
             summary.error_counts[i] += group.error_counts[i];
@@ -269,7 +276,11 @@ pub fn read(
     }
     summary.avg_ms =
         (summary.latency_count > 0).then(|| summary.latency_total / summary.latency_count);
+    summary.cache_hit_rate = summary.hit_rate();
     let mut credentials: Vec<_> = groups.into_values().collect();
+    for group in &mut credentials {
+        group.cache_hit_rate = group.hit_rate();
+    }
     credentials.sort_by_key(|group| {
         (
             group.credential == "Unidentified",
@@ -284,6 +295,12 @@ pub fn read(
         credentials,
         summary,
     })
+}
+
+impl CredentialTraffic {
+    fn hit_rate(&self) -> Option<f64> {
+        (self.cache_prompt > 0).then(|| self.cache_read as f64 / self.cache_prompt as f64)
+    }
 }
 
 fn add_tokens(total: &mut Option<u64>, value: Option<u64>) {
@@ -343,6 +360,7 @@ fn aggregate(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "Unidentified".into());
+    let claude = service == "Claude";
     let group = groups
         .entry((service.clone(), credential.clone()))
         .or_insert_with(|| CredentialTraffic {
@@ -364,6 +382,19 @@ fn aggregate(
     add_tokens(&mut group.input_tokens, token("input_tokens"));
     add_tokens(&mut group.output_tokens, token("output_tokens"));
     add_tokens(&mut group.cached_input_tokens, token("cached_input_tokens"));
+    // Only calls reporting both counts contribute to the hit rate. Anthropic input_tokens
+    // excludes cache reads and writes; OpenAI input_tokens already includes cached tokens.
+    if let (Some(input), Some(cached)) = (token("input_tokens"), token("cached_input_tokens")) {
+        let prompt = if claude {
+            input
+                .saturating_add(cached)
+                .saturating_add(token("cache_creation_input_tokens").unwrap_or(0))
+        } else {
+            input
+        };
+        group.cache_read = group.cache_read.saturating_add(cached);
+        group.cache_prompt = group.cache_prompt.saturating_add(prompt);
+    }
     if let Some(ms) = e.duration_ms() {
         group.latency_total += ms;
         group.latency_count += 1;
@@ -476,6 +507,7 @@ mod tests {
         assert_eq!(model.summary.input_tokens, Some(30));
         assert_eq!(model.summary.output_tokens, Some(15));
         assert_eq!(model.summary.cached_input_tokens, Some(6));
+        assert_eq!(model.summary.cache_hit_rate, Some(0.2));
         assert_eq!(model.credentials.len(), 1);
     }
 
@@ -888,5 +920,35 @@ mod tests {
         assert_eq!(codex.counts[0], 2);
         assert_eq!(codex.counts[29], 1);
         assert_eq!(codex.errors, 3);
+    }
+
+    #[test]
+    fn cache_hit_rate_counts_claude_cache_tokens_outside_input_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let mut raw = String::new();
+        for (service, call, path, usage) in [
+            ("claude", "claude-call", "/v1/messages", serde_json::json!({"input_tokens":"10", "cached_input_tokens":"30", "cache_creation_input_tokens":"10"})),
+            ("codex", "codex-call", "/v1/responses", serde_json::json!({"input_tokens":"40", "cached_input_tokens":"10"})),
+            ("codex", "no-usage", "/v1/responses", serde_json::json!({})),
+        ] {
+            let mut row = serde_json::json!({"timestamp":timestamp, "event":"model_call_finished", "request_id":call, "model_call_id":call, "service":service, "provider":"account", "method":"POST", "path":path, "status":"200"});
+            row.as_object_mut().unwrap().extend(usage.as_object().unwrap().clone());
+            raw.push_str(&format!("{row}\n"));
+        }
+        std::fs::write(&path, raw).unwrap();
+        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let rate = |service| {
+            model
+                .credentials
+                .iter()
+                .find(|c| c.service == service)
+                .unwrap()
+                .cache_hit_rate
+        };
+        assert_eq!(rate("Claude"), Some(0.6));
+        assert_eq!(rate("Codex"), Some(0.25));
+        assert_eq!(model.summary.cache_hit_rate, Some(40.0 / 90.0));
     }
 }

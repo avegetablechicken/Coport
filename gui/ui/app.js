@@ -549,7 +549,7 @@ async function loadTraffic() {
 function modelTokenStats(stats) {
   if (ui.trafficScope !== "model") return "";
   const tokens = (n) => n == null ? "—" : n.toLocaleString();
-  return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}</div>`;
+  return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
 
 function renderActivityTraffic() {
