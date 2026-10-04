@@ -1,7 +1,7 @@
 //! Procedurally rasterized icons, so the app ships without binary assets.
 //!
-//! The glyph is `‹✦›`: code brackets around the sparkle that marks AI agents,
-//! i.e. a proxy built for coding agents.
+//! The glyph is a lighthouse above the water: a port that shows traffic the
+//! way out. Its beams shine while the proxy runs and go dark otherwise.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -12,8 +12,9 @@ pub enum Status {
 
 type Rgba = [f32; 4];
 
-const INDIGO_TOP: Rgba = [0.42, 0.40, 0.95, 1.0];
-const INDIGO_BOTTOM: Rgba = [0.29, 0.25, 0.80, 1.0];
+const NIGHT_TOP: Rgba = [0.08, 0.15, 0.40, 1.0];
+const NIGHT_BOTTOM: Rgba = [0.10, 0.42, 0.92, 1.0];
+const SHADOW: Rgba = [0.0, 0.10, 0.35, 1.0];
 const WHITE: Rgba = [1.0, 1.0, 1.0, 1.0];
 const GREEN: Rgba = [0.20, 0.78, 0.42, 1.0];
 const GREY: Rgba = [0.62, 0.64, 0.68, 1.0];
@@ -22,26 +23,32 @@ const RED: Rgba = [0.94, 0.30, 0.30, 1.0];
 /// Monochrome glyph for the macOS menu bar; only alpha is significant.
 #[cfg(target_os = "macos")]
 pub fn template(size: u32, status: Status) -> Vec<u8> {
-    let running = status == Status::Running;
-    let alpha = if running { 1.0 } else { 0.6 };
+    let lit = status == Status::Running;
+    let alpha = if lit { 1.0 } else { 0.6 };
     raster(size, |x, y| {
-        let g = glyph(x, y, 0.0, 1.0, running);
+        let g = coverage(glyph_sdf(x, y, lit));
         [0.0, 0.0, 0.0, g * alpha]
     })
 }
 
 /// Colored badge for Windows and Linux trays and the window icon.
 pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
+    const OFFSET: f32 = 0.10;
+    const SCALE: f32 = 0.80;
+    let lit = status.is_none_or(|s| s == Status::Running);
     raster(size, |x, y| {
         let mut px = [0.0; 4];
-        // Rounded-square badge with a vertical gradient.
+        // Rounded-square badge with a night-sky gradient.
         let badge = coverage(rounded_rect_sdf(x, y, 0.5, 0.5, 0.46, 0.46, 0.22));
         if badge > 0.0 {
-            let c = mix(INDIGO_TOP, INDIGO_BOTTOM, y);
+            let c = mix(NIGHT_TOP, NIGHT_BOTTOM, ((y - 0.04) / 0.92).clamp(0.0, 1.0));
             over(&mut px, c, badge);
         }
-        let g = glyph(x, y, 0.08, 0.84, true);
-        over(&mut px, WHITE, g * badge);
+        let (gx, gy) = ((x - OFFSET) / SCALE, (y - OFFSET) / SCALE);
+        // Soft shadow: the glyph's distance field, offset downwards and faded.
+        let shadow = (0.5 - glyph_sdf(gx, gy - 0.025, lit) / 0.05).clamp(0.0, 1.0);
+        over(&mut px, SHADOW, shadow * 0.28 * badge);
+        over(&mut px, WHITE, coverage(glyph_sdf(gx, gy, lit)) * badge);
         if let Some(status) = status {
             let color = match status {
                 Status::Running => GREEN,
@@ -61,32 +68,43 @@ pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
     })
 }
 
-/// Coverage of the `‹✦›` glyph: code brackets around an AI sparkle, mapped
-/// into the square `[offset, offset + scale]`. A stopped proxy shows the
-/// sparkle as an outline.
-fn glyph(x: f32, y: f32, offset: f32, scale: f32, solid: bool) -> f32 {
-    let (x, y) = ((x - offset) / scale, (y - offset) / scale);
-    let stroke = 0.095;
-    let mut d = f32::MAX;
-    for (outer, tip) in [(0.27, 0.06), (0.73, 0.94)] {
-        d = d.min(segment_sdf(x, y, (outer, 0.25), (tip, 0.5)) - stroke / 2.0);
-        d = d.min(segment_sdf(x, y, (tip, 0.5), (outer, 0.75)) - stroke / 2.0);
-    }
-    let star = sparkle(x, y, 0.5, 0.5, 0.25);
-    let star = if solid {
-        star
+/// Signed distance (negative inside) to the lighthouse glyph in the unit
+/// square. An unlit lighthouse has no beams and a hollow lantern.
+fn glyph_sdf(x: f32, y: f32, lit: bool) -> f32 {
+    // Tower tapering outwards from y 0.40 to 0.84, with one band cut out.
+    let half = 0.085 + (y - 0.40) / 0.44 * 0.075;
+    let tower = ((x - 0.5).abs() - half).max((y - 0.62).abs() - 0.22);
+    let tower = tower.max(-((y - 0.58).abs() - 0.035));
+    let gallery = rounded_rect_sdf(x, y, 0.5, 0.385, 0.14, 0.025, 0.02);
+    let lantern = rounded_rect_sdf(x, y, 0.5, 0.30, 0.075, 0.065, 0.02);
+    let roof = triangle_sdf(x, y, [(0.39, 0.24), (0.61, 0.24), (0.5, 0.13)]) - 0.012;
+    let mut d = tower.min(gallery).min(lantern).min(roof);
+    if lit {
+        for s in [-1.0, 1.0] {
+            let beam = [
+                (0.5 + s * 0.13, 0.29),
+                (0.5 + s * 0.45, 0.17),
+                (0.5 + s * 0.45, 0.39),
+            ];
+            d = d.min(triangle_sdf(x, y, beam) - 0.012);
+        }
     } else {
-        star.max(-sparkle(x, y, 0.5, 0.5, 0.13))
-    };
-    coverage(d.min(star))
+        d = d.max(-rounded_rect_sdf(x, y, 0.5, 0.30, 0.035, 0.03, 0.01));
+    }
+    d.min(wave_sdf(x, y) - 0.03)
 }
 
-/// Four-point star with concave sides: `(|dx|/r)^k + (|dy|/r)^k <= 1`, k < 1.
-/// Returns a signed value that is negative inside (not a true distance,
-/// which hard-edged supersampled coverage does not need).
-fn sparkle(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> f32 {
-    const K: f32 = 0.62;
-    ((x - cx).abs() / r).powf(K) + ((y - cy).abs() / r).powf(K) - 1.0
+/// Distance to the water line: two sine periods across the bottom.
+fn wave_sdf(x: f32, y: f32) -> f32 {
+    const STEPS: usize = 32;
+    let point = |i: usize| {
+        let t = i as f32 / STEPS as f32;
+        let phase = t * 4.0 * std::f32::consts::PI;
+        (0.12 + 0.76 * t, 0.92 + 0.015 * phase.sin())
+    };
+    (1..=STEPS)
+        .map(|i| segment_sdf(x, y, point(i - 1), point(i)))
+        .fold(f32::MAX, f32::min)
 }
 
 fn raster(size: u32, shade: impl Fn(f32, f32) -> Rgba) -> Vec<u8> {
@@ -126,6 +144,19 @@ fn coverage(d: f32) -> f32 {
 
 fn circle_sdf(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> f32 {
     ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r
+}
+
+/// Signed distance to a triangle, negative inside.
+fn triangle_sdf(x: f32, y: f32, p: [(f32, f32); 3]) -> f32 {
+    let mut d = f32::MAX;
+    let mut sides = [0.0; 3];
+    for i in 0..3 {
+        let (a, b) = (p[i], p[(i + 1) % 3]);
+        d = d.min(segment_sdf(x, y, a, b));
+        sides[i] = (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0);
+    }
+    let inside = sides.iter().all(|&s| s >= 0.0) || sides.iter().all(|&s| s <= 0.0);
+    if inside { -d } else { d }
 }
 
 fn segment_sdf(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
