@@ -30,6 +30,8 @@ use url::Url;
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
+#[path = "relay.rs"]
+mod relay;
 #[path = "server_transport.rs"]
 mod transport;
 use transport::*;
@@ -802,26 +804,45 @@ fn relay_stream(
     seconds: f64,
 ) -> Relay {
     Box::pin(async move {
-        let transfer = async {
-            let downstream = upgrade
-                .await
-                .map_err(|_| std::io::Error::other("Upgrade failed"))?;
-            let mut downstream = TokioIo::new(downstream);
-            tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+        let idle = Duration::from_secs_f64(seconds);
+        let downstream = match tokio::time::timeout(idle, upgrade).await {
+            Ok(Ok(downstream)) => downstream,
+            result => {
+                log.outcome = "request_failed";
+                log.field(
+                    "reason",
+                    if result.is_err() {
+                        "upgrade_timeout"
+                    } else {
+                        "upgrade_failed"
+                    },
+                );
+                return;
+            }
         };
-        match tokio::time::timeout(Duration::from_secs_f64(seconds), transfer).await {
-            Ok(Ok((sent, received))) => {
-                log.bytes = received as usize;
-                log.field("sent_bytes", sent);
-                log.outcome = "request_finished";
-            }
-            Ok(Err(_)) => {
+        let progress = Mutex::new(relay::Progress::new());
+        let result =
+            relay::copy_idle(TokioIo::new(downstream), &mut upstream, idle, &progress).await;
+        let progress = progress.into_inner().unwrap();
+        log.bytes = progress.received as usize;
+        log.field("sent_bytes", progress.sent);
+        match result {
+            Ok(()) => log.outcome = "request_finished",
+            Err(error) => {
                 log.outcome = "request_failed";
-                log.field("reason", "tunnel_transport_error");
-            }
-            Err(_) => {
-                log.outcome = "request_failed";
-                log.field("reason", "tunnel_timeout");
+                log.field(
+                    "reason",
+                    if progress.failure.is_none() && error.kind() == std::io::ErrorKind::TimedOut {
+                        "tunnel_idle_timeout"
+                    } else {
+                        "tunnel_transport_error"
+                    },
+                );
+                log.field("transport_error_kind", format!("{:?}", error.kind()));
+                if let Some((side, operation, _)) = progress.failure {
+                    log.field("error_side", side);
+                    log.field("error_operation", operation);
+                }
             }
         }
         drop(log);

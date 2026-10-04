@@ -528,8 +528,10 @@ real connection attempt serves as the initial check, so successful sockets are
 reused rather than opened twice.
 
 CONNECT and upgraded WebSocket connections count toward the 128-connection
-limit, close on service shutdown, and have a maximum relay lifetime of
-`request_timeout_seconds` (measured after establishment). They preserve buffered
+limit, close on service shutdown, and expire after `request_timeout_seconds`
+without data progress in either direction. Active tunnels have no total lifetime
+limit. Failure logs retain transferred byte counts and sanitized error side,
+operation, and kind (without payloads or credentials). They preserve buffered
 early data and TCP half-closes. This listener supports CONNECT authority-form and
 API origin-form requests; it does not accept absolute-form plain HTTP proxy requests.
 
@@ -978,8 +980,8 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - Inbound limits: 32 MiB request body, 64 KiB headers, 128 concurrent connections, and a 30-second read timeout. Content-Length and chunked uploads are supported; each connection handles one request.
 - `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
-- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. CONNECT candidates likewise share one establishment deadline; the relay lifetime starts separately after connection establishment. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
-- `request_timeout_seconds` accepts 1–3600 seconds and configures both the upstream request timeout and the total resource timeout. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
+- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. CONNECT candidates likewise share one establishment deadline; the relay idle timeout starts separately after connection establishment. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
+- `request_timeout_seconds` accepts 1–3600 seconds and configures the HTTP request timeout and the idle timeout for established WebSocket/CONNECT tunnels. Tunnel activity in either direction resets the idle timer; active tunnels have no total lifetime limit. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
 - After rebuilding a running service, restart that process to use the new executable.
