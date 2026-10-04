@@ -19,42 +19,46 @@ pub enum TrafficScope {
     Model,
 }
 
-fn is_model_request(entry: &Entry) -> bool {
-    let raw = entry
-        .get("path")
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("");
-    let path = raw
-        .strip_prefix("/codex/")
-        .or_else(|| raw.strip_prefix("/anthropic/"))
-        .or_else(|| raw.strip_prefix("/claude/"))
-        .unwrap_or(raw)
-        .trim_start_matches('/');
-    let parsed = if path.starts_with("https://") || path.starts_with("http://") {
-        reqwest::Url::parse(path).ok()
-    } else {
-        None
-    };
-    let path = parsed
-        .as_ref()
-        .map(|u| u.path())
-        .unwrap_or(path)
-        .trim_matches('/');
-    let ends = |suffix: &str| path == suffix || path.ends_with(&format!("/{suffix}"));
-    match entry.get("method") {
-        Some("POST") => {
-            ends("responses")
-                || ends("responses/compact")
-                || ends("messages")
-                || ends("chat/completions")
-                || ends("completions")
-        }
-        // Codex's streaming WebSocket upgrade uses GET on the model endpoint.
-        Some("GET") => ends("responses"),
-        _ => false,
+fn included_in_scope(entry: &Entry, scope: TrafficScope) -> bool {
+    let model_event = entry.event.starts_with("model_call_");
+    match scope {
+        TrafficScope::All => !model_event,
+        TrafficScope::Model => model_event || is_historical_http_call(entry),
     }
+}
+
+fn is_historical_http_call(entry: &Entry) -> bool {
+    // One HTTP model request is one call even before per-call events existed.
+    // Upgraded GET connections cannot tell us how many generations occurred.
+    !entry.event.starts_with("model_call_")
+        && !entry.fields.contains_key("model_call_id")
+        && entry.get("method") == Some("POST")
+        && coport::model_calls::is_model_endpoint("POST", entry.get("path").unwrap_or(""))
+}
+
+// Later lifecycle stages supply the outcome and credential, but a request is
+// counted from its first recorded event, including an open WebSocket connection.
+fn lifecycle_rank(entry: &Entry) -> u8 {
+    if entry.is_request_end() || entry.is_model_call_end() {
+        return 4;
+    }
+    match entry.event.as_str() {
+        "upstream_response" | "model_call_updated" => 3,
+        "route_selected" => 2,
+        "request_received" | "model_call_started" => 1,
+        _ => 0,
+    }
+}
+
+fn merge_request(current: &mut Entry, mut incoming: Entry) {
+    let time = current.time.into_iter().chain(incoming.time).min();
+    if lifecycle_rank(&incoming) > lifecycle_rank(current) {
+        std::mem::swap(current, &mut incoming);
+    }
+    for (key, value) in incoming.fields {
+        current.fields.entry(key).or_insert(value);
+    }
+    current.time = time;
 }
 
 #[derive(Serialize)]
@@ -76,6 +80,9 @@ pub struct CredentialTraffic {
     requests: u64,
     errors: u64,
     bytes: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
     avg_ms: Option<u64>,
     counts: Vec<u64>,
     error_counts: Vec<u64>,
@@ -129,6 +136,8 @@ pub fn read(
     });
     let files = current.into_iter().chain(archives.map(|p| open(&p)));
     let mut seen_requests = HashSet::new();
+    let mut requests = BTreeMap::<String, Entry>::new();
+    let mut explicit_call_requests = HashSet::new();
     #[cfg(unix)]
     let mut identities = std::collections::HashSet::new();
     for file in files {
@@ -179,32 +188,62 @@ pub fn read(
                     .entry((service.to_owned(), id.to_owned()))
                     .or_insert_with(|| label.to_owned());
             }
-            if entry.is_request_end()
-                && entry
-                    .time
-                    .is_some_and(|t| t.timestamp_millis() >= start && t.timestamp_millis() < end)
+            if !included_in_scope(&entry, scope)
+                || lifecycle_rank(&entry) == 0
+                || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
             {
-                // Imported stderr history may overlap the live/rotated logs.
-                let identity = entry
-                    .get("request_id")
-                    .filter(|id| !id.is_empty())
-                    .map(|id| format!("{}:{id}", entry.event))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}:{:?}:{}",
-                            entry.event,
-                            entry.time,
-                            serde_json::to_string(&entry.fields).unwrap_or_default()
-                        )
-                    });
+                continue;
+            }
+            if let Some(id) = entry
+                .get(if entry.event.starts_with("model_call_") {
+                    "model_call_id"
+                } else {
+                    "request_id"
+                })
+                .filter(|id| !id.is_empty())
+            {
+                if entry.event.starts_with("model_call_")
+                    && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
+                {
+                    explicit_call_requests.insert(request_id.to_owned());
+                }
+                let id = format!(
+                    "{}:{id}",
+                    if entry.event.starts_with("model_call_") {
+                        "call"
+                    } else {
+                        "request"
+                    }
+                );
+                if let Some(current) = requests.get_mut(&id) {
+                    merge_request(current, entry);
+                } else {
+                    requests.insert(id, entry);
+                }
+            } else if entry.is_request_end()
+                && (scope == TrafficScope::All || is_historical_http_call(&entry))
+            {
+                // Uncorrelated connection events can only be counted separately.
+                // New model-call events always require their explicit call ID.
+                let identity = format!(
+                    "{}:{:?}:{}",
+                    entry.event,
+                    entry.time,
+                    serde_json::to_string(&entry.fields).unwrap_or_default()
+                );
                 if seen_requests.insert(identity) {
                     entries.push(entry);
                 }
             }
         }
     }
-    for entry in &entries {
-        if scope == TrafficScope::Model && !is_model_request(entry) {
+    for entry in entries.iter().chain(requests.values()) {
+        if scope == TrafficScope::Model
+            && is_historical_http_call(entry)
+            && entry
+                .get("request_id")
+                .is_some_and(|id| explicit_call_requests.contains(id))
+        {
             continue;
         }
         aggregate(&mut groups, entry, start, end, bucket_minutes, &labels);
@@ -218,6 +257,9 @@ pub fn read(
         summary.requests += group.requests;
         summary.errors += group.errors;
         summary.bytes += group.bytes;
+        add_tokens(&mut summary.input_tokens, group.input_tokens);
+        add_tokens(&mut summary.output_tokens, group.output_tokens);
+        add_tokens(&mut summary.cached_input_tokens, group.cached_input_tokens);
         summary.latency_total += group.latency_total;
         summary.latency_count += group.latency_count;
         for i in 0..30 {
@@ -244,6 +286,12 @@ pub fn read(
     })
 }
 
+fn add_tokens(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
 fn aggregate(
     groups: &mut BTreeMap<(String, String), CredentialTraffic>,
     e: &Entry,
@@ -252,7 +300,7 @@ fn aggregate(
     bucket_minutes: u64,
     labels: &BTreeMap<(String, String), String>,
 ) {
-    if !e.is_request_end() {
+    if lifecycle_rank(e) == 0 {
         return;
     }
     let Some(time) = e.time.map(|t| t.timestamp_millis()) else {
@@ -312,6 +360,10 @@ fn aggregate(
         group.error_counts[slot] += 1;
     }
     group.bytes += e.bytes();
+    let token = |key| e.get(key).and_then(|v| v.parse().ok());
+    add_tokens(&mut group.input_tokens, token("input_tokens"));
+    add_tokens(&mut group.output_tokens, token("output_tokens"));
+    add_tokens(&mut group.cached_input_tokens, token("cached_input_tokens"));
     if let Some(ms) = e.duration_ms() {
         group.latency_total += ms;
         group.latency_count += 1;
@@ -324,43 +376,180 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quota_category_matches_inference_not_management_endpoints() {
-        for (method, path, expected) in [
-            ("POST", "/v1/responses", true),
-            ("POST", "/backend-api/codex/responses/compact", true),
-            (
-                "GET",
-                "/codex/https://example.invalid/v1/responses?model=x",
-                true,
-            ),
-            ("POST", "/anthropic/v1/messages", true),
-            (
-                "POST",
-                "/claude/https://example.invalid/api/v1/messages",
-                true,
-            ),
-            ("POST", "/v1/chat/completions", true),
-            ("POST", "/v1/completions", true),
-            ("POST", "/anthropic/v1/messages/count_tokens", false),
-            ("GET", "/v1/responses/response-id", false),
-            ("GET", "/backend-api/wham/usage", false),
-            ("GET", "/anthropic/api/oauth/usage", false),
-            ("POST", "/anthropic/v1/oauth/token", false),
-            ("POST", "/backend-api/codex/analytics-events/events", false),
-            ("POST", "/mcp/openaiDeveloperDocs", false),
-            ("GET", "/v1/models", false),
-            ("CONNECT", "api.anthropic.com:443", false),
-            ("POST", "/v1/not-responses", false),
-        ] {
-            let entry = Entry {
-                seq: 0,
-                time: None,
-                event: "request_finished".into(),
-                fields: serde_json::from_value(serde_json::json!({"method":method,"path":path}))
-                    .unwrap(),
-            };
-            assert_eq!(is_model_request(&entry), expected, "{method} {path}");
+    fn historical_http_calls_survive_rotation_without_double_counting_new_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let mut records = vec![
+            serde_json::json!({"event":"request_received", "request_id":"responses", "method":"POST", "path":"/v1/responses", "provider":"old"}),
+            serde_json::json!({"event":"request_finished", "request_id":"responses", "method":"POST", "path":"/v1/responses", "status":"200", "received_bytes":"100", "provider":"old"}),
+            serde_json::json!({"event":"request_failed", "method":"POST", "path":"/anthropic/v1/messages", "status":"502", "provider":"old"}),
+            serde_json::json!({"event":"request_finished", "request_id":"chat", "method":"POST", "path":"/codex/https://example.invalid/v1/chat/completions", "status":"200", "provider":"old"}),
+            serde_json::json!({"event":"request_finished", "request_id":"compact", "method":"POST", "path":"/responses/compact", "status":"200", "provider":"old"}),
+            serde_json::json!({"event":"request_finished", "request_id":"tokens", "method":"POST", "path":"/anthropic/v1/messages/count_tokens", "status":"200"}),
+            serde_json::json!({"event":"request_finished", "request_id":"ws", "method":"GET", "path":"/v1/responses", "status":"101"}),
+            serde_json::json!({"event":"request_finished", "request_id":"modern", "model_call_id":"modern-call", "method":"POST", "path":"/v1/responses", "status":"200"}),
+            serde_json::json!({"event":"model_call_finished", "request_id":"modern", "model_call_id":"modern-call", "method":"POST", "path":"/v1/responses", "status":"200", "provider":"new", "input_tokens":"10"}),
+        ];
+        for row in &mut records {
+            row["timestamp"] = serde_json::json!(timestamp);
         }
+        let raw = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
+        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        assert_eq!(model.summary.requests, 5);
+        assert_eq!(model.summary.errors, 1);
+        assert_eq!(model.summary.bytes, 100);
+        assert_eq!(model.summary.input_tokens, Some(10));
+        assert_eq!(model.summary.counts.iter().sum::<u64>(), 5);
+        let old = model
+            .credentials
+            .iter()
+            .filter(|c| c.credential == "old")
+            .collect::<Vec<_>>();
+        assert_eq!(old.iter().map(|c| c.requests).sum::<u64>(), 4);
+        assert!(old.iter().all(|c| c.input_tokens.is_none()));
+    }
+
+    #[test]
+    fn model_scope_counts_historical_http_but_not_connections_or_orphan_call_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let records = [
+            serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":"http", "method":"POST", "path":"/v1/responses", "status":"200"}),
+            serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":"ws", "method":"GET", "path":"/v1/responses", "status":"101"}),
+            serde_json::json!({"event":"model_call_finished", "timestamp":timestamp, "request_id":"missing-call-id"}),
+        ];
+        std::fs::write(
+            &path,
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(
+            read(&path, 30, &BTreeMap::new(), TrafficScope::Model)
+                .unwrap()
+                .summary
+                .requests,
+            1
+        );
+        assert_eq!(
+            read(&path, 30, &BTreeMap::new(), TrafficScope::All)
+                .unwrap()
+                .summary
+                .requests,
+            2
+        );
+    }
+
+    #[test]
+    fn counts_websocket_turns_and_http_calls_without_counting_their_connections_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let mut rows = vec![
+            serde_json::json!({"event":"request_received", "request_id":"ws", "method":"GET", "path":"/v1/responses"}),
+            serde_json::json!({"event":"request_finished", "request_id":"ws", "method":"GET", "path":"/v1/responses", "status":"101"}),
+            serde_json::json!({"event":"request_finished", "request_id":"http", "model_call_id":"http-call", "method":"POST", "path":"/v1/responses", "status":"200"}),
+            serde_json::json!({"event":"request_finished", "request_id":"handshake-only", "method":"GET", "path":"/v1/responses", "status":"101"}),
+        ];
+        for (call, request, event) in [
+            ("one", "ws", "model_call_finished"),
+            ("two", "ws", "model_call_cancelled"),
+            ("http-call", "http", "model_call_failed"),
+        ] {
+            rows.push(serde_json::json!({"event":"model_call_started", "request_id":request, "model_call_id":call, "provider":"account", "method":"GET", "path":"/v1/responses"}));
+            rows.push(serde_json::json!({"event":event, "request_id":request, "model_call_id":call, "provider":"account", "method":"GET", "path":"/v1/responses", "input_tokens":"10", "output_tokens":"5", "cached_input_tokens":"2"}));
+        }
+        for row in &mut rows {
+            row["timestamp"] = serde_json::json!(timestamp);
+        }
+        let raw = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
+        let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
+        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        assert_eq!(all.summary.requests, 3);
+        assert_eq!(model.summary.requests, 3);
+        assert_eq!(model.summary.errors, 1);
+        assert_eq!(model.summary.input_tokens, Some(30));
+        assert_eq!(model.summary.output_tokens, Some(15));
+        assert_eq!(model.summary.cached_input_tokens, Some(6));
+        assert_eq!(model.credentials.len(), 1);
+    }
+
+    #[test]
+    fn active_model_requests_are_counted_once_and_updated_on_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let start = (Local::now() - chrono::Duration::seconds(150)).to_rfc3339();
+        let finish = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let received = serde_json::json!({
+            "timestamp":start, "event":"model_call_started", "model_call_id":"call", "request_id":"ws",
+            "method":"GET", "path":"/v1/responses",
+        });
+        let routed = serde_json::json!({
+            "timestamp":start, "event":"model_call_updated", "model_call_id":"call", "request_id":"ws",
+            "method":"GET", "path":"/v1/responses", "provider":"model-account",
+        });
+        let response = serde_json::json!({
+            "timestamp":start, "event":"model_call_updated", "model_call_id":"call", "request_id":"ws",
+            "method":"GET", "path":"/v1/responses", "status":"101",
+        });
+        let history = format!("{received}\n{routed}\n{response}\n");
+        std::fs::write(&path, &history).unwrap();
+        let active = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        assert_eq!(active.summary.requests, 1);
+        assert_eq!(active.summary.errors, 0);
+        assert_eq!(active.summary.avg_ms, None);
+        assert_eq!(active.credentials[0].credential, "model-account");
+
+        // The end is read before its start in the rotated file, and duplicated
+        // history must not count a second request or overwrite its final result.
+        std::fs::write(path.with_file_name("proxy.log.1"), &history).unwrap();
+        let finished = serde_json::json!({
+            "timestamp":finish, "event":"model_call_failed", "model_call_id":"call", "request_id":"ws",
+            "method":"GET", "path":"/v1/responses", "status":"101",
+            "received_bytes":"128", "duration_ms":"60000",
+        });
+        std::fs::write(&path, format!("{finished}\n{history}{finished}\n")).unwrap();
+        let completed = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        assert_eq!(completed.summary.requests, 1);
+        assert_eq!(completed.summary.errors, 1);
+        assert_eq!(completed.summary.bytes, 128);
+        assert_eq!(completed.summary.avg_ms, Some(60000));
+        assert_eq!(completed.credentials[0].credential, "model-account");
+        assert_eq!(completed.summary.counts, active.summary.counts);
+    }
+
+    #[test]
+    fn requests_are_bucketed_by_start_and_management_is_excluded_from_model_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let old = (Local::now() - chrono::Duration::minutes(40)).to_rfc3339();
+        let now = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let records = [
+            serde_json::json!({"timestamp":old, "event":"request_received",
+                "request_id":"old", "method":"GET", "path":"/v1/responses"}),
+            serde_json::json!({"timestamp":now, "event":"request_finished",
+                "request_id":"old", "method":"GET", "path":"/v1/responses", "status":"101"}),
+            serde_json::json!({"timestamp":now, "event":"request_received",
+                "request_id":"new", "method":"POST", "path":"/anthropic/v1/messages"}),
+            serde_json::json!({"timestamp":now, "event":"model_call_started",
+                "request_id":"new", "model_call_id":"new-call", "method":"POST", "path":"/anthropic/v1/messages"}),
+            serde_json::json!({"timestamp":now, "event":"request_received",
+                "request_id":"usage", "method":"GET", "path":"/backend-api/wham/usage"}),
+        ];
+        std::fs::write(
+            &path,
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
+        assert_eq!(model.summary.requests, 1);
+        assert_eq!(all.summary.requests, 2);
     }
 
     #[test]
@@ -368,14 +557,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
-        let row = |event, method, path, status, bytes, duration, provider| {
-            serde_json::json!({
+        let row = |event: &str, method: &str, path: &str, status, bytes, duration, provider| {
+            let mut record = serde_json::json!({
                 "timestamp":timestamp, "event":event, "method":method, "path":path,
                 "status":status, "received_bytes":bytes, "duration_ms":duration,
-                "provider":provider, "service":"codex",
-            })
-            .to_string()
-                + "\n"
+                "provider":provider, "service":"codex", "request_id":uuid::Uuid::new_v4().to_string(),
+            });
+            let model_event = match (method, path, event) {
+                ("POST", "/v1/responses", "request_finished") => Some("model_call_finished"),
+                ("POST", "/v1/responses", "request_failed") => Some("model_call_failed"),
+                ("POST", "/v1/responses", "request_cancelled") => Some("model_call_cancelled"),
+                _ => None,
+            };
+            if let Some(model_event) = model_event {
+                record["model_call_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+                let connection = format!("{record}\n");
+                record["event"] = serde_json::json!(model_event);
+                format!("{connection}{record}\n")
+            } else {
+                format!("{record}\n")
+            }
         };
         std::fs::write(
             &path,
@@ -439,11 +640,11 @@ mod tests {
         let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
         assert_eq!(all.summary.requests, 6);
         assert_eq!(all.credentials.len(), 2);
-        assert_eq!(model.summary.requests, 4);
+        assert_eq!(model.summary.requests, 3);
         assert_eq!(model.summary.errors, 1);
-        assert_eq!(model.summary.bytes, 160);
-        assert_eq!(model.summary.avg_ms, Some(25));
-        assert_eq!(model.summary.counts.iter().sum::<u64>(), 4);
+        assert_eq!(model.summary.bytes, 110);
+        assert_eq!(model.summary.avg_ms, Some(26));
+        assert_eq!(model.summary.counts.iter().sum::<u64>(), 3);
         assert_eq!(model.summary.error_counts.iter().sum::<u64>(), 1);
         assert_eq!(model.credentials.len(), 1);
         assert_eq!(model.credentials[0].credential, "model");

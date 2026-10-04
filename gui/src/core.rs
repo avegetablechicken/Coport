@@ -299,6 +299,7 @@ impl Core {
         let mut rows = self.logs.entries(|e| {
             let keep = match filter {
                 "errors" => e.is_error(),
+                "models" => e.is_model_call_end(),
                 "all" => true,
                 _ => e.is_request_end(),
             };
@@ -607,7 +608,7 @@ impl From<Entry> for EntryDto {
             service: e.get("path").and(e.service()),
             proxy: e.get("proxy").map(str::to_owned),
             duration_ms: e.duration_ms(),
-            bytes: e.is_request_end().then(|| e.bytes()),
+            bytes: (e.is_request_end() || e.is_model_call_end()).then(|| e.bytes()),
             error: e.is_error(),
             reason: e.get("reason").map(str::to_owned),
             event: e.event,

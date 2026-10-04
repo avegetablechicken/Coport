@@ -349,11 +349,11 @@ function trafficBlock() {
      ${ui.homeTrafficError ? `<span class="traffic-update-error" title="${esc(ui.homeTrafficError)}">Update failed</span>` : ""}
      ${chart(st.counts, st.errorCounts)}
      <div class="strip">
-       ${stat("Requests", st.requests)}
+       ${stat(ui.trafficScope === "model" ? "Calls" : "Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(st.avgMs))}
        ${stat("Received", fmtBytes(st.bytes))}
-     </div></div>`
+     </div>${modelTokenStats(st)}</div>`
   );
 }
 
@@ -522,9 +522,9 @@ function trafficRangeSelect(id, selected, label) {
 }
 
 function trafficControls(prefix, minutes, label) {
-  return `<span class="traffic-controls"><select id="${prefix}-scope" class="select traffic-scope" aria-label="Traffic request category" title="Quota requests: model inference endpoints, including errors and cancellations. Actual charges are not recorded; CONNECT contents cannot be classified.">
+  return `<span class="traffic-controls"><select id="${prefix}-scope" class="select traffic-scope" aria-label="Traffic request category" title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls. CONNECT contents cannot be classified.">
     <option value="all" ${ui.trafficScope === "all" ? "selected" : ""}>All</option>
-    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Quota</option>
+    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Model Calls</option>
   </select>${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
@@ -546,6 +546,12 @@ async function loadTraffic() {
   if (ui.page === "activity") renderActivityTraffic();
 }
 
+function modelTokenStats(stats) {
+  if (ui.trafficScope !== "model") return "";
+  const tokens = (n) => n == null ? "—" : n.toLocaleString();
+  return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}</div>`;
+}
+
 function renderActivityTraffic() {
   const el = $("activity-traffic");
   if (!el) return;
@@ -557,12 +563,13 @@ function renderActivityTraffic() {
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
       ${chart(c.counts, c.errorCounts, true)}
-      <div class="strip">${stat("Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>
+      <div class="strip">${stat(ui.trafficScope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c)}
     </div>`;
   }).join("");
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
+    <p class="traffic-note">${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.</p>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
     ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${esc(date(traffic.end))}</span></div><p class="traffic-note">${traffic.bucketMinutes} min per bar</p>`}
     <p class="traffic-note">Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.</p>`;
@@ -587,6 +594,7 @@ function renderActivityList() {
   if (!filters) return;
   filters.innerHTML = [
     ["requests", "Requests"],
+    ["models", "Model Calls"],
     ["errors", "Errors"],
     ["all", "All Events"],
   ]
@@ -599,15 +607,17 @@ function renderActivityList() {
 }
 
 function requestRow(e, expandable) {
-  const cancelled = e.event === "request_cancelled";
-  const code = cancelled ? "CXL" : e.status ?? (e.error ? "ERR" : "—");
-  const meta = [fmtTime(e.time), e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
+  const cancelled = e.event === "request_cancelled" || e.event === "model_call_cancelled";
+  const modelCall = e.event.startsWith("model_call_");
+  const unknown = e.event === "model_call_unknown";
+  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : e.event === "model_call_finished" ? "OK" : "RUN") : e.status ?? (e.error ? "ERR" : "—");
+  const meta = [fmtTime(e.time), modelCall && e.fields?.model, e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
     .join(" · ");
   const tag = expandable ? "button" : "div";
   const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
   return `<${tag} class="req" ${attrs}>
-    <span class="status ${cancelled ? "cancelled" : statusClass(e.status)}"${cancelled ? ' title="Cancelled" aria-label="Cancelled"' : ""}>${esc(code)}</span>
+    <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : modelCall ? (e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${cancelled ? ' title="Cancelled" aria-label="Cancelled"' : unknown ? ' title="Outcome unavailable" aria-label="Outcome unavailable"' : ""}>${esc(code)}</span>
     <span class="req-main">
       <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(e.path ?? e.event)}</span>
       ${expandable && meta ? `<span class="req-meta">${esc(meta)}</span>` : ""}

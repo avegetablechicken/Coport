@@ -107,6 +107,17 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     };
                     io.write_all(format!("HTTP/1.1 {status} Profile\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode=="websocket_calls" {
+                    io.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n").await.unwrap();
+                    for id in ["turn-one", "turn-two"] {
+                        let payload = read_test_ws_message(&mut io, true).await;
+                        let event: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        assert_eq!(event["type"], "response.create");
+                        let message = json!({"type":"response.completed", "response":{"id":id,"model":"test-model","usage":{"input_tokens":10,"output_tokens":4}}}).to_string();
+                        io.write_all(&test_ws_message(message.as_bytes(), false)).await.unwrap();
+                    }
+                    let _ = io.read_u8().await;
+                }
                 else if response_mode=="websocket" || response_mode=="websocket_bad" {
                     let accept = if response_mode=="websocket_bad" { "invalid" } else { "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" };
                     io.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: test\r\n\r\n").as_bytes()).await.unwrap();
@@ -2119,4 +2130,90 @@ async fn cold_selection_consumes_the_request_budget_and_logs_eligibility_separat
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(raw.contains("\"event\":\"route_health\""));
     assert!(raw.contains("\"available\":\"true\""));
+}
+
+fn test_ws_message(payload: &[u8], masked: bool) -> Vec<u8> {
+    let flag = if masked { 128 } else { 0 };
+    let mut frame = vec![0x81];
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8 | flag);
+    } else {
+        frame.push(126 | flag);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    let mask = [1, 2, 3, 4];
+    if masked {
+        frame.extend_from_slice(&mask);
+    }
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ if masked { mask[i % 4] } else { 0 }),
+    );
+    frame
+}
+async fn read_test_ws_message<R: AsyncRead + Unpin>(reader: &mut R, masked: bool) -> Vec<u8> {
+    assert_eq!(reader.read_u8().await.unwrap(), 0x81);
+    let length = reader.read_u8().await.unwrap();
+    assert_eq!(length & 128 != 0, masked);
+    let length = match length & 127 {
+        126 => reader.read_u16().await.unwrap() as usize,
+        n => n as usize,
+    };
+    let mut mask = [0; 4];
+    if masked {
+        reader.read_exact(&mut mask).await.unwrap();
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).await.unwrap();
+    if masked {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    payload
+}
+#[tokio::test]
+async fn responses_websocket_records_two_model_calls_while_connection_stays_open() {
+    let fixture = fixture("http", "websocket_calls").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key:\n      upstream.invalid: selected\n")).await;
+    trust(&running, &fixture, &endpoint);
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket.write_all(b"GET /codex/https://upstream.invalid/v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    assert!(
+        read_response_head(&mut socket)
+            .await
+            .starts_with("HTTP/1.1 101")
+    );
+    for id in ["turn-one", "turn-two"] {
+        socket
+            .write_all(&test_ws_message(
+                br#"{"type":"response.create","model":"test-model","input":"PRIVATE PROMPT"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        let response = read_test_ws_message(&mut socket, false).await;
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["response"]["id"], id);
+    }
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let rows: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let calls: Vec<_> = rows
+        .iter()
+        .filter(|r| r["event"] == "model_call_finished")
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0]["model_call_id"], calls[1]["model_call_id"]);
+    assert_eq!(calls[0]["request_id"], calls[1]["request_id"]);
+    assert_eq!(calls[1]["output_tokens"], "4");
+    assert!(!raw.contains("PRIVATE PROMPT"));
+    assert!(!rows.iter().any(|r| r["event"] == "request_finished"));
 }

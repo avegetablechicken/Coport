@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 dotenvy = "0.15"
 futures-util = "0.3"
+flate2 = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 httparse = "1"

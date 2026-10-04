@@ -2,6 +2,15 @@
 listen_port: 8787
 request_timeout_seconds: 300
 
+# Model WebSockets use per-call phases instead of the HTTP/CONNECT timeout.
+# Optional; these are the defaults. Inter-turn idle 0 disables that timer only.
+websocket:
+  first_message_seconds: 30
+  first_output_seconds: 900
+  read_seconds: 900
+  write_seconds: 120
+  inter_turn_idle_seconds: 300
+
 # HTTP CONNECT, HTTPS CONNECT or SOCKS5; explicit ports required.
 proxies:
   us: "http://127.0.0.1:8101"

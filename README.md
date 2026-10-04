@@ -966,6 +966,40 @@ fails, logging continues in the current file; failures are also reported on stde
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
 | `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
 | `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
+| `model_call_started` / `model_call_updated` | One HTTP model request or WebSocket `response.create`, identified by `model_call_id` separately from its connection's `request_id`. |
+| `model_call_finished` / `model_call_failed` / `model_call_cancelled` | Per-call outcome, model, response ID, duration, and reported input/output/cache token usage when available. WebSocket success requires a model terminal event delivered to the client. |
+| `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
+
+The GUI's **Model Calls** scope counts each HTTP generation/compaction request and
+each WebSocket generation, including active calls. **All** counts network requests
+and connections instead. Model calls are deduplicated by call ID across log rotation.
+New model calls are read from explicit `model_call_*` events with a `model_call_id`.
+Historical HTTP generation/compaction requests also count as one call each;
+requests already carrying a call ID are excluded from this fallback to avoid double
+counting. WebSocket connection records are never used to infer calls.
+Token totals include only reported usage; missing usage displays as unknown, not zero.
+These totals are not provider quota or billing measurements. No prompts, generated
+text, or tool arguments are written to these logs.
+
+Responses WebSocket sessions have independent `websocket` timeout settings:
+`first_message_seconds` (30), `first_output_seconds` (900), `read_seconds` (900),
+`write_seconds` (120), and `inter_turn_idle_seconds` (300). Values are seconds;
+only inter-turn idle accepts 0 to disable its timer. The first-output deadline
+waits for semantic output, not a handshake, `response.created`, or heartbeats.
+After output begins, upstream model messages refresh the read deadline. Successful
+terminal delivery starts the between-turn idle timer; new calls start fresh timers.
+Writes have a separate timeout budget, including across fragments. Idle sessions
+close with code 1000; first-message/output/read timeouts use 1001 and write failures
+use 1011. Close frames are sent where the transport permits, never inside a partial
+data frame. Connection logs record the stage, direction, close code, frame size and
+whether downstream bytes were written. An unfinished call remains failed even when
+the upstream closes normally. CONNECT and other opaque tunnels retain the shared
+byte-activity timeout from `request_timeout_seconds`.
+
+The WebSocket observer handles masking, fragmentation and negotiated
+`permessage-deflate` (including context takeover). Frames and reconstructed or
+inflated messages are limited to 32 MiB. Exceeding observation limits records a gap
+and closes the model WebSocket; it does not silently fabricate successful calls.
 
 The GUI's exit-IP lookup and proxy-port diagnostic are display-only checks.
 They do not feed the daemon's per-destination route-health cache; a reachable

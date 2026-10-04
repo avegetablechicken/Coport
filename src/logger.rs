@@ -186,6 +186,7 @@ pub struct RequestLog {
 impl RequestLog {
     pub fn event(&self, event: &str) {
         self.logger.write(event, self.fields.clone());
+        crate::model_calls::http_event(self, event);
     }
     pub fn field(&mut self, key: &str, value: impl ToString) {
         self.fields.insert(key.into(), json!(value.to_string()));

@@ -5,6 +5,7 @@ mod codex_env;
 pub mod config;
 pub mod identity;
 pub mod logger;
+pub mod model_calls;
 pub mod routing;
 pub mod server;
 mod tunnel;

@@ -142,9 +142,53 @@ struct Raw {
     listen_port: u16,
     request_timeout_seconds: f64,
     #[serde(default)]
+    websocket: WebSocketTimeouts,
+    #[serde(default)]
     proxies: BTreeMap<String, String>,
     #[serde(default)]
     connect: BTreeMap<String, Choice>,
+}
+
+/// Responses WebSockets use protocol phases, independently of HTTP/CONNECT idle time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSocketTimeouts {
+    pub first_message_seconds: f64,
+    pub first_output_seconds: f64,
+    pub read_seconds: f64,
+    pub write_seconds: f64,
+    pub inter_turn_idle_seconds: f64,
+}
+impl Default for WebSocketTimeouts {
+    fn default() -> Self {
+        Self {
+            first_message_seconds: 30.0,
+            first_output_seconds: 900.0,
+            read_seconds: 900.0,
+            write_seconds: 120.0,
+            inter_turn_idle_seconds: 300.0,
+        }
+    }
+}
+impl WebSocketTimeouts {
+    fn validate(&self) -> Result<()> {
+        if [
+            self.first_message_seconds,
+            self.first_output_seconds,
+            self.read_seconds,
+            self.write_seconds,
+        ]
+        .iter()
+        .any(|n| !n.is_finite() || !(1.0..=3600.0).contains(n))
+            || !self.inter_turn_idle_seconds.is_finite()
+            || !(0.0..=3600.0).contains(&self.inter_turn_idle_seconds)
+        {
+            return Err(Error::config(
+                "WebSocket timeouts must be 1–3600 seconds; inter-turn idle may also be 0 to disable.",
+            ));
+        }
+        Ok(())
+    }
 }
 /// Top-level keys of the retired configuration layout, now rejected with a
 /// pointer to the `codex` section instead of a generic unknown-field error.
@@ -167,6 +211,7 @@ pub struct Config {
     pub claude: crate::claude::Claude,
     pub listen_port: u16,
     pub request_timeout_seconds: f64,
+    pub websocket: WebSocketTimeouts,
     pub proxies: BTreeMap<String, String>,
     pub connect: BTreeMap<String, Choice>,
 }
@@ -203,6 +248,7 @@ impl Config {
             claude: raw.claude,
             listen_port: raw.listen_port,
             request_timeout_seconds: raw.request_timeout_seconds,
+            websocket: raw.websocket,
             proxies: raw.proxies,
             connect: raw.connect,
         };
@@ -252,6 +298,7 @@ impl Config {
         {
             return Err(Error::config("Invalid port or timeout (1–3600 seconds)."));
         }
+        self.websocket.validate()?;
         crate::url_routing::validate_routes(&self.codex.routing.api_key)?;
         let account = validate_upstream(&self.codex.base_url.account)?;
         if account.path().trim_matches('/') == "backend-api/codex" {
@@ -635,6 +682,29 @@ pub fn redacted_endpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_phase_timeouts_are_independent_and_validated() {
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\n").unwrap();
+        assert_eq!(config.websocket.first_output_seconds, 900.0);
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nwebsocket:\n  read_seconds: 1200\n  inter_turn_idle_seconds: 0\n").unwrap();
+        assert_eq!(config.websocket.read_seconds, 1200.0);
+        assert_eq!(config.websocket.inter_turn_idle_seconds, 0.0);
+        for line in [
+            "write_seconds: 0",
+            "first_output_seconds: .nan",
+            "read_seconds: 3601",
+            "inter_turn_idle_seconds: -1",
+            "unknown: 2",
+        ] {
+            assert!(
+                Config::parse(&format!(
+                    "listen_port: 8787\nrequest_timeout_seconds: 3\nwebsocket:\n  {line}\n"
+                ))
+                .is_err()
+            );
+        }
+    }
     const BASE: &str = "listen_port: 8787\nrequest_timeout_seconds: 3\n";
 
     #[test]

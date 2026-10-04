@@ -34,6 +34,8 @@ pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 mod relay;
 #[path = "server_transport.rs"]
 mod transport;
+#[path = "websocket_relay.rs"]
+mod websocket_relay;
 use transport::*;
 
 pub struct Server {
@@ -237,6 +239,10 @@ impl Server {
             return Ok(response(200, "{\"ok\":true}"));
         }
         let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
+        if incoming.method() == "POST" && crate::model_calls::is_model_endpoint("POST", &target) {
+            log.field("model_call_id", uuid::Uuid::new_v4());
+            log.field("model_transport", "http");
+        }
         log.event("request_received");
         if incoming.method() == "CONNECT" {
             log.field("service", "connect");
@@ -292,12 +298,24 @@ impl Server {
                     match upstream.upgrade().await {
                         Ok(upstream) => {
                             log.status = 101;
+                            log.field("status", 101);
+                            if crate::model_calls::is_model_endpoint("GET", &target) {
+                                log.field("model_transport", "websocket");
+                                log.field(
+                                    "websocket_extensions",
+                                    headers
+                                        .get("sec-websocket-extensions")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or(""),
+                                );
+                            }
                             log.event("upstream_response");
-                            let _ = relay.send(relay_stream(
+                            let _ = relay.send(relay_websocket_or_tunnel(
                                 upgrade,
                                 Box::new(upstream),
                                 log,
                                 self.config.request_timeout_seconds,
+                                self.config.websocket.clone(),
                             ));
                             let mut response =
                                 Response::builder().status(101).body(empty()).unwrap();
@@ -318,6 +336,14 @@ impl Server {
                 log.field("headers_ms", log.started.elapsed().as_millis());
                 log.event("upstream_response");
                 let headers = filtered_headers(upstream.headers());
+                let mut observer = log.fields.contains_key("model_call_id").then(|| {
+                    crate::model_calls::HttpObserver::new(
+                        headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.starts_with("text/event-stream")),
+                    )
+                });
                 let no_body =
                     log.fields["method"] == "HEAD" || matches!(status.as_u16(), 204 | 304);
                 let mut response = Response::builder().status(status);
@@ -335,10 +361,15 @@ impl Server {
                     // Owning the upstream stream here propagates disconnect cancellation and backpressure.
                     while let Some(chunk)=stream.next().await {
                         match chunk {
-                            Ok(bytes)=> { log.bytes+=bytes.len(); yield Ok::<_,std::io::Error>(Frame::data(bytes)); }
+                            Ok(bytes)=> {
+                                log.bytes+=bytes.len();
+                                if let Some(observer) = observer.as_mut() { observer.feed(&bytes, &mut log); }
+                                yield Ok::<_,std::io::Error>(Frame::data(bytes));
+                            }
                             Err(_)=> { log.outcome="request_failed"; log.field("reason","transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
                         }
                     }
+                    if let Some(observer) = observer.as_mut() { observer.finish(&mut log); }
                     log.outcome="request_finished";
                     drop(log);
                 };
@@ -585,6 +616,9 @@ impl Server {
         };
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
+        if log.fields.contains_key("model_call_id") {
+            crate::model_calls::observe_request(&bytes, log);
+        }
         let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
             || route.as_ref().is_some_and(|r| r.custom_upstream);
         let mut headers = filtered_headers(&parts.headers);
@@ -795,6 +829,41 @@ fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {
         error.status,
         &json!({"error":{"message":error.message}}).to_string(),
     )
+}
+
+fn relay_websocket_or_tunnel(
+    upgrade: hyper::upgrade::OnUpgrade,
+    upstream: crate::tunnel::Socket,
+    mut log: RequestLog,
+    seconds: f64,
+    settings: crate::config::WebSocketTimeouts,
+) -> Relay {
+    if log
+        .fields
+        .get("model_transport")
+        .and_then(serde_json::Value::as_str)
+        != Some("websocket")
+    {
+        return relay_stream(upgrade, upstream, log, seconds);
+    }
+    Box::pin(async move {
+        match tokio::time::timeout(Duration::from_secs_f64(seconds), upgrade).await {
+            Ok(Ok(downstream)) => {
+                websocket_relay::run(TokioIo::new(downstream), upstream, &mut log, &settings).await
+            }
+            result => {
+                log.outcome = "request_failed";
+                log.field(
+                    "reason",
+                    if result.is_err() {
+                        "upgrade_timeout"
+                    } else {
+                        "upgrade_failed"
+                    },
+                );
+            }
+        }
+    })
 }
 
 fn relay_stream(

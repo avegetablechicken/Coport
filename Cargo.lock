@@ -555,6 +555,7 @@ dependencies = [
  "clap",
  "dirs",
  "dotenvy",
+ "flate2",
  "futures-util",
  "http-body-util",
  "httparse",

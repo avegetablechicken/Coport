@@ -36,6 +36,15 @@ impl Entry {
     pub fn status(&self) -> Option<u16> {
         self.get("status")?.parse().ok()
     }
+    pub fn is_model_call_end(&self) -> bool {
+        matches!(
+            self.event.as_str(),
+            "model_call_finished"
+                | "model_call_failed"
+                | "model_call_cancelled"
+                | "model_call_unknown"
+        )
+    }
     pub fn duration_ms(&self) -> Option<u64> {
         self.get("duration_ms")?.parse().ok()
     }
@@ -45,6 +54,9 @@ impl Entry {
             .unwrap_or(0)
     }
     pub fn is_error(&self) -> bool {
+        if self.event.starts_with("model_call_") {
+            return self.event == "model_call_failed";
+        }
         self.event == "request_failed"
             || self.event == "request_rejected"
             || self.event == "route_unavailable"

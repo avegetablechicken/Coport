@@ -1106,7 +1106,7 @@ details.disclosure[open] summary svg {
 .route-proxy-long .tag { font-size: 10px; max-width: 16ch; }
 
 .traffic-controls { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px; min-width: 0; }
-.traffic-scope { max-width: 112px; }
+.traffic-scope { max-width: 150px; }
 .block-head:has(.traffic-controls) { flex-wrap: wrap; }
 .traffic-controls { margin-left: auto; }
 
