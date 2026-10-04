@@ -292,7 +292,18 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
         token: uuid::Uuid::new_v4().to_string(),
     };
     let logger = Arc::new(Logger::new(log_path.clone()));
-    let server = Arc::new(Server::new(config, logger.clone()));
+    let mut server = Server::new(config, logger.clone());
+    // Without TLS, plain-HTTP clients still work; HTTPS base URLs fail to connect.
+    match coport::local_tls::acceptor(&coport::local_tls::dir_for(&config_path)) {
+        Ok(tls) => server = server.with_tls(tls),
+        Err(e) => logger.write(
+            "tls_disabled",
+            [("reason".to_owned(), e.message.into())]
+                .into_iter()
+                .collect(),
+        ),
+    }
+    let server = Arc::new(server);
     let started = Instant::now();
     let (shutdown, stop) = tokio::sync::oneshot::channel::<()>();
     let startup = tokio::spawn({

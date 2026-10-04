@@ -371,7 +371,8 @@ function connectBlock() {
     `${row("Claude Code", s.urls.claude)}${row("Codex", s.urls.codex)}
      <details class="disclosure"><summary>${ICON.chevron}Setup snippets</summary>
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
-       ${snippet("Top of ~/.codex/config.toml, then restart Codex", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.base}/backend-api"`)}
+       ${snippet("Top of ~/.codex/config.toml, then restart Codex", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
+       ${snippet("CA for HTTPS: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
      </details>`
   );
 }

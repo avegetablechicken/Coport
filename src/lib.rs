@@ -4,6 +4,7 @@ mod claude_settings;
 mod codex_env;
 pub mod config;
 pub mod identity;
+pub mod local_tls;
 pub mod logger;
 pub mod model_calls;
 pub mod routing;

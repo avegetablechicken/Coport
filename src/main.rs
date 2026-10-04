@@ -82,8 +82,20 @@ async fn run(args: Args) -> Result<()> {
         "coport listening on http://127.0.0.1:{}",
         config.listen_port
     );
+    let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
+    let mut server = Server::new(config, logger.clone());
+    match coport::local_tls::acceptor(&tls_dir) {
+        Ok(tls) => {
+            server = server.with_tls(tls);
+            println!(
+                "TLS on the same port; clients trust {}",
+                tls_dir.join(coport::local_tls::CA_FILE).display()
+            );
+        }
+        Err(e) => eprintln!("TLS disabled: {e}"),
+    }
     logger.write("server_started", serde_json::Map::new());
-    let server = Arc::new(Server::new(config, logger.clone()));
+    let server = Arc::new(server);
     server.startup_log().await;
     server
         .serve(listener, shutdown())

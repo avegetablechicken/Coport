@@ -2217,3 +2217,45 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
     assert!(!raw.contains("PRIVATE PROMPT"));
     assert!(!rows.iter().any(|r| r["event"] == "request_finished"));
 }
+#[tokio::test]
+async fn tls_and_plain_http_share_the_listening_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));
+    let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\n").unwrap();
+    let tls = crate::local_tls::acceptor(temp.path()).unwrap();
+    let server = Arc::new(Server::new(config, logger).with_tls(tls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _task = tokio::spawn(server.serve(listener, std::future::pending()));
+    let ca = std::fs::read(temp.path().join(crate::local_tls::CA_FILE)).unwrap();
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .build()
+        .unwrap();
+    for base in [
+        format!("http://127.0.0.1:{port}"),
+        format!("https://127.0.0.1:{port}"),
+        format!("https://localhost:{port}"),
+    ] {
+        let response = client
+            .get(format!("{base}/backend-api/wham/usage"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "{base}");
+    }
+    // A client without the CA is refused rather than served in plain text.
+    assert!(
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .build()
+            .unwrap()
+            .get(format!("https://127.0.0.1:{port}/backend-api/wham/usage"))
+            .send()
+            .await
+            .is_err()
+    );
+}

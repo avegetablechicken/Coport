@@ -597,7 +597,8 @@ fn validate_provider_upstream(value: &str) -> Result<()> {
 }
 pub fn unwrap_upstream(value: &str) -> Result<String> {
     if let Ok(u) = Url::parse(value) {
-        if u.scheme() == "http"
+        // The listener also serves TLS, so the wrapper may use either scheme.
+        if matches!(u.scheme(), "http" | "https")
             && u.host_str() == Some("127.0.0.1")
             && u.port().is_some()
             && u.username().is_empty()
@@ -862,10 +863,15 @@ mod tests {
         ] {
             assert!(validate_upstream(u).is_err(), "{u}");
         }
-        assert_eq!(
-            unwrap_upstream("http://127.0.0.1:7889/https://provider.invalid/v1").unwrap(),
-            "https://provider.invalid/v1"
-        );
+        for wrapper in [
+            "http://127.0.0.1:7889/https://provider.invalid/v1",
+            "https://127.0.0.1:7889/https://provider.invalid/v1",
+        ] {
+            assert_eq!(
+                unwrap_upstream(wrapper).unwrap(),
+                "https://provider.invalid/v1"
+            );
+        }
         // Provider upstreams accept public IPv4 HTTPS addresses, directly or
         // through the local wrapper form, while base URLs stay hostname-only.
         assert_eq!(
@@ -873,7 +879,7 @@ mod tests {
             "https://182.92.106.196:6060"
         );
         assert_eq!(
-            unwrap_upstream("http://127.0.0.1:7889/https://182.92.106.196:6060/v1").unwrap(),
+            unwrap_upstream("https://127.0.0.1:7889/https://182.92.106.196:6060/v1").unwrap(),
             "https://182.92.106.196:6060/v1"
         );
         assert!(validate_upstream("https://182.92.106.196:6060").is_err());

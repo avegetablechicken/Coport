@@ -45,6 +45,7 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     // Timestamps track last use for bounded LRU eviction, not expiry.
     claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 }
 impl Server {
     pub fn new(config: Config, logger: Arc<Logger>) -> Self {
@@ -54,7 +55,13 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Mutex::new(HashMap::new()),
+            tls: None,
         }
+    }
+    /// Also accept TLS on the listening port; plain HTTP keeps working.
+    pub fn with_tls(mut self, tls: tokio_rustls::TlsAcceptor) -> Self {
+        self.tls = Some(tls);
+        self
     }
     async fn claude_route(
         &self,
@@ -791,23 +798,20 @@ impl Server {
                     let server=self.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
-                    let mut socket=socket;
-                    let prefix=match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket)).await {
-                        Ok(Ok(prefix))=>prefix,
-                        result=> {
-                            let status=match result { Ok(Err(e))=>e.status, _=>408 };
-                            use tokio::io::AsyncWriteExt;
-                            let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
-                            return;
-                        }
+                    // A TLS ClientHello starts with the handshake record type 0x16;
+                    // no HTTP method does, so both share the port.
+                    let mut first=[0u8;1];
+                    let tls=match (&server.tls, tokio::time::timeout(Duration::from_secs(30), socket.peek(&mut first)).await) {
+                        (_, Ok(Ok(0))|Ok(Err(_))|Err(_))=>return,
+                        (Some(tls), _) if first[0]==0x16=>Some(tls.clone()),
+                        _=>None,
                     };
-                    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
-                    // Keep Hyper's upgrade handshake intact. Disabling keep-alive
-                    // overwrites Connection: Upgrade with Connection: close.
-                    // Ordinary HTTP responses explicitly send Connection: close.
-                    let _=http1::Builder::new().max_buf_size(65536).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30))
-                        .serve_connection(TokioIo::new(PrefixedSocket { prefix, socket }),service_fn(move |r|server.clone().handle(r, relay_tx.clone()))).with_upgrades().await;
-                    if let Ok(relay) = relay_rx.try_recv() { relay.await; }
+                    match tls {
+                        Some(tls)=>if let Ok(Ok(socket))=tokio::time::timeout(Duration::from_secs(30), tls.accept(socket)).await {
+                            server.connection(socket).await;
+                        },
+                        None=>server.connection(socket).await,
+                    }
                     });
                 }
             }
@@ -815,6 +819,43 @@ impl Server {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         Ok(())
+    }
+    async fn connection<S>(self: Arc<Self>, mut socket: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let prefix = match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket))
+            .await
+        {
+            Ok(Ok(prefix)) => prefix,
+            result => {
+                let status = match result {
+                    Ok(Err(e)) => e.status,
+                    _ => 408,
+                };
+                use tokio::io::AsyncWriteExt;
+                let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
+                let _ = socket.shutdown().await;
+                return;
+            }
+        };
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
+        // Keep Hyper's upgrade handshake intact. Disabling keep-alive
+        // overwrites Connection: Upgrade with Connection: close.
+        // Ordinary HTTP responses explicitly send Connection: close.
+        let _ = http1::Builder::new()
+            .max_buf_size(65536)
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(30))
+            .serve_connection(
+                TokioIo::new(PrefixedSocket { prefix, socket }),
+                service_fn(move |r| self.clone().handle(r, relay_tx.clone())),
+            )
+            .with_upgrades()
+            .await;
+        if let Ok(relay) = relay_rx.try_recv() {
+            relay.await;
+        }
     }
 }
 
@@ -936,7 +977,7 @@ async fn read_body(body: Incoming) -> Result<Bytes> {
 }
 // Reject ambiguity before Hyper normalizes duplicate Content-Length or TE+CL.
 // Buffered bytes (including any body prefix) are then passed to Hyper unchanged.
-async fn read_head(socket: &mut tokio::net::TcpStream) -> Result<Bytes> {
+async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Bytes> {
     use tokio::io::AsyncReadExt;
     let mut data = Vec::with_capacity(8192);
     loop {
@@ -990,11 +1031,11 @@ async fn read_head(socket: &mut tokio::net::TcpStream) -> Result<Bytes> {
         }
     }
 }
-struct PrefixedSocket {
+struct PrefixedSocket<S> {
     prefix: Bytes,
-    socket: tokio::net::TcpStream,
+    socket: S,
 }
-impl tokio::io::AsyncRead for PrefixedSocket {
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedSocket<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1009,7 +1050,7 @@ impl tokio::io::AsyncRead for PrefixedSocket {
         std::pin::Pin::new(&mut self.socket).poll_read(cx, buf)
     }
 }
-impl tokio::io::AsyncWrite for PrefixedSocket {
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedSocket<S> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

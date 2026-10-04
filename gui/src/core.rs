@@ -267,6 +267,11 @@ impl Core {
             urls: Urls {
                 claude: format!("{base}/anthropic"),
                 codex: format!("{base}/v1"),
+                chatgpt: format!("https://127.0.0.1:{port}/backend-api"),
+                ca_certificate: coport::local_tls::dir_for(&self.config_path())
+                    .join(coport::local_tls::CA_FILE)
+                    .display()
+                    .to_string(),
                 base,
             },
             config: ConfigDto {
@@ -487,6 +492,9 @@ struct Urls {
     base: String,
     claude: String,
     codex: String,
+    /// Codex 0.160+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
+    chatgpt: String,
+    ca_certificate: String,
 }
 
 #[derive(Serialize)]

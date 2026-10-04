@@ -395,7 +395,7 @@ Top-level Codex settings (before any TOML table):
 
 ```toml
 openai_base_url = "http://127.0.0.1:7889/v1"
-chatgpt_base_url = "http://127.0.0.1:7889/backend-api"
+chatgpt_base_url = "https://127.0.0.1:7889/backend-api"
 ```
 
 The first setting controls model requests; the second independently controls
@@ -403,6 +403,58 @@ ChatGPT backend requests. Codex only adds `/backend-api` automatically for
 recognized official hostnames, so include it for a loopback URL. Restart Codex
 after editing. HTTP/SSE and HTTP/1.1 WebSocket upgrades use the same credential
 and upstream routes.
+
+Codex 0.160 and later refuse a plain-HTTP `chatgpt_base_url` ("workspace
+backend must use an HTTPS origin without credentials"), so the listening port
+also accepts TLS: a connection that starts with a TLS handshake is decrypted,
+anything else is served as plain HTTP. On first start coport creates a private
+CA in `tls/` next to the configuration file (`tls/ca.pem`, with an owner-only
+`tls/ca-key.pem`) and issues a certificate for `127.0.0.1` and `localhost`
+from it on every start. Point Codex at that CA in the environment it starts
+from; it is trusted in addition to the system roots. For the Linux service:
+
+```sh
+export CODEX_CA_CERTIFICATE="$HOME/.local/share/coport-rust/tls/ca.pem"
+```
+
+Use the `tls/ca.pem` beside your own configuration file; the GUI's setup
+snippets show the exact path. Deleting `tls/` creates a new CA on the next
+start.
+
+A shell export does not reach the Codex desktop app. Both read `~/.codex/.env`,
+but Codex ignores `CODEX_*` variables there; set `SSL_CERT_FILE` instead, which
+Codex also adds to its system roots. Commands Codex runs do not inherit it under
+`shell_environment_policy.inherit = "core"`:
+
+```sh
+echo "SSL_CERT_FILE=$HOME/.local/share/coport-rust/tls/ca.pem" >> ~/.codex/.env
+```
+
+Codex 0.160 TUIs attach to a shared managed app-server that reads `.env` only
+when it starts, so run `codex app-server daemon restart` after changing it.
+
+Alternatively, add the CA to the system trust store; Codex reads it, so neither
+variable is needed. The CA carries critical name constraints permitting only
+`localhost` and `127.0.0.1`, so it cannot vouch for any other host. On
+Debian/Ubuntu:
+
+```sh
+sudo cp ~/.local/share/coport-rust/tls/ca.pem /usr/local/share/ca-certificates/coport.crt
+sudo update-ca-certificates
+```
+
+On macOS, add it to the System keychain as a trusted root (the GUI's default
+configuration lives in `~/Library/Caches/io.github.coport.gui/`, the service's in
+`~/Library/Application Support/coport-rust/`):
+
+```sh
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \
+  ~/Library/Caches/io.github.coport.gui/tls/ca.pem
+security verify-cert -c ~/Library/Caches/io.github.coport.gui/tls/ca.pem
+```
+
+The serving certificate is valid for one year from each start, within Apple's
+825-day limit. Recreating `tls/` requires trusting the new CA again.
 
 For matched ChatGPT credentials, `/responses`, `/v1/responses` and
 `/backend-api/codex/responses` map to the same model endpoint. Official
