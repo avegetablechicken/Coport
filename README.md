@@ -701,7 +701,8 @@ locally. Explicit URL routes need no token in this service's configuration.
 
 A custom CA supplied to the Claude client does not automatically become trusted
 by the proxy. Explicit API routes use native TLS for compatibility with Node/OpenSSL;
-Credential-based Codex routes and default Claude routes retain rustls. Both verify certificates and
+Codex providers with their own `base_url` count as explicit API routes; account routes, API Keys for
+the default API base and default Claude routes retain rustls. Both verify certificates and
 hostname/IP identity. On Linux, supply a self-signed API certificate through the
 service's `SSL_CERT_FILE` CA bundle (include the system CAs), and restart. Other
 platforms use their native certificate stores. Linux builds vendor OpenSSL and

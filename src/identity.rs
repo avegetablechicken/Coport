@@ -610,6 +610,19 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[tokio::test]
+    async fn default_api_base_keys_keep_rustls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "PLAIN_TEST_KEY_5512=plain-key\n").unwrap();
+        let c = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    api_key: {{PLAIN_TEST_KEY_5512: none}}\n",
+            serde_json::to_string(dir.path()).unwrap()
+        ))
+        .unwrap();
+        let route = c.resolve(Some("Bearer plain-key"), false).await.unwrap();
+        assert_eq!(route.upstream, c.codex.base_url.api_key);
+        assert!(!route.custom_upstream);
+    }
+    #[tokio::test]
     async fn configured_homes_keep_provider_config_and_credentials_together() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
@@ -637,13 +650,13 @@ mod tests {
             ("key-a", "https://a.example.com/v1"),
             ("key-b", "https://b.example.com/v1"),
         ] {
-            assert_eq!(
-                c.resolve(Some(&format!("Bearer {token}")), false)
-                    .await
-                    .unwrap()
-                    .upstream,
-                upstream
-            );
+            let route = c
+                .resolve(Some(&format!("Bearer {token}")), false)
+                .await
+                .unwrap();
+            assert_eq!(route.upstream, upstream);
+            // Own base_url: native TLS, as for explicit URL routes.
+            assert!(route.custom_upstream);
         }
         // An unlisted home is not searched, even when its files remain present.
         c.codex.homes.pop();

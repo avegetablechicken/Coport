@@ -78,6 +78,10 @@ impl Config {
             {
                 Ok(credentials) => {
                     for credential in credentials.into_iter().filter(|c| c.token == token) {
+                        // A provider with its own base_url is a third-party API, like
+                        // an explicit URL route: use native TLS for compatibility with
+                        // certificates rustls rejects (e.g. a self-signed CA as leaf).
+                        let custom_upstream = credential.upstream != self.codex.base_url.api_key;
                         matches.push(Route {
                             token: credential.token,
                             account_id: credential.account_id,
@@ -85,7 +89,7 @@ impl Config {
                             provider: Some(p.label().into()),
                             proxy: p.proxy.clone(),
                             upstream: credential.upstream,
-                            custom_upstream: false,
+                            custom_upstream,
                         });
                     }
                 }
