@@ -60,12 +60,16 @@ enum Response {
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
+    directory: PathBuf,
 }
 
 impl Client {
     pub fn discover(dir: &Path) -> Option<(Self, Status)> {
         let endpoint = serde_json::from_slice(&std::fs::read(dir.join(ENDPOINT)).ok()?).ok()?;
-        let client = Self { endpoint };
+        let client = Self {
+            endpoint,
+            directory: dir.to_owned(),
+        };
         let status = client.status().ok()?;
         Some((client, status))
     }
@@ -81,10 +85,17 @@ impl Client {
     pub fn stop(&self) -> io::Result<()> {
         match self.request(Action::Stop, STOP_TIMEOUT) {
             Ok(Response::Stopped) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+            // A dead loopback endpoint can time out on Windows instead of
+            // refusing the connection. Only a released daemon lock proves
+            // that the old process has stopped; a timeout alone does not.
+            Err(_) if self.registration_is_unlocked() => Ok(()),
             Err(e) => Err(e),
             _ => Err(io::Error::other("Unexpected daemon stop response")),
         }
+    }
+
+    fn registration_is_unlocked(&self) -> bool {
+        lock_file(&self.directory.join("daemon.lock")).is_ok_and(|lock| lock.try_lock().is_ok())
     }
 
     fn request(&self, action: Action, timeout: Duration) -> io::Result<Response> {
@@ -365,6 +376,26 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_daemon_is_stopped_only_after_its_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_file(&dir.path().join("daemon.lock")).unwrap();
+        lock.try_lock().unwrap();
+        // Reserve a port without listening so control requests cannot succeed.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let client = Client {
+            endpoint: Endpoint {
+                port: socket.local_addr().unwrap().port(),
+                token: "unreachable".into(),
+            },
+            directory: dir.path().to_owned(),
+        };
+        assert!(client.stop().is_err());
+        drop(lock);
+        client.stop().unwrap();
+    }
 
     #[test]
     fn daemon_lock_excludes_another_handle_until_released() {
