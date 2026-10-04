@@ -524,7 +524,7 @@ function trafficRangeSelect(id, selected, label) {
 function trafficControls(prefix, minutes, label) {
   return `<span class="traffic-controls"><select id="${prefix}-scope" class="select traffic-scope" aria-label="Traffic request category" title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls. CONNECT contents cannot be classified.">
     <option value="all" ${ui.trafficScope === "all" ? "selected" : ""}>All</option>
-    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Model Calls</option>
+    <option value="model" ${ui.trafficScope === "model" ? "selected" : ""}>Models</option>
   </select>${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
@@ -566,7 +566,7 @@ function renderActivityTraffic() {
       <div class="strip">${stat(ui.trafficScope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c)}
     </div>`;
   }).join("");
-  el.innerHTML = `<div class="block-head"><span class="block-title">Traffic by Credential</span>
+  el.innerHTML = `<div class="block-head"><span class="block-title">Traffic</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     <p class="traffic-note">Sorted by received traffic · largest first. Red indicates errors; each chart uses its own scale.</p>
     <p class="traffic-note">${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.</p>
@@ -580,7 +580,7 @@ function activityShell() {
   return `<div class="page">
     <section class="block" id="activity-traffic"></section>
     <section class="block">
-      <div class="block-head"><span class="block-title">Activity Log</span></div>
+      <div class="block-head"><span class="block-title">Log</span></div>
       <label class="search">${ICON.search}
         <input class="field" id="search" type="search" spellcheck="false" placeholder="Filter by path, proxy or status" value="${esc(ui.search)}" /></label>
       <div class="segmented" id="filters"></div>
@@ -594,7 +594,7 @@ function renderActivityList() {
   if (!filters) return;
   filters.innerHTML = [
     ["requests", "Requests"],
-    ["models", "Model Calls"],
+    ["models", "Models"],
     ["errors", "Errors"],
     ["all", "All Events"],
   ]
