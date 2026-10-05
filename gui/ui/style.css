@@ -1089,8 +1089,9 @@ details.disclosure[open] summary svg {
   white-space: pre-line;
   line-height: 1.45;
 }
-.traffic-note { color: var(--secondary); font-size: 10px; line-height: 1.5; margin: 6px 0 0; }
-.traffic-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
+.traffic-axis { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
+.traffic-axis > :nth-child(2) { text-align: center; white-space: nowrap; }
+.traffic-axis > :last-child { text-align: right; }
 
 .traffic-service {
   display: inline-flex;

@@ -105,13 +105,14 @@ pub fn read(
 ) -> Result<Traffic, String> {
     let bucket_minutes = match minutes {
         30 => 1,
-        360 => 12,
-        720 => 24,
-        1440 => 48,
-        10080 => 336,
+        360 => 15,
+        720 => 30,
+        1440 => 60,
+        10080 => 360,
         43200 => 1440,
         _ => return Err("Unsupported traffic range".into()),
     };
+    let bucket_count = (minutes / bucket_minutes) as usize;
     let end = Local::now().timestamp_millis();
     let start = end - minutes as i64 * 60_000;
     let mut groups = BTreeMap::new();
@@ -254,8 +255,8 @@ pub fn read(
         aggregate(&mut groups, entry, start, end, bucket_minutes, &labels);
     }
     let mut summary = CredentialTraffic {
-        counts: vec![0; 30],
-        error_counts: vec![0; 30],
+        counts: vec![0; bucket_count],
+        error_counts: vec![0; bucket_count],
         ..Default::default()
     };
     for group in groups.values() {
@@ -269,7 +270,7 @@ pub fn read(
         summary.latency_count += group.latency_count;
         summary.cache_read += group.cache_read;
         summary.cache_prompt += group.cache_prompt;
-        for i in 0..30 {
+        for i in 0..bucket_count {
             summary.counts[i] += group.counts[i];
             summary.error_counts[i] += group.error_counts[i];
         }
@@ -360,14 +361,15 @@ fn aggregate(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "Unidentified".into());
+    let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
     let claude = service == "Claude";
     let group = groups
         .entry((service.clone(), credential.clone()))
         .or_insert_with(|| CredentialTraffic {
             service,
             credential,
-            counts: vec![0; 30],
-            error_counts: vec![0; 30],
+            counts: vec![0; bucket_count],
+            error_counts: vec![0; bucket_count],
             ..Default::default()
         });
     let slot = ((time - start) / (bucket_minutes as i64 * 60_000)) as usize;
@@ -776,8 +778,27 @@ mod tests {
             line(100, "a", "200") + &line(43201, "a", "200") + "invalid\n",
         )
         .unwrap();
-        for range in [30, 360, 720, 1440, 10080, 43200] {
+        for (range, bucket_minutes, bars) in [
+            (30, 1, 30),
+            (360, 15, 24),
+            (720, 30, 24),
+            (1440, 60, 24),
+            (10080, 360, 28),
+            (43200, 1440, 30),
+        ] {
             let traffic = read(&path, range, &BTreeMap::new(), TrafficScope::All).unwrap();
+            assert_eq!(traffic.bucket_minutes, bucket_minutes);
+            assert_eq!(traffic.summary.counts.len(), bars);
+            assert_eq!(traffic.summary.error_counts.len(), bars);
+            assert_eq!(
+                traffic.summary.counts.iter().sum::<u64>(),
+                traffic.summary.requests
+            );
+            for group in &traffic.credentials {
+                assert_eq!(group.counts.len(), bars);
+                assert_eq!(group.error_counts.len(), bars);
+                assert_eq!(group.error_counts.iter().sum::<u64>(), group.errors);
+            }
             assert_eq!(traffic.credentials.len(), 2);
             assert_eq!(traffic.summary.requests, if range == 30 { 2 } else { 3 });
             assert_eq!(traffic.summary.errors, 1);
