@@ -1226,8 +1226,25 @@ setInterval(() => {
 const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 
 listen("state-changed", scheduleRefresh);
-listen("panel-shown", () => refresh().then(probeStale));
-listen("panel-hidden", () => closeSelect());
+const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;
+let panelHiddenAt = null;
+listen("panel-shown", () => {
+  const returnHome = panelHiddenAt !== null && Date.now() - panelHiddenAt >= PANEL_PAGE_TIMEOUT_MS;
+  panelHiddenAt = null;
+  if (returnHome) {
+    ui.page = "main";
+    ui.choosePath = false;
+    closeSelect();
+    render();
+    $("content").scrollTop = 0;
+  }
+  return refresh().then(probeStale);
+});
+listen("panel-hidden", () => {
+  // Repeated native hide events must not extend the previous page's lifetime.
+  panelHiddenAt ??= Date.now();
+  closeSelect();
+});
 refresh().then(probeStale);
 
 // Refresh even when no new requests arrive, so the rolling window advances.
