@@ -317,10 +317,14 @@ impl Claude {
         let mut keys = HashSet::new();
         if self.account_auth_file_only {
             for (label, account, directory) in &self.account_sources() {
-                self.account_choice(
-                    account.claude_identity(directory.as_deref()).as_ref(),
-                    Some(label),
-                )?;
+                let identity = account.claude_identity(directory.as_deref());
+                match self.account_choice(identity.as_ref(), Some(label)) {
+                    Ok(_) => {}
+                    // As during request routing, a saved credential without a
+                    // local route match can use the explicit profile lookup.
+                    Err(_) if self.routing.account_probe.is_some() => {}
+                    Err(error) => return Err(error),
+                }
                 if !keys.insert(account.claude_token().await?) {
                     return Err(Error::config(
                         "Multiple Claude routes have the same credential.",
@@ -1176,6 +1180,35 @@ claude:
             .status,
             401
         );
+    }
+
+    #[tokio::test]
+    async fn credential_check_accepts_saved_account_requiring_profile_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join(".credentials.json");
+        std::fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        let mut c = config(&format!("claude:\n  config_dirs: [{}]\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: none\n", serde_json::to_string(dir.path()).unwrap())).claude;
+        c.check_credentials().await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer saved-secret".parse().unwrap());
+        assert!(c.resolve(&headers).await.unwrap().needs_profile);
+        c.routing.account_probe = None;
+        assert!(c.check_credentials().await.is_err());
+        c.routing.account_probe = Some(Choice::direct());
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"other-id","emailAddress":"other@example.invalid"}}"#,
+        )
+        .unwrap();
+        c.check_credentials().await.unwrap();
+        assert!(c.resolve(&headers).await.unwrap().needs_profile);
+        std::fs::remove_file(dir.path().join(".claude.json")).unwrap();
+        std::fs::write(&credentials, "{}").unwrap();
+        assert!(c.check_credentials().await.is_err());
     }
 
     #[tokio::test]

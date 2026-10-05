@@ -574,7 +574,13 @@ function routingBlock() {
   const report = Object.fromEntries(s.routes.map((r) => [r.name.toLowerCase(), r]));
   const section = (name, svc) => {
     const r = report[name.toLowerCase()];
-    const badge = r ? (r.ok ? "" : `<span class="bad" data-tip="${esc(r.reason ?? "")}">Unavailable</span>`) : "";
+    // Startup credential checks do not establish whole-service availability.
+    // Older daemons also reported a missing local identity as a route failure
+    // even when the configured account probe can resolve it.
+    const profileWarning = name === "Claude" && r?.reason === "Claude account has no proxy route."
+      && svc.accountRoutes.some((route) => ["unknown", "remote", "probe_failed"].includes(route.activation));
+    const badge = r && !r.ok && !profileWarning
+      ? `<span class="bad" data-tip="${esc(r.reason ?? "")}">Credential warning</span>` : "";
     const configured = svc.configured || svc.fallbacks.some((f) => f.proxies);
     if (!configured) {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
