@@ -113,7 +113,7 @@ impl AccountSource {
             serde_json::from_slice(&std::fs::read(metadata).ok()?).ok()?;
         ClaudeIdentity::local(&value["oauthAccount"])
     }
-    async fn claude_token(&self) -> Result<String> {
+    pub(crate) async fn claude_token(&self) -> Result<String> {
         if let Some(name) = &self.auth_env {
             return environment_key(name).await;
         }
@@ -448,9 +448,9 @@ impl Claude {
                 identity = account.claude_identity(directory.as_deref());
                 match self.account_choice(identity.as_ref(), Some(label)) {
                     Ok(proxy) => matches.push((label, proxy)),
-                    // A saved token proves the credential source, not the account's
-                    // identity. Resolve missing metadata before selecting an email route.
-                    Err(_) if identity.is_none() && self.routing.account_probe.is_some() => {
+                    // Missing or stale local metadata can be resolved using the
+                    // saved token and an explicitly configured probe route.
+                    Err(_) if self.routing.account_probe.is_some() => {
                         local_needs_profile = true;
                     }
                     Err(error) => return Err(error),

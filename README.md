@@ -138,8 +138,9 @@ label (`default` for flat `auth_file`) and `claude.routing.account_fallback`.
 Metadata refreshes per request. Missing/malformed metadata leaves explicit source
 label and fallback routing available. An environment-backed account source has
 no associated metadata file and uses its configured label/fallback. If a saved
-token has no usable local identity and neither source-label nor fallback routing
-matches, an explicit `account_probe` resolves its identity before account routing.
+token has no matching local identity, source-label, or fallback route, an explicit
+`account_probe` resolves its identity before account routing. This includes stale
+local metadata that no longer matches a configured account.
 This also applies in `account_auth_file_only: true` mode, since the token already
 matches a saved credential. Existing label/fallback routes do not require a probe.
 
@@ -763,6 +764,14 @@ This does not install a login service or provide automatic crash recovery.
 The configuration is edited in your text editor; the panel validates it whenever
 the file changes and offers a restart when the running proxy is out of date. The
 right-click menu offers Open Panel, Start/Stop, Restart and Quit.
+
+With `account_auth_file_only: true`, Routing shows account activation from the
+configured credentials. Claude accounts without a local route match are checked
+through `account_probe` using their saved OAuth token. A successful probe keeps
+the warning icon to indicate the missing local match; a failed probe shows
+`Probe failed` alongside the icon. Probe results are cached for 30 seconds;
+changing the token or configuration triggers a new check. Without a token, a
+probe cannot authenticate and the account remains inactive.
 
 The GUI supports YAML configuration files (`.yaml` and `.yml`). `--config` and
 files explicitly selected in Settings are remembered. Without a saved choice,

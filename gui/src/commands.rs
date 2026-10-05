@@ -14,8 +14,15 @@ use tauri::{AppHandle, State};
 type Result<T = ()> = std::result::Result<T, String>;
 
 #[tauri::command]
-pub fn get_state(state: State<AppState>) -> Snapshot {
-    state.core.lock().unwrap().snapshot()
+pub async fn get_state(state: State<'_, AppState>) -> Result<Snapshot> {
+    let (mut snapshot, probe) = {
+        let mut core = state.core.lock().unwrap();
+        (core.snapshot(), core.account_probe())
+    };
+    if let Some(probe) = probe {
+        snapshot.set_account_route_states(probe.account_route_states().await);
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]

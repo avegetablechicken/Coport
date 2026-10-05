@@ -45,6 +45,9 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     // Timestamps track last use for bounded LRU eviction, not expiry.
     claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
+    // UI checks are serialized and cached briefly, including failures. The key
+    // is the credential, so switching a saved login forces a new check.
+    account_checks: tokio::sync::Mutex<HashMap<String, (Instant, Result<Option<String>>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 }
 impl Server {
@@ -55,6 +58,7 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Mutex::new(HashMap::new()),
+            account_checks: tokio::sync::Mutex::new(HashMap::new()),
             tls: None,
         }
     }
@@ -62,6 +66,113 @@ impl Server {
     pub fn with_tls(mut self, tls: tokio_rustls::TlsAcceptor) -> Self {
         self.tls = Some(tls);
         self
+    }
+
+    /// Resolve locally unknown account routes using the same authenticated
+    /// profile probe as requests. Remote success retains its distinct state so
+    /// the UI can keep warning that the local OAuth metadata did not match.
+    pub async fn account_route_states(
+        &self,
+    ) -> [std::collections::BTreeMap<String, &'static str>; 2] {
+        let mut states = self.config.account_route_states().await;
+        if !states[1].values().any(|state| *state == "unknown") {
+            return states;
+        }
+        let mut checks = self.account_checks.lock().await;
+        checks.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+        let mut confirmed = Vec::new();
+        let mut failed = false;
+        for (source, account, directory) in self.config.claude.account_sources() {
+            let matched_local =
+                account
+                    .claude_identity(directory.as_deref())
+                    .is_some_and(|identity| {
+                        crate::identity::routing_account_label(
+                            &self.config.claude.routing,
+                            &identity.account_id,
+                            &identity.usernames,
+                            &source,
+                        )
+                        .is_some()
+                    });
+            if matched_local
+                || self.config.claude.routing.account.contains_key(&source)
+                || self.config.claude.routing.account_fallback.is_some()
+            {
+                continue;
+            }
+            let Ok(token) = account.claude_token().await else {
+                continue;
+            };
+            let result = if let Some((_, result)) = checks.get(&token) {
+                result.clone()
+            } else {
+                // A status refresh must revalidate upstream access, not merely
+                // reuse the request router's identity cache indefinitely.
+                if let Ok(mut profiles) = self.claude_profiles.lock() {
+                    profiles.remove(&token);
+                }
+                let mut log = RequestLog {
+                    logger: self.logger.clone(),
+                    fields: json!({"service": "claude"}).as_object().unwrap().clone(),
+                    started: Instant::now(),
+                    status: 0,
+                    bytes: 0,
+                    outcome: "account_probe_failed",
+                };
+                let result = async {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "authorization",
+                        format!("Bearer {token}")
+                            .parse()
+                            .map_err(|_| Error::config("Invalid Claude account credential."))?,
+                    );
+                    let route = self.claude_route(&headers, &mut log).await?;
+                    Ok(route.identity.as_ref().and_then(|identity| {
+                        crate::identity::routing_account_label(
+                            &self.config.claude.routing,
+                            &identity.account_id,
+                            &identity.usernames,
+                            &source,
+                        )
+                    }))
+                };
+                let result = tokio::time::timeout(
+                    Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
+                    result,
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::config("Claude account probe timed out.")));
+                match &result {
+                    Ok(_) => log.outcome = "account_probe_finished",
+                    Err(error) => log.field("reason", error.message),
+                }
+                if checks.len() >= 128 {
+                    checks.clear();
+                }
+                checks.insert(token, (Instant::now(), result.clone()));
+                result
+            };
+            match result {
+                Ok(Some(label)) => confirmed.push(label),
+                Ok(None) => {}
+                Err(_) => failed = true,
+            }
+        }
+        for state in states[1].values_mut() {
+            if *state == "unknown" {
+                *state = if failed { "probe_failed" } else { "inactive" };
+            }
+        }
+        for label in confirmed {
+            if let Some(state) = states[1].get_mut(&label) {
+                if *state != "active" {
+                    *state = "remote";
+                }
+            }
+        }
+        states
     }
     async fn claude_route(
         &self,

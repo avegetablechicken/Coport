@@ -22,6 +22,7 @@ pub struct Core {
     pub settings: Settings,
     pub launch_at_login: bool,
     config: ConfigCache,
+    account_probe: Option<std::sync::Arc<coport::server::Server>>,
     /// Config file modification time when the proxy last started.
     started_stamp: Option<Option<SystemTime>>,
 }
@@ -77,6 +78,7 @@ impl Core {
             launch_at_login: platform::launch_at_login(),
             settings,
             config: ConfigCache::default(),
+            account_probe: None,
             started_stamp,
         }
     }
@@ -106,6 +108,7 @@ impl Core {
             return;
         }
         cache.exists = path.is_file();
+        self.account_probe = None;
         cache.parsed = Some(match std::fs::read_to_string(&path) {
             Ok(text) => parse_config(&text),
             Err(_) => Err("Cannot read configuration file.".to_owned()),
@@ -116,6 +119,22 @@ impl Core {
 
     pub fn invalidate_config(&mut self) {
         self.config = ConfigCache::default();
+        self.account_probe = None;
+    }
+
+    pub(crate) fn account_probe(&mut self) -> Option<std::sync::Arc<coport::server::Server>> {
+        if self.account_probe.is_none() {
+            let config = self.loaded_config()?.clone();
+            let logger = std::sync::Arc::new(coport::logger::Logger::new(
+                self.settings
+                    .log_path()
+                    .with_file_name("account-probes.jsonl"),
+            ));
+            self.account_probe = Some(std::sync::Arc::new(coport::server::Server::new(
+                config, logger,
+            )));
+        }
+        self.account_probe.clone()
     }
 
     pub(crate) fn loaded_config(&self) -> Option<&Config> {
@@ -398,6 +417,7 @@ fn service(
                 kind: kind(selector),
                 proxies: choice.names().to_vec(),
                 detail: detail(selector),
+                activation: None,
             })
             .collect()
     };
@@ -457,6 +477,21 @@ pub struct Snapshot {
     config: ConfigDto,
     check: CheckDto,
     settings: SettingsDto,
+}
+
+impl Snapshot {
+    pub fn set_account_route_states(&mut self, states: [BTreeMap<String, &'static str>; 2]) {
+        if let Some(details) = &mut self.config.details {
+            for (service, states) in [&mut details.codex, &mut details.claude]
+                .into_iter()
+                .zip(states)
+            {
+                for route in &mut service.account_routes {
+                    route.activation = states.get(&route.selector).copied();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -556,6 +591,7 @@ struct KeyValue {
 
 #[derive(Serialize)]
 struct RouteRow {
+    activation: Option<&'static str>,
     selector: String,
     kind: &'static str,
     proxies: Vec<String>,

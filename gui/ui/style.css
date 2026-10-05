@@ -1107,6 +1107,28 @@ details.disclosure[open] summary svg {
 .route-icon { width: 13px; height: 13px; flex: none; color: var(--secondary); }
 .route-icon svg { width: 100%; height: 100%; }
 .route-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-activation { flex: none; font-size: 10px; }
+.route-warning { display: inline-flex; width: 14px; height: 14px; color: var(--tertiary); cursor: help; }
+.route-warning svg { width: 100%; height: 100%; }
+.route-warning[data-tip]::after { content: none; }
+/* Outside the scrolling panel; JS keeps all edges inside the viewport. */
+.route-tooltip {
+  position: fixed;
+  z-index: 100;
+  width: max-content;
+  max-width: min(240px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 4px 7px;
+  border-radius: 3px;
+  background: var(--window);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16), 0 0 0 0.5px var(--separator);
+  color: var(--secondary);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .route-destination { flex: 0 1 auto; min-width: 0; max-width: 55%; text-align: right; }
 .route-destination .chain { display: flex; flex-wrap: wrap; gap: 3px; padding: 3px 0; }
 .route-destination .tag { display: block; line-height: 17px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

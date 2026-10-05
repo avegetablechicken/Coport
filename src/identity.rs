@@ -467,6 +467,69 @@ async fn shell_value(_: &str) -> Result<String> {
 }
 
 impl Config {
+    /// Local route activation, not upstream token validity. Archived logins are
+    /// deliberately excluded: only configured sources can admit requests.
+    pub async fn account_route_states(&self) -> [BTreeMap<String, &'static str>; 2] {
+        let initial = |required: bool, routing: &crate::config::Routing| {
+            routing
+                .account
+                .keys()
+                .filter(|_| required)
+                .map(|name| (name.clone(), "inactive"))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut codex = initial(self.codex.account_auth_file_only, &self.codex.routing);
+        if !codex.is_empty() {
+            for (source, account, _) in self.codex.account_sources() {
+                if let Ok(identity) = self.codex.account_identity(&account).await {
+                    if let Some(label) = routing_account_label(
+                        &self.codex.routing,
+                        &identity.account_id,
+                        &identity.usernames,
+                        &source,
+                    ) {
+                        codex.insert(label, "active");
+                    }
+                }
+            }
+        }
+        let mut claude = initial(self.claude.account_auth_file_only, &self.claude.routing);
+        if !claude.is_empty() {
+            for (source, account, directory) in self.claude.account_sources() {
+                if account.claude_token().await.is_err() {
+                    continue;
+                }
+                let identity = account.claude_identity(directory.as_deref());
+                let label = match &identity {
+                    Some(identity) => routing_account_label(
+                        &self.claude.routing,
+                        &identity.account_id,
+                        &identity.usernames,
+                        &source,
+                    ),
+                    None => self
+                        .claude
+                        .routing
+                        .account
+                        .contains_key(&source)
+                        .then_some(source),
+                };
+                if let Some(label) = label {
+                    claude.insert(label, "active");
+                } else if self.claude.routing.account_fallback.is_none()
+                    && self.claude.routing.account_probe.is_some()
+                {
+                    for state in claude.values_mut() {
+                        if *state == "inactive" {
+                            *state = "unknown";
+                        }
+                    }
+                }
+            }
+        }
+        [codex, claude]
+    }
+
     /// Safe display names for recorded account IDs, using routing's selector precedence.
     pub async fn traffic_credential_labels(&self) -> BTreeMap<(String, String), String> {
         let mut labels = BTreeMap::new();
@@ -608,6 +671,71 @@ pub(crate) fn routing_account_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn route_activation_tracks_saved_logins_and_file_only_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let saved = |id: &str| {
+            serde_json::json!({"tokens": {"account_id": id, "access_token": "token"}}).to_string()
+        };
+        std::fs::write(&auth, saved("first")).unwrap();
+        std::fs::write(dir.path().join("auth-second.json"), saved("second")).unwrap();
+        let mut config = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    account: {{first: none, second: none}}\nclaude:\n  config_dirs: [{}]\n  routing:\n    account: {{'user@example.com': none}}\n",
+            serde_json::to_string(dir.path()).unwrap(), serde_json::to_string(dir.path()).unwrap()
+        )).unwrap();
+        let states = config.account_route_states().await;
+        assert_eq!(states[0]["first"], "active");
+        assert_eq!(states[0]["second"], "inactive");
+        assert_eq!(states[1]["user@example.com"], "inactive");
+        std::fs::write(&auth, saved("second")).unwrap();
+        let states = config.account_route_states().await;
+        assert_eq!(states[0]["first"], "inactive");
+        assert_eq!(states[0]["second"], "active");
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"token"}}"#,
+        )
+        .unwrap();
+        config.claude.routing.account_probe = Some(crate::config::Choice::One("none".into()));
+        assert_eq!(
+            config.account_route_states().await[1]["user@example.com"],
+            "unknown"
+        );
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"uuid","emailAddress":"user@example.com"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.account_route_states().await[1]["user@example.com"],
+            "active"
+        );
+        // Local OAuth identity takes precedence over a configured source label.
+        config
+            .claude
+            .routing
+            .account
+            .insert("default".into(), crate::config::Choice::One("none".into()));
+        let states = config.account_route_states().await;
+        assert_eq!(states[1]["user@example.com"], "active");
+        assert_eq!(states[1]["default"], "inactive");
+        std::fs::write(dir.path().join(".credentials.json"), "{}").unwrap();
+        assert_eq!(
+            config.account_route_states().await[1]["user@example.com"],
+            "inactive"
+        );
+        config.codex.account_auth_file_only = false;
+        config.claude.account_auth_file_only = false;
+        assert!(
+            config
+                .account_route_states()
+                .await
+                .iter()
+                .all(BTreeMap::is_empty)
+        );
+    }
     use serde_json::json;
     #[tokio::test]
     async fn default_api_base_keys_keep_rustls() {

@@ -650,6 +650,119 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
 }
 
 #[tokio::test]
+async fn account_status_probes_remote_identity_and_preserves_warning_state() {
+    for (behavior, expected) in [("sse", "remote"), ("profile_unauthorized", "probe_failed")] {
+        let mut lookup = fixture("http", behavior).await;
+        let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join(".credentials.json");
+        std::fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
+        trust(&running, &lookup, &endpoint);
+        let states = running.server.account_route_states().await;
+        assert_eq!(states[1]["remote@example.invalid"], expected);
+        assert_eq!(
+            states[1]["other@example.invalid"],
+            if expected == "remote" {
+                "inactive"
+            } else {
+                "probe_failed"
+            }
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        let request = lookup.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /api/oauth/profile "));
+        assert!(request.contains("authorization: Bearer saved-secret"));
+        // Both successes and failures are cached to avoid polling storms.
+        assert_eq!(running.server.account_route_states().await, states);
+        assert!(lookup.requests.try_recv().is_err());
+        for (at, _) in running.server.account_checks.lock().await.values_mut() {
+            *at = Instant::now() - Duration::from_secs(31);
+        }
+        assert_eq!(running.server.account_route_states().await, states);
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /api/oauth/profile ")
+        );
+        // Metadata that no longer matches a route still uses the saved token's probe.
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"stale","emailAddress":"stale@example.invalid"}}"#,
+        )
+        .unwrap();
+        assert_eq!(running.server.account_route_states().await, states);
+        // A changed credential cannot reuse another token's probe result.
+        std::fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"replacement-secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            running.server.account_route_states().await[1]["remote@example.invalid"],
+            expected
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT ")
+        );
+        assert!(
+            lookup
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .contains("authorization: Bearer replacement-secret")
+        );
+        // Local matches take precedence, even with a failed cached remote check.
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"local","emailAddress":"remote@example.invalid"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            running.server.account_route_states().await[1]["remote@example.invalid"],
+            "active"
+        );
+        assert!(lookup.requests.try_recv().is_err());
+        std::fs::remove_file(&credentials).unwrap();
+        assert_eq!(
+            running.server.account_route_states().await[1]["remote@example.invalid"],
+            "inactive"
+        );
+        assert!(lookup.requests.try_recv().is_err());
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        assert!(!log.contains("saved-secret") && !log.contains("replacement-secret"));
+    }
+}
+
+#[tokio::test]
 async fn claude_saved_token_without_metadata_probes_then_routes_and_caches() {
     for file_only in [false, true] {
         let mut lookup = fixture("http", "sse").await;

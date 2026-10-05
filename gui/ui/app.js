@@ -19,6 +19,7 @@ const ICON = {
   search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
   trash: svg('<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>'),
   info: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.75v.01"/>'),
+  warning: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5M12 16.25v.01"/>'),
   folder: svg('<path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9.5a2 2 0 0 0-2-2h-7l-2-2.5H5a2 2 0 0 0-2 2.5z"/>'),
 };
 
@@ -123,6 +124,7 @@ function serviceMark(service) {
 const ui = {
   snap: null,
   fetchedAt: 0,
+  refreshRequest: 0,
   page: "main",
   filter: "requests",
   search: "",
@@ -148,10 +150,12 @@ const ui = {
 };
 
 async function refresh() {
+  const request = ++ui.refreshRequest;
   const [snap, recent] = await Promise.all([
     invoke("get_state"),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
+  if (request !== ui.refreshRequest) return;
   ui.snap = snap;
   ui.recent = recent.slice(0, 5);
   const proxies = snap.config.details?.proxies ?? [];
@@ -215,6 +219,7 @@ function renderTop() {
 }
 
 function renderPage() {
+  hideRouteTooltip();
   const content = $("content");
   if (ui.page === "activity") {
     if (ui.builtPage !== "activity") {
@@ -469,11 +474,20 @@ function routingChain(names) {
   return `<span class="chain">${names.map((name) => `<span class="route-proxy${name.length > 14 ? " route-proxy-long" : ""}" title="${esc(name === "none" ? "direct" : name)}">${tag(name)}</span>`).join('<span class="arrow">→</span>')}</span>`;
 }
 
-function routingRow(route, account) {
+function routingRow(route, account, fileOnly = false) {
   const identity = routeIdentity(route.selector, route.kind || (account ? "account" : "unknown"));
+  const warning = route.activation === "remote"
+    ? "No match in the local OAuth account cache. The account probe confirmed this account is available."
+    : "No match in the local OAuth account cache. The account probe could not confirm availability. Check the credential and account probe connection.";
+  const needsWarning = ["unknown", "remote", "probe_failed"].includes(route.activation);
+  const activation = !account || !fileOnly ? ""
+    : (route.activation === "inactive"
+      ? '<span class="route-activation bad" title="No configured local credential currently selects this account route. Sign in or configure its credential source.">Inactive</span>' : "")
+      + (route.activation === "probe_failed" ? '<span class="route-activation bad">Probe failed</span>' : "")
+      + (needsWarning ? `<span class="route-activation route-warning tip-wide" tabindex="0" role="img" aria-label="${esc(warning)}" data-tip="${esc(warning)}">${ICON.warning}</span>` : "");
   if (account || route.kind === "api_key") {
     return `<div class="route-summary route-static">
-      <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(route.selector)}">${esc(identity.name)}</span></span>
+      <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(route.selector)}">${esc(identity.name)}</span>${activation}</span>
       <span class="route-destination">${routingChain(route.proxies)}</span>
     </div>`;
   }
@@ -495,6 +509,64 @@ document.addEventListener("pointerover", (event) => {
   }
 });
 
+// Render account warnings outside the scrolling panel, with viewport-aware
+// placement instead of extending a pseudo-element left of the icon.
+let routeTooltipTimer;
+let routeTooltipOwner;
+
+function hideRouteTooltip() {
+  clearTimeout(routeTooltipTimer);
+  routeTooltipOwner?.removeAttribute("aria-describedby");
+  routeTooltipOwner = null;
+  $("route-tooltip").hidden = true;
+}
+
+function routeTooltipPosition(anchor, size, width, height) {
+  const margin = 12;
+  const left = Math.max(margin, Math.min(anchor.left, width - size.width - margin));
+  const above = anchor.top - size.height - 6;
+  const top = Math.max(margin, Math.min(above >= margin ? above : anchor.bottom + 6, height - size.height - margin));
+  return { left, top };
+}
+
+function showRouteTooltip(owner) {
+  if (routeTooltipOwner === owner) return;
+  hideRouteTooltip();
+  routeTooltipOwner = owner;
+  routeTooltipTimer = setTimeout(() => {
+    if (!owner.isConnected) return hideRouteTooltip();
+    const tip = $("route-tooltip");
+    tip.textContent = owner.dataset.tip;
+    tip.hidden = false;
+    tip.style.visibility = "hidden";
+    const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+    tip.style.visibility = "visible";
+    owner.setAttribute("aria-describedby", "route-tooltip");
+  }, 500);
+}
+
+for (const type of ["pointerover", "focusin"]) {
+  document.addEventListener(type, (event) => {
+    const owner = event.target.closest?.(".route-warning");
+    if (owner) showRouteTooltip(owner);
+  });
+}
+for (const type of ["pointerout", "focusout"]) {
+  document.addEventListener(type, (event) => {
+    const owner = event.target.closest?.(".route-warning");
+    if (!owner || owner.contains(event.relatedTarget)) return;
+    if (type === "pointerout" && document.activeElement === owner) return;
+    if (type === "focusout" && owner.matches(":hover")) return;
+    hideRouteTooltip();
+  });
+}
+document.addEventListener("scroll", (event) => {
+  if (event.target !== $("route-tooltip")) hideRouteTooltip();
+}, true);
+window.addEventListener("resize", hideRouteTooltip);
+
 function routingBlock() {
   const s = ui.snap;
   const d = s.config.details;
@@ -507,7 +579,7 @@ function routingBlock() {
     if (!configured) {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
     }
-    const rows = svc.accountRoutes.map((route) => routingRow(route, true)).join("")
+    const rows = svc.accountRoutes.map((route) => routingRow(route, true, svc.fileOnly)).join("")
       + svc.apiKeyRoutes.map((route) => routingRow(route, false)).join("");
     const fallbacks = svc.fallbacks.filter((f) => f.proxies)
       .sort((a, b) => MINOR_FALLBACKS.has(a.key) - MINOR_FALLBACKS.has(b.key))
@@ -1039,5 +1111,5 @@ refresh().then(probeStale);
 setInterval(() => {
   if (document.hidden) return;
   if (ui.page === "activity") loadTraffic();
-  else if (ui.page === "main") loadHomeTraffic();
+  else if (ui.page === "main") refresh();
 }, 15000);
