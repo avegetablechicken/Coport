@@ -1587,31 +1587,77 @@ async fn connect_only_falls_back_to_explicit_candidates_before_establishment() {
 
 #[tokio::test]
 async fn claude_named_settings_forward_to_file_upstream_through_selected_proxy() {
+    for (base_path, target) in [
+        ("/custom", "/anthropic/v1/messages"),
+        (
+            "/custom",
+            "/anthropic/https://upstream.invalid/custom/v1/messages",
+        ),
+        (
+            "/custom",
+            "/claude/https://upstream.invalid/custom/v1/messages",
+        ),
+        ("", "/https://upstream.invalid/v1/messages"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api.json"), serde_json::to_string(&serde_json::json!({"env": {
+        "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:8787/https://upstream.invalid{base_path}"),
+        "ANTHROPIC_AUTH_TOKEN": "profile-secret"
+    }})).unwrap()).unwrap();
+        let mut fixture = fixture("http", "sse").await;
+        let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key:\n      api: selected\n", serde_json::to_string(dir.path()).unwrap())).await;
+        trust(&running, &fixture, &endpoint);
+        let mut response = http()
+            .post(format!("{}{target}", running.url))
+            .bearer_auth("profile-secret")
+            .body("model-body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{target}");
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(connect.starts_with("CONNECT upstream.invalid:443"));
+        assert!(!connect.contains("profile-secret"));
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with(&format!("POST {base_path}/v1/messages HTTP/1.1")));
+        assert!(request.contains("authorization: Bearer profile-secret"));
+        assert!(!request.contains("oauth-2025-04-20"));
+        assert!(request.ends_with("model-body"));
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+        fixture.release.notify_one();
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: last\n\n");
+    }
+}
+
+#[tokio::test]
+async fn claude_explicit_target_is_checked_before_forwarding_or_profile_lookup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("api.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://upstream.invalid/custom","ANTHROPIC_AUTH_TOKEN":"profile-secret"}}"#).unwrap();
     let mut fixture = fixture("http", "sse").await;
     let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
-    let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key:\n      api: selected\n", serde_json::to_string(dir.path()).unwrap())).await;
+    let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{}]\n  account_auth_file_only: false\n  routing:\n    account_probe: selected\n    api_key:\n      api: selected\n", serde_json::to_string(dir.path()).unwrap())).await;
     trust(&running, &fixture, &endpoint);
-    let mut response = http()
-        .post(format!("{}/anthropic/v1/messages", running.url))
-        .bearer_auth("profile-secret")
-        .body("model-body")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let connect = fixture.requests.recv().await.unwrap();
-    assert!(connect.starts_with("CONNECT upstream.invalid:443"));
-    assert!(!connect.contains("profile-secret"));
-    let request = fixture.requests.recv().await.unwrap();
-    assert!(request.starts_with("POST /custom/v1/messages HTTP/1.1"));
-    assert!(request.contains("authorization: Bearer profile-secret"));
-    assert!(!request.contains("oauth-2025-04-20"));
-    assert!(request.ends_with("model-body"));
-    assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
-    fixture.release.notify_one();
-    assert_eq!(response.chunk().await.unwrap().unwrap(), "data: last\n\n");
+    for token in ["profile-secret", "unknown-account-secret"] {
+        for target in [
+            "/https://other.invalid/custom/v1/messages",
+            "/https://upstream.invalid:444/custom/v1/messages",
+            "/https://upstream.invalid/custom-evil/v1/messages",
+            "/https://upstream.invalid/v1/messages",
+        ] {
+            let response = http()
+                .post(format!("{}/anthropic{target}", running.url))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 502, "{target}");
+            assert!(response.text().await.unwrap().contains(
+                "Explicit upstream must match the credential's configured HTTPS upstream and API base."
+            ));
+            assert!(fixture.requests.try_recv().is_err());
+        }
+    }
 }
 
 #[tokio::test]

@@ -130,7 +130,7 @@ impl Server {
                             .parse()
                             .map_err(|_| Error::config("Invalid Claude account credential."))?,
                     );
-                    let route = self.claude_route(&headers, &mut log).await?;
+                    let route = self.claude_route(&headers, None, &mut log).await?;
                     Ok(route.identity.as_ref().and_then(|identity| {
                         crate::identity::routing_account_label(
                             &self.config.claude.routing,
@@ -179,9 +179,15 @@ impl Server {
     async fn claude_route(
         &self,
         headers: &HeaderMap,
+        target: Option<&str>,
         log: &mut RequestLog,
     ) -> Result<crate::claude::ClaudeRoute> {
         let mut route = self.config.claude.resolve(headers).await?;
+        if let Some(target) = target {
+            // Validate against the matched credential's upstream, before any
+            // OAuth profile lookup. Named settings can override the global base.
+            route.url(target)?;
+        }
         if !route.needs_profile {
             return Ok(route);
         }
@@ -587,17 +593,12 @@ impl Server {
         } else {
             crate::claude::target(target).or_else(|| explicit_api_route.as_ref().map(|_| target))
         };
-        if let Some(claude_target) = claude_target {
-            if explicit_api_route.is_none() {
-                // Reject undeclared destinations before an OAuth profile lookup.
-                self.config.claude.url(claude_target)?;
-            }
-        }
         let claude_route = if claude_target.is_some() {
             Some(if let Some(route) = explicit_api_route {
                 route
             } else {
-                self.claude_route(incoming.headers(), log).await?
+                self.claude_route(incoming.headers(), claude_target, log)
+                    .await?
             })
         } else {
             None
