@@ -227,11 +227,21 @@ mod tests {
             out,
             "listen_port: 9000 # local\nrequest_timeout_seconds: 300\n"
         );
-        let out = set_scalar(EXAMPLE, &["websocket", "read_seconds"], "1200").unwrap();
-        assert_eq!(
-            out,
-            EXAMPLE.replace("  read_seconds: 900\n", "  read_seconds: 1200\n")
-        );
+        // Git may check the fixture out with CRLF on Windows. Exercise both
+        // styles on every platform and require the edit to preserve them.
+        let example_lf = EXAMPLE.replace("\r\n", "\n");
+        for newline in ["\n", "\r\n"] {
+            let example = example_lf.replace('\n', newline);
+            let out = set_scalar(&example, &["websocket", "read_seconds"], "1200").unwrap();
+            assert_eq!(
+                out,
+                example.replace(
+                    &format!("  read_seconds: 900{newline}"),
+                    &format!("  read_seconds: 1200{newline}")
+                )
+            );
+            assert_eq!(Config::parse(&out).unwrap().websocket.read_seconds, 1200.0);
+        }
         let out = set_scalar(EXAMPLE, &["claude", "account_auth_file_only"], "false").unwrap();
         let config = Config::parse(&out).unwrap();
         assert!(!config.claude.account_auth_file_only);
