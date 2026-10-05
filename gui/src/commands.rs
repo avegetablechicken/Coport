@@ -9,18 +9,29 @@ use crate::{
     tray,
 };
 use serde::Deserialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// Returns immediately with the last account activation; a refresh of it runs
+/// in the background and emits `state-changed` when the result differs.
 #[tauri::command]
-pub async fn get_state(state: State<'_, AppState>) -> Result<Snapshot> {
-    let (mut snapshot, probe) = {
-        let mut core = state.core.lock().unwrap();
-        (core.snapshot(), core.account_probe())
-    };
-    if let Some(probe) = probe {
-        snapshot.set_account_route_states(probe.account_route_states().await);
+pub async fn get_state(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot> {
+    let mut core = state.core.lock().unwrap();
+    let mut snapshot = core.snapshot();
+    if let Some(states) = core.account_states() {
+        snapshot.set_account_route_states(states);
+    }
+    if let Some(probe) = core.begin_account_states() {
+        tauri::async_runtime::spawn(async move {
+            let states = probe.account_route_states().await;
+            let state = app.state::<AppState>();
+            state
+                .core
+                .lock()
+                .unwrap()
+                .finish_account_states(&probe, states);
+        });
     }
     Ok(snapshot)
 }

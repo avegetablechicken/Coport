@@ -23,6 +23,10 @@ pub struct Core {
     pub launch_at_login: bool,
     config: ConfigCache,
     account_probe: Option<std::sync::Arc<coport::server::Server>>,
+    /// Last account activation; kept across config changes until replaced.
+    account_states: Option<AccountStates>,
+    account_states_pending: bool,
+    notify: Notify,
     /// Config file modification time when the proxy last started.
     started_stamp: Option<Option<SystemTime>>,
 }
@@ -73,12 +77,18 @@ impl Core {
             settings.save();
         }
         Self {
-            logs: LogFeed::new(log_path.unwrap_or_else(|| settings.log_path()), notify),
+            logs: LogFeed::new(
+                log_path.unwrap_or_else(|| settings.log_path()),
+                notify.clone(),
+            ),
             controller,
             launch_at_login: platform::launch_at_login(),
             settings,
             config: ConfigCache::default(),
             account_probe: None,
+            account_states: None,
+            account_states_pending: false,
+            notify,
             started_stamp,
         }
     }
@@ -109,6 +119,7 @@ impl Core {
         }
         cache.exists = path.is_file();
         self.account_probe = None;
+        self.account_states_pending = false;
         cache.parsed = Some(match std::fs::read_to_string(&path) {
             Ok(text) => parse_config(&text),
             Err(_) => Err("Cannot read configuration file.".to_owned()),
@@ -119,10 +130,53 @@ impl Core {
 
     pub fn invalidate_config(&mut self) {
         self.config = ConfigCache::default();
-        self.account_probe = None;
+        self.reset_account_probe();
     }
 
-    pub(crate) fn account_probe(&mut self) -> Option<std::sync::Arc<coport::server::Server>> {
+    fn reset_account_probe(&mut self) {
+        self.account_probe = None;
+        self.account_states_pending = false;
+    }
+
+    pub(crate) fn account_states(&self) -> Option<AccountStates> {
+        self.account_states.clone()
+    }
+
+    /// Starts an account activation refresh unless one is already running.
+    /// Profile lookups can take seconds, so snapshots never wait for them.
+    pub(crate) fn begin_account_states(
+        &mut self,
+    ) -> Option<std::sync::Arc<coport::server::Server>> {
+        if self.account_states_pending {
+            return None;
+        }
+        let probe = self.account_probe()?;
+        self.account_states_pending = true;
+        Some(probe)
+    }
+
+    /// Stores the result of `begin_account_states`, notifying on change.
+    /// Results for a configuration that has since been replaced are dropped.
+    pub(crate) fn finish_account_states(
+        &mut self,
+        probe: &std::sync::Arc<coport::server::Server>,
+        states: AccountStates,
+    ) {
+        if !self
+            .account_probe
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, probe))
+        {
+            return;
+        }
+        self.account_states_pending = false;
+        if self.account_states.as_ref() != Some(&states) {
+            self.account_states = Some(states);
+            (self.notify)();
+        }
+    }
+
+    fn account_probe(&mut self) -> Option<std::sync::Arc<coport::server::Server>> {
         if self.account_probe.is_none() {
             let config = self.loaded_config()?.clone();
             let logger = std::sync::Arc::new(coport::logger::Logger::new(
@@ -480,8 +534,10 @@ pub struct Snapshot {
     settings: SettingsDto,
 }
 
+pub(crate) type AccountStates = [BTreeMap<String, &'static str>; 2];
+
 impl Snapshot {
-    pub fn set_account_route_states(&mut self, states: [BTreeMap<String, &'static str>; 2]) {
+    pub fn set_account_route_states(&mut self, states: AccountStates) {
         if let Some(details) = &mut self.config.details {
             for (service, states) in [&mut details.codex, &mut details.claude]
                 .into_iter()
