@@ -515,7 +515,7 @@ function routingBlock() {
     return `<div class="routing-service"><div class="subhead"><span>${name}</span>${badge}</div>${rows}
       ${fallbacks ? `<div class="route-defaults"><div class="route-defaults-title">Defaults &amp; helpers</div>${fallbacks}</div>` : ""}</div>`;
   };
-  return block("Routing", `Timeout ${d.timeoutSecs} s`, section("Codex", d.codex) + section("Claude", d.claude));
+  return block("Routing", "", section("Codex", d.codex) + section("Claude", d.claude));
 }
 
 // ---------------------------------------------------------------- activity
