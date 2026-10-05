@@ -3,7 +3,8 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-if (navigator.userAgent.includes("Mac")) document.documentElement.classList.add("macos");
+const IS_MAC = navigator.userAgent.includes("Mac");
+if (IS_MAC) document.documentElement.classList.add("macos");
 
 // ---------------------------------------------------------------- icons
 
@@ -184,7 +185,7 @@ function uptime() {
 
 // ---------------------------------------------------------------- render
 
-const BACK_KEYS = /Mac/.test(navigator.platform) ? "Meta+[" : "Control+[";
+const BACK_KEYS = IS_MAC ? "Meta+[" : "Alt+ArrowLeft";
 
 function render() {
   if (!ui.snap) return;
@@ -1079,10 +1080,13 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   const mod = event.metaKey || event.ctrlKey;
+  const back = !event.shiftKey && (IS_MAC
+    ? event.metaKey && !event.ctrlKey && !event.altKey && event.key === "["
+    : event.altKey && !event.ctrlKey && !event.metaKey && event.key === "ArrowLeft");
   if (event.key === "Escape") {
     if (ui.page !== "main") act("page", { dataset: { page: "main" } });
     else invoke("hide_panel");
-  } else if (mod && event.key === "[") {
+  } else if (back) {
     // Same as the Back button, on every page that has one.
     event.preventDefault();
     if (ui.page !== "main") act("page", { dataset: { page: "main" } });
