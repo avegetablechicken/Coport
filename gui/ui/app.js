@@ -132,7 +132,7 @@ const ui = {
   rows: [],
   recent: [],
   trafficMinutes: 30,
-  trafficScope: "all",
+  trafficScope: "model",
   homeTraffic: null,
   homeTrafficMinutes: 30,
   homeTrafficRequest: 0,

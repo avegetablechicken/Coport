@@ -14,8 +14,8 @@ use std::{
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficScope {
-    #[default]
     All,
+    #[default]
     Model,
 }
 
