@@ -38,6 +38,8 @@ mod transport;
 mod websocket_relay;
 use transport::*;
 
+type AccountCheck = (Instant, Result<Option<String>>);
+
 pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
@@ -47,7 +49,7 @@ pub struct Server {
     claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
     // UI checks are serialized and cached briefly, including failures. The key
     // is the credential, so switching a saved login forces a new check.
-    account_checks: tokio::sync::Mutex<HashMap<String, (Instant, Result<Option<String>>)>>,
+    account_checks: tokio::sync::Mutex<HashMap<String, AccountCheck>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 }
 impl Server {
