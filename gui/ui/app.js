@@ -935,7 +935,18 @@ function queueFit() {
   });
 }
 
-new ResizeObserver(queueFit).observe($("content"));
+// #content fills the window, so in-page growth (e.g. an opened disclosure)
+// only shows up on the page element, which each render replaces.
+const fitObserver = new ResizeObserver(queueFit);
+fitObserver.observe($("content"));
+let observedPage = null;
+new MutationObserver(() => {
+  const page = $("content").firstElementChild;
+  if (page === observedPage) return;
+  if (observedPage) fitObserver.unobserve(observedPage);
+  if (page) fitObserver.observe(page);
+  observedPage = page;
+}).observe($("content"), { childList: true });
 
 // ---------------------------------------------------------------- actions
 
