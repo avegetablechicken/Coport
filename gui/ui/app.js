@@ -148,6 +148,7 @@ const ui = {
   choosePath: false,
   websocketOpen: false,
   snippetsOpen: false,
+  rendering: false,
   proxies: {},
   tagColors: {},
 };
@@ -240,6 +241,7 @@ function renderPage() {
   const focused = content.contains(document.activeElement) && document.activeElement.matches("input[id]")
     ? document.activeElement : null;
   const typing = focused && { id: focused.id, value: focused.value, start: focused.selectionStart, end: focused.selectionEnd };
+  ui.rendering = true;
   content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : main()}</div>`;
   const field = typing && $(typing.id);
   if (field) {
@@ -247,6 +249,7 @@ function renderPage() {
     field.focus();
     field.setSelectionRange(typing.start, typing.end);
   }
+  ui.rendering = false;
 }
 
 /// A block: titled box with an optional right-aligned headline.
@@ -906,6 +909,21 @@ function configSettings() {
   )}`;
 }
 
+/// Saves a number field when it differs from the configuration. Called on
+/// focus loss rather than `change`: a re-render recreates the focused field,
+/// which resets the baseline `change` compares against.
+async function commitConfigField(input) {
+  const key = input.dataset.config;
+  const text = input.value.trim();
+  const value = Number(text);
+  if (text === "" || !Number.isFinite(value)) {
+    toast("Enter a number");
+    render();
+  } else if (value !== ui.snap.config.details?.editable[key]) {
+    await setConfigValue(key, value);
+  }
+}
+
 async function setConfigValue(key, value) {
   try {
     await invoke("set_config_value", { key, value });
@@ -1115,18 +1133,6 @@ document.addEventListener("change", async (event) => {
     await loadTraffic();
     return;
   }
-  const configKey = event.target.dataset?.config;
-  if (configKey) {
-    const text = event.target.value.trim();
-    const value = Number(text);
-    if (text === "" || !Number.isFinite(value)) {
-      toast("Enter a number");
-      render();
-    } else if (value !== ui.snap.config.details?.editable[configKey]) {
-      await setConfigValue(configKey, value);
-    }
-    return;
-  }
   const key = event.target.dataset?.setting;
   if (!key) return;
   await invoke("update_settings", { patch: { [key]: event.target.value } });
@@ -1186,6 +1192,10 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "Enter" && event.target.id === "config-path") {
     act("apply-path");
   }
+});
+
+document.addEventListener("focusout", (event) => {
+  if (!ui.rendering && event.target.matches?.("[data-config]")) commitConfigField(event.target);
 });
 
 // Re-renders rebuild disclosures, so their open state lives in `ui`.
