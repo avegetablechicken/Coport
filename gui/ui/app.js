@@ -794,7 +794,7 @@ function requestRow(e, expandable) {
   const modelCall = e.event.startsWith("model_call_");
   const unknown = e.event === "model_call_unknown";
   const incomplete = e.event === "model_call_incomplete";
-  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : incomplete ? "INC" : e.event === "model_call_finished" ? "OK" : "RUN") : e.status ?? (e.error ? "ERR" : "—");
+  const code = cancelled ? "CXL" : modelCall ? (unknown ? "?" : e.error ? "ERR" : incomplete ? "INC" : e.event === "model_call_finished" ? "OK" : "RUN") : e.error && !(e.status >= 400) ? "ERR" : e.status ?? "—";
   const tip = cancelled ? "Cancelled" : unknown ? "Outcome unavailable" : incomplete ? `Incomplete${e.fields?.incomplete_reason ? `: ${e.fields.incomplete_reason}` : ""}` : "";
   const meta = [fmtTime(e.time), modelCall && e.fields?.model, e.service, e.proxy && (e.proxy === "none" ? "direct" : e.proxy), e.bytes != null && fmtBytes(e.bytes)]
     .filter(Boolean)
