@@ -147,6 +147,7 @@ const ui = {
   builtPage: null,
   choosePath: false,
   websocketOpen: false,
+  snippetsOpen: false,
   proxies: {},
   tagColors: {},
 };
@@ -389,7 +390,7 @@ function connectBlock() {
     "Connect",
     "",
     `${row("Claude Code", s.urls.claude)}${row("Codex", s.urls.codex)}
-     <details class="disclosure"><summary>${ICON.chevron}Setup snippets</summary>
+     <details class="disclosure" id="setup-snippets" ${ui.snippetsOpen ? "open" : ""}><summary>${ICON.chevron}Setup snippets</summary>
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Top of ~/.codex/config.toml, then restart Codex", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
        ${snippet("CA for HTTPS: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
@@ -855,7 +856,7 @@ function settings() {
          <button class="btn" data-action="check" ${s.config.exists && !s.check.running ? "" : "disabled"}
            data-tip="Validates credential sources like --check">Check Credentials</button>
        </div>
-       <details class="disclosure" ${ui.choosePath ? "open" : ""}><summary>${ICON.chevron}Use another file</summary>
+       <details class="disclosure" id="config-path-disclosure" ${ui.choosePath ? "open" : ""}><summary>${ICON.chevron}Use another file</summary>
          <div class="inline-form"><input class="field" id="config-path" spellcheck="false" aria-label="YAML configuration path" placeholder="Path to config.yaml or config.yml" value="${esc(s.config.path)}" />
            <button class="btn" data-action="apply-path">Apply</button></div>
        </details>`
@@ -1187,8 +1188,12 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+// Re-renders rebuild disclosures, so their open state lives in `ui`.
 document.addEventListener("toggle", (event) => {
-  if (event.target.id === "websocket-timeouts") ui.websocketOpen = event.target.open;
+  const { id, open } = event.target;
+  if (id === "websocket-timeouts") ui.websocketOpen = open;
+  else if (id === "config-path-disclosure") ui.choosePath = open;
+  else if (id === "setup-snippets") ui.snippetsOpen = open;
 }, true);
 
 document.addEventListener("contextmenu", (event) => {
