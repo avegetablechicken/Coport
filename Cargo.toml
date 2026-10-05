@@ -41,6 +41,16 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Same keyring backends as the Codex CLI, so its saved logins are readable.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["linux-native-async-persistent", "crypto-rust", "tokio"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 

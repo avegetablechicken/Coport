@@ -495,10 +495,10 @@ async fn claude_native_auth_paths_and_sse_passthrough() {
         let mut fixture = fixture("http", "sse").await;
         let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
         let credentials = tempfile::tempdir().unwrap();
-        let file = credentials.path().join("credentials.json");
+        let file = credentials.path().join(".credentials.json");
         std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"model-secret"}}"#).unwrap();
         let dir = serde_json::to_string(&credentials.path()).unwrap();
-        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{dir}]\n  auth_file: credentials.json\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{dir}]\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
         trust(&running, &fixture, &endpoint);
         let name = if bearer { "authorization" } else { "x-api-key" };
         let value = if bearer {
@@ -770,10 +770,10 @@ async fn claude_saved_token_without_metadata_probes_then_routes_and_caches() {
         let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
         let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
         let credentials = tempfile::tempdir().unwrap();
-        let file = credentials.path().join("credentials.json");
+        let file = credentials.path().join(".credentials.json");
         std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#).unwrap();
         let dir = serde_json::to_string(&credentials.path()).unwrap();
-        let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  config_dirs: [{dir}]\n  auth_file: credentials.json\n  account_auth_file_only: {file_only}\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
+        let running = running(&format!("proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nclaude:\n  config_dirs: [{dir}]\n  account_auth_file_only: {file_only}\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: selected\n    account_probe: lookup\n")).await;
         trust(&running, &lookup, &lookup_endpoint);
         trust(&running, &payload, &payload_endpoint);
         for first in [true, false] {

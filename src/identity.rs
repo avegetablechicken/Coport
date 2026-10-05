@@ -45,20 +45,26 @@ fn usernames(access: &Value, id: &Value) -> Vec<String> {
         .collect()
 }
 impl Identity {
+    /// A saved Codex login file, such as an archived `auth-*.json`.
     pub fn read(path: &str) -> Result<Self> {
-        let raw =
-            std::fs::read(expand(path)).map_err(|_| Error::config("Cannot read auth_file."))?;
-        let value: Value =
-            serde_json::from_slice(&raw).map_err(|_| Error::config("Invalid auth_file."))?;
+        let raw = std::fs::read(expand(path))
+            .map_err(|_| Error::config("Cannot read Codex login file."))?;
+        Self::parse(
+            &serde_json::from_slice(&raw)
+                .map_err(|_| Error::config("Invalid Codex login file."))?,
+        )
+    }
+    /// The ChatGPT account of a saved Codex login (`auth.json` layout).
+    pub fn parse(value: &Value) -> Result<Self> {
         let tokens = &value["tokens"];
         let id = tokens["account_id"]
             .as_str()
             .filter(|s| valid_token(s))
-            .ok_or(Error::config("auth_file requires tokens.account_id."))?;
+            .ok_or(Error::config("Codex login requires tokens.account_id."))?;
         let token = tokens["access_token"]
             .as_str()
             .filter(|s| valid_token(s))
-            .ok_or(Error::config("auth_file requires tokens.access_token."))?;
+            .ok_or(Error::config("Codex login requires tokens.access_token."))?;
         Ok(Self {
             account_id: id.into(),
             token: token.into(),
@@ -83,6 +89,99 @@ impl Identity {
             refresh_token: None,
             usernames: usernames(&c, &Value::Null),
         })
+    }
+}
+/// Where the Codex CLI keeps its login for a home (`cli_auth_credentials_store`).
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum AuthStore {
+    #[default]
+    File,
+    Keyring,
+    Auto,
+    Ephemeral,
+}
+#[derive(Default, Deserialize)]
+struct AuthSettings {
+    #[serde(default)]
+    cli_auth_credentials_store: AuthStore,
+    #[serde(default)]
+    features: AuthFeatures,
+}
+#[derive(Deserialize)]
+struct AuthFeatures {
+    /// Encrypted local secrets file instead of a direct keyring entry; Codex
+    /// enables it by default on Windows only.
+    #[serde(default = "secret_auth_storage_default")]
+    secret_auth_storage: bool,
+}
+impl Default for AuthFeatures {
+    fn default() -> Self {
+        Self {
+            secret_auth_storage: secret_auth_storage_default(),
+        }
+    }
+}
+fn secret_auth_storage_default() -> bool {
+    cfg!(windows)
+}
+fn auth_settings(home: &Path) -> Result<AuthSettings> {
+    match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) => {
+            toml::from_str(&text).map_err(|_| Error::config("Cannot parse Codex config.toml."))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthSettings::default()),
+        Err(_) => Err(Error::config("Cannot read Codex config.toml.")),
+    }
+}
+/// The Codex CLI's keyring account for a home: a digest of its canonical path.
+fn keyring_account(home: &Path) -> String {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let digest = ring::digest::digest(&ring::digest::SHA256, home.to_string_lossy().as_bytes());
+    let hex: String = digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("cli|{hex}")
+}
+const KEYRING_SERVICE: &str = "Codex Auth";
+/// The login the Codex CLI saved for `home`, read from wherever that home's
+/// `config.toml` tells Codex to keep it.
+pub(crate) async fn saved_auth(home: &Path) -> Result<Value> {
+    let settings = auth_settings(home)?;
+    let file = || {
+        let raw = std::fs::read(home.join("auth.json"))
+            .map_err(|_| Error::config("Cannot read Codex auth.json."))?;
+        serde_json::from_slice::<Value>(&raw).map_err(|_| Error::config("Invalid Codex auth.json."))
+    };
+    let keyring = || async {
+        if settings.features.secret_auth_storage {
+            return Err(Error::config(
+                "Codex encrypted auth storage (secret_auth_storage) is not supported.",
+            ));
+        }
+        crate::keychain::read(KEYRING_SERVICE, &keyring_account(home))
+            .await?
+            .map(|raw| {
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|_| Error::config("Invalid Codex login in the OS credential store."))
+            })
+            .transpose()
+    };
+    match settings.cli_auth_credentials_store {
+        AuthStore::File => file(),
+        AuthStore::Keyring => keyring()
+            .await?
+            .ok_or(Error::config("No Codex login in the OS credential store.")),
+        // As in Codex, any keyring miss or failure falls back to the file.
+        AuthStore::Auto => match keyring().await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => file(),
+            Err(error) => file().map_err(|_| error),
+        },
+        AuthStore::Ephemeral => Err(Error::config(
+            "Codex keeps ephemeral logins in its own process memory.",
+        )),
     }
 }
 #[derive(Deserialize)]
@@ -136,11 +235,8 @@ pub struct ProviderCredential {
     pub account_id: Option<String>,
 }
 
-fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>)> {
-    let raw =
-        std::fs::read(path).map_err(|_| Error::config("Cannot read Codex provider auth.json."))?;
-    let value: Value = serde_json::from_slice(&raw)
-        .map_err(|_| Error::config("Invalid Codex provider auth.json."))?;
+async fn saved_provider_auth(home: &Path) -> Result<(String, Option<String>)> {
+    let value = saved_auth(home).await?;
     let mode = value["auth_mode"].as_str().unwrap_or_else(|| {
         if value["OPENAI_API_KEY"].is_string() {
             "apikey"
@@ -151,7 +247,7 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
     match mode {
         "apikey" => Ok((
             key(value["OPENAI_API_KEY"].as_str().ok_or(Error::config(
-                "Codex provider auth.json requires OPENAI_API_KEY.",
+                "Codex provider login requires OPENAI_API_KEY.",
             ))?)?,
             None,
         )),
@@ -159,7 +255,7 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
             let token = key(value["tokens"]["access_token"]
                 .as_str()
                 .ok_or(Error::config(
-                    "Codex provider auth.json requires tokens.access_token.",
+                    "Codex provider login requires tokens.access_token.",
                 ))?)?;
             let account = value["tokens"]["account_id"]
                 .as_str()
@@ -167,9 +263,7 @@ fn saved_provider_auth(path: &std::path::Path) -> Result<(String, Option<String>
                 .map(String::from);
             Ok((token, account))
         }
-        _ => Err(Error::config(
-            "Unsupported Codex provider auth.json auth_mode.",
-        )),
+        _ => Err(Error::config("Unsupported Codex provider login auth_mode.")),
     }
 }
 impl Codex {
@@ -303,13 +397,10 @@ impl Provider {
         {
             (key(token)?, None)
         } else if definition.is_some_and(|(_, d)| d.requires_openai_auth) {
-            saved_provider_auth(
-                &home
-                    .ok_or(Error::config(
-                        "Saved provider authentication requires a configured Codex home.",
-                    ))?
-                    .join("auth.json"),
-            )?
+            saved_provider_auth(home.ok_or(Error::config(
+                "Saved provider authentication requires a configured Codex home.",
+            ))?)
+            .await?
         } else {
             return Err(Error::config(
                 "Codex provider has no configured Bearer credential.",
@@ -358,42 +449,31 @@ pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Resul
 }
 impl Codex {
     pub(crate) async fn account_identity(&self, source: &AccountSource) -> Result<Identity> {
-        if let Some(name) = &source.auth_env {
-            let mut found = None;
-            let inherited = crate::codex_env::inherited();
-            for home in &self.homes {
-                let environment = crate::codex_env::load(&expand(home).join(".env"), &inherited);
-                if let Some(value) = environment.get(name) {
-                    let token = key(value)?;
-                    if found.as_ref().is_some_and(|previous| previous != &token) {
-                        return Err(Error::config(
-                            "Account environment variable has different values across Codex homes; use auth_file sources.",
-                        ));
-                    }
-                    found = Some(token);
+        let name = match source {
+            AccountSource::Directory(home) => return Identity::parse(&saved_auth(home).await?),
+            AccountSource::Env(name) => name,
+        };
+        let mut found = None;
+        let inherited = crate::codex_env::inherited();
+        for home in &self.homes {
+            let environment = crate::codex_env::load(&expand(home).join(".env"), &inherited);
+            if let Some(value) = environment.get(name) {
+                let token = key(value)?;
+                if found.as_ref().is_some_and(|previous| previous != &token) {
+                    return Err(Error::config(
+                        "Account environment variable has different values across Codex homes; use their saved logins instead.",
+                    ));
                 }
-            }
-            if let Some(token) = found {
-                return Identity::from_token(&token).ok_or(Error::config(
-                    "Codex account token requires ChatGPT account claims.",
-                ));
+                found = Some(token);
             }
         }
-        source.codex_identity().await
-    }
-}
-
-impl AccountSource {
-    pub(crate) async fn codex_identity(&self) -> Result<Identity> {
-        if let Some(name) = &self.auth_env {
-            let token = environment_key(name).await?;
-            return Identity::from_token(&token).ok_or(Error::config(
-                "Codex account token requires ChatGPT account claims.",
-            ));
-        }
-        Identity::read(self.auth_file.as_deref().ok_or(Error::config(
-            "Codex account requires an explicit credential source.",
-        ))?)
+        let token = match found {
+            Some(token) => token,
+            None => environment_key(name).await?,
+        };
+        Identity::from_token(&token).ok_or(Error::config(
+            "Codex account token requires ChatGPT account claims.",
+        ))
     }
 }
 #[cfg(unix)]
@@ -480,7 +560,7 @@ impl Config {
         };
         let mut codex = initial(self.codex.account_auth_file_only, &self.codex.routing);
         if !codex.is_empty() {
-            for (source, account, _) in self.codex.account_sources() {
+            for (source, account) in self.codex.account_sources() {
                 if let Ok(identity) = self.codex.account_identity(&account).await {
                     if let Some(label) = routing_account_label(
                         &self.codex.routing,
@@ -495,11 +575,11 @@ impl Config {
         }
         let mut claude = initial(self.claude.account_auth_file_only, &self.claude.routing);
         if !claude.is_empty() {
-            for (source, account, directory) in self.claude.account_sources() {
+            for (source, account) in self.claude.account_sources() {
                 if account.claude_token().await.is_err() {
                     continue;
                 }
-                let identity = account.claude_identity(directory.as_deref());
+                let identity = account.claude_identity();
                 let label = match &identity {
                     Some(identity) => routing_account_label(
                         &self.claude.routing,
@@ -533,7 +613,7 @@ impl Config {
     /// Safe display names for recorded account IDs, using routing's selector precedence.
     pub async fn traffic_credential_labels(&self) -> BTreeMap<(String, String), String> {
         let mut labels = BTreeMap::new();
-        for (source, account, _) in self.codex.account_sources() {
+        for (source, account) in self.codex.account_sources() {
             if let Ok(identity) = self.codex.account_identity(&account).await {
                 if let Some(selector) = routing_account_label(
                     &self.codex.routing,
@@ -578,8 +658,8 @@ impl Config {
                 }
             }
         }
-        for (source, account, directory) in self.claude.account_sources() {
-            if let Some(identity) = account.claude_identity(directory.as_deref()) {
+        for (source, account) in self.claude.account_sources() {
+            if let Some(identity) = account.claude_identity() {
                 if let Some(selector) = routing_account_label(
                     &self.claude.routing,
                     &identity.account_id,
@@ -627,7 +707,7 @@ impl Config {
         self.claude.check_credentials().await?;
         let mut keys = HashSet::new();
         if self.codex.account_auth_file_only {
-            for (label, source, _) in &self.codex.account_sources() {
+            for (label, source) in &self.codex.account_sources() {
                 let i = self.codex.account_identity(source).await?;
                 self.account_choice(&i, Some(label))?;
                 if !keys.insert(i.token) {
@@ -831,36 +911,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relative_account_files_use_each_configured_home() {
+    async fn account_logins_come_from_each_home_and_its_credential_store() {
         let dir = tempfile::tempdir().unwrap();
+        let login = |label: &str, token: &str| {
+            json!({"tokens":{"account_id":label, "access_token":token}}).to_string()
+        };
         for label in ["a", "b"] {
             let home = dir.path().join(label);
             std::fs::create_dir(&home).unwrap();
             std::fs::write(
-                home.join("login.json"),
-                json!({"tokens":{
-                    "account_id":label, "access_token":format!("token-{label}")
-                }})
-                .to_string(),
+                home.join("auth.json"),
+                login(label, &format!("token-{label}")),
             )
             .unwrap();
         }
+        // Home b keeps its login in the keyring; its auth.json is stale.
+        let b = dir.path().join("b");
+        std::fs::write(
+            b.join("config.toml"),
+            "cli_auth_credentials_store = \"keyring\"\n",
+        )
+        .unwrap();
+        crate::keychain::set_test_entry(
+            KEYRING_SERVICE,
+            &keyring_account(&b),
+            Some(&login("b", "keyring-b")),
+        );
         let c = Config::parse(&format!(
             "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}, {}]\n  auth_file: login.json\n  routing:\n    account: {{a: none, b: none}}\n",
             serde_json::to_string(&dir.path().join("a")).unwrap(),
-            serde_json::to_string(&dir.path().join("b")).unwrap()
+            serde_json::to_string(&b).unwrap()
         )).unwrap();
         c.check_credentials().await.unwrap();
-        for label in ["a", "b"] {
+        for (token, account) in [("token-a", "a"), ("keyring-b", "b")] {
             assert_eq!(
-                c.resolve(Some(&format!("Bearer token-{label}")), false)
+                c.resolve(Some(&format!("Bearer {token}")), false)
                     .await
                     .unwrap()
                     .account_id
                     .as_deref(),
-                Some(label)
+                Some(account)
             );
         }
+        assert_eq!(
+            c.resolve(Some("Bearer token-b"), false)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_auth_follows_the_configured_credential_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let token = |value: Value| value["tokens"]["access_token"].as_str().map(String::from);
+        let set_store = |store: &str| {
+            std::fs::write(home.join("config.toml"), format!("model = \"x\"\ncli_auth_credentials_store = \"{store}\"\n[features]\nother = true\n")).unwrap()
+        };
+        let keyring = |value: Option<&str>| {
+            crate::keychain::set_test_entry(KEYRING_SERVICE, &keyring_account(home), value)
+        };
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"file"}}"#,
+        )
+        .unwrap();
+        // No config.toml, or the default store: only auth.json counts.
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("file")
+        );
+        keyring(Some(r#"{"tokens":{"access_token":"keyring"}}"#));
+        set_store("file");
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("file")
+        );
+        set_store("keyring");
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("keyring")
+        );
+        set_store("auto");
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("keyring")
+        );
+        set_store("ephemeral");
+        assert!(saved_auth(home).await.is_err());
+        // The encrypted secrets backend is not a readable keyring entry.
+        std::fs::write(
+            home.join("config.toml"),
+            "cli_auth_credentials_store = \"keyring\"\n[features]\nsecret_auth_storage = true\n",
+        )
+        .unwrap();
+        assert!(saved_auth(home).await.is_err());
+        std::fs::write(
+            home.join("config.toml"),
+            "cli_auth_credentials_store = \"auto\"\n[features]\nsecret_auth_storage = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("file")
+        );
+        // Auto falls back to the file when the keyring has no login or fails.
+        keyring(None);
+        set_store("auto");
+        assert_eq!(
+            token(saved_auth(home).await.unwrap()).as_deref(),
+            Some("file")
+        );
+        std::fs::remove_file(home.join("auth.json")).unwrap();
+        assert!(saved_auth(home).await.is_err());
+        set_store("unknown");
+        assert!(saved_auth(home).await.is_err());
+    }
+
+    #[test]
+    fn keyring_account_matches_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let digest = ring::digest::digest(
+            &ring::digest::SHA256,
+            canonical.to_string_lossy().as_bytes(),
+        );
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(keyring_account(dir.path()), format!("cli|{}", &hex[..16]));
     }
 
     #[tokio::test]

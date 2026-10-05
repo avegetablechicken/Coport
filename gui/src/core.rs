@@ -8,7 +8,7 @@ use crate::{
     proxy::{Controller, Notify, Phase, Probe},
     settings::Settings,
 };
-use coport::config::{AccountSource, Choice, Config, Routing, redacted_endpoint};
+use coport::config::{Choice, Config, Routing, redacted_endpoint};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -435,7 +435,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
                 ("apiKeyUpstream", config.codex.base_url.api_key.clone()),
             ],
             config.codex.account_auth_file_only,
-            &config.codex.accounts,
+            config.codex.auth_env.is_some(),
             &config.codex.routing,
             true,
             |selector| describe::codex_api_key(config, selector),
@@ -444,7 +444,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
         claude: service(
             vec![("upstream", config.claude.base_url.clone())],
             config.claude.account_auth_file_only,
-            &config.claude.accounts,
+            config.claude.auth_env.is_some(),
             &config.claude.routing,
             false,
             |selector| describe::claude_api_key(config, selector),
@@ -456,7 +456,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
 fn service(
     upstreams: Vec<(&'static str, String)>,
     file_only: bool,
-    accounts: &BTreeMap<String, AccountSource>,
+    auth_env: bool,
     routing: &Routing,
     codex: bool,
     api_key_detail: impl Fn(&str) -> Option<String>,
@@ -490,25 +490,12 @@ fn service(
         fallback("accountProbe", &routing.account_probe)
     });
     ServiceDto {
-        configured: !(accounts.is_empty()
-            && routing.account.is_empty()
-            && routing.api_key.is_empty()),
+        configured: auth_env || !routing.account.is_empty() || !routing.api_key.is_empty(),
         upstreams: upstreams
             .into_iter()
             .map(|(key, value)| KeyValue {
                 key: key.to_owned(),
                 value,
-            })
-            .collect(),
-        credentials: accounts
-            .iter()
-            .map(|(label, source)| KeyValue {
-                key: label.clone(),
-                value: match (&source.auth_file, &source.auth_env) {
-                    (Some(file), _) => file.clone(),
-                    (_, Some(env)) => format!("${env}"),
-                    _ => "—".into(),
-                },
             })
             .collect(),
         file_only,
@@ -635,7 +622,6 @@ struct ProbeDto {
 struct ServiceDto {
     configured: bool,
     upstreams: Vec<KeyValue>,
-    credentials: Vec<KeyValue>,
     file_only: bool,
     account_routes: Vec<RouteRow>,
     api_key_routes: Vec<RouteRow>,

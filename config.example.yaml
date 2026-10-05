@@ -32,8 +32,9 @@ codex:
     account: "https://chatgpt.com/backend-api"
   # Explicit credential directories; process CODEX_HOME is ignored.
   homes: ["~/.codex"] # Default when omitted.
-  auth_file: "auth.json" # Relative to each configured home.
-  # auth_env: CHATGPT_ACCESS_TOKEN # Alternative to auth_file, not both.
+  # Each home's login is read from where its config.toml stores it: auth.json
+  # or the OS credential store (cli_auth_credentials_store).
+  # auth_env: CHATGPT_ACCESS_TOKEN # Use this token instead of saved logins.
   account_auth_file_only: true
   routing:
     account:
@@ -46,8 +47,8 @@ claude:
   base_url: "https://api.anthropic.com" # Root without /v1.
   # Explicit credential directories; process CLAUDE_CONFIG_DIR is ignored.
   config_dirs: ["~/.claude"] # Default when omitted.
-  auth_file: ".credentials.json" # Relative to each configured config dir.
-  # auth_env: CLAUDE_CODE_OAUTH_TOKEN # Alternative to auth_file, not both.
+  # Each directory's login: the macOS keychain entry, then .credentials.json.
+  # auth_env: CLAUDE_CODE_OAUTH_TOKEN # Use this token instead of saved logins.
   account_auth_file_only: true
   routing:
     account:

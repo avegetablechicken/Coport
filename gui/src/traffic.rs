@@ -838,7 +838,7 @@ mod tests {
         )
         .unwrap();
         let config = coport::config::Config::parse(&format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{0}]\n  auth_file: auth.json\n  routing:\n    account: {{default: none}}\n    api_key: {{MY_API_KEY: none}}\nclaude:\n  config_dirs: [{0}]\n  auth_file: .credentials.json\n  routing:\n    account: {{'user@example.test': none, default: none}}\n",
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{0}]\n  routing:\n    account: {{default: none}}\n    api_key: {{MY_API_KEY: none}}\nclaude:\n  config_dirs: [{0}]\n  routing:\n    account: {{'user@example.test': none, default: none}}\n",
             serde_json::to_string(dir.path()).unwrap()
         )).unwrap();
         let labels = config.traffic_credential_labels().await;

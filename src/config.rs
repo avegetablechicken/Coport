@@ -61,28 +61,12 @@ pub struct Routing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_fallback: Option<Choice>,
 }
-#[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccountSource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_env: Option<String>,
-}
-impl AccountSource {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.auth_file.is_some() == self.auth_env.is_some()
-            || self.auth_file.as_ref().is_some_and(|s| s.trim().is_empty())
-        {
-            return Err(Error::config(
-                "An account must select one credential source.",
-            ));
-        }
-        if let Some(name) = &self.auth_env {
-            validate_env(name)?;
-        }
-        Ok(())
-    }
+/// Where an account credential comes from: the login the CLI saved for a
+/// configured directory, or an access token environment variable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountSource {
+    Directory(PathBuf),
+    Env(String),
 }
 pub(crate) fn validate_env(name: &str) -> Result<()> {
     if name.is_empty()
@@ -102,7 +86,8 @@ pub(crate) fn validate_env(name: &str) -> Result<()> {
 pub struct Codex {
     pub homes: Vec<String>,
     pub base_url: Bases,
-    pub accounts: BTreeMap<String, AccountSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_env: Option<String>,
     pub routing: Routing,
     pub account_auth_file_only: bool,
     #[serde(skip)]
@@ -113,7 +98,7 @@ impl Default for Codex {
         Self {
             homes: default_codex_homes(),
             base_url: Bases::default(),
-            accounts: BTreeMap::new(),
+            auth_env: None,
             routing: Routing::default(),
             account_auth_file_only: true,
             providers: Vec::new(),
@@ -286,7 +271,7 @@ impl Config {
             }
             self.validate_choice(choice)?;
         }
-        validate_directories(&self.codex.homes, &self.codex.accounts)?;
+        validate_directories(&self.codex.homes)?;
         if self.codex.routing.account_probe.is_some() {
             return Err(Error::config(
                 "account_probe is only supported under claude.routing.",
@@ -307,18 +292,15 @@ impl Config {
             ));
         }
         validate_upstream(&self.codex.base_url.api_key)?;
-        for (label, source) in &self.codex.accounts {
-            if label.trim().is_empty() {
-                return Err(Error::config("Empty Codex account label."));
-            }
-            source.validate()?;
+        if let Some(name) = &self.codex.auth_env {
+            validate_env(name)?;
         }
         let accounts =
             !self.codex.routing.account.is_empty() || self.codex.routing.account_fallback.is_some();
-        if (!self.codex.accounts.is_empty() && !accounts)
+        if (self.codex.auth_env.is_some() && !accounts)
             || (self.codex.account_auth_file_only
                 && accounts
-                && self.codex.accounts.is_empty()
+                && self.codex.auth_env.is_none()
                 && self.codex.homes.is_empty())
         {
             return Err(Error::config(
@@ -386,10 +368,7 @@ pub(crate) fn default_claude_config_dirs() -> Vec<String> {
     vec!["~/.claude".into()]
 }
 
-pub(crate) fn validate_directories(
-    directories: &[String],
-    accounts: &BTreeMap<String, AccountSource>,
-) -> Result<()> {
+pub(crate) fn validate_directories(directories: &[String]) -> Result<()> {
     let mut paths = std::collections::HashSet::new();
     for directory in directories {
         let path = expand(directory);
@@ -399,73 +378,38 @@ pub(crate) fn validate_directories(
             ));
         }
     }
-    for source in accounts.values() {
-        if let Some(file) = &source.auth_file {
-            let path = std::path::Path::new(file);
-            if path.is_absolute() || file.starts_with('~') {
-                return Err(Error::config(
-                    "auth_file must be a file name relative to the credential directories.",
-                ));
-            }
-            if directories.is_empty() {
-                return Err(Error::config(
-                    "auth_file requires a configured credential directory.",
-                ));
-            }
-            if path.components().any(|part| {
-                !matches!(
-                    part,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            }) {
-                return Err(Error::config(
-                    "auth_file must stay inside its credential directory.",
-                ));
-            }
-        }
-    }
     Ok(())
 }
 
-// Keep the source label separate from its directory: every listed directory can
-// supply the same relative auth_file, while account ID/email still selects routing.
-pub(crate) type DirectoryAccount = (String, AccountSource, Option<PathBuf>);
-
-pub(crate) fn directory_accounts(
-    accounts: &BTreeMap<String, AccountSource>,
+/// Account sources with their routing label. A token environment variable is
+/// the only source when configured; otherwise, with account routing enabled,
+/// each configured directory supplies the login its CLI saved there. All use
+/// the label `default`, so account ID/email distinguishes the directories.
+pub(crate) fn account_sources(
+    auth_env: Option<&str>,
     directories: &[String],
     routing: &Routing,
-    filename: &str,
-) -> Vec<DirectoryAccount> {
-    let mut accounts = accounts.clone();
-    if accounts.is_empty() && (!routing.account.is_empty() || routing.account_fallback.is_some()) {
-        accounts.insert(
-            "default".into(),
-            AccountSource {
-                auth_file: Some(filename.into()),
-                auth_env: None,
-            },
-        );
+) -> Vec<(String, AccountSource)> {
+    if let Some(name) = auth_env {
+        return vec![("default".into(), AccountSource::Env(name.into()))];
     }
-    let mut sources = Vec::new();
-    for (label, source) in accounts {
-        if let Some(file) = &source.auth_file {
-            for directory in directories {
-                let directory = expand(directory);
-                let mut resolved = source.clone();
-                resolved.auth_file = Some(directory.join(file).to_string_lossy().into_owned());
-                sources.push((label.clone(), resolved, Some(directory)));
-            }
-        } else {
-            sources.push((label, source, None));
-        }
+    if routing.account.is_empty() && routing.account_fallback.is_none() {
+        return Vec::new();
     }
-    sources
+    directories
+        .iter()
+        .map(|directory| {
+            (
+                "default".into(),
+                AccountSource::Directory(expand(directory)),
+            )
+        })
+        .collect()
 }
 
 impl Codex {
-    pub(crate) fn account_sources(&self) -> Vec<DirectoryAccount> {
-        directory_accounts(&self.accounts, &self.homes, &self.routing, "auth.json")
+    pub(crate) fn account_sources(&self) -> Vec<(String, AccountSource)> {
+        account_sources(self.auth_env.as_deref(), &self.homes, &self.routing)
     }
 }
 
@@ -518,33 +462,18 @@ fn apply_override(root: &mut serde_yaml_ng::Value, entry: &str) -> Result<()> {
     Ok(())
 }
 
-/// Turn a flat `auth_file`/`auth_env` into the single `default` account
-/// source used internally. Nested `accounts` maps are not accepted.
+/// Reject the retired nested `accounts` map and drop `auth_file`: the CLIs
+/// always save their login under a fixed name, so it never selected anything.
 pub(crate) fn normalize_auth(value: &mut serde_yaml_ng::Value) -> Result<()> {
     let Some(map) = value.as_mapping_mut() else {
         return Ok(());
     };
     if map.contains_key("accounts") {
         return Err(Error::config(
-            "Nested accounts are not supported; use auth_file or auth_env.",
+            "Nested accounts are not supported; list credential directories or use auth_env.",
         ));
     }
-    if !map.contains_key("auth_file") && !map.contains_key("auth_env") {
-        return Ok(());
-    }
-    let mut source = serde_yaml_ng::Mapping::new();
-    for key in ["auth_file", "auth_env"] {
-        if let Some(value) = map.remove(key) {
-            source.insert(key.into(), value);
-        }
-    }
-    map.insert(
-        "accounts".into(),
-        serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::from_iter([(
-            "default".into(),
-            serde_yaml_ng::Value::Mapping(source),
-        )])),
-    );
+    map.remove("auth_file");
     Ok(())
 }
 
@@ -730,45 +659,52 @@ mod tests {
     }
 
     #[test]
-    fn auth_files_are_relative_to_each_credential_directory() {
+    fn account_sources_are_credential_directories_and_ignore_auth_file() {
         for (service, field) in [("codex", "homes"), ("claude", "config_dirs")] {
             let base = format!("{BASE}{service}:\n");
-            let valid = format!(
-                "{base}  {field}: [~/work, ~/other]\n  auth_file: nested/login.json\n  routing:\n    account: {{default: none}}\n"
-            );
-            let c = Config::parse(&valid).unwrap();
-            let sources = if service == "codex" {
-                c.codex.account_sources()
-            } else {
-                c.claude.account_sources()
+            let sources = |text: &str| {
+                let c = Config::parse(text).unwrap();
+                if service == "codex" {
+                    c.codex.account_sources()
+                } else {
+                    c.claude.account_sources()
+                }
             };
-            let files: Vec<_> = sources
-                .iter()
-                .map(|(label, source, _)| {
-                    (
-                        label.as_str(),
-                        PathBuf::from(source.auth_file.as_ref().unwrap()),
-                    )
-                })
-                .collect();
-            // Compare path components: Windows accepts both slash styles.
+            let routed = format!(
+                "{base}  {field}: [~/work, ~/other]\n  routing:\n    account: {{default: none}}\n"
+            );
+            let directories = [
+                (
+                    "default".to_string(),
+                    AccountSource::Directory(expand("~/work")),
+                ),
+                (
+                    "default".to_string(),
+                    AccountSource::Directory(expand("~/other")),
+                ),
+            ];
+            assert_eq!(sources(&routed), directories);
+            // The CLIs save logins under fixed names, so auth_file selects nothing.
+            for file in [
+                "auth.json",
+                "nested/login.json",
+                "../login.json",
+                "/absolute.json",
+            ] {
+                let text =
+                    routed.replace("  routing:", &format!("  auth_file: {file}\n  routing:"));
+                assert_eq!(sources(&text), directories, "{file}");
+            }
+            assert!(sources(&format!("{base}  {field}: [~/work]\n")).is_empty());
             assert_eq!(
-                files,
-                [
-                    ("default", expand("~/work/nested/login.json")),
-                    ("default", expand("~/other/nested/login.json")),
-                ]
+                sources(&routed.replace("  routing:", "  auth_env: TOKEN\n  routing:")),
+                [("default".to_string(), AccountSource::Env("TOKEN".into()))]
             );
             for invalid in [
                 format!("{base}  {field}: [relative/path]\n"),
                 format!("{base}  {field}: [~/same, ~/same]\n"),
-                format!(
-                    "{base}  {field}: []\n  auth_file: login.json\n  routing:\n    account: {{default: none}}\n"
-                ),
-                valid.replace("nested/login.json", "../login.json"),
-                valid.replace("nested/login.json", "/absolute/login.json"),
-                valid.replace("nested/login.json", "~/login.json"),
                 format!("{base}  {field}: {{work: ~/work}}\n"),
+                routed.replace("  routing:", "  auth_env: 'not a name'\n  routing:"),
             ] {
                 assert!(Config::parse(&invalid).is_err(), "{invalid}");
             }
@@ -811,7 +747,7 @@ mod tests {
             "codex:\n  typo: true\n",
             "codex:\n  homes: []\n  routing:\n    account: {test: none}\n",
             "codex:\n  routing:\n    api_key:\n      TEST:\n        proxy: none\n",
-            "codex:\n  auth_file: auth.json\n  auth_env: TOKEN\n  routing:\n    account: {default: none}\n",
+            "codex:\n  auth_env: TOKEN\n",
             "claude:\n  config_dirs: []\n  routing:\n    account: {absent: none}\n",
             "claude:\n  routing:\n    mcp_fallback: none\n",
         ] {
@@ -922,14 +858,8 @@ claude:
         // URL selectors route explicit upstreams; only the others are providers.
         assert_eq!(c.codex.providers.len(), 1);
         assert_eq!(c.codex.providers[0].label(), "OPENAI_API_KEY");
-        assert_eq!(
-            c.codex.accounts["default"].auth_file.as_deref(),
-            Some("auth.json")
-        );
-        assert_eq!(
-            c.claude.accounts["default"].auth_env.as_deref(),
-            Some("CLAUDE_TOKEN")
-        );
+        assert_eq!(c.codex.auth_env, None);
+        assert_eq!(c.claude.auth_env.as_deref(), Some("CLAUDE_TOKEN"));
         assert_eq!(c.claude.base_url, "https://api.anthropic.com");
     }
 

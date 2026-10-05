@@ -23,7 +23,8 @@ pub struct Claude {
     pub config_dirs: Vec<String>,
     pub account_auth_file_only: bool,
     pub base_url: String,
-    pub accounts: BTreeMap<String, AccountSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_env: Option<String>,
     pub routing: Routing,
 }
 impl Default for Claude {
@@ -32,7 +33,7 @@ impl Default for Claude {
             config_dirs: crate::config::default_claude_config_dirs(),
             account_auth_file_only: true,
             base_url: default_base(),
-            accounts: BTreeMap::new(),
+            auth_env: None,
             routing: Routing::default(),
         }
     }
@@ -70,7 +71,7 @@ impl<'de> Deserialize<'de> for Claude {
             #[serde(default = "default_base")]
             base_url: String,
             #[serde(default)]
-            accounts: BTreeMap<String, AccountSource>,
+            auth_env: Option<String>,
             #[serde(default)]
             routing: Routing,
         }
@@ -79,32 +80,80 @@ impl<'de> Deserialize<'de> for Claude {
             config_dirs: n.config_dirs,
             account_auth_file_only: n.account_auth_file_only,
             base_url: n.base_url,
-            accounts: n.accounts,
+            auth_env: n.auth_env,
             routing: n.routing,
         })
     }
 }
-impl AccountSource {
-    fn claude_credential_path(&self) -> Result<std::path::PathBuf> {
-        self.auth_file
-            .as_ref()
-            .map(|s| expand(s))
-            .ok_or(Error::config(
-                "Claude account requires an explicit credential source.",
-            ))
+/// Claude Code's keychain entry for a config directory: unsuffixed for the
+/// default `~/.claude`, otherwise suffixed with a digest of the directory path.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_services(directory: &std::path::Path) -> Vec<String> {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        directory.to_string_lossy().as_bytes(),
+    );
+    let suffix: String = digest.as_ref()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut services = Vec::new();
+    // The default directory is unsuffixed unless CLAUDE_CONFIG_DIR named it.
+    if directory == expand("~/.claude") {
+        services.push("Claude Code-credentials".into());
     }
-    pub(crate) fn claude_identity(
-        &self,
-        directory: Option<&std::path::Path>,
-    ) -> Option<ClaudeIdentity> {
+    services.push(format!("Claude Code-credentials-{suffix}"));
+    services
+}
+/// Claude Code's keychain account: the login user name.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_account() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+        .unwrap_or_else(|| "claude-code-user".into())
+}
+/// The OAuth login Claude Code saved for a config directory. Like Claude Code,
+/// the macOS keychain takes precedence over `.credentials.json`.
+async fn saved_credentials(directory: &std::path::Path) -> Result<serde_json::Value> {
+    let file = || {
+        let raw = std::fs::read(directory.join(".credentials.json"))
+            .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
+        serde_json::from_slice(&raw).map_err(|_| Error::config("Invalid Claude credentials file."))
+    };
+    #[cfg(any(target_os = "macos", test))]
+    {
+        let mut failure = None;
+        for service in keychain_services(directory) {
+            match crate::keychain::read(&service, &keychain_account()).await {
+                Ok(Some(raw)) => {
+                    return serde_json::from_str(&raw).map_err(|_| {
+                        Error::config("Invalid Claude credentials in the OS credential store.")
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = failure {
+            return file().map_err(|_| error);
+        }
+    }
+    file()
+}
+impl AccountSource {
+    pub(crate) fn claude_identity(&self) -> Option<ClaudeIdentity> {
         // An environment token is not evidence that it belongs to the local
         // CLI metadata. Such configured sources retain label/fallback routing.
-        if self.auth_env.is_some() {
+        let AccountSource::Directory(directory) = self else {
             return None;
-        }
-        let path = self.claude_credential_path().ok()?;
-        let directory = directory.or_else(|| path.parent())?;
-        let metadata = if directory == expand("~/.claude") {
+        };
+        let metadata = if *directory == expand("~/.claude") {
             expand("~/.claude.json")
         } else {
             directory.join(".claude.json")
@@ -113,15 +162,18 @@ impl AccountSource {
             serde_json::from_slice(&std::fs::read(metadata).ok()?).ok()?;
         ClaudeIdentity::local(&value["oauthAccount"])
     }
-    pub(crate) async fn claude_token(&self) -> Result<String> {
-        if let Some(name) = &self.auth_env {
-            return environment_key(name).await;
+    /// The saved OAuth login, absent for an environment token source.
+    pub(crate) async fn claude_credentials(&self) -> Option<Result<serde_json::Value>> {
+        match self {
+            AccountSource::Directory(directory) => Some(saved_credentials(directory).await),
+            AccountSource::Env(_) => None,
         }
-        let path = self.claude_credential_path()?;
-        let raw = std::fs::read(path)
-            .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
-        let value: serde_json::Value = serde_json::from_slice(&raw)
-            .map_err(|_| Error::config("Invalid Claude credentials file."))?;
+    }
+    pub(crate) async fn claude_token(&self) -> Result<String> {
+        let value = match self {
+            AccountSource::Env(name) => return environment_key(name).await,
+            AccountSource::Directory(directory) => saved_credentials(directory).await?,
+        };
         value["claudeAiOauth"]["accessToken"]
             .as_str()
             .filter(|s| valid_token(s))
@@ -218,36 +270,28 @@ pub fn target(target: &str) -> Option<&str> {
 }
 
 impl Claude {
-    pub(crate) fn account_sources(&self) -> Vec<crate::config::DirectoryAccount> {
-        crate::config::directory_accounts(
-            &self.accounts,
-            &self.config_dirs,
-            &self.routing,
-            ".credentials.json",
-        )
+    pub(crate) fn account_sources(&self) -> Vec<(String, AccountSource)> {
+        crate::config::account_sources(self.auth_env.as_deref(), &self.config_dirs, &self.routing)
     }
 
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
-        crate::config::validate_directories(&self.config_dirs, &self.accounts)?;
+        crate::config::validate_directories(&self.config_dirs)?;
         validate_upstream(&self.base_url)?;
         if self.routing.mcp_fallback.is_some() {
             return Err(Error::config(
                 "mcp_fallback is only supported under codex.routing.",
             ));
         }
-        for (label, account) in &self.accounts {
-            if label.trim().is_empty() {
-                return Err(Error::config("Empty Claude account label."));
-            }
-            account.validate()?;
+        if let Some(name) = &self.auth_env {
+            validate_env(name)?;
         }
         if self.account_auth_file_only
-            && self.accounts.is_empty()
+            && self.auth_env.is_none()
             && self.config_dirs.is_empty()
             && !self.routing.account.is_empty()
         {
             return Err(Error::config(
-                "Claude file-only account routing requires an auth_file or auth_env.",
+                "Claude file-only account routing requires config_dirs or auth_env.",
             ));
         }
         for (label, choice) in &self.routing.account {
@@ -316,8 +360,8 @@ impl Claude {
     pub async fn check_credentials(&self) -> Result<()> {
         let mut keys = HashSet::new();
         if self.account_auth_file_only {
-            for (label, account, directory) in &self.account_sources() {
-                let identity = account.claude_identity(directory.as_deref());
+            for (label, account) in &self.account_sources() {
+                let identity = account.claude_identity();
                 match self.account_choice(identity.as_ref(), Some(label)) {
                     Ok(_) => {}
                     // As during request routing, a saved credential without a
@@ -359,19 +403,13 @@ impl Claude {
     pub async fn resolve_refresh(&self, token: &str) -> Result<(Choice, Option<String>)> {
         let mut matches = Vec::new();
         let mut unavailable = false;
-        for (label, account, directory) in self.account_sources() {
-            if account.auth_env.is_some() {
+        for (label, account) in self.account_sources() {
+            let Some(value) = account.claude_credentials().await else {
                 continue;
-            }
-            let value = account.claude_credential_path().and_then(|path| {
-                let raw = std::fs::read(path)
-                    .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
-                serde_json::from_slice::<serde_json::Value>(&raw)
-                    .map_err(|_| Error::config("Invalid Claude credentials file."))
-            });
+            };
             match value {
                 Ok(value) if value["claudeAiOauth"]["refreshToken"].as_str() == Some(token) => {
-                    matches.push((label, account.claude_identity(directory.as_deref())));
+                    matches.push((label, account.claude_identity()));
                 }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
@@ -434,9 +472,9 @@ impl Claude {
         let account_sources = self.account_sources();
         if bearer {
             let mut sources = Vec::new();
-            for (label, account, directory) in &account_sources {
+            for (label, account) in &account_sources {
                 match account.claude_token().await {
-                    Ok(value) if value == token => sources.push((label, account, directory)),
+                    Ok(value) if value == token => sources.push((label, account)),
                     Ok(_) => {}
                     Err(_) => unavailable = true,
                 }
@@ -447,9 +485,9 @@ impl Claude {
                     "Claude credential matches multiple routes.",
                 ));
             }
-            if let Some((label, account, directory)) = sources.pop() {
+            if let Some((label, account)) = sources.pop() {
                 matched_account = true;
-                identity = account.claude_identity(directory.as_deref());
+                identity = account.claude_identity();
                 match self.account_choice(identity.as_ref(), Some(label)) {
                     Ok(proxy) => matches.push((label, proxy)),
                     // Missing or stale local metadata can be resolved using the
@@ -765,13 +803,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_directories_resolve_relative_credentials_and_local_identity() {
+    async fn configured_directories_resolve_saved_credentials_and_local_identity() {
         let dir = tempfile::tempdir().unwrap();
         for label in ["a", "b"] {
             let home = dir.path().join(label);
-            std::fs::create_dir_all(home.join("nested")).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
             std::fs::write(
-                home.join("nested/login.json"),
+                home.join(".credentials.json"),
                 serde_json::json!({
                     "claudeAiOauth":{"accessToken":format!("token-{label}")}
                 })
@@ -783,7 +821,7 @@ mod tests {
             }).to_string()).unwrap();
         }
         let config = Config::parse(&format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  config_dirs: [{}, {}]\n  auth_file: nested/login.json\n  routing:\n    account: {{a: none, b: none}}\n",
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nclaude:\n  config_dirs: [{}, {}]\n  routing:\n    account: {{a: none, b: none}}\n",
             serde_json::to_string(&dir.path().join("a")).unwrap(),
             serde_json::to_string(&dir.path().join("b")).unwrap()
         )).unwrap();
@@ -939,43 +977,95 @@ claude:
     #[tokio::test]
     async fn accounts_reload_and_reject_duplicates_and_wrong_header_types() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("credentials.json");
-        let write = |token: &str| {
-            std::fs::write(&path, serde_json::json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"never-forward"}}).to_string()).unwrap()
+        let write = |dir: &str, token: &str| {
+            let dir = temp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".credentials.json"), serde_json::json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"never-forward"}}).to_string()).unwrap()
         };
-        write("first-secret");
+        write("personal", "first-secret");
         let mut c = config("").claude;
-        c.accounts.insert(
-            "personal".into(),
-            AccountSource {
-                auth_file: Some(path.to_string_lossy().into()),
-                auth_env: None,
-            },
-        );
+        c.config_dirs = vec![temp.path().join("personal").to_string_lossy().into()];
         c.routing
             .account
-            .insert("personal".into(), Choice::One("selected".into()));
-        c.routing
-            .account
-            .insert("duplicate".into(), Choice::One("selected".into()));
+            .insert("default".into(), Choice::One("selected".into()));
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer first-secret".parse().unwrap());
         let r = c.resolve(&h).await.unwrap();
         assert!(r.matched_account);
         assert_eq!(r.proxy.label(), "selected");
-        assert_eq!(r.label, "personal");
-        write("second-secret");
+        assert_eq!(r.label, "default");
+        write("personal", "second-secret");
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
         h.insert("authorization", "Bearer second-secret".parse().unwrap());
         assert!(c.resolve(&h).await.is_ok());
-        c.accounts
-            .insert("duplicate".into(), c.accounts["personal"].clone());
+        write("duplicate", "second-secret");
+        c.config_dirs
+            .push(temp.path().join("duplicate").to_string_lossy().into());
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 409);
         assert!(c.check_credentials().await.is_err());
         h.insert("x-api-key", "second-secret".parse().unwrap());
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 400);
         h.remove("authorization");
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
+    }
+
+    #[tokio::test]
+    async fn keychain_login_precedes_the_credentials_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let login = |token: &str| {
+            serde_json::json!({"claudeAiOauth":{"accessToken":token,"refreshToken":format!("{token}-refresh")}})
+                .to_string()
+        };
+        std::fs::write(dir.join(".credentials.json"), login("file-secret")).unwrap();
+        let mut c = config("").claude;
+        c.config_dirs = vec![dir.to_string_lossy().into()];
+        c.routing
+            .account
+            .insert("default".into(), Choice::One("selected".into()));
+        let services = keychain_services(&dir);
+        // A non-default directory has only the digest-suffixed entry.
+        assert_eq!(services.len(), 1);
+        assert!(services[0].starts_with("Claude Code-credentials-"));
+        assert_eq!(services[0].len(), "Claude Code-credentials-".len() + 8);
+        assert_eq!(
+            keychain_services(&expand("~/.claude"))[0],
+            "Claude Code-credentials"
+        );
+        let source = AccountSource::Directory(dir.clone());
+        assert_eq!(source.claude_token().await.unwrap(), "file-secret");
+        crate::keychain::set_test_entry(
+            &services[0],
+            &keychain_account(),
+            Some(&login("keychain-secret")),
+        );
+        assert_eq!(source.claude_token().await.unwrap(), "keychain-secret");
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer keychain-secret".parse().unwrap());
+        assert!(c.resolve(&h).await.unwrap().matched_account);
+        h.insert("authorization", "Bearer file-secret".parse().unwrap());
+        assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
+        assert!(c.resolve_refresh("keychain-secret-refresh").await.is_ok());
+        assert!(c.resolve_refresh("file-secret-refresh").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unreadable_keychain_falls_back_to_the_credentials_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = AccountSource::Directory(temp.path().to_path_buf());
+        crate::keychain::set_test_entry(
+            &keychain_services(temp.path())[0],
+            &keychain_account(),
+            None,
+        );
+        assert!(source.claude_token().await.is_err());
+        std::fs::write(
+            temp.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"file-secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(source.claude_token().await.unwrap(), "file-secret");
     }
 
     #[tokio::test]
@@ -1086,8 +1176,9 @@ claude:
             "codex:\n  routing:\n      account_fallback: []",
             "codex:\n  routing:\n      api_key_fallback: absent",
             "codex:\n  base_url: http://api.anthropic.com",
-            "auth_env: TOKEN\n  auth_file: file\n  routing:\n    account: {default: none}",
-            "auth_file: ''\n  routing:\n    account: {default: none}",
+            "auth_env: 'not a name'\n  routing:\n    account: {default: none}",
+            "accounts: {a: {auth_env: TOKEN}}\n  routing:\n    account: {a: none}",
+            "config_dirs: []\n  routing:\n    account: {default: none}",
         ] {
             assert!(
                 Config::parse(&format!(

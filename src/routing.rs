@@ -50,7 +50,7 @@ impl Config {
         let mut unavailable = false;
         let mut identities = Vec::new();
         let account_sources = self.codex.account_sources();
-        for (label, source, _) in &account_sources {
+        for (label, source) in &account_sources {
             match self.codex.account_identity(source).await {
                 Ok(i) if i.token == token => identities.push((i, Some(label.as_str()))),
                 Ok(_) => {}
@@ -153,7 +153,7 @@ impl Config {
     /// saved login whose proxy is used. Nothing is injected upstream.
     pub async fn resolve_refresh(&self, refresh_token: &str) -> Result<(Choice, Option<String>)> {
         let mut unavailable = false;
-        for (label, source, _) in &self.codex.account_sources() {
+        for (label, source) in &self.codex.account_sources() {
             match self.codex.account_identity(source).await {
                 Ok(i) if i.refresh_token.as_deref() == Some(refresh_token) => {
                     let proxy = self.account_choice(&i, Some(label))?;

@@ -84,19 +84,16 @@ impl Server {
         checks.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
         let mut confirmed = Vec::new();
         let mut failed = false;
-        for (source, account, directory) in self.config.claude.account_sources() {
-            let matched_local =
-                account
-                    .claude_identity(directory.as_deref())
-                    .is_some_and(|identity| {
-                        crate::identity::routing_account_label(
-                            &self.config.claude.routing,
-                            &identity.account_id,
-                            &identity.usernames,
-                            &source,
-                        )
-                        .is_some()
-                    });
+        for (source, account) in self.config.claude.account_sources() {
+            let matched_local = account.claude_identity().is_some_and(|identity| {
+                crate::identity::routing_account_label(
+                    &self.config.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                )
+                .is_some()
+            });
             if matched_local
                 || self.config.claude.routing.account.contains_key(&source)
                 || self.config.claude.routing.account_fallback.is_some()
@@ -286,7 +283,7 @@ impl Server {
         Ok(())
     }
     pub async fn startup_log(&self) {
-        for (label, source, _) in &self.config.codex.account_sources() {
+        for (label, source) in &self.config.codex.account_sources() {
             match self
                 .config
                 .codex
