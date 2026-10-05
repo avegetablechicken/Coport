@@ -822,12 +822,11 @@ function detail(e) {
 function settings() {
   const s = ui.snap;
   const set = s.settings;
-  let status;
+  let status = "";
   if (!s.config.exists) status = message("warn", "The file does not exist yet.");
   else if (s.config.error) status = message("bad", esc(s.config.error));
   else if (s.config.changedSinceStart)
     status = message("warn", "Changed since the proxy started.", `<button class="btn" data-action="restart">Restart to Apply</button>`);
-  else status = message("good", "Configuration is valid.");
   let check = "";
   if (s.check.running) check = message("info", "Checking credentials…");
   else if (s.check.message != null) check = message(s.check.ok ? "good" : "bad", esc(s.check.message));
