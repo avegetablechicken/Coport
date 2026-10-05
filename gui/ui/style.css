@@ -634,6 +634,25 @@ input.field::placeholder {
   box-shadow: 0 0 0 0.5px var(--control-border), 0 0.5px 1px rgba(0, 0, 0, 0.12);
 }
 
+.number-field {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+}
+
+.number-field input.field {
+  width: 58px;
+  height: 20px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.number-field .unit {
+  width: 7px;
+  color: var(--tertiary);
+}
+
 .inline-form {
   display: flex;
   gap: 6px;

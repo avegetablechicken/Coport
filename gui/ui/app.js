@@ -146,6 +146,7 @@ const ui = {
   expanded: new Set(),
   builtPage: null,
   choosePath: false,
+  websocketOpen: false,
   proxies: {},
   tagColors: {},
 };
@@ -234,7 +235,17 @@ function renderPage() {
   }
   closeSelect();
   ui.builtPage = ui.page;
+  // State refreshes must not discard what is being typed.
+  const focused = content.contains(document.activeElement) && document.activeElement.matches("input[id]")
+    ? document.activeElement : null;
+  const typing = focused && { id: focused.id, value: focused.value, start: focused.selectionStart, end: focused.selectionEnd };
   content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : main()}</div>`;
+  const field = typing && $(typing.id);
+  if (field) {
+    field.value = typing.value;
+    field.focus();
+    field.setSelectionRange(typing.start, typing.end);
+  }
 }
 
 /// A block: titled box with an optional right-aligned headline.
@@ -833,6 +844,7 @@ function settings() {
        <div class="row"><span class="row-label">Appearance</span>
          ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
     )}
+    ${configSettings()}
     ${block(
       "Configuration",
       "",
@@ -855,6 +867,52 @@ function settings() {
       `<div class="row"><span class="row-label path selectable">${esc(set.logPath)}</span>
          <button class="icon-btn" data-action="open" data-target="log-folder" data-tip="Open folder" aria-label="Open log folder">${ICON.folder}</button></div>`
     )}`;
+}
+
+/// Network and Subscription Logins: values written to the YAML configuration, applied on restart.
+function configSettings() {
+  const v = ui.snap.config.details?.editable;
+  if (!v) return "";
+  const field = (key, label, unit = "", description = "") => {
+    const id = `config-${key.replaceAll(".", "-")}`;
+    const note = description ? `<span class="setting-description" id="${id}-description">${description}</span>` : "";
+    return `<div class="row"><span class="row-label">${label}${note}</span>
+      <span class="number-field"><input class="field" id="${id}" data-config="${key}" inputmode="decimal" spellcheck="false"
+        value="${esc(String(v[key]))}" aria-label="${label}"${description ? ` aria-describedby="${id}-description"` : ""} /><span class="unit">${unit}</span></span></div>`;
+  };
+  const flag = (key, label, description) => {
+    const id = `config-${key.replaceAll(".", "-")}`;
+    return `<div class="row"><span class="row-label">${label}<span class="setting-description" id="${id}-description">${description}</span></span>
+      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}" aria-describedby="${id}-description"></button></div>`;
+  };
+  return `${block(
+    "Network",
+    "",
+    `${field("listen_port", "Listen port")}
+     ${field("request_timeout_seconds", "Request timeout", "s")}
+     <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
+       ${field("websocket.first_message_seconds", "First message", "s")}
+       ${field("websocket.first_output_seconds", "First output", "s")}
+       ${field("websocket.read_seconds", "Read", "s")}
+       ${field("websocket.write_seconds", "Write", "s")}
+       ${field("websocket.inter_turn_idle_seconds", "Inter-turn idle", "s", "0 disables this timer.")}
+     </details>`
+  )}
+  ${block(
+    "Subscription Logins",
+    "",
+    `${flag("codex.account_auth_file_only", "Codex: saved logins only", "Off also accepts other ChatGPT logins, routed by their token claims.")}
+     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "Off also accepts other Claude logins after a profile lookup.")}`
+  )}`;
+}
+
+async function setConfigValue(key, value) {
+  try {
+    await invoke("set_config_value", { key, value });
+  } catch (e) {
+    toast(String(e));
+  }
+  await refresh();
 }
 
 // ---------------------------------------------------------------- sizing
@@ -963,6 +1021,9 @@ async function act(action, el) {
       await invoke("update_settings", { patch: { keepProxyRunningOnQuit: el.getAttribute("aria-checked") !== "true" } });
       await refresh();
       break;
+    case "config-flag":
+      await setConfigValue(el.dataset.key, el.getAttribute("aria-checked") !== "true");
+      break;
     case "create-config":
       try {
         await invoke("create_example_config");
@@ -1043,6 +1104,18 @@ document.addEventListener("change", async (event) => {
     await loadTraffic();
     return;
   }
+  const configKey = event.target.dataset?.config;
+  if (configKey) {
+    const text = event.target.value.trim();
+    const value = Number(text);
+    if (text === "" || !Number.isFinite(value)) {
+      toast("Enter a number");
+      render();
+    } else if (value !== ui.snap.config.details?.editable[configKey]) {
+      await setConfigValue(configKey, value);
+    }
+    return;
+  }
   const key = event.target.dataset?.setting;
   if (!key) return;
   await invoke("update_settings", { patch: { [key]: event.target.value } });
@@ -1079,6 +1152,11 @@ document.addEventListener("keydown", (event) => {
     showSelect(event.target, event.key === "ArrowUp");
     return;
   }
+  if (event.target.matches("[data-config]") && (event.key === "Enter" || event.key === "Escape")) {
+    if (event.key === "Escape") event.target.value = ui.snap.config.details?.editable[event.target.dataset.config] ?? "";
+    event.target.blur();
+    return;
+  }
   const mod = event.metaKey || event.ctrlKey;
   const back = !event.shiftKey && (IS_MAC
     ? event.metaKey && !event.ctrlKey && !event.altKey && event.key === "["
@@ -1098,6 +1176,10 @@ document.addEventListener("keydown", (event) => {
     act("apply-path");
   }
 });
+
+document.addEventListener("toggle", (event) => {
+  if (event.target.id === "websocket-timeouts") ui.websocketOpen = event.target.open;
+}, true);
 
 document.addEventListener("contextmenu", (event) => {
   if (!event.target.closest(".selectable, input, pre, dd")) event.preventDefault();

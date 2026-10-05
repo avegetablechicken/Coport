@@ -130,6 +130,24 @@ pub fn set_config_path(app: AppHandle, state: State<AppState>, path: String) -> 
     result
 }
 
+/// Changes one supported YAML value; the proxy picks it up on restart.
+#[tauri::command]
+pub fn set_config_value(
+    app: AppHandle,
+    state: State<AppState>,
+    key: String,
+    value: serde_json::Value,
+) -> Result {
+    let result = {
+        let mut core = state.core.lock().unwrap();
+        let result = crate::config_edit::set_value(&core.config_path(), &key, &value);
+        core.invalidate_config();
+        result
+    };
+    tray::sync(&app);
+    result
+}
+
 const EXAMPLE: &str = include_str!("../../config.example.yaml");
 
 #[tauri::command]

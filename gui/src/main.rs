@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod commands;
+mod config_edit;
 mod core;
 mod describe;
 mod icon;
@@ -103,6 +104,7 @@ fn main() {
             commands::update_settings,
             commands::set_launch_at_login,
             commands::set_config_path,
+            commands::set_config_value,
             commands::create_example_config,
             commands::open_path,
             commands::copy_text,

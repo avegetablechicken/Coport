@@ -347,6 +347,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
     ConfigDetails {
         listen_port: config.listen_port,
         timeout_secs: config.request_timeout_seconds,
+        editable: crate::config_edit::values(config),
         proxies: config
             .proxies
             .iter()
@@ -547,6 +548,8 @@ struct ConfigDto {
 struct ConfigDetails {
     listen_port: u16,
     timeout_secs: f64,
+    /// Values the Settings page edits, by dotted YAML key.
+    editable: BTreeMap<&'static str, serde_json::Value>,
     proxies: Vec<ProxyDto>,
     codex: ServiceDto,
     claude: ServiceDto,
