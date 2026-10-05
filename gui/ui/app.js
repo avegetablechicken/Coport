@@ -756,7 +756,7 @@ function settings() {
     )}
     ${block(
       "Configuration",
-      "YAML (.yaml / .yml)",
+      "",
       `<div class="path selectable">${esc(s.config.path)}</div>
        ${status}${check}
        <div class="actions">
