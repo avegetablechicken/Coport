@@ -943,7 +943,8 @@ function ringSector(from, to, outer, inner, gap = 1.6, radius = 3) {
   ].join(" ");
 }
 
-/// Input plus output tokens, or null when neither was reported.
+/// Input plus output tokens, or null when neither was reported. Input already
+/// counts the whole prompt, cached tokens included, for every service.
 function shareTokens(c) {
   return c.inputTokens == null && c.outputTokens == null ? null : (c.inputTokens ?? 0) + (c.outputTokens ?? 0);
 }
@@ -1011,7 +1012,7 @@ function renderActivityTraffic() {
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
     "Sorted by received traffic, largest first. Red indicates errors; each chart uses its own scale.",
-    `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
+    `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
   ].join("\n\n");
   const minutes = traffic?.bucketMinutes;

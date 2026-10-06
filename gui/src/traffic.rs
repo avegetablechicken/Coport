@@ -322,21 +322,29 @@ fn aggregate(
     }
     group.bytes += e.bytes();
     let token = |key| e.get(key).and_then(|v| v.parse().ok());
-    add_tokens(&mut group.input_tokens, token("input_tokens"));
+    let cached = token("cached_input_tokens");
+    // Input counts the whole prompt for every service, so cached input is part of it.
+    // OpenAI input_tokens already includes cached tokens; Anthropic input_tokens
+    // excludes cache reads and writes, which are added here.
+    let input = if claude {
+        [
+            token("input_tokens"),
+            cached,
+            token("cache_creation_input_tokens"),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(u64::saturating_add)
+    } else {
+        token("input_tokens")
+    };
+    add_tokens(&mut group.input_tokens, input);
     add_tokens(&mut group.output_tokens, token("output_tokens"));
-    add_tokens(&mut group.cached_input_tokens, token("cached_input_tokens"));
-    // Only calls reporting both counts contribute to the hit rate. Anthropic input_tokens
-    // excludes cache reads and writes; OpenAI input_tokens already includes cached tokens.
-    if let (Some(input), Some(cached)) = (token("input_tokens"), token("cached_input_tokens")) {
-        let prompt = if claude {
-            input
-                .saturating_add(cached)
-                .saturating_add(token("cache_creation_input_tokens").unwrap_or(0))
-        } else {
-            input
-        };
+    add_tokens(&mut group.cached_input_tokens, cached);
+    // Only calls reporting both counts contribute to the hit rate.
+    if let (Some(input), Some(cached), Some(_)) = (input, cached, token("input_tokens")) {
         group.cache_read = group.cache_read.saturating_add(cached);
-        group.cache_prompt = group.cache_prompt.saturating_add(prompt);
+        group.cache_prompt = group.cache_prompt.saturating_add(input);
     }
     if let Some(ms) = e.duration_ms() {
         group.latency_total += ms;
@@ -957,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_rate_counts_claude_cache_tokens_outside_input_tokens() {
+    fn claude_input_counts_cache_reads_and_writes_like_openai() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
@@ -996,5 +1004,18 @@ mod tests {
         assert_eq!(rate("Claude"), Some(0.6));
         assert_eq!(rate("Codex"), Some(0.25));
         assert_eq!(model.summary.cache_hit_rate, Some(40.0 / 90.0));
+        let input = |service| {
+            let group = model
+                .credentials
+                .iter()
+                .find(|c| c.service == service)
+                .unwrap();
+            (group.input_tokens, group.cached_input_tokens)
+        };
+        // Claude: 10 uncached + 30 read + 10 written; Codex input already includes its 10 cached.
+        assert_eq!(input("Claude"), (Some(50), Some(30)));
+        assert_eq!(input("Codex"), (Some(40), Some(10)));
+        assert_eq!(model.summary.input_tokens, Some(90));
+        assert_eq!(model.summary.cached_input_tokens, Some(40));
     }
 }

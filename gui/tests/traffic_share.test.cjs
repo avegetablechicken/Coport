@@ -98,3 +98,13 @@ test('home traffic keeps the category it was read for', async () => {
   assert.equal(ui.homeTraffic.scope, 'all');
   assert.equal(ui.homeTraffic.requests, 3);
 });
+test('Models adds output to input, which already holds cached tokens', () => {
+  const { shareTokens, trafficShare } = setup();
+  // The backend counts cached input inside input for every service.
+  for (const service of ['Claude', 'Codex']) {
+    assert.equal(shareTokens(credential('c', 1, service, { inputTokens: 1000, outputTokens: 20, cachedInputTokens: 900 })), 1020);
+  }
+  assert.equal(shareTokens(credential('out', 1, 'Claude', { outputTokens: 50 })), 50);
+  assert.equal(shareTokens(credential('silent', 1, 'Claude', { cachedInputTokens: 5 })), null);
+  assert.match(trafficShare([credential('c', 1, 'Claude', { inputTokens: 1000, outputTokens: 20, cachedInputTokens: 900 })], 'model'), /Claude · c: 1,020 tokens/);
+});
