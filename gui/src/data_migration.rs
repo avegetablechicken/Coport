@@ -8,25 +8,32 @@ const ITEMS: [&str; 3] = ["config.yaml", "tls", "logs"];
 pub fn prepare() -> io::Result<()> {
     prepare_paths(
         &crate::settings::legacy_cache_dir(),
+        &crate::settings::legacy_app_dir(),
         &crate::settings::app_dir(),
     )
 }
 
-fn prepare_paths(source: &Path, target: &Path) -> io::Result<()> {
+fn prepare_paths(source: &Path, legacy: &Path, target: &Path) -> io::Result<()> {
     if target.join(MARKER).try_exists()? || !source.try_exists()? {
         return Ok(());
     }
     private_dir(target)?;
     // Hold the daemon's own lock throughout the copy. Discovery alone can fail
     // while the daemon is starting/stopping and cannot prove files are idle.
-    let lock = crate::daemon::lock_file(&target.join("daemon.lock"))?;
-    lock.try_lock().map_err(|error| io::Error::other(format!(
-        "Stop the proxy in the previous Coport app, then reopen this version to migrate its data. No source files will be deleted. Cannot acquire the daemon lock: {error}"
-    )))?;
-    migrate(source, target)
+    // A daemon from the previous version holds its lock in the old directory.
+    let mut locks = vec![crate::daemon::lock_file(&target.join("daemon.lock"))?];
+    if legacy.join("daemon.lock").try_exists()? {
+        locks.push(crate::daemon::lock_file(&legacy.join("daemon.lock"))?);
+    }
+    for lock in &locks {
+        lock.try_lock().map_err(|error| io::Error::other(format!(
+            "Stop the proxy in the previous Coport app, then reopen this version to migrate its data. No source files will be deleted. Cannot acquire the daemon lock: {error}"
+        )))?;
+    }
+    migrate(source, legacy, target)
 }
 
-fn migrate(source: &Path, target: &Path) -> io::Result<()> {
+fn migrate(source: &Path, legacy: &Path, target: &Path) -> io::Result<()> {
     if target.join(MARKER).try_exists()? || !source.try_exists()? {
         return Ok(());
     }
@@ -46,6 +53,11 @@ fn migrate(source: &Path, target: &Path) -> io::Result<()> {
                 ),
             ));
         }
+    }
+    // Preferences are kept where they already exist rather than compared.
+    let preferences = legacy.join("gui.json");
+    if fs::symlink_metadata(&preferences).is_ok_and(|m| m.is_file()) {
+        files.push((preferences, target.join("gui.json")));
     }
     for (from, to) in files {
         if to.try_exists()? {
@@ -138,7 +150,7 @@ mod tests {
             fs::write(source.join("logs/proxy.log.1"), b"rotated").unwrap();
             fs::write(source.join("logs/history/proxy.log.1.jsonl"), b"archive").unwrap();
             fs::write(target.join("gui.json"), b"preferences").unwrap();
-            migrate(&source, &target).unwrap();
+            migrate(&source, &dir.path().join("legacy"), &target).unwrap();
             for name in [
                 "config.yaml",
                 "tls/ca-key.pem",
@@ -167,7 +179,7 @@ mod tests {
                 );
             }
             fs::write(target.join("config.yaml"), b"new configuration").unwrap();
-            migrate(&source, &target).unwrap();
+            migrate(&source, &dir.path().join("legacy"), &target).unwrap();
             assert_eq!(
                 fs::read(target.join("config.yaml")).unwrap(),
                 b"new configuration"
@@ -185,11 +197,11 @@ mod tests {
         fs::write(source.join("config.yaml"), b"original config").unwrap();
         fs::write(source.join("tls/ca-key.pem"), b"original key").unwrap();
         fs::write(target.join("tls/ca-key.pem"), b"different key").unwrap();
-        assert!(migrate(&source, &target).is_err());
+        assert!(migrate(&source, &dir.path().join("legacy"), &target).is_err());
         assert!(!target.join("config.yaml").exists());
         assert!(!target.join(MARKER).exists());
         fs::write(target.join("tls/ca-key.pem"), b"original key").unwrap();
-        migrate(&source, &target).unwrap();
+        migrate(&source, &dir.path().join("legacy"), &target).unwrap();
         assert!(target.join(MARKER).exists());
     }
 
@@ -204,11 +216,11 @@ mod tests {
         fs::write(source.join("config.yaml"), b"original config").unwrap();
         let lock = crate::daemon::lock_file(&target.join("daemon.lock")).unwrap();
         lock.try_lock().unwrap();
-        assert!(prepare_paths(&source, &target).is_err());
+        assert!(prepare_paths(&source, &dir.path().join("legacy"), &target).is_err());
         assert!(!target.join("config.yaml").exists());
         assert!(!target.join(MARKER).exists());
         drop(lock);
-        prepare_paths(&source, &target).unwrap();
+        prepare_paths(&source, &dir.path().join("legacy"), &target).unwrap();
         assert_eq!(
             fs::read(target.join("config.yaml")).unwrap(),
             b"original config"
@@ -216,10 +228,38 @@ mod tests {
     }
 
     #[test]
+    fn previous_daemon_lock_prevents_migration_and_preferences_follow() {
+        let _guard = crate::daemon::spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cache");
+        let legacy = dir.path().join("legacy");
+        let target = dir.path().join("support");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(source.join("config.yaml"), b"original config").unwrap();
+        fs::write(legacy.join("gui.json"), b"preferences").unwrap();
+        let lock = crate::daemon::lock_file(&legacy.join("daemon.lock")).unwrap();
+        lock.try_lock().unwrap();
+        assert!(prepare_paths(&source, &legacy, &target).is_err());
+        assert!(!target.join("config.yaml").exists());
+        assert!(!target.join("gui.json").exists());
+        assert!(!target.join(MARKER).exists());
+        drop(lock);
+        prepare_paths(&source, &legacy, &target).unwrap();
+        assert_eq!(fs::read(target.join("gui.json")).unwrap(), b"preferences");
+        assert_eq!(fs::read(legacy.join("gui.json")).unwrap(), b"preferences");
+    }
+
+    #[test]
     fn missing_legacy_directory_is_a_fresh_install() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("support");
-        migrate(&dir.path().join("absent"), &target).unwrap();
+        migrate(
+            &dir.path().join("absent"),
+            &dir.path().join("legacy"),
+            &target,
+        )
+        .unwrap();
         assert!(!target.exists());
     }
 
@@ -233,7 +273,7 @@ mod tests {
         let outside = dir.path().join("outside");
         fs::write(&outside, b"keep").unwrap();
         std::os::unix::fs::symlink(&outside, source.join("config.yaml")).unwrap();
-        assert!(migrate(&source, &target).is_err());
+        assert!(migrate(&source, &dir.path().join("legacy"), &target).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
         assert!(!target.exists());
     }

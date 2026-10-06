@@ -73,6 +73,13 @@ pub fn traffic_compatibility_path() -> PathBuf {
     app_dir().join("traffic-compatibility.json")
 }
 
+/// Where versions that kept their data in the cache ran the daemon and kept `gui.json`.
+pub(crate) fn legacy_app_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("coport")
+}
+
 pub(crate) fn legacy_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .expect("Cannot locate the current user's application cache directory")

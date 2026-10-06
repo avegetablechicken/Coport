@@ -41,7 +41,6 @@ Usage: coport-gui [--background]
 const LAUNCH_OPEN_DELAY: Duration = Duration::from_millis(400);
 
 fn main() {
-    let settings = settings::Settings::load();
     // Opening the app by hand shows the panel; login items start quietly.
     let mut open = true;
     let mut args = std::env::args().skip(1);
@@ -119,6 +118,8 @@ fn main() {
                 app.manage(Mutex::new(instance));
                 return Ok(());
             }
+            // Loaded after the migration, which may bring the previous version's preferences.
+            let settings = settings::Settings::load();
             let handle = app.handle().clone();
             let notify = tray_notifier(handle);
             let appearance = settings.appearance;
