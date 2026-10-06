@@ -148,6 +148,8 @@ const ui = {
   fetchedAt: 0,
   refreshRequest: 0,
   page: "main",
+  /// Opened from View All: keep the Log at the top until the user scrolls.
+  pinLog: false,
   filter: "requests",
   search: "",
   searchMode: "keyword",
@@ -261,6 +263,21 @@ async function loadActivity(mode) {
   if (mode === "live") keepLogScroll(update);
   else update();
 }
+
+/// Offset of the Log block from where the first block of the page starts.
+function logOffset() {
+  const content = $("content");
+  const log = content.querySelector(".log-block");
+  if (!log) return null;
+  return log.getBoundingClientRect().top - content.getBoundingClientRect().top - parseFloat(getComputedStyle(content).paddingTop);
+}
+
+/// Scrolls the Activity page so the Log block starts at the top. Until the
+/// user scrolls, Traffic loading above it keeps it there.
+function scrollToLog() {
+  $("content").scrollTop += logOffset() ?? 0;
+}
+
 
 /// Applies `update` without moving the Log rows in view when the list is
 /// scrolled, so entries added above do not push them down.
@@ -540,7 +557,7 @@ function snippet(label, code) {
 
 function recentBlock() {
   const rows = ui.recent;
-  const aside = rows.length ? `<button class="text-link" data-action="page" data-page="activity">View All</button>` : "";
+  const aside = rows.length ? `<button class="text-link" data-action="page" data-page="activity" data-target="log">View All</button>` : "";
   const body = rows.length
     ? rows.map((e) => requestRow(e, false)).join("")
     : `<div class="placeholder">${ui.snap.phase.state === "running" ? "Waiting for the first request…" : "Start the proxy to see requests."}</div>`;
@@ -1065,6 +1082,9 @@ function renderActivityTraffic() {
   closeSelect();
   const el = $("activity-traffic");
   if (!el) return;
+  // While the Log is at or above the top, Traffic changing height must not move it.
+  const logBefore = logOffset();
+  const keepLog = logBefore != null && logBefore <= 0.5 && $("content").scrollTop > 0;
   const traffic = ui.traffic;
   const scope = traffic?.scope ?? ui.trafficScope;
   el.setAttribute("aria-busy", String(ui.trafficLoading));
@@ -1096,6 +1116,8 @@ function renderActivityTraffic() {
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
     ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
+  if (ui.pinLog) scrollToLog();
+  else if (keepLog) $("content").scrollTop += logOffset() - logBefore;
   queueFit();
 }
 
@@ -1434,8 +1456,10 @@ async function act(action, el) {
         await loadActivity();
       }
       if (ui.page === "main") loadHomeTraffic();
+      ui.pinLog = ui.page === "activity" && el.dataset.target === "log";
       render();
       $("content").scrollTop = 0;
+      if (ui.pinLog) scrollToLog();
       break;
     case "power":
       try {
@@ -1560,6 +1584,11 @@ async function act(action, el) {
       await invoke("quit_app");
       break;
   }
+}
+
+// Any scroll or input on the page ends a View All pin of the Log.
+for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
+  $("content").addEventListener(type, () => { ui.pinLog = false; }, { passive: true });
 }
 
 document.addEventListener("click", (event) => {
