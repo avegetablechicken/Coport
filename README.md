@@ -415,8 +415,9 @@ recognized official hostnames, so include it for a loopback URL. Restart Codex
 after editing. HTTP/SSE and HTTP/1.1 WebSocket upgrades use the same credential
 and upstream routes.
 
-Codex 0.160 and later refuse a plain-HTTP `chatgpt_base_url` ("workspace
-backend must use an HTTPS origin without credentials"), so the listening port
+Signed in with ChatGPT, Codex 0.156 and later refuse a plain-HTTP
+`chatgpt_base_url` ("workspace backend must use an HTTPS origin without
+credentials"); `openai_base_url` may stay HTTP. The listening port therefore
 also accepts TLS: a connection that starts with a TLS handshake is decrypted,
 anything else is served as plain HTTP. On first start coport creates a private
 CA in `tls/` next to the configuration file (`tls/ca.pem`, with an owner-only

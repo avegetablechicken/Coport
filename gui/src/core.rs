@@ -593,7 +593,7 @@ struct Urls {
     base: String,
     claude: String,
     codex: String,
-    /// Codex 0.160+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
+    /// Codex 0.156+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
     chatgpt: String,
     ca_certificate: String,
 }

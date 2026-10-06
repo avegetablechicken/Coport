@@ -1,4 +1,4 @@
-//! Loopback TLS for clients that refuse plain-HTTP base URLs (Codex 0.160+
+//! Loopback TLS for clients that refuse plain-HTTP base URLs (Codex 0.156+
 //! requires an HTTPS `chatgpt_base_url`). A private CA is created once and
 //! kept beside the configuration; clients trust `ca.pem`. The serving
 //! certificate is reissued from that CA on every start.
