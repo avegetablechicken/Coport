@@ -402,6 +402,12 @@ fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
         "path" => e
             .get("path")
             .is_some_and(|path| path.to_lowercase().contains(needle)),
+        // Configuration names: the matched account route, or the API Key
+        // variable, provider ID, Claude settings name or URL route.
+        "credential" => ["account_label", "provider"].iter().any(|key| {
+            e.get(key)
+                .is_some_and(|name| name.to_lowercase().contains(needle))
+        }),
         _ => {
             e.event.contains(needle)
                 || e.fields.values().any(|v| {
@@ -758,6 +764,23 @@ mod tests {
         assert!(!matches_search(&entry, "proxy", "other-proxy"));
         assert!(matches_search(&entry, "path", "responses"));
         assert!(!matches_search(&entry, "path", "office"));
+        assert!(!matches_search(&entry, "credential", "office"));
+        for (key, name) in [
+            ("account_label", "Work@Example.com"),
+            ("provider", "OPENAI_API_KEY"),
+        ] {
+            entry.fields.insert(key.into(), serde_json::json!(name));
+            assert!(matches_search(&entry, "credential", &name.to_lowercase()));
+            assert!(matches_search(&entry, "credential", "work") == (key == "account_label"));
+            assert!(matches_search(&entry, "credential", "openai") == (key == "provider"));
+            entry.fields.remove(key);
+        }
+        // Other fields, such as the account ID, are not configuration names.
+        entry
+            .fields
+            .insert("account_id".into(), serde_json::json!("acct-openai"));
+        assert!(!matches_search(&entry, "credential", "openai"));
+        entry.fields.remove("account_id");
         entry
             .fields
             .insert("proxy".into(), serde_json::json!("none"));
@@ -767,7 +790,7 @@ mod tests {
         entry.fields.remove("status");
         assert!(!matches_search(&entry, "proxy", "direct"));
         assert!(!matches_search(&entry, "status", "200"));
-        for mode in ["keyword", "path", "proxy", "status"] {
+        for mode in ["keyword", "path", "proxy", "status", "credential"] {
             assert!(matches_search(&entry, mode, ""));
         }
     }

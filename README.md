@@ -756,8 +756,10 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the
 search condition dropdown for Keyword (all string fields), Path (contains),
-Proxy (exact name, or `direct` for a direct connection), or Status (exact
-three-digit HTTP status). Searches ignore case and surrounding whitespace; an
+Proxy (exact name, or `direct` for a direct connection), Status (exact
+three-digit HTTP status), or Credential (contains; the configuration name that
+routed the request: an account route such as an email or `default`, an API Key
+variable or Codex provider ID, a Claude settings/profile name, or a URL route). Searches ignore case and surrounding whitespace; an
 empty search shows all entries in the selected tab and time range.
 
 Enable **Settings → General → Keep proxy running after quit** to leave the
