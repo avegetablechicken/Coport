@@ -516,15 +516,15 @@ function trafficBlock() {
 
 function connectBlock() {
   const s = ui.snap;
-  const row = (name, url) => `<div class="row">
-      <span class="row-label">${name}</span>
+  const row = (name, service, url) => `<div class="row">
+      <span class="row-label"><span class="connect-app">${serviceMark(service)}${name}</span></span>
       <span class="row-value selectable">${esc(url)}</span>
       <button class="icon-btn" data-action="copy" data-text="${esc(url)}" data-tip="Copy" aria-label="Copy ${name} base URL">${ICON.copy}</button>
     </div>`;
   return block(
     "Connect",
     "",
-    `${row("Claude Code", s.urls.claude)}${row("Codex", s.urls.codex)}
+    `${row("Claude Code", "Claude", s.urls.claude)}${row("Codex", "Codex", s.urls.codex)}
      <details class="disclosure" id="setup-snippets" ${ui.snippetsOpen ? "open" : ""}><summary>${ICON.chevron}Setup snippets</summary>
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Top of ~/.codex/config.toml, then restart Codex", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}

@@ -1249,6 +1249,8 @@ details.disclosure[open] summary svg {
   -webkit-mask: var(--service-icon) center / contain no-repeat;
   mask: var(--service-icon) center / contain no-repeat;
 }
+.connect-app { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.connect-app .service-mark { width: 14px; height: 14px; }
 .claude-mark { --service-icon: url("icons/claude.svg"); }
 .codex-mark { --service-icon: url("icons/codex.svg"); }
 
