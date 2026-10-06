@@ -1,7 +1,8 @@
 //! Procedurally rasterized icons, so the app ships without binary assets.
 //!
 //! The glyph is a lighthouse above the water: a port that shows traffic the
-//! way out. Its beams shine while the proxy runs and go dark otherwise.
+//! way out. Its beams shine while the proxy runs and go dark otherwise. The
+//! badge is set at dusk, a clay sky over a teal sea, after Claude and Codex.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -12,22 +13,75 @@ pub enum Status {
 
 type Rgba = [f32; 4];
 
-const NIGHT_TOP: Rgba = [0.08, 0.15, 0.40, 1.0];
-const NIGHT_BOTTOM: Rgba = [0.10, 0.42, 0.92, 1.0];
+/// Vertical gradient stops of the badge: sky, horizon glow, then the sea.
+const DUSK: [(f32, Rgba); 5] = [
+    (0.08, [0.722, 0.353, 0.243, 1.0]),
+    (0.40, [0.824, 0.494, 0.345, 1.0]),
+    (0.57, [0.902, 0.655, 0.486, 1.0]),
+    (0.70, [0.243, 0.620, 0.604, 1.0]),
+    (0.96, [0.051, 0.373, 0.408, 1.0]),
+];
+const HALO: Rgba = [1.0, 0.945, 0.839, 1.0];
 const SHADOW: Rgba = [0.0, 0.10, 0.35, 1.0];
 const WHITE: Rgba = [1.0, 1.0, 1.0, 1.0];
 const GREEN: Rgba = [0.20, 0.78, 0.42, 1.0];
 const GREY: Rgba = [0.62, 0.64, 0.68, 1.0];
 const RED: Rgba = [0.94, 0.30, 0.30, 1.0];
 
+/// The water line: two sine periods across the bottom, thinning to its ends.
+const WAVE: Wave = Wave {
+    from: 0.12,
+    to: 0.88,
+    radius: 0.026,
+    base: 0.915,
+    amplitude: 0.015,
+    periods: 2.0,
+    phase: 0.0,
+};
+/// A shorter, fainter swell below the water line.
+const SWELL: Wave = Wave {
+    from: 0.30,
+    to: 0.70,
+    radius: 0.016,
+    base: 0.985,
+    amplitude: 0.010,
+    periods: 1.0,
+    phase: 1.4,
+};
+
 /// Monochrome glyph for the macOS menu bar; only alpha is significant.
 #[cfg(target_os = "macos")]
 pub fn template(size: u32, status: Status) -> Vec<u8> {
+    // Shrink the glyph towards the top to leave room below for both waves,
+    // drawn thicker and lower than on the badge so they stay apart at 22pt.
+    const SCALE: f32 = 0.88;
+    const TOP: f32 = 0.03;
+    const WATER: Wave = Wave {
+        base: 0.95,
+        radius: 0.040,
+        ..WAVE
+    };
+    const SWELL_BELOW: Wave = Wave {
+        base: 1.10,
+        radius: 0.030,
+        ..SWELL
+    };
     let lit = status == Status::Running;
     let alpha = if lit { 1.0 } else { 0.6 };
     raster(size, |x, y| {
-        let g = coverage(glyph_sdf(x, y, lit));
-        [0.0, 0.0, 0.0, g * alpha]
+        let (gx, gy) = ((x - 0.5) / SCALE + 0.5, (y - TOP) / SCALE + 0.13);
+        let d = tower_sdf(gx, gy, lit)
+            .min(WATER.sdf(gx, gy))
+            .min(SWELL_BELOW.sdf(gx, gy));
+        let mut a = coverage(d);
+        if lit {
+            // Beams fade as they travel away from the lantern.
+            for side in [-1.0, 1.0] {
+                let (d, t) = beam(gx, gy, side);
+                a = a.max(coverage(d) * (1.0 - 0.6 * t));
+            }
+        }
+        [0.0, 0.0, 0.0, a * alpha]
     })
 }
 
@@ -38,17 +92,34 @@ pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
     let lit = status.is_none_or(|s| s == Status::Running);
     raster(size, |x, y| {
         let mut px = [0.0; 4];
-        // Rounded-square badge with a night-sky gradient.
+        // Rounded-square badge with a dusk gradient.
         let badge = coverage(rounded_rect_sdf(x, y, 0.5, 0.5, 0.46, 0.46, 0.22));
         if badge > 0.0 {
-            let c = mix(NIGHT_TOP, NIGHT_BOTTOM, ((y - 0.04) / 0.92).clamp(0.0, 1.0));
-            over(&mut px, c, badge);
+            over(&mut px, gradient(&DUSK, y), badge);
         }
         let (gx, gy) = ((x - OFFSET) / SCALE, (y - OFFSET) / SCALE);
-        // Soft shadow: the glyph's distance field, offset downwards and faded.
-        let shadow = (0.5 - glyph_sdf(gx, gy - 0.025, lit) / 0.05).clamp(0.0, 1.0);
-        over(&mut px, SHADOW, shadow * 0.28 * badge);
-        over(&mut px, WHITE, coverage(glyph_sdf(gx, gy, lit)) * badge);
+        if lit {
+            // Warm halo around the lantern.
+            let r = ((gx - 0.5).powi(2) + ((gy - 0.30) * 1.3).powi(2)).sqrt();
+            over(
+                &mut px,
+                HALO,
+                (1.0 - smoothstep(0.06, 0.30, r)) * 0.55 * badge,
+            );
+        }
+        // Soft shadow: the tower's distance field, offset downwards and faded.
+        let shadow = (0.5 - tower_sdf(gx, gy - 0.025, lit) / 0.05).clamp(0.0, 1.0);
+        over(&mut px, SHADOW, shadow * 0.22 * badge);
+        if lit {
+            // Beams fade as they travel away from the lantern.
+            for side in [-1.0, 1.0] {
+                let (d, t) = beam(gx, gy, side);
+                over(&mut px, WHITE, coverage(d) * (1.0 - 0.6 * t) * badge);
+            }
+        }
+        over(&mut px, WHITE, coverage(SWELL.sdf(gx, gy)) * 0.7 * badge);
+        over(&mut px, WHITE, coverage(WAVE.sdf(gx, gy)) * badge);
+        over(&mut px, WHITE, coverage(tower_sdf(gx, gy, lit)) * badge);
         if let Some(status) = status {
             let color = match status {
                 Status::Running => GREEN,
@@ -68,9 +139,9 @@ pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
     })
 }
 
-/// Signed distance (negative inside) to the lighthouse glyph in the unit
-/// square. An unlit lighthouse has no beams and a hollow lantern.
-fn glyph_sdf(x: f32, y: f32, lit: bool) -> f32 {
+/// Signed distance (negative inside) to the lighthouse without its beams, in
+/// the unit square. An unlit lighthouse has a hollow lantern.
+fn tower_sdf(x: f32, y: f32, lit: bool) -> f32 {
     // Tower tapering outwards from y 0.40 to 0.84, with one band cut out.
     let half = 0.085 + (y - 0.40) / 0.44 * 0.075;
     let tower = ((x - 0.5).abs() - half).max((y - 0.62).abs() - 0.22);
@@ -78,33 +149,81 @@ fn glyph_sdf(x: f32, y: f32, lit: bool) -> f32 {
     let gallery = rounded_rect_sdf(x, y, 0.5, 0.385, 0.14, 0.025, 0.02);
     let lantern = rounded_rect_sdf(x, y, 0.5, 0.30, 0.075, 0.065, 0.02);
     let roof = triangle_sdf(x, y, [(0.39, 0.24), (0.61, 0.24), (0.5, 0.13)]) - 0.012;
-    let mut d = tower.min(gallery).min(lantern).min(roof);
+    let d = tower.min(gallery).min(lantern).min(roof);
     if lit {
-        for s in [-1.0, 1.0] {
-            let beam = [
-                (0.5 + s * 0.13, 0.29),
-                (0.5 + s * 0.45, 0.17),
-                (0.5 + s * 0.45, 0.39),
-            ];
-            d = d.min(triangle_sdf(x, y, beam) - 0.012);
-        }
+        d
     } else {
-        d = d.max(-rounded_rect_sdf(x, y, 0.5, 0.30, 0.035, 0.03, 0.01));
+        d.max(-rounded_rect_sdf(x, y, 0.5, 0.30, 0.035, 0.03, 0.01))
     }
-    d.min(wave_sdf(x, y) - 0.03)
 }
 
-/// Distance to the water line: two sine periods across the bottom.
-fn wave_sdf(x: f32, y: f32) -> f32 {
-    const STEPS: usize = 32;
-    let point = |i: usize| {
-        let t = i as f32 / STEPS as f32;
-        let phase = t * 4.0 * std::f32::consts::PI;
-        (0.12 + 0.76 * t, 0.92 + 0.015 * phase.sin())
-    };
-    (1..=STEPS)
-        .map(|i| segment_sdf(x, y, point(i - 1), point(i)))
-        .fold(f32::MAX, f32::min)
+/// Distance to the beam on `side` (-1 left, 1 right): a cone from the lantern
+/// with an arc at its far end. Also returns how far along the beam the point
+/// lies, from 0 at the lantern to 1 at the arc.
+fn beam(x: f32, y: f32, side: f32) -> (f32, f32) {
+    const NEAR: f32 = 0.12;
+    const FAR: f32 = 0.47;
+    const HALF_ANGLE: f32 = 13.0 * std::f32::consts::PI / 180.0;
+    let (dx, dy) = ((x - 0.5) * side, y - 0.30);
+    let r = (dx * dx + dy * dy).sqrt();
+    let edge = (dy.atan2(dx).abs() - HALF_ANGLE) * r;
+    let d = edge.max(r - FAR).max(NEAR - r) - 0.006;
+    (d, ((r - NEAR) / (FAR - NEAR)).clamp(0.0, 1.0))
+}
+
+struct Wave {
+    from: f32,
+    to: f32,
+    radius: f32,
+    base: f32,
+    amplitude: f32,
+    periods: f32,
+    phase: f32,
+}
+
+impl Wave {
+    /// Distance to a sine stroke whose radius tapers towards both ends.
+    fn sdf(&self, x: f32, y: f32) -> f32 {
+        const STEPS: usize = 32;
+        if (y - self.base).abs() > self.amplitude + self.radius + 0.05 {
+            return f32::MAX;
+        }
+        let point = |t: f32| {
+            let phase = t * self.periods * 2.0 * std::f32::consts::PI + self.phase;
+            let x = self.from + (self.to - self.from) * t;
+            (x, self.base + self.amplitude * phase.sin())
+        };
+        let radius = |t: f32| self.radius * (std::f32::consts::PI * t).sin().powf(0.6).max(0.25);
+        (0..STEPS)
+            .map(|i| {
+                let (t0, t1) = (i as f32 / STEPS as f32, (i + 1) as f32 / STEPS as f32);
+                let (a, b) = (point(t0), point(t1));
+                let (pax, pay) = (x - a.0, y - a.1);
+                let (bax, bay) = (b.0 - a.0, b.1 - a.1);
+                let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay)).clamp(0.0, 1.0);
+                let d = ((pax - bax * h).powi(2) + (pay - bay * h).powi(2)).sqrt();
+                // Interpolate the radius along the segment so the edge stays smooth.
+                d - radius(t0 + (t1 - t0) * h)
+            })
+            .fold(f32::MAX, f32::min)
+    }
+}
+
+/// Smooth interpolation between gradient stops sorted by position.
+fn gradient(stops: &[(f32, Rgba)], t: f32) -> Rgba {
+    let mut color = stops[0].1;
+    for pair in stops.windows(2) {
+        let ((t0, a), (t1, b)) = (pair[0], pair[1]);
+        if t > t0 {
+            color = mix(a, b, smoothstep(t0, t1, t));
+        }
+    }
+    color
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn raster(size: u32, shade: impl Fn(f32, f32) -> Rgba) -> Vec<u8> {
