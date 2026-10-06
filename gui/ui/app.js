@@ -425,7 +425,15 @@ function proxyBlock() {
   return block("Proxy", head, strip + messages);
 }
 
-function chart(values, errors, showPeak = false) {
+/// Bars of a stats object's buckets: requests, or with Models reported input
+/// plus output tokens, in the ring's unit. Red marks the share of failed
+/// requests or calls; buckets whose calls reported no usage keep a stub bar.
+function chart(stats, scope, showPeak = false) {
+  const model = scope === "model";
+  const values = model ? stats.tokenCounts : stats.counts;
+  const calls = stats.counts;
+  const errors = stats.errorCounts;
+  const { unit, format } = shareMeasure(scope);
   const n = values.length;
   if (!n) return "";
   const max = Math.max(1, ...values);
@@ -436,10 +444,11 @@ function chart(values, errors, showPeak = false) {
   let bars = "";
   values.forEach((v, i) => {
     const x = (i * (bar + gap)).toFixed(2);
-    const bh = v ? Math.max(2.5, (v / max) * h) : 1;
-    bars += `<rect class="${v ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"><title>${v} requests</title></rect>`;
+    const bh = v ? Math.max(2.5, (v / max) * h) : calls[i] ? 2.5 : 1;
+    const title = model ? `${v.toLocaleString("en-US")} tokens · ${calls[i].toLocaleString("en-US")} calls` : `${v.toLocaleString("en-US")} requests`;
+    bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"><title>${title}</title></rect>`;
     if (errors[i]) {
-      const eh = (bh * errors[i]) / v;
+      const eh = (bh * errors[i]) / calls[i];
       bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
     }
   });
@@ -451,7 +460,7 @@ function chart(values, errors, showPeak = false) {
   // Align edge labels inward so the first/last bucket cannot clip the value.
   const shift = position < 20 ? "0" : position > 80 ? "-100%" : "-50%";
   return `<div class="traffic-chart">
-    <span class="chart-peak" style="left:${position}%;transform:translateX(${shift})" title="Peak: ${peak.toLocaleString("en-US")} requests per bar">${peak.toLocaleString("en-US")}</span>
+    <span class="chart-peak" style="left:${position}%;transform:translateX(${shift})" title="Peak: ${peak.toLocaleString("en-US")} ${unit} per bar">${format(peak)}</span>
     ${peak ? `<span class="chart-peak-stem" style="left:${position}%" aria-hidden="true"></span>` : ""}
     ${plot}
   </div>`;
@@ -494,7 +503,7 @@ function trafficBlock() {
     range,
     `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
      ${ui.homeTrafficError ? `<span class="traffic-update-error" title="${esc(ui.homeTrafficError)}">Update failed</span>` : ""}
-     ${chart(st.counts, st.errorCounts)}
+     ${chart(st, st.scope)}
      <div class="strip">
        ${stat(st.scope === "model" ? "Calls" : "Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
@@ -1005,13 +1014,13 @@ function renderActivityTraffic() {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
-      ${chart(c.counts, c.errorCounts, true)}
+      ${chart(c, scope, true)}
       <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
   }).join("");
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
-    "Sorted by received traffic, largest first. Red indicates errors; each chart uses its own scale.",
+    "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
     `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
   ].join("\n\n");

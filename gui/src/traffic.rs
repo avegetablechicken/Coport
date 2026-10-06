@@ -87,6 +87,8 @@ pub struct CredentialTraffic {
     avg_ms: Option<u64>,
     counts: Vec<u64>,
     error_counts: Vec<u64>,
+    /// Reported input plus output tokens per bucket; calls without usage add nothing.
+    token_counts: Vec<u64>,
     #[serde(skip)]
     latency_total: u64,
     #[serde(skip)]
@@ -198,6 +200,7 @@ pub fn read(
     let mut summary = CredentialTraffic {
         counts: vec![0; bucket_count],
         error_counts: vec![0; bucket_count],
+        token_counts: vec![0; bucket_count],
         ..Default::default()
     };
     for group in groups.values() {
@@ -214,6 +217,7 @@ pub fn read(
         for i in 0..bucket_count {
             summary.counts[i] += group.counts[i];
             summary.error_counts[i] += group.error_counts[i];
+            summary.token_counts[i] += group.token_counts[i];
         }
     }
     summary.avg_ms =
@@ -311,6 +315,7 @@ fn aggregate(
             credential,
             counts: vec![0; bucket_count],
             error_counts: vec![0; bucket_count],
+            token_counts: vec![0; bucket_count],
             ..Default::default()
         });
     let slot = ((time - start) / (bucket_minutes as i64 * 60_000)) as usize;
@@ -338,8 +343,11 @@ fn aggregate(
     } else {
         token("input_tokens")
     };
+    let output = token("output_tokens");
     add_tokens(&mut group.input_tokens, input);
-    add_tokens(&mut group.output_tokens, token("output_tokens"));
+    add_tokens(&mut group.output_tokens, output);
+    group.token_counts[slot] = group.token_counts[slot]
+        .saturating_add(input.unwrap_or(0).saturating_add(output.unwrap_or(0)));
     add_tokens(&mut group.cached_input_tokens, cached);
     // Only calls reporting both counts contribute to the hit rate.
     if let (Some(input), Some(cached), Some(_)) = (input, cached, token("input_tokens")) {
@@ -529,6 +537,7 @@ mod tests {
         assert_eq!(model.summary.errors, 1);
         assert_eq!(model.summary.input_tokens, Some(30));
         assert_eq!(model.summary.output_tokens, Some(15));
+        assert_eq!(model.summary.token_counts.iter().sum::<u64>(), 45);
         assert_eq!(model.summary.cached_input_tokens, Some(6));
         assert_eq!(model.summary.cache_hit_rate, Some(0.2));
         assert_eq!(model.credentials.len(), 1);
@@ -1017,5 +1026,13 @@ mod tests {
         assert_eq!(input("Codex"), (Some(40), Some(10)));
         assert_eq!(model.summary.input_tokens, Some(90));
         assert_eq!(model.summary.cached_input_tokens, Some(40));
+        // Bars use the same input plus output tokens; the call without usage adds nothing.
+        assert_eq!(model.summary.token_counts.iter().sum::<u64>(), 90);
+        let claude = model
+            .credentials
+            .iter()
+            .find(|c| c.service == "Claude")
+            .unwrap();
+        assert_eq!(claude.token_counts.iter().sum::<u64>(), 50);
     }
 }
