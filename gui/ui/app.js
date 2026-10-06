@@ -917,7 +917,10 @@ function shareGroups(credentials, measure) {
     const shown = named.length > SHARE_SHADES ? SHARE_SHADES - 1 : named.length;
     const slices = named.slice(0, shown).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
     const rest = named.slice(shown);
-    if (rest.length) slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true });
+    if (rest.length) {
+      const members = rest.map((c) => ({ name: c.credential, value: measure(c) }));
+      slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true, members });
+    }
     for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true, unidentified: true });
     return { service, value: sum(own), slices };
   });
@@ -993,7 +996,9 @@ function trafficShare(credentials, scope) {
   const widths = slices.map((s) => Math.max(s.value / total, 0.025));
   const turn = widths.reduce((sum, w) => sum + w, 0);
   const color = (s) => (s.muted ? "var(--track)" : `var(${s.color})`);
-  const label = (s) => `${s.service} · ${s.name}: ${s.value == null ? "no reported usage" : `${s.value.toLocaleString("en-US")} ${unit}`}`;
+  const amount = (n) => (n == null ? "no reported usage" : `${n.toLocaleString("en-US")} ${unit}`);
+  // Others lists every configuration it groups, one per line.
+  const label = (s) => [`${s.service} · ${s.name}: ${amount(s.value)}`, ...(s.members ?? []).map((m) => `${m.name}: ${amount(m.value)}`)].join("\n");
   let cursor = 0;
   const paths = slices.map((s, i) => {
     const from = cursor;

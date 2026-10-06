@@ -163,6 +163,15 @@ test('Models leaves out unidentified calls without tokens, All keeps them', () =
   // Should an unidentified call ever report tokens, it stays visible.
   assert.match(trafficShare([credential('Unidentified', 1, 'Codex', { outputTokens: 5 })], 'model'), /Unidentified/);
 });
+test('Others lists every configuration it groups on hover', () => {
+  const { trafficShare } = setup();
+  const named = Array.from({ length: 5 }, (_, i) => credential(`c${i}`, 100 - i, 'Claude'));
+  const html = trafficShare(named, 'all');
+  const tip = 'Claude · Others (2): 193 requests\nc3: 97 requests\nc4: 96 requests';
+  // Both the legend row and its ring sector carry the list.
+  assert.equal(html.split(`title="${tip}"`).length, 2);
+  assert.equal(html.split(`<title>${tip}</title>`).length, 2);
+});
 test('Unidentified takes an extra row in All, so named rows match Models', () => {
   const { trafficShare } = setup();
   const tokens = { inputTokens: 100, outputTokens: 1 };
