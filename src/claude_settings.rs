@@ -40,14 +40,25 @@ pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>
         if !visited.insert(canonical) {
             continue;
         }
-        for entry in std::fs::read_dir(directory)
-            .map_err(|_| Error::config("Cannot read Claude settings directory."))?
-        {
-            let entry =
-                entry.map_err(|_| Error::config("Cannot read Claude settings directory."))?;
-            let kind = entry
-                .file_type()
-                .map_err(|_| Error::config("Cannot read Claude settings entry."))?;
+        // Claude Code creates and removes files here while it runs; an entry
+        // that disappears during the walk is skipped rather than failing.
+        let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(e) if gone(&e) => continue,
+            Err(_) => return Err(Error::config("Cannot read Claude settings directory.")),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if gone(&e) => continue,
+                Err(_) => return Err(Error::config("Cannot read Claude settings directory.")),
+            };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) if gone(&e) => continue,
+                Err(_) => return Err(Error::config("Cannot read Claude settings entry.")),
+            };
             if kind.is_dir() {
                 pending.push(entry.path());
                 continue;
@@ -68,8 +79,11 @@ pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>
             if !settings_match && !exact_match {
                 continue;
             }
-            let path = std::fs::canonicalize(entry.path())
-                .map_err(|_| Error::config("Cannot read Claude settings file."))?;
+            let path = match std::fs::canonicalize(entry.path()) {
+                Ok(path) => path,
+                Err(e) if gone(&e) => continue,
+                Err(_) => return Err(Error::config("Cannot read Claude settings file.")),
+            };
             if settings_match {
                 settings.insert(path.clone());
             }
