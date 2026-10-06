@@ -232,6 +232,12 @@ async function loadActivity(mode) {
   } catch (error) {
     // A failed live update keeps the list; the next one retries.
     if (!current() || mode === "live") return;
+    // A failed older page keeps the pages already loaded, so it can be retried.
+    if (mode === "more") {
+      renderActivityList();
+      toast(String(error));
+      return;
+    }
     ui.rows = [];
     ui.activityNext = null;
     ui.activityError = String(error);
