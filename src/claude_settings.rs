@@ -1,6 +1,12 @@
 //! Named Claude settings files, resolved only inside configured directories.
 use crate::{Error, Result, config::expand};
 use serde_json::Value;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 pub(crate) fn is_url(name: &str) -> bool {
     !(name.ends_with(".json") && !name.contains(['/', ':', '\\']))
@@ -25,8 +31,52 @@ pub(crate) struct Profile {
     pub upstream: String,
 }
 
+/// How long a search result is reused. Requests resolve selectors on every
+/// call and the default directory holds all of Claude Code's data, so it is
+/// not walked each time; the selected file itself is still read every time.
+#[cfg(not(test))]
+const SEARCH_TTL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SEARCH_TTL: Duration = Duration::ZERO;
+
+/// Search results by directories and selector, with their expiry.
+type Searches = BTreeMap<(Vec<String>, String), (Instant, Option<PathBuf>)>;
+
 pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>> {
+    load_within(directories, name, SEARCH_TTL)
+}
+
+fn load_within(directories: &[String], name: &str, ttl: Duration) -> Result<Option<Profile>> {
+    static SEARCHES: Mutex<Searches> = Mutex::new(BTreeMap::new());
     validate_name(name)?;
+    let key = (directories.to_vec(), name.to_owned());
+    let cached = {
+        let mut searches = SEARCHES.lock().unwrap();
+        let now = Instant::now();
+        searches.retain(|_, (expires, _)| *expires > now);
+        searches.get(&key).map(|(_, path)| path.clone())
+    };
+    // A selected file that is gone is searched for again at once.
+    let path = match cached {
+        Some(path) if path.as_ref().is_none_or(|p| p.is_file()) => path,
+        _ => {
+            let path = find(directories, name)?;
+            if !ttl.is_zero() {
+                SEARCHES
+                    .lock()
+                    .unwrap()
+                    .insert(key, (Instant::now() + ttl, path.clone()));
+            }
+            path
+        }
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    read(&path).map(Some)
+}
+
+fn find(directories: &[String], name: &str) -> Result<Option<PathBuf>> {
     let mut settings = std::collections::BTreeSet::new();
     let mut exact = std::collections::BTreeSet::new();
     let mut pending: Vec<_> = directories.iter().map(|d| expand(d)).collect();
@@ -60,7 +110,11 @@ pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>
                 Err(_) => return Err(Error::config("Cannot read Claude settings entry.")),
             };
             if kind.is_dir() {
-                pending.push(entry.path());
+                // Repository internals never hold settings, and plugin
+                // marketplaces under the default directory are clones.
+                if entry.file_name() != ".git" {
+                    pending.push(entry.path());
+                }
                 continue;
             }
             // Never follow symlinks out of the configured tree or into cycles.
@@ -98,9 +152,10 @@ pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>
             "Multiple Claude settings files match the API selector; use a more specific filename.",
         ));
     }
-    let Some(path) = matches.first() else {
-        return Ok(None);
-    };
+    Ok(matches.into_iter().next())
+}
+
+fn read(path: &Path) -> Result<Profile> {
     let text = std::fs::read_to_string(path)
         .map_err(|_| Error::config("Cannot read Claude settings file."))?;
     let document: Value =
@@ -124,10 +179,10 @@ pub(crate) fn load(directories: &[String], name: &str) -> Result<Option<Profile>
         .filter(|s| !s.is_empty())
         .ok_or(Error::config("Claude settings require ANTHROPIC_BASE_URL."))?;
     let upstream = crate::config::unwrap_upstream(upstream)?;
-    Ok(Some(Profile {
+    Ok(Profile {
         token: token.into(),
         upstream,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -189,6 +244,50 @@ mod tests {
         assert!(!is_url("work.settings.json"));
         assert!(is_url("https://provider.invalid/api.json"));
         assert!(is_url("api.example.com"));
+    }
+
+    #[test]
+    fn searches_are_reused_but_files_are_read_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_string_lossy().into_owned()];
+        let ttl = Duration::from_secs(60);
+        write(&dir.path().join("cached.json"), "first.invalid");
+        assert_eq!(
+            load_within(&dirs, "cached", ttl).unwrap().unwrap().upstream,
+            "https://first.invalid"
+        );
+        // Edits to the selected file apply at once; a new rival file is only
+        // found by a later search.
+        write(&dir.path().join("cached.json"), "edited.invalid");
+        write(&dir.path().join("settings-cached.json"), "rival.invalid");
+        assert_eq!(
+            load_within(&dirs, "cached", ttl).unwrap().unwrap().upstream,
+            "https://edited.invalid"
+        );
+        // A removed selection is searched for again immediately.
+        std::fs::remove_file(dir.path().join("cached.json")).unwrap();
+        assert_eq!(
+            load_within(&dirs, "cached", ttl).unwrap().unwrap().upstream,
+            "https://rival.invalid"
+        );
+    }
+
+    #[test]
+    fn repositories_are_not_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_string_lossy().into_owned()];
+        let objects = dir.path().join("plugins/marketplace/.git/refs");
+        std::fs::create_dir_all(&objects).unwrap();
+        write(&objects.join("settings-api.json"), "git.invalid");
+        assert!(load(&dirs, "api").unwrap().is_none());
+        write(
+            &dir.path().join("plugins/marketplace/api.json"),
+            "plugin.invalid",
+        );
+        assert_eq!(
+            load(&dirs, "api").unwrap().unwrap().upstream,
+            "https://plugin.invalid"
+        );
     }
 
     #[test]

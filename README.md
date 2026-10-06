@@ -222,7 +222,9 @@ Search is recursive across `claude.config_dirs`, without following child symlink
 As in OpenQuota, JSON filenames containing both `settings` and the selector take
 priority; otherwise the filename or its stem must equal the selector (`api` or
 `api.json`). Multiple matching files are an error; use a more specific filename.
-File credentials and upstreams are reloaded for requests. Only when no file
+File credentials and upstreams are reloaded for requests; which file a selector
+names is searched for again at most every 10 seconds (sooner if it is removed),
+and `.git` directories are skipped. Only when no file
 matches is the selector treated as an environment variable, using `claude.base_url`.
 Malformed or incomplete selected files never fall back to environment values.
 Domain/URL selectors retain their explicit-upstream routing behavior.
