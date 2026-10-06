@@ -968,8 +968,13 @@ details.disclosure[open] summary svg {
 }
 
 .snippet {
-  position: relative;
   margin-top: 6px;
+}
+
+/* The copy button stays on the code, however many lines the label takes. */
+.snippet-code {
+  position: relative;
+  margin-top: 3px;
 }
 
 .snippet-label {
@@ -978,7 +983,7 @@ details.disclosure[open] summary svg {
 }
 
 .snippet pre {
-  margin: 3px 0 0;
+  margin: 0;
   padding: 6px 26px 6px 8px;
   border-radius: 5px;
   background: var(--track);
@@ -993,7 +998,7 @@ details.disclosure[open] summary svg {
 
 .snippet .icon-btn {
   position: absolute;
-  top: 16px;
+  top: 0;
   right: 3px;
 }
 

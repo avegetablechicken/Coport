@@ -534,8 +534,8 @@ function connectBlock() {
 }
 
 function snippet(label, code) {
-  return `<div class="snippet"><div class="snippet-label">${label}</div><pre>${esc(code)}</pre>
-    <button class="icon-btn" data-action="copy" data-text="${esc(code)}" aria-label="Copy snippet">${ICON.copy}</button></div>`;
+  return `<div class="snippet"><div class="snippet-label">${label}</div><div class="snippet-code"><pre>${esc(code)}</pre>
+    <button class="icon-btn" data-action="copy" data-text="${esc(code)}" aria-label="Copy snippet">${ICON.copy}</button></div></div>`;
 }
 
 function recentBlock() {
