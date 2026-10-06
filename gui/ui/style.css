@@ -30,12 +30,15 @@
   --codex-1: #3a3a3c;
   --codex-2: #707075;
   --codex-3: #a5a5aa;
+  --codex-4: #c7c7cc;
   --claude-1: #e8622c;
   --claude-2: #f28a5c;
   --claude-3: #f7b292;
+  --claude-4: #fbd2c0;
   --other-1: #9b51e0;
   --other-2: #b67ff0;
   --other-3: #d0aef7;
+  --other-4: #e6d5fb;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
@@ -67,6 +70,7 @@
     --codex-1: #f2f2f7;
     --codex-2: #c2c2c7;
     --codex-3: #8e8e93;
+    --codex-4: #636366;
   }
 }
 

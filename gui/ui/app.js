@@ -897,12 +897,13 @@ function modelTokenStats(stats, scope) {
 }
 
 const SHARE_SERVICES = ["Codex", "Claude"];
-const SHARE_SHADES = 3;
+const SHARE_SHADES = 4;
 
 /// Credentials grouped by service, each group in one hue. `measure` gives a
-/// credential's amount, or null when it is unknown. Within a group the largest
-/// credentials take the shades, the rest fold into "Others", and unidentified
-/// requests come last; both are drawn without a hue.
+/// credential's amount, or null when it is unknown. Each credential takes a shade
+/// while they fit; beyond that the largest keep theirs and at least two others
+/// fold into "Others". Unidentified requests come last; Others and unidentified
+/// are drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
   const used = credentials.filter((c) => c.requests > 0);
@@ -913,8 +914,9 @@ function shareGroups(credentials, measure) {
     const own = used.filter((c) => c.service === service);
     const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
     const hue = SHARE_SERVICES.includes(service) ? service.toLowerCase() : "other";
-    const slices = named.slice(0, SHARE_SHADES).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
-    const rest = named.slice(SHARE_SHADES);
+    const shown = named.length > SHARE_SHADES ? SHARE_SHADES - 1 : named.length;
+    const slices = named.slice(0, shown).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
+    const rest = named.slice(shown);
     if (rest.length) slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true });
     for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true });
     return { service, value: sum(own), slices };
@@ -1068,7 +1070,7 @@ function renderActivityTraffic() {
   }).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
   const notes = [
-    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
+    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; a service with more than four shows its three largest and groups the rest as Others.",
     "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
     `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Requests from a renamed configuration, one with a changed base URL, or logged before base URLs were recorded are merged and marked for review. Unidentified requests have no logged credential, or match no single current configuration. Logs are never rewritten.",

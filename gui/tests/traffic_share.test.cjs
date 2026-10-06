@@ -23,13 +23,15 @@ test('groups by service with one hue each and keeps unidentified last', () => {
 });
 test('folds credentials beyond the shades into Others per service', () => {
   const { shareGroups } = setup();
-  const named = Array.from({ length: 5 }, (_, i) => credential(`c${i}`, 100 - i, 'Claude'));
+  const named = Array.from({ length: 6 }, (_, i) => credential(`c${i}`, 100 - i, 'Claude'));
   const [group] = shareGroups([...named, credential('Unidentified', 5, 'Claude')], requests);
-  assert.deepEqual(group.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (2)', 'Unidentified']);
-  assert.equal(group.slices[3].value, 97 + 96);
+  assert.deepEqual(group.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (3)', 'Unidentified']);
+  assert.equal(group.slices[3].value, 97 + 96 + 95);
   assert.equal(group.slices[3].muted, true);
-  // Exactly at the limit, nothing is grouped.
-  assert.equal(shareGroups(named.slice(0, 3), requests)[0].slices.some((s) => s.muted), false);
+  // Others never holds a single credential: four fit, five group two.
+  const four = shareGroups(named.slice(0, 4), requests)[0].slices;
+  assert.deepEqual(four.map((s) => s.color), ['--claude-1', '--claude-2', '--claude-3', '--claude-4']);
+  assert.deepEqual(shareGroups(named.slice(0, 5), requests)[0].slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (2)']);
 });
 test('services other than Codex and Claude follow them in a neutral hue', () => {
   const { shareGroups } = setup();
