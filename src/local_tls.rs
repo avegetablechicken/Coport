@@ -6,18 +6,19 @@ use crate::{Error, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-    NameConstraints,
+    NameConstraints, PublicKeyData,
 };
 use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio_rustls::{
     TlsAcceptor,
     rustls::{
         self,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
         server::{ClientHello, ResolvesServerCert},
         sign::CertifiedKey,
     },
@@ -25,6 +26,8 @@ use tokio_rustls::{
 
 pub const CA_FILE: &str = "ca.pem";
 const CA_KEY_FILE: &str = "ca-key.pem";
+/// Held while a CA is created, so concurrent first starts write one pair.
+const CA_LOCK_FILE: &str = "ca.lock";
 
 /// Directory holding the CA for the configuration at `config`.
 pub fn dir_for(config: &Path) -> PathBuf {
@@ -122,23 +125,75 @@ fn ca_params() -> CertificateParams {
 }
 
 fn load_or_create_ca(dir: &Path) -> std::io::Result<KeyPair> {
-    let (cert_path, key_path) = (dir.join(CA_FILE), dir.join(CA_KEY_FILE));
-    let stored = std::fs::read_to_string(&key_path)
-        .ok()
-        .filter(|_| cert_path.is_file())
-        .and_then(|text| KeyPair::from_pem(&text).ok());
-    if let Some(key) = stored {
+    if let Some(key) = load_ca(dir) {
         return Ok(key);
     }
     std::fs::create_dir_all(dir)?;
+    let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE))?;
+    // Another instance may have created the pair while this one waited.
+    if let Some(key) = load_ca(dir) {
+        return Ok(key);
+    }
     let key = KeyPair::generate().map_err(std::io::Error::other)?;
     let cert = ca_params()
         .self_signed(&key)
         .map_err(std::io::Error::other)?;
     // NamedTempFile is created owner-only; the key keeps that mode.
-    persist(dir, &key_path, key.serialize_pem().as_bytes())?;
-    persist(dir, &cert_path, cert.pem().as_bytes())?;
+    persist(dir, &dir.join(CA_KEY_FILE), key.serialize_pem().as_bytes())?;
+    persist(dir, &dir.join(CA_FILE), cert.pem().as_bytes())?;
     Ok(key)
+}
+
+/// The stored key, only if `ca.pem` certifies it. A certificate for another
+/// key can never be verified, so such a pair is replaced like a missing one.
+fn load_ca(dir: &Path) -> Option<KeyPair> {
+    let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join(CA_KEY_FILE)).ok()?).ok()?;
+    let cert = CertificateDer::from_pem_file(dir.join(CA_FILE)).ok()?;
+    let public = key.subject_public_key_info();
+    cert.windows(public.len())
+        .any(|w| w == public.as_slice())
+        .then_some(key)
+}
+
+/// An exclusively created file, removed on drop. One left by a process that
+/// died while creating the CA is taken over once it is clearly stale.
+struct CreationLock(PathBuf);
+
+impl CreationLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        const STALE: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + STALE + Duration::from_secs(5);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => return Ok(Self(path.to_owned())),
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+                Err(e) => {
+                    let stale = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_some_and(|age| age > STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(path);
+                    } else if Instant::now() > deadline {
+                        return Err(e);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CreationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn persist(dir: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -169,5 +224,60 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+        assert!(!dir.path().join(CA_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn a_certificate_for_another_key_is_replaced_with_a_matching_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_ca(dir.path()).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        load_or_create_ca(other.path()).unwrap();
+        let mismatched = std::fs::read(other.path().join(CA_FILE)).unwrap();
+        std::fs::write(dir.path().join(CA_FILE), &mismatched).unwrap();
+        assert!(load_ca(dir.path()).is_none());
+        let key = load_or_create_ca(dir.path()).unwrap();
+        assert_ne!(std::fs::read(dir.path().join(CA_FILE)).unwrap(), mismatched);
+        assert_eq!(
+            load_ca(dir.path()).unwrap().public_key_raw(),
+            key.public_key_raw()
+        );
+    }
+
+    #[test]
+    fn concurrent_first_starts_write_one_consistent_pair() {
+        for _ in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Barrier::new(8);
+            let keys: Vec<Vec<u8>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            load_or_create_ca(dir.path())
+                                .unwrap()
+                                .public_key_raw()
+                                .to_vec()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let stored = load_ca(dir.path()).unwrap();
+            assert!(keys.iter().all(|k| k == stored.public_key_raw()));
+        }
+    }
+
+    #[test]
+    fn a_stale_creation_lock_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(CA_LOCK_FILE);
+        let file = std::fs::File::create(&lock).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        drop(file);
+        load_or_create_ca(dir.path()).unwrap();
+        assert!(load_ca(dir.path()).is_some());
+        assert!(!lock.exists());
     }
 }
