@@ -588,6 +588,7 @@ struct RouteReport {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Urls {
     base: String,
     claude: String,
@@ -760,7 +761,7 @@ impl From<Entry> for EntryDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_search, parse_config, replace_config};
+    use super::{Urls, matches_search, parse_config, replace_config};
     use crate::logs::Entry;
 
     #[test]
@@ -818,6 +819,23 @@ mod tests {
     }
 
     const EXAMPLE: &str = include_str!("../../config.example.yaml");
+
+    #[test]
+    fn connect_urls_use_the_field_names_the_panel_reads() {
+        let urls = serde_json::to_value(Urls {
+            base: "http://127.0.0.1:8787".into(),
+            claude: "claude".into(),
+            codex: "codex".into(),
+            chatgpt: "chatgpt".into(),
+            ca_certificate: "/tls/ca.pem".into(),
+        })
+        .unwrap();
+        // The panel's setup snippets read `urls.caCertificate`.
+        assert_eq!(urls["caCertificate"], "/tls/ca.pem");
+        for key in ["base", "claude", "codex", "chatgpt"] {
+            assert!(urls[key].is_string());
+        }
+    }
 
     #[test]
     fn example_config_is_valid() {
