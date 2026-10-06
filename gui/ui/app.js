@@ -918,7 +918,7 @@ function shareGroups(credentials, measure) {
     const slices = named.slice(0, shown).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
     const rest = named.slice(shown);
     if (rest.length) slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true });
-    for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true });
+    for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true, unidentified: true });
     return { service, value: sum(own), slices };
   });
 }
@@ -978,7 +978,11 @@ function shareMeasure(scope) {
 /// grouped by service.
 function trafficShare(credentials, scope) {
   const { unit, measure, format } = shareMeasure(scope);
-  const groups = shareGroups(credentials, measure);
+  // Unidentified model calls were rejected before reaching an upstream, so they
+  // report no tokens; Models leaves them out, with any service left empty.
+  const groups = shareGroups(credentials, measure)
+    .map((g) => (scope === "model" ? { ...g, slices: g.slices.filter((s) => !s.unidentified || s.value > 0) } : g))
+    .filter((g) => g.slices.length);
   const total = groups.reduce((sum, g) => sum + (g.value ?? 0), 0);
   if (!total) return "";
   const size = 84;

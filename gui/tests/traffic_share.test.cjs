@@ -145,3 +145,30 @@ test('Models charts of calls without reported usage show no zero token peak', ()
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
 });
+test('Models leaves out unidentified calls without tokens, All keeps them', () => {
+  const { trafficShare } = setup();
+  const credentials = [
+    credential('a', 3, 'Codex', { inputTokens: 100, outputTokens: 20 }),
+    credential('Unidentified', 4, 'Codex'),
+    // Claude only has rejected calls, so the whole service is left out.
+    credential('Unidentified', 2, 'Claude'),
+  ];
+  const model = trafficShare(credentials, 'model');
+  assert.doesNotMatch(model, /Unidentified/);
+  assert.doesNotMatch(model, /\[Claude\]/);
+  assert.match(model, /<span>a<\/span><span>120<\/span>/);
+  const all = trafficShare(credentials, 'all');
+  assert.equal((all.match(/<span>Unidentified<\/span>/g) || []).length, 2);
+  assert.match(all, /\[Claude\]/);
+  // Should an unidentified call ever report tokens, it stays visible.
+  assert.match(trafficShare([credential('Unidentified', 1, 'Codex', { outputTokens: 5 })], 'model'), /Unidentified/);
+});
+test('Unidentified takes an extra row in All, so named rows match Models', () => {
+  const { trafficShare } = setup();
+  const tokens = { inputTokens: 100, outputTokens: 1 };
+  const named = Array.from({ length: 4 }, (_, i) => credential(`c${i}`, 10 - i, 'Codex', tokens));
+  const credentials = [...named, credential('Unidentified', 50, 'Codex')];
+  const rows = (html) => [...html.matchAll(/<i style="[^"]*"><\/i><span>([^<]+)<\/span>/g)].map((m) => m[1]);
+  assert.deepEqual(rows(trafficShare(credentials, 'model')), ['c0', 'c1', 'c2', 'c3']);
+  assert.deepEqual(rows(trafficShare(credentials, 'all')), ['c0', 'c1', 'c2', 'c3', 'Unidentified']);
+});
