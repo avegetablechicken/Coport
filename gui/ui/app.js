@@ -159,6 +159,9 @@ const ui = {
   activityFrom: null,
   activityTo: null,
   activityNext: null,
+  // Pages past the first have been loaded; a live update keeps them.
+  activityPaged: false,
+  activityLoadingMore: false,
   activityError: "",
   recent: [],
   trafficMinutes: 30,
@@ -196,6 +199,7 @@ async function refresh() {
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
   if (ui.page === "main" && Date.now() - ui.homeTrafficFetchedAt >= 15000) loadHomeTraffic();
+  if (ui.page === "activity") scheduleActivityLog();
   render();
 }
 
@@ -205,34 +209,98 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(refresh, 120);
 }
 
-/// Lists the chosen range newest first; `more` appends the next, older page. The range
-/// is read once by the backend, then filters, searches and pages reuse it.
-async function loadActivity(more = false) {
+/// Lists the chosen range newest first. `"more"` appends the next, older page; `"live"`
+/// re-reads the log for lines written since and keeps the older pages already loaded.
+/// Otherwise the backend reuses its last read of the range for filters, searches and pages.
+async function loadActivity(mode) {
   if (ui.activityTo == null) resolveActivityRange();
   const request = ++ui.activityRequest;
   const query = {
     filter: ui.filter, search: ui.search, searchMode: ui.searchMode,
     range: { from: ui.activityFrom, to: ui.activityTo + 60 * 1000 },
-    after: more ? ui.activityNext : null,
+    after: mode === "more" ? ui.activityNext : null,
+    fresh: mode === "live",
   };
   const current = () => request === ui.activityRequest && query.filter === ui.filter && query.search === ui.search
     && query.searchMode === ui.searchMode && query.range.from === ui.activityFrom && query.range.to === ui.activityTo + 60 * 1000;
+  if (mode === "more") ui.activityLoadingMore = true;
   let activity;
   try {
     activity = await invoke("get_activity", query);
   } catch (error) {
-    if (!current()) return;
+    // A failed live update keeps the list; the next one retries.
+    if (!current() || mode === "live") return;
     ui.rows = [];
     ui.activityNext = null;
     ui.activityError = String(error);
     renderActivityList();
     return;
+  } finally {
+    if (mode === "more") ui.activityLoadingMore = false;
   }
   if (!current()) return;
   ui.activityError = "";
-  ui.rows = more ? ui.rows.concat(activity.rows) : activity.rows;
-  ui.activityNext = activity.next;
-  renderActivityList();
+  if (mode === "more") {
+    ui.rows = ui.rows.concat(activity.rows);
+    ui.activityNext = activity.next;
+    ui.activityPaged = true;
+    renderActivityList();
+    return;
+  }
+  // Older pages loaded below the first stay, minus what left a rolling range.
+  const last = activity.rows.at(-1);
+  const older = mode === "live" && ui.activityPaged && activity.next
+    ? ui.rows.filter((e) => e.time >= ui.activityFrom && (e.time < last.time || (e.time === last.time && e.seq < last.seq)))
+    : [];
+  const update = () => {
+    ui.rows = activity.rows.concat(older);
+    if (!older.length) ui.activityNext = activity.next;
+    ui.activityPaged = older.length > 0;
+    renderActivityList();
+  };
+  if (mode === "live") keepLogScroll(update);
+  else update();
+}
+
+/// Applies `update` without moving the Log rows in view when the list is
+/// scrolled, so entries added above do not push them down.
+function keepLogScroll(update) {
+  const list = $("activity-list");
+  if (!list) return update();
+  const content = $("content");
+  const top = content.getBoundingClientRect().top;
+  const anchor = list.getBoundingClientRect().top < top
+    ? [...list.querySelectorAll(".req[data-seq]")].find((el) => el.getBoundingClientRect().bottom > top)
+    : null;
+  const before = anchor?.getBoundingClientRect().top;
+  update();
+  const after = anchor && $("activity-list")?.querySelector(`.req[data-seq="${anchor.dataset.seq}"]`);
+  if (after) content.scrollTop += after.getBoundingClientRect().top - before;
+}
+
+/// Lists log lines written since the last read when the range reaches the
+/// present (or a preset moved with the clock). Waits while a choice is open or
+/// an older page is loading.
+function refreshActivityLog() {
+  if (ui.page !== "activity" || document.hidden || openSelect || ui.activityLoadingMore) return;
+  if (!$("range-editor")?.hidden) return;
+  const [from, to] = [ui.activityFrom, ui.activityTo];
+  resolveActivityRange();
+  if (from === ui.activityFrom && to === ui.activityTo && to < currentMinute()) return;
+  loadActivity("live");
+}
+
+// New log lines arrive in bursts; list them at most every few seconds.
+const LOG_REFRESH_MS = 3000;
+let logRefreshAt = 0;
+let logRefreshTimer = null;
+function scheduleActivityLog() {
+  if (logRefreshTimer) return;
+  logRefreshTimer = setTimeout(() => {
+    logRefreshTimer = null;
+    logRefreshAt = Date.now();
+    refreshActivityLog();
+  }, Math.max(0, logRefreshAt + LOG_REFRESH_MS - Date.now()));
 }
 
 function uptime() {
@@ -1167,7 +1235,7 @@ async function act(action, el) {
         loadTraffic();
         // Presets follow the clock; a custom range stays as chosen.
         resolveActivityRange();
-        await loadActivity(false);
+        await loadActivity();
       }
       if (ui.page === "main") loadHomeTraffic();
       render();
@@ -1210,7 +1278,7 @@ async function act(action, el) {
       break;
     case "activity-more":
       el.disabled = true;
-      await loadActivity(true);
+      await loadActivity("more");
       break;
     case "activity-preset":
       ui.activityPreset = el.dataset.target;
@@ -1449,6 +1517,8 @@ refresh().then(probeStale);
 // Refresh even when no new requests arrive, so the rolling window advances.
 setInterval(() => {
   if (document.hidden) return;
-  if (ui.page === "activity") loadTraffic();
-  else if (ui.page === "main") refresh();
+  if (ui.page === "activity") {
+    loadTraffic();
+    scheduleActivityLog();
+  } else if (ui.page === "main") refresh();
 }, 15000);

@@ -45,7 +45,8 @@ pub struct ActivityRange {
 
 /// Without `range`, the newest live events. With it, the range's entries
 /// newest first, a page at a time older than `after`; the range is read once and
-/// later filters, searches and pages reuse that read.
+/// later filters, searches and pages reuse that read unless `fresh` asks for a
+/// re-read.
 #[tauri::command]
 pub async fn get_activity(
     state: State<'_, AppState>,
@@ -54,6 +55,7 @@ pub async fn get_activity(
     search_mode: Option<String>,
     range: Option<ActivityRange>,
     after: Option<Cursor>,
+    fresh: Option<bool>,
 ) -> Result<ActivityDto> {
     let search_mode = search_mode.unwrap_or_else(|| "keyword".into());
     let Some(range) = range else {
@@ -76,11 +78,15 @@ pub async fn get_activity(
     };
     let mut rows = Vec::new();
     let mut after = after;
+    // A fresh listing re-reads the log for lines written since the last read.
+    let mut cached = !fresh.unwrap_or(false);
     loop {
         // One extra row tells whether another page follows.
         let (page, path) = {
             let core = state.core.lock().unwrap();
-            let page = core.activity_page(&query, after, activity::PAGE + 1 - rows.len());
+            let page = cached
+                .then(|| core.activity_page(&query, after, activity::PAGE + 1 - rows.len()))
+                .flatten();
             (page, core.logs.path())
         };
         let begin = match page {
@@ -101,6 +107,7 @@ pub async fn get_activity(
         .map_err(|_| "Cannot read the log".to_owned())??;
         state.core.lock().unwrap().store_activity_scan(scan);
         after = begin;
+        cached = true;
     }
     let next = (rows.len() > activity::PAGE)
         .then(|| rows.get(activity::PAGE - 1).and_then(activity::cursor))
