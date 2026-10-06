@@ -907,7 +907,10 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
         .unwrap()
         .get_mut("first-secret")
         .unwrap()
-        .0 = Instant::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        .0 = Instant::now()
+        // Windows counts `Instant` from boot, so it may not reach back 30 days.
+        .checked_sub(Duration::from_secs(30 * 24 * 60 * 60))
+        .unwrap_or_else(Instant::now);
     let response = http()
         .post(format!("{}/anthropic/api/oauth/usage", running.url))
         .bearer_auth("first-secret")
@@ -930,6 +933,7 @@ async fn claude_profile_cache_evicts_only_least_recently_used_identity() {
         "account": {"uuid": "id", "email": "person@example.invalid"}
     }))
     .unwrap();
+    let start = Instant::now();
     for index in 0..128 {
         running
             .server
@@ -937,8 +941,10 @@ async fn claude_profile_cache_evicts_only_least_recently_used_identity() {
             .unwrap();
     }
     {
+        // Older than every other entry, without reaching back past boot on Windows.
         let mut cache = running.server.claude_profiles.lock().unwrap();
-        cache.get_mut("token-42").unwrap().0 = Instant::now() - Duration::from_secs(86400);
+        cache.get_mut("token-42").unwrap().0 =
+            start.checked_sub(Duration::from_secs(1)).unwrap_or(start);
     }
     // Replacing an existing token at capacity must not evict another account.
     running
