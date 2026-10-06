@@ -2472,6 +2472,29 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
     assert!(!rows.iter().any(|r| r["event"] == "request_finished"));
 }
 #[tokio::test]
+async fn a_connection_reset_before_accept_does_not_stop_the_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));
+    let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\n").unwrap();
+    let server = Arc::new(Server::new(config, logger));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Queue a connection that the client resets before the server accepts it.
+    let early = tokio::net::TcpStream::connect(addr).await.unwrap();
+    early.set_zero_linger().unwrap();
+    drop(early);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let task = tokio::spawn(server.serve(listener, std::future::pending()));
+    let response = http()
+        .get(format!("http://{addr}/backend-api/wham/usage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert!(!task.is_finished());
+    task.abort();
+}
+#[tokio::test]
 async fn tls_and_plain_http_share_the_listening_port() {
     let temp = tempfile::tempdir().unwrap();
     let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));

@@ -911,9 +911,15 @@ impl Server {
                 _=&mut monitor=>{},
                 Some(_)=tasks.join_next(), if !tasks.is_empty()=>{},
                 accepted=listener.accept()=> {
-                    let (socket,_)=accepted?;
+                    // One failed connection must not stop the listener; the pause
+                    // keeps a shortage of file descriptors from spinning the loop.
+                    let socket=match accepted {
+                        Ok((socket,_))=>socket,
+                        Err(_)=>{ tokio::time::sleep(Duration::from_millis(50)).await; continue; }
+                    };
                     let Ok(permit)=limit.clone().try_acquire_owned() else { drop(socket); continue; };
-                    socket.set_nodelay(true)?;
+                    // Fails on macOS for a peer that reset before it was accepted.
+                    let _=socket.set_nodelay(true);
                     let server=self.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
