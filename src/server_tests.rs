@@ -183,10 +183,18 @@ impl Drop for Running {
 async fn running(config: &str) -> Running {
     let temp = tempfile::tempdir().unwrap();
     let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));
-    let config = Config::parse(&format!(
+    let mut config = Config::parse(&format!(
         "listen_port: 7889\nrequest_timeout_seconds: 3\n{config}"
     ))
     .unwrap();
+    // Default login directories stand in for empty ones, never the developer's own.
+    let isolated = |name: &str| vec![temp.path().join(name).to_string_lossy().into_owned()];
+    if config.claude.config_dirs == crate::config::default_claude_config_dirs() {
+        config.claude.config_dirs = isolated("claude");
+    }
+    if config.codex.homes == crate::config::default_codex_homes() {
+        config.codex.homes = isolated("codex");
+    }
     let server = Arc::new(Server::new(config, logger));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
