@@ -600,6 +600,14 @@ input.field::placeholder {
   color: var(--tertiary);
 }
 
+.activity-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.activity-search .select { flex-shrink: 0; }
+.activity-search .search { flex: 1; min-width: 0; }
+
 .search {
   position: relative;
   display: block;

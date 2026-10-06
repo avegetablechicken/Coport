@@ -754,6 +754,12 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 | Activity | Live, searchable request log from `logs/proxy.log`; click a request for all fields |
 | Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
 
+The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the
+search condition dropdown for Keyword (all string fields), Path (contains),
+Proxy (exact name, or `direct` for a direct connection), or Status code (exact
+three-digit HTTP status). Searches ignore case and surrounding whitespace; an
+empty search shows all entries in the selected tab and retained list window.
+
 Enable **Settings → General → Keep proxy running after quit** to leave the
 independent proxy daemon running when choosing Quit (including the tray menu and
 keyboard shortcut). The GUI process actually exits: its WebView, tray icon, and

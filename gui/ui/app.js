@@ -131,6 +131,8 @@ const ui = {
   page: "main",
   filter: "requests",
   search: "",
+  searchMode: "keyword",
+  activityRequest: 0,
   rows: [],
   recent: [],
   trafficMinutes: 30,
@@ -179,7 +181,12 @@ function scheduleRefresh() {
 }
 
 async function loadActivity(rerender = true) {
-  ui.rows = await invoke("get_activity", { filter: ui.filter, search: ui.search });
+  const request = ++ui.activityRequest;
+  const query = { filter: ui.filter, search: ui.search, searchMode: ui.searchMode, minutes: ui.trafficMinutes };
+  const activity = await invoke("get_activity", query);
+  if (request !== ui.activityRequest || query.filter !== ui.filter || query.search !== ui.search
+      || query.searchMode !== ui.searchMode || query.minutes !== ui.trafficMinutes) return;
+  ui.rows = activity;
   if (rerender) renderActivityList();
 }
 
@@ -792,13 +799,21 @@ function renderActivityTraffic() {
   queueFit();
 }
 
+const SEARCH_MODES = [["keyword", "Keyword"], ["path", "Path"], ["proxy", "Proxy"], ["status", "Status code"]];
+function searchPlaceholder() {
+  return { keyword: "Search log fields", path: "Path contains…", proxy: "Exact proxy name or direct", status: "HTTP status, e.g. 429" }[ui.searchMode];
+}
+
 function activityShell() {
   return `<div class="page">
     <section class="block" id="activity-traffic"></section>
     <section class="block">
       <div class="block-head"><span class="block-title">Log</span></div>
-      <label class="search">${ICON.search}
-        <input class="field" id="search" type="search" spellcheck="false" placeholder="Filter by path, proxy or status" value="${esc(ui.search)}" /></label>
+      <div class="activity-search">
+        ${panelSelect("search-mode", SEARCH_MODES, ui.searchMode, "Search condition")}
+        <label class="search">${ICON.search}
+          <input class="field" id="search" type="search" spellcheck="false" aria-label="Search logs" placeholder="${esc(searchPlaceholder())}" value="${esc(ui.search)}" /></label>
+      </div>
       <div class="segmented" id="filters"></div>
       <div id="activity-list"></div>
     </section>
@@ -1123,6 +1138,13 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "search-mode") {
+    ui.searchMode = event.target.value;
+    clearTimeout(searchTimer);
+    $("search").placeholder = searchPlaceholder();
+    await loadActivity();
+    return;
+  }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {
     ui.trafficScope = event.target.value;
     // Both views share the category. In-flight results from the old category

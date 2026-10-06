@@ -341,8 +341,14 @@ impl Core {
         }
     }
 
-    pub fn activity(&self, filter: &str, search: &str, limit: usize) -> Vec<EntryDto> {
-        let needle = search.to_lowercase();
+    pub fn activity(
+        &self,
+        filter: &str,
+        search: &str,
+        search_mode: &str,
+        limit: usize,
+    ) -> Vec<EntryDto> {
+        let needle = search.trim().to_lowercase();
         let mut rows = self.logs.entries(|e| {
             let keep = match filter {
                 "errors" => e.is_error(),
@@ -350,7 +356,7 @@ impl Core {
                 "all" => true,
                 _ => e.is_request_end(),
             };
-            keep && (needle.is_empty() || matches_search(e, &needle))
+            keep && (needle.is_empty() || matches_search(e, search_mode, &needle))
         });
         rows.reverse();
         rows.truncate(limit);
@@ -358,12 +364,32 @@ impl Core {
     }
 }
 
-fn matches_search(e: &Entry, needle: &str) -> bool {
-    e.event.contains(needle)
-        || e.fields.values().any(|v| {
-            v.as_str()
-                .is_some_and(|s| s.to_lowercase().contains(needle))
-        })
+fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    match mode {
+        "proxy" => e.get("proxy").is_some_and(|proxy| {
+            proxy.to_lowercase() == needle || (proxy == "none" && needle == "direct")
+        }),
+        "status" => {
+            needle.len() == 3
+                && needle.bytes().all(|b| b.is_ascii_digit())
+                && needle.parse::<u16>().ok().is_some_and(|status| {
+                    (100..=599).contains(&status) && e.status() == Some(status)
+                })
+        }
+        "path" => e
+            .get("path")
+            .is_some_and(|path| path.to_lowercase().contains(needle)),
+        _ => {
+            e.event.contains(needle)
+                || e.fields.values().any(|v| {
+                    v.as_str()
+                        .is_some_and(|s| s.to_lowercase().contains(needle))
+                })
+        }
+    }
 }
 
 fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
@@ -669,7 +695,45 @@ impl From<Entry> for EntryDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config, replace_config};
+    use super::{matches_search, parse_config, replace_config};
+    use crate::logs::Entry;
+
+    #[test]
+    fn activity_search_modes_target_only_the_selected_field() {
+        let mut entry = Entry {
+            seq: 1,
+            time: None,
+            event: "request_finished".into(),
+            fields: serde_json::from_value(serde_json::json!({
+                "status": "200", "duration_ms": "1500", "proxy": "Office",
+                "path": "/v1/responses", "request_id": "other-proxy-500"
+            }))
+            .unwrap(),
+        };
+        assert!(matches_search(&entry, "keyword", "500"));
+        assert!(!matches_search(&entry, "status", "500"));
+        assert!(matches_search(&entry, "status", "200"));
+        for invalid in ["20", "2xx", "0200", "200 500", "abc"] {
+            assert!(!matches_search(&entry, "status", invalid));
+        }
+        assert!(matches_search(&entry, "proxy", "office"));
+        assert!(!matches_search(&entry, "proxy", "off"));
+        assert!(!matches_search(&entry, "proxy", "other-proxy"));
+        assert!(matches_search(&entry, "path", "responses"));
+        assert!(!matches_search(&entry, "path", "office"));
+        entry
+            .fields
+            .insert("proxy".into(), serde_json::json!("none"));
+        assert!(matches_search(&entry, "proxy", "direct"));
+        assert!(matches_search(&entry, "proxy", "none"));
+        entry.fields.remove("proxy");
+        entry.fields.remove("status");
+        assert!(!matches_search(&entry, "proxy", "direct"));
+        assert!(!matches_search(&entry, "status", "200"));
+        for mode in ["keyword", "path", "proxy", "status"] {
+            assert!(matches_search(&entry, mode, ""));
+        }
+    }
 
     const EXAMPLE: &str = include_str!("../../config.example.yaml");
 

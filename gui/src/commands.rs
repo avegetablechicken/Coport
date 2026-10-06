@@ -37,8 +37,18 @@ pub async fn get_state(app: AppHandle, state: State<'_, AppState>) -> Result<Sna
 }
 
 #[tauri::command]
-pub fn get_activity(state: State<AppState>, filter: String, search: String) -> Vec<EntryDto> {
-    state.core.lock().unwrap().activity(&filter, &search, 300)
+pub fn get_activity(
+    state: State<AppState>,
+    filter: String,
+    search: String,
+    search_mode: Option<String>,
+) -> Vec<EntryDto> {
+    state.core.lock().unwrap().activity(
+        &filter,
+        &search,
+        search_mode.as_deref().unwrap_or("keyword"),
+        300,
+    )
 }
 
 #[tauri::command]
