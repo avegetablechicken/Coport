@@ -97,6 +97,10 @@ pub struct CredentialTraffic {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    /// Claude only: reported input without cache reads or writes.
+    uncached_input_tokens: Option<u64>,
+    /// Claude only: input written to the prompt cache.
+    cache_write_tokens: Option<u64>,
     cache_hit_rate: Option<f64>,
     avg_ms: Option<u64>,
     counts: Vec<u64>,
@@ -376,6 +380,13 @@ fn aggregate(
     group.token_counts[slot] = group.token_counts[slot]
         .saturating_add(input.unwrap_or(0).saturating_add(output.unwrap_or(0)));
     add_tokens(&mut group.cached_input_tokens, cached);
+    if claude {
+        add_tokens(&mut group.uncached_input_tokens, token("input_tokens"));
+        add_tokens(
+            &mut group.cache_write_tokens,
+            token("cache_creation_input_tokens"),
+        );
+    }
     // Only calls reporting both counts contribute to the hit rate.
     if let (Some(input), Some(cached), Some(_)) = (input, cached, token("input_tokens")) {
         group.cache_read = group.cache_read.saturating_add(cached);
@@ -1362,5 +1373,20 @@ mod tests {
             .find(|c| c.service == "Claude")
             .unwrap();
         assert_eq!(claude.token_counts.iter().sum::<u64>(), 50);
+        // The parts of Claude input are kept for its tooltip; Codex has none.
+        assert_eq!(
+            (claude.uncached_input_tokens, claude.cache_write_tokens),
+            (Some(10), Some(10))
+        );
+        let codex = model
+            .credentials
+            .iter()
+            .find(|c| c.service == "Codex")
+            .unwrap();
+        assert_eq!(
+            (codex.uncached_input_tokens, codex.cache_write_tokens),
+            (None, None)
+        );
+        assert_eq!(model.summary.uncached_input_tokens, None);
     }
 }

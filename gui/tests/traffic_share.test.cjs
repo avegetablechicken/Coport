@@ -181,3 +181,15 @@ test('Unidentified takes an extra row in All, so named rows match Models', () =>
   assert.deepEqual(rows(trafficShare(credentials, 'model')), ['c0', 'c1', 'c2', 'c3']);
   assert.deepEqual(rows(trafficShare(credentials, 'all')), ['c0', 'c1', 'c2', 'c3', 'Unidentified']);
 });
+test('Claude Input Tokens explain uncached input and cache writes on hover', () => {
+  const context = setup('model');
+  context.ICON = { warning: '!' };
+  context.stat = (label, value) => `<${label}=${value}>`;
+  vm.runInContext(source.slice(source.indexOf('function modelTokenStats('), source.indexOf('const SHARE_SERVICES')), context);
+  const claude = { service: 'Claude', inputTokens: 50, uncachedInputTokens: 10, cacheWriteTokens: 10, cachedInputTokens: 30, outputTokens: 5, cacheHitRate: 0.6 };
+  const html = context.modelTokenStats(claude, 'model');
+  assert.match(html, /data-tip="Uncached input: 10\nCache writes: 10\nCache reads: 30 \(Cached Input\)"/);
+  assert.match(html, /=50>/);
+  assert.doesNotMatch(context.modelTokenStats({ ...claude, service: 'Codex' }, 'model'), /data-tip/);
+  assert.doesNotMatch(context.modelTokenStats({ ...claude, inputTokens: null }, 'model'), /data-tip/);
+});

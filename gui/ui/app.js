@@ -910,7 +910,12 @@ async function loadTraffic() {
 function modelTokenStats(stats, scope) {
   if (scope !== "model") return "";
   const tokens = (n) => n == null ? "—" : n.toLocaleString();
-  return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
+  // Claude reports cache reads and writes apart from input; Input Tokens adds them.
+  const parts = stats.service === "Claude" && stats.inputTokens != null
+    ? [`Uncached input: ${tokens(stats.uncachedInputTokens)}`, `Cache writes: ${tokens(stats.cacheWriteTokens)}`, `Cache reads: ${tokens(stats.cachedInputTokens)} (Cached Input)`].join("\n")
+    : "";
+  const input = parts ? `Input Tokens<span class="info-tip stat-tip" data-tip="${esc(parts)}" aria-label="${esc(parts)}">${ICON.warning}</span>` : "Input Tokens";
+  return `<div class="strip">${stat(input, tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
 
 const SHARE_SERVICES = ["Codex", "Claude"];

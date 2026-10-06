@@ -1222,6 +1222,9 @@ details.disclosure[open] summary svg {
 .info-tip { display: inline-grid; place-items: center; width: 16px; height: 16px; margin-left: -4px; color: var(--tertiary); cursor: default; }
 .info-tip:hover { color: var(--secondary); }
 .info-tip svg { width: 12px; height: 12px; }
+.stat-tip { width: 12px; height: 12px; margin-left: 2px; vertical-align: -2px; }
+.stat-tip svg { width: 11px; height: 11px; }
+.stat-tip[data-tip]:hover::after { left: -60px; width: max-content; max-width: 220px; }
 .info-tip[data-tip]:hover::after {
   top: calc(100% + 4px);
   bottom: auto;
