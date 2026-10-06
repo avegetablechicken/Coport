@@ -316,6 +316,10 @@ const EXAMPLE: &str = include_str!("../../config.example.yaml");
 pub fn create_example_config(state: State<AppState>) -> Result {
     let mut core = state.core.lock().unwrap();
     let path = core.config_path();
+    // The panel may still offer this after the file was created elsewhere.
+    if path.exists() {
+        return Err("A configuration file already exists.".into());
+    }
     crate::settings::write_private(&path, EXAMPLE.as_bytes()).map_err(|e| e.to_string())?;
     core.invalidate_config();
     platform::edit(&path);
