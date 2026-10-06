@@ -82,7 +82,8 @@ fn account_routing_refresh_startup_snapshot_and_private_logs() {
     refused(&app, &a, &b, Some("token-a"), 502);
     app.write("config.yaml", "invalid: [");
     refused(&app, &a, &b, Some("token-a"), 502);
-    assert!(!app.command().status().unwrap().success());
+    // `--check` validates without binding, so the running port cannot mask the result.
+    assert!(!app.command().arg("--check").status().unwrap().success());
     fs::remove_file(app.path("config.yaml")).unwrap();
     refused(&app, &a, &b, Some("token-a"), 502);
     assert_eq!(app.request(None, None, "/health", "GET").0, 200);
@@ -355,7 +356,8 @@ fn mixed_providers_mcp_account_endpoints_and_independent_fallbacks() {
         "/responses",
         "fallback-default.invalid",
     );
-    assert!(!app.command().status().unwrap().success());
+    // `--check` validates without binding, so the running port cannot mask the result.
+    assert!(!app.command().arg("--check").status().unwrap().success());
     login(&app, "fallback-account", "fallback-account-token");
     app.write("home/config.toml","[model_providers.reverse]\nenv_key = \"REVERSE_TEST_KEY\"\nbase_url = \"https://provider-a.invalid/v1\"\n");
     fs::remove_file(app.path("home/.env")).unwrap();
