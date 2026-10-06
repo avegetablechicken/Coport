@@ -43,18 +43,10 @@ pub struct Exit {
 /// makes dual-stack exits report their (shorter, more familiar) IPv4 address.
 const TRACE_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
 
-#[derive(Clone)]
-pub struct CheckResult {
-    pub ok: bool,
-    pub message: String,
-}
-
 #[derive(Default)]
 struct Shared {
     phase: Option<Phase>,
     generation: u64,
-    check: Option<CheckResult>,
-    checking: bool,
     probes: BTreeMap<String, (Probe, Instant)>,
 }
 
@@ -225,44 +217,6 @@ impl Controller {
         } else {
             self.stop()
         }
-    }
-
-    /// Validates configuration and credential sources, like `--check`.
-    pub fn check(&self, config_path: &Path) {
-        let path = config_path.to_owned();
-        let shared = self.shared.clone();
-        let notify = self.notify.clone();
-        {
-            let mut s = self.lock();
-            s.checking = true;
-            s.check = None;
-        }
-        self.rt.spawn(async move {
-            let result = match Config::read(&path) {
-                Ok(config) => config.check_credentials().await.map(|_| ()),
-                Err(e) => Err(e),
-            };
-            let mut s = shared.lock().unwrap();
-            s.checking = false;
-            s.check = Some(match result {
-                Ok(()) => CheckResult {
-                    ok: true,
-                    message: "Configuration, credentials and routes are valid.".into(),
-                },
-                Err(e) => CheckResult {
-                    ok: false,
-                    message: e.message.to_string(),
-                },
-            });
-            drop(s);
-            notify();
-        });
-        (self.notify)();
-    }
-
-    pub fn check_state(&self) -> (bool, Option<CheckResult>) {
-        let s = self.lock();
-        (s.checking, s.check.clone())
     }
 
     /// Tests an outbound proxy. Proxies on this machine (typically local

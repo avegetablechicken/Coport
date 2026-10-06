@@ -83,12 +83,6 @@ pub fn restart_proxy(app: AppHandle, state: State<AppState>) {
     tray::sync(&app);
 }
 
-#[tauri::command]
-pub fn check_credentials(state: State<AppState>) {
-    let core = state.core.lock().unwrap();
-    core.controller.check(&core.config_path());
-}
-
 /// Tests one proxy, or all of them when `name` is absent. With `stale_only`,
 /// only proxies without a recent result are tested (used when the panel opens).
 #[tauri::command]
@@ -134,11 +128,30 @@ pub fn set_launch_at_login(state: State<AppState>, enabled: bool) -> Result {
     state.core.lock().unwrap().set_launch_at_login(enabled)
 }
 
+/// Replaces the configuration with a YAML file chosen in a file dialog, after
+/// validating it. Returns false when the dialog is cancelled.
 #[tauri::command]
-pub fn set_config_path(app: AppHandle, state: State<AppState>, path: String) -> Result {
-    let result = state.core.lock().unwrap().apply_config_path(&path);
+pub async fn import_config(app: AppHandle) -> Result<bool> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = panel::with_modal(&app, || {
+        app.dialog()
+            .file()
+            .set_title("Import Configuration")
+            .add_filter("YAML", &["yaml", "yml"])
+            .blocking_pick_file()
+    });
+    let Some(picked) = picked else {
+        return Ok(false);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let result = app
+        .state::<AppState>()
+        .core
+        .lock()
+        .unwrap()
+        .import_config(&path);
     tray::sync(&app);
-    result
+    result.map(|()| true)
 }
 
 /// Changes one supported YAML value; the proxy picks it up on restart.
@@ -171,22 +184,20 @@ pub fn create_example_config(state: State<AppState>) -> Result {
     Ok(())
 }
 
-/// Opens a file or folder: `config`, `config-folder`, `log-folder` or `log`.
+/// Opens or reveals a file: `config` (in the editor), `config-reveal`,
+/// `log` or `log-reveal`. The log is the one the panel is reading.
 #[tauri::command]
 pub fn open_path(state: State<AppState>, target: String) {
-    let core = state.core.lock().unwrap();
-    let config = core.config_path();
-    let log = core.settings.log_path();
+    let (config, log) = {
+        let core = state.core.lock().unwrap();
+        (core.config_path(), core.logs.path())
+    };
     match target.as_str() {
         "config" => platform::edit(&config),
-        "config-folder" => config.parent().into_iter().for_each(platform::open),
-        "log" => platform::open(&log),
-        "log-folder" => {
-            if let Some(dir) = log.parent() {
-                let _ = std::fs::create_dir_all(dir);
-                platform::open(dir);
-            }
-        }
+        "config-reveal" => platform::reveal(&config),
+        "log" if log.is_file() => platform::open(&log),
+        // Nothing logged yet: show where the log will be written.
+        "log" | "log-reveal" => platform::reveal(&log),
         _ => {}
     }
 }

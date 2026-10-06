@@ -294,6 +294,10 @@ select:focus-visible {
   background: var(--red);
 }
 
+.dot.warn {
+  background: var(--orange);
+}
+
 /* Evenly spread label/value pairs. */
 .strip {
   display: flex;
@@ -651,18 +655,6 @@ input.field::placeholder {
 .number-field .unit {
   width: 7px;
   color: var(--tertiary);
-}
-
-.inline-form {
-  display: flex;
-  gap: 6px;
-  padding-bottom: 4px;
-}
-
-.path {
-  color: var(--secondary);
-  word-break: break-all;
-  white-space: normal;
 }
 
 /* ---------------------------------------------------------------- requests */
@@ -1193,9 +1185,31 @@ details.disclosure[open] summary svg {
   white-space: nowrap;
 }
 .select-menu button[aria-selected="true"] { font-weight: 600; }
+.action-menu { min-width: 150px; }
+.menu-separator {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--separator);
+}
 .select-menu button:hover,
 .select-menu button:focus {
   background: var(--accent);
   color: #fff;
   outline: none;
+}
+
+/* Settings → Files: one status per file; actions live in its ⋯ menu. */
+.file-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+.icon-btn.more {
+  border-radius: 4px;
+}
+.icon-btn.more[aria-expanded="true"] {
+  color: var(--label);
+  background: var(--track);
 }

@@ -14,6 +14,30 @@ pub fn open(path: &Path) {
     let _ = cmd.arg(path).spawn();
 }
 
+/// Shows a file selected in Finder or Explorer; other platforms open its folder.
+/// A file that does not exist yet reveals its (created) folder instead.
+pub fn reveal(path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(dir);
+        return open(dir);
+    }
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg("-R").arg(path).spawn();
+    // Explorer parses its own command line: quote the path after `/select,`.
+    #[cfg(target_os = "windows")]
+    let _ = {
+        use std::os::windows::process::CommandExt;
+        Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn()
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    open(dir);
+}
+
 /// Opens a text file in the user's editor.
 pub fn edit(path: &Path) {
     #[cfg(target_os = "macos")]

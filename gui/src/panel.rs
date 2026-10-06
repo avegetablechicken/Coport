@@ -5,7 +5,7 @@ use crate::placement::{self, Rect};
 use std::{
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -23,6 +23,8 @@ const DISMISS_DELAY: Duration = Duration::from_millis(100);
 pub struct PanelState {
     /// Bumped by every show and tray click; stale dismissals compare unequal.
     generation: AtomicU64,
+    /// Set while a dialog opened from the panel holds focus.
+    modal: AtomicBool,
     anchor: Mutex<Option<Rect>>,
     content_height: Mutex<Option<f64>>,
 }
@@ -66,6 +68,17 @@ pub fn toggle(app: &AppHandle, anchor: Option<Rect>) {
     } else {
         show(app, anchor);
     }
+}
+
+/// Runs a blocking dialog (off the main thread) without the focus loss
+/// dismissing the panel, then returns focus to the panel.
+pub fn with_modal<T>(app: &AppHandle, dialog: impl FnOnce() -> T) -> T {
+    state(app).modal.store(true, Ordering::SeqCst);
+    let result = dialog();
+    state(app).modal.store(false, Ordering::SeqCst);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show(&handle, None));
+    result
 }
 
 /// Resizes the panel to the frontend's content height and re-anchors it.
@@ -128,9 +141,11 @@ pub fn on_window_event(w: &tauri::Window, event: &WindowEvent) {
                 std::thread::sleep(DISMISS_DELAY);
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || {
-                    let current = state(&handle).generation.load(Ordering::SeqCst) == token;
+                    let panel = state(&handle);
+                    let current = panel.generation.load(Ordering::SeqCst) == token;
+                    let modal = panel.modal.load(Ordering::SeqCst);
                     let focused = window(&handle).is_some_and(|w| w.is_focused().unwrap_or(false));
-                    if current && !focused {
+                    if current && !modal && !focused {
                         hide(&handle);
                     }
                 });

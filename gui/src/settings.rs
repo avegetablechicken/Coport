@@ -12,11 +12,10 @@ pub enum Appearance {
 }
 
 /// Preferences of the GUI itself; proxy behavior stays in the YAML config.
+/// Older `config_path`/`log_path` entries are ignored: both paths are fixed.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub config_path: String,
-    pub log_path: String,
     pub appearance: Appearance,
     pub start_proxy_on_launch: bool,
     pub keep_proxy_running_on_quit: bool,
@@ -25,11 +24,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            config_path: default_config_path().to_string_lossy().into_owned(),
-            log_path: cache_dir()
-                .join("logs/proxy.log")
-                .to_string_lossy()
-                .into_owned(),
             appearance: Appearance::System,
             start_proxy_on_launch: true,
             keep_proxy_running_on_quit: false,
@@ -52,15 +46,6 @@ impl Settings {
     pub fn try_save(&self) -> std::io::Result<()> {
         write_private(&settings_file(), &serde_json::to_vec_pretty(self)?)
     }
-
-    pub fn config_path(&self) -> PathBuf {
-        coport::config::expand(&self.config_path)
-    }
-
-    /// GUI logs have their own location, independent of the proxy configuration.
-    pub fn log_path(&self) -> PathBuf {
-        coport::config::expand(&self.log_path)
-    }
 }
 
 pub fn app_dir() -> PathBuf {
@@ -73,10 +58,14 @@ fn settings_file() -> PathBuf {
     app_dir().join("gui.json")
 }
 
-/// The GUI has one default location, independent of its working directory.
-/// Explicit paths chosen in Settings or through --config still take precedence.
-fn default_config_path() -> PathBuf {
+/// The GUI's only configuration file, independent of its working directory.
+pub fn config_path() -> PathBuf {
     cache_dir().join("config.yaml")
+}
+
+/// The GUI's request log, beside its configuration.
+pub fn log_path() -> PathBuf {
+    cache_dir().join("logs/proxy.log")
 }
 
 fn cache_dir() -> PathBuf {
@@ -116,46 +105,18 @@ mod tests {
     }
 
     #[test]
-    fn log_path_defaults_to_cache_and_can_be_overridden_independently() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"config_path":"/custom/config.yaml"}"#).unwrap();
-        assert_eq!(
-            settings.log_path(),
-            dirs::cache_dir()
-                .unwrap()
-                .join("io.github.coport.gui/logs/proxy.log")
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("custom.log");
-        let settings: Settings =
-            serde_json::from_value(serde_json::json!({"log_path":path})).unwrap();
-        assert_eq!(settings.log_path(), path);
-        let restored: Settings =
-            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
-        assert_eq!(restored.log_path(), path);
-    }
-
-    #[test]
-    fn default_config_uses_only_the_application_cache() {
-        let expected = dirs::cache_dir()
-            .unwrap()
-            .join("io.github.coport.gui/config.yaml");
-        assert_eq!(Settings::default().config_path(), expected);
-        let missing_path: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(missing_path.config_path(), expected);
-    }
-
-    #[test]
-    fn explicitly_selected_yaml_paths_are_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["custom.yaml", "custom.yml"] {
-            let path = dir.path().join(name);
-            let settings: Settings = serde_json::from_value(serde_json::json!({
-                "config_path": path,
-            }))
-            .unwrap();
-            assert_eq!(settings.config_path(), path);
-        }
+    fn paths_are_fixed_in_the_application_cache() {
+        let cache = dirs::cache_dir().unwrap().join("io.github.coport.gui");
+        assert_eq!(config_path(), cache.join("config.yaml"));
+        assert_eq!(log_path(), cache.join("logs/proxy.log"));
+        // Paths saved by older versions are ignored and not written back.
+        let settings: Settings = serde_json::from_str(
+            r#"{"config_path":"/custom/config.yaml","log_path":"/custom.log","appearance":"Dark"}"#,
+        )
+        .unwrap();
+        assert!(settings.appearance == Appearance::Dark);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("config_path").is_none() && saved.get("log_path").is_none());
     }
 
     #[test]

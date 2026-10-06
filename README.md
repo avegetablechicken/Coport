@@ -738,7 +738,7 @@ the command-line proxy keeps its own minimum.
 
 ```sh
 cargo build --locked --release -p coport-gui
-target/release/coport-gui --config config.yaml
+target/release/coport-gui
 ```
 
 The panel follows the layout of native menu bar utilities such as eul: on macOS
@@ -770,7 +770,10 @@ in the GUI's application directory; stale discovery data is replaced after a cra
 This does not install a login service or provide automatic crash recovery.
 
 The configuration is edited in your text editor; the panel validates it whenever
-the file changes and offers a restart when the running proxy is out of date. The
+the file changes and offers a restart when the running proxy is out of date.
+Settings can also reveal it in Finder/Explorer, or import another YAML file to
+replace it; an invalid file is rejected and leaves the configuration unchanged.
+The request log can be opened or revealed the same way. The
 right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 
 With `account_auth_file_only: true`, Routing shows account activation from the
@@ -781,20 +784,18 @@ the warning icon to indicate the missing local match; a failed probe shows
 changing the token or configuration triggers a new check. Without a token, a
 probe cannot authenticate and the account remains inactive.
 
-The GUI supports YAML configuration files (`.yaml` and `.yml`). `--config` and
-files explicitly selected in Settings are remembered. Without a saved choice,
-the only default is `io.github.coport.gui/config.yaml` in the user's application cache
-directory: `~/Library/Caches/io.github.coport.gui/config.yaml` on macOS,
+The GUI uses one fixed configuration file, `io.github.coport.gui/config.yaml` in
+the user's application cache directory: `~/Library/Caches/io.github.coport.gui/config.yaml` on macOS,
 `$XDG_CACHE_HOME/io.github.coport.gui/config.yaml` (normally `~/.cache/io.github.coport.gui/config.yaml`)
 on Linux, or `%LOCALAPPDATA%/io.github.coport.gui/config.yaml` on Windows. The GUI never
 searches the working directory for configuration. It offers to create a missing
-configuration from `config.example.yaml`. Existing saved paths are retained;
-GUI preferences and daemon discovery stay in the per-user configuration directory.
-The CLI's default remains `./config.yaml`. GUI logs default to
-`io.github.coport.gui/logs/proxy.log` in the same application cache directory, independent
-of the selected YAML file. The `log_path` field in `gui.json` can override this
-location. The CLI continues to log beside its configuration unless `--log-file`
-is supplied. Opening the app shows the
+configuration from `config.example.yaml` or to import a YAML file (`.yaml` or
+`.yml`). Paths saved by earlier versions are ignored; a daemon still running another
+file is reported as out of date until restarted. GUI preferences and daemon
+discovery stay in the per-user configuration directory. The CLI's default remains
+`./config.yaml`. GUI logs are written to `io.github.coport.gui/logs/proxy.log` in
+the same application cache directory. The CLI continues to log beside its
+configuration unless `--log-file` is supplied. Opening the app shows the
 panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.

@@ -28,9 +28,8 @@ pub struct AppState {
 }
 
 const USAGE: &str = "\
-Usage: coport-gui [--config <path>] [--background]
+Usage: coport-gui [--background]
 
-  --config <path>              Use and remember this configuration file
   --background                 Start in the menu bar / tray without the panel
                                (used by Launch at Login)
   --export-icon <png> [size]   Write the app icon as PNG and exit
@@ -40,23 +39,12 @@ Usage: coport-gui [--config <path>] [--background]
 const LAUNCH_OPEN_DELAY: Duration = Duration::from_millis(400);
 
 fn main() {
-    let mut settings = settings::Settings::load();
+    let settings = settings::Settings::load();
     // Opening the app by hand shows the panel; login items start quietly.
     let mut open = true;
-    let mut config_requested = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--config" => {
-                config_requested = true;
-                let Some(path) = args.next() else {
-                    return usage_error();
-                };
-                let path = coport::config::expand(&path);
-                let path = std::path::absolute(&path).unwrap_or(path);
-                settings.config_path = path.to_string_lossy().into_owned();
-                settings.save();
-            }
             "--background" => open = false,
             "--open" => open = true,
             "--export-icon" => {
@@ -92,6 +80,7 @@ fn main() {
     };
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(panel::PanelState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
@@ -99,11 +88,10 @@ fn main() {
             commands::get_traffic,
             commands::set_running,
             commands::restart_proxy,
-            commands::check_credentials,
             commands::probe_proxy,
             commands::update_settings,
             commands::set_launch_at_login,
-            commands::set_config_path,
+            commands::import_config,
             commands::set_config_value,
             commands::create_example_config,
             commands::open_path,
@@ -124,11 +112,7 @@ fn main() {
             let mut core = core::Core::new(settings.clone(), notify);
             let start = settings.start_proxy_on_launch && core.config_exists();
             open |= !core.config_exists();
-            if config_requested && core.settings.config_path != settings.config_path {
-                core.settings.config_path = settings.config_path.clone();
-                core.settings.save();
-                core.start();
-            } else if start && !core.controller.is_running() {
+            if start && !core.controller.is_running() {
                 core.start();
             }
             app.manage(AppState {

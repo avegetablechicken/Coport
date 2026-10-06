@@ -12,7 +12,7 @@ function panel(page = "settings") {
   let now = 0;
   const events = {};
   const content = { scrollTop: 120 };
-  const ui = { page, choosePath: true };
+  const ui = { page };
   const rendered = [];
   vm.runInNewContext(handlers, {
     ui,
@@ -38,7 +38,6 @@ test("first show and short reopening preserve the current page", async () => {
   p.advance(timeout - 1);
   await p.events["panel-shown"]();
   assert.equal(p.ui.page, "settings");
-  assert.equal(p.ui.choosePath, true);
   assert.equal(p.content.scrollTop, 120);
 });
 
@@ -51,7 +50,6 @@ for (const page of ["settings", "activity"]) {
     p.advance(1);
     await p.events["panel-shown"]();
     assert.equal(p.ui.page, "main");
-    assert.equal(p.ui.choosePath, false);
     assert.equal(p.content.scrollTop, 0);
     assert.deepEqual(p.rendered, ["main"]);
   });

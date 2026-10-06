@@ -4,6 +4,7 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const IS_MAC = navigator.userAgent.includes("Mac");
+const REVEAL_LABEL = IS_MAC ? "Show in Finder" : navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in Folder";
 if (IS_MAC) document.documentElement.classList.add("macos");
 
 // ---------------------------------------------------------------- icons
@@ -21,6 +22,7 @@ const ICON = {
   trash: svg('<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>'),
   info: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.75v.01"/>'),
   warning: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5M12 16.25v.01"/>'),
+  more: svg('<circle cx="6.5" cy="12" r="1.1"/><circle cx="12" cy="12" r="1.1"/><circle cx="17.5" cy="12" r="1.1"/>', 'fill="currentColor" stroke-width="0.8"'),
   folder: svg('<path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9.5a2 2 0 0 0-2-2h-7l-2-2.5H5a2 2 0 0 0-2 2.5z"/>'),
 };
 
@@ -145,7 +147,6 @@ const ui = {
   trafficRequest: 0,
   expanded: new Set(),
   builtPage: null,
-  choosePath: false,
   websocketOpen: false,
   snippetsOpen: false,
   rendering: false,
@@ -285,9 +286,9 @@ function proxyBlock() {
   if (!s.config.exists) {
     messages += message(
       "warn",
-      `No configuration file at <span class="selectable">${esc(s.config.path)}</span>.`,
+      "No configuration file yet.",
       `<button class="btn" data-action="create-config">Create from Example</button>
-       <button class="btn" data-action="choose-config">Choose File…</button>`
+       <button class="btn" data-action="import-config">Import…</button>`
     );
   } else if (s.config.error) {
     messages += message("bad", esc(s.config.error), `<button class="btn" data-action="open" data-target="config">Edit Configuration</button>`);
@@ -660,16 +661,8 @@ function showSelect(trigger, last = false) {
   menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
   menu.innerHTML = options.map(([value, label]) => `<button type="button" role="option"
     tabindex="-1" value="${esc(value)}" aria-selected="${String(value) === trigger.value}">${esc(label)}</button>`).join("");
-  openSelect = { trigger, menu };
-  trigger.setAttribute("aria-expanded", "true");
-  trigger.setAttribute("aria-controls", menu.id);
-  document.body.append(menu);
-  const rect = trigger.getBoundingClientRect();
-  menu.style.minWidth = `${rect.width}px`;
-  menu.style.maxHeight = `${Math.max(0, window.innerHeight - 8)}px`;
-  const bounds = menu.getBoundingClientRect();
-  menu.style.left = `${Math.max(4, Math.min(rect.right - bounds.width, window.innerWidth - bounds.width - 4))}px`;
-  menu.style.top = `${Math.max(4, Math.min(rect.bottom + 3, window.innerHeight - bounds.height - 4))}px`;
+  placeMenu(trigger, menu);
+  menu.style.minWidth = `${trigger.getBoundingClientRect().width}px`;
   const items = [...menu.children];
   (last ? items.at(-1) : items.find((el) => el.value === trigger.value) ?? items[0]).focus();
   menu.addEventListener("click", (event) => {
@@ -681,6 +674,46 @@ function showSelect(trigger, last = false) {
     closeSelect(true);
     if (changed) trigger.dispatchEvent(new Event("change", { bubbles: true }));
   });
+}
+
+/// Opens `menu` below `trigger`, right-aligned and kept inside the panel.
+function placeMenu(trigger, menu) {
+  openSelect = { trigger, menu };
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.setAttribute("aria-controls", menu.id);
+  document.body.append(menu);
+  const rect = trigger.getBoundingClientRect();
+  menu.style.maxHeight = `${Math.max(0, window.innerHeight - 8)}px`;
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(rect.right - bounds.width, window.innerWidth - bounds.width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(rect.bottom + 3, window.innerHeight - bounds.height - 4))}px`;
+}
+
+/// An action menu: placed and dismissed like a select, but each item runs its
+/// own `data-action`. `null` entries become separators.
+function showMenu(trigger, last = false) {
+  const wasOpen = openSelect?.trigger === trigger;
+  closeSelect();
+  if (wasOpen) return;
+  const menu = document.createElement("div");
+  menu.id = "panel-select-options";
+  menu.className = "select-menu action-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
+  menu.innerHTML = JSON.parse(trigger.dataset.menu).map((item) => item
+    ? `<button type="button" role="menuitem" tabindex="-1" data-action="${esc(item.action)}"${item.target ? ` data-target="${esc(item.target)}"` : ""}>${esc(item.label)}</button>`
+    : '<div class="menu-separator" role="separator"></div>').join("");
+  placeMenu(trigger, menu);
+  const items = menuItems(menu);
+  (last ? items.at(-1) : items[0])?.focus();
+  // Close before the document's click handler runs the item's action.
+  menu.addEventListener("click", (event) => {
+    if (event.target.closest("[data-action]")) closeSelect(true);
+  });
+}
+
+function menuItems(menu) {
+  return [...menu.querySelectorAll("button")];
 }
 
 document.addEventListener("pointerdown", (event) => {
@@ -832,14 +865,6 @@ function detail(e) {
 function settings() {
   const s = ui.snap;
   const set = s.settings;
-  let status = "";
-  if (!s.config.exists) status = message("warn", "The file does not exist yet.");
-  else if (s.config.error) status = message("bad", esc(s.config.error));
-  else if (s.config.changedSinceStart)
-    status = message("warn", "Changed since the proxy started.", `<button class="btn" data-action="restart">Restart to Apply</button>`);
-  let check = "";
-  if (s.check.running) check = message("info", "Checking credentials…");
-  else if (s.check.message != null) check = message(s.check.ok ? "good" : "bad", esc(s.check.message));
   return `
     ${block(
       "General",
@@ -854,28 +879,39 @@ function settings() {
          ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
     )}
     ${configSettings()}
-    ${block(
-      "Configuration",
-      "",
-      `<div class="path selectable">${esc(s.config.path)}</div>
-       ${status}${check}
-       <div class="actions">
-         <button class="btn" data-action="open" data-target="config">Edit…</button>
-         <button class="btn" data-action="open" data-target="config-folder">Show in Folder</button>
-         <button class="btn" data-action="check" ${s.config.exists && !s.check.running ? "" : "disabled"}
-           data-tip="Validates credential sources like --check">Check Credentials</button>
-       </div>
-       <details class="disclosure" id="config-path-disclosure" ${ui.choosePath ? "open" : ""}><summary>${ICON.chevron}Use another file</summary>
-         <div class="inline-form"><input class="field" id="config-path" spellcheck="false" aria-label="YAML configuration path" placeholder="Path to config.yaml or config.yml" value="${esc(s.config.path)}" />
-           <button class="btn" data-action="apply-path">Apply</button></div>
-       </details>`
-    )}
-    ${block(
-      "Request Log",
-      "",
-      `<div class="row"><span class="row-label path selectable">${esc(set.logPath)}</span>
-         <button class="icon-btn" data-action="open" data-target="log-folder" data-tip="Open folder" aria-label="Open log folder">${ICON.folder}</button></div>`
-    )}`;
+    ${filesBlock()}`;
+}
+
+/// The fixed configuration and log files: a status per file, actions in a ⋯ menu.
+function filesBlock() {
+  const { config, settings } = ui.snap;
+  const status = (dot, text) => `<span class="file-status">${dot ? `<span class="dot ${dot}"></span>` : ""}${text}</span>`;
+  const configStatus = !config.exists ? status("", "Not created")
+    : config.error ? status("failed", "Invalid")
+    : config.changedSinceStart ? status("warn", "Changed")
+    : status("running", "Valid");
+  const configMenu = [
+    config.exists ? { label: "Edit", action: "open", target: "config" } : { label: "Create from Example", action: "create-config" },
+    { label: "Import…", action: "import-config" },
+    config.changedSinceStart && { label: "Restart Proxy to Apply", action: "restart" },
+    null,
+    { label: REVEAL_LABEL, action: "open", target: "config-reveal" },
+  ].filter((item) => item !== false);
+  const logMenu = [
+    { label: "Open", action: "open", target: "log" },
+    null,
+    { label: REVEAL_LABEL, action: "open", target: "log-reveal" },
+  ];
+  const row = (name, value, items) => `<div class="row"><span class="row-label row-name">${name}</span>${value}
+    <button type="button" class="icon-btn more" data-menu="${esc(JSON.stringify(items))}" aria-label="${name} actions"
+      aria-haspopup="menu" aria-expanded="false">${ICON.more}</button></div>`;
+  return block(
+    "Files",
+    "",
+    `${config.error ? message("bad", esc(config.error)) : ""}
+     ${row("Configuration", configStatus, configMenu)}
+     ${row("Request Log", status("", settings.logBytes == null ? "Empty" : fmtBytes(settings.logBytes)), logMenu)}`
+  );
 }
 
 /// Network and Subscription Logins: values written to the YAML configuration, applied on restart.
@@ -985,7 +1021,6 @@ async function act(action, el) {
         await loadActivity(false);
       }
       if (ui.page === "main") loadHomeTraffic();
-      if (ui.page !== "settings") ui.choosePath = false;
       render();
       $("content").scrollTop = 0;
       break;
@@ -1036,10 +1071,6 @@ async function act(action, el) {
       await invoke("probe_proxy", { name: el.dataset.name ?? null });
       await refresh();
       break;
-    case "check":
-      await invoke("check_credentials");
-      await refresh();
-      break;
     case "launch-at-login":
       try {
         await invoke("set_launch_at_login", { enabled: el.getAttribute("aria-checked") !== "true" });
@@ -1068,26 +1099,14 @@ async function act(action, el) {
       }
       await refresh();
       break;
-    case "choose-config":
-      ui.page = "settings";
-      ui.choosePath = true;
-      render();
-      $("config-path")?.focus();
-      break;
-    case "apply-path": {
-      const path = $("config-path").value.trim();
-      if (path) {
-        try {
-          await invoke("set_config_path", { path });
-          ui.choosePath = false;
-          toast("Configuration file changed");
-        } catch (error) {
-          toast(String(error));
-        }
-        await refresh();
+    case "import-config":
+      try {
+        if (await invoke("import_config")) toast("Configuration imported");
+      } catch (e) {
+        toast(String(e));
       }
+      await refresh();
       break;
-    }
     case "quit":
       await invoke("quit_app");
       break;
@@ -1097,6 +1116,8 @@ async function act(action, el) {
 document.addEventListener("click", (event) => {
   const select = event.target.closest("[data-options]");
   if (select) { showSelect(select); return; }
+  const menu = event.target.closest("[data-menu]");
+  if (menu) { showMenu(menu); return; }
   const el = event.target.closest("[data-action]");
   if (el && !el.disabled) act(el.dataset.action, el);
 });
@@ -1156,7 +1177,7 @@ document.addEventListener("input", (event) => {
 document.addEventListener("keydown", (event) => {
   if (openSelect) {
     const { menu } = openSelect;
-    const items = [...menu.children];
+    const items = menuItems(menu);
     const index = items.indexOf(document.activeElement);
     if (event.key === "Escape" || event.key === "Tab") {
       closeSelect(true);
@@ -1170,9 +1191,9 @@ document.addEventListener("keydown", (event) => {
       items[next].focus();
       return;
     }
-  } else if (event.target.matches("[data-options]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+  } else if (event.target.matches("[data-options], [data-menu]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
     event.preventDefault();
-    showSelect(event.target, event.key === "ArrowUp");
+    (event.target.dataset.menu ? showMenu : showSelect)(event.target, event.key === "ArrowUp");
     return;
   }
   if (event.target.matches("[data-config]") && (event.key === "Enter" || event.key === "Escape")) {
@@ -1208,7 +1229,6 @@ document.addEventListener("focusout", (event) => {
 document.addEventListener("toggle", (event) => {
   const { id, open } = event.target;
   if (id === "websocket-timeouts") ui.websocketOpen = open;
-  else if (id === "config-path-disclosure") ui.choosePath = open;
   else if (id === "setup-snippets") ui.snippetsOpen = open;
 }, true);
 
@@ -1233,7 +1253,6 @@ listen("panel-shown", () => {
   panelHiddenAt = null;
   if (returnHome) {
     ui.page = "main";
-    ui.choosePath = false;
     closeSelect();
     render();
     $("content").scrollTop = 0;

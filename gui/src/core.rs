@@ -55,30 +55,40 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
     Config::parse(text).map_err(|e| e.message.to_owned())
 }
 
+/// Copies a YAML file over `target` byte for byte, only if it is a valid configuration.
+fn replace_config(source: &Path, target: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(source)
+        .map_err(|e| format!("Cannot read the selected file: {e}"))?;
+    Config::parse(&text).map_err(|e| e.message.to_string())?;
+    crate::settings::write_private(target, text.as_bytes())
+        .map_err(|e| format!("Cannot replace the configuration: {e}"))
+}
+
 fn file_stamp(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 impl Core {
-    pub fn new(mut settings: Settings, notify: Notify) -> Self {
+    pub fn new(settings: Settings, notify: Notify) -> Self {
         let controller = Controller::new(notify.clone());
         let attached = controller.daemon_status();
-        let started_stamp = attached.map(|status| status.config_modified);
+        // A daemon started from another file by an older version keeps running
+        // until restarted; it is reported as out of date, not adopted.
+        let same_file = |path: &Path| {
+            let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            canonical(path) == canonical(&crate::settings::config_path())
+        };
+        let started_stamp = attached.map(|status| {
+            if same_file(&status.config_path) {
+                status.config_modified
+            } else {
+                Some(SystemTime::UNIX_EPOCH)
+            }
+        });
         let log_path = attached.map(|status| status.log_path.clone());
-        if let Some(status) = attached {
-            // The live daemon is authoritative, even if auto-start is disabled.
-            // Resolve compatibility links left by configuration migrations.
-            settings.config_path = status
-                .config_path
-                .canonicalize()
-                .unwrap_or_else(|_| status.config_path.clone())
-                .to_string_lossy()
-                .into_owned();
-            settings.save();
-        }
         Self {
             logs: LogFeed::new(
-                log_path.unwrap_or_else(|| settings.log_path()),
+                log_path.unwrap_or_else(crate::settings::log_path),
                 notify.clone(),
             ),
             controller,
@@ -94,7 +104,7 @@ impl Core {
     }
 
     pub fn config_path(&self) -> PathBuf {
-        self.settings.config_path()
+        crate::settings::config_path()
     }
 
     pub fn config_exists(&mut self) -> bool {
@@ -180,9 +190,7 @@ impl Core {
         if self.account_probe.is_none() {
             let config = self.loaded_config()?.clone();
             let logger = std::sync::Arc::new(coport::logger::Logger::new(
-                self.settings
-                    .log_path()
-                    .with_file_name("account-probes.jsonl"),
+                crate::settings::log_path().with_file_name("account-probes.jsonl"),
             ));
             self.account_probe = Some(std::sync::Arc::new(coport::server::Server::new(
                 config, logger,
@@ -204,10 +212,10 @@ impl Core {
     }
 
     pub fn start(&mut self) {
-        self.logs.set_path(self.settings.log_path());
+        self.logs.set_path(crate::settings::log_path());
         self.started_stamp = Some(file_stamp(&self.config_path()));
         self.controller
-            .start(&self.settings.config_path(), self.settings.log_path());
+            .start(&self.config_path(), crate::settings::log_path());
         self.invalidate_config();
     }
 
@@ -215,44 +223,12 @@ impl Core {
         self.controller.stop()
     }
 
-    pub fn apply_config_path(&mut self, path: &str) -> Result<(), String> {
-        if path.trim().is_empty() {
-            return Err("Choose a YAML configuration file.".into());
-        }
-        let path = coport::config::expand(path.trim())
-            .canonicalize()
-            .map_err(|e| format!("Cannot open configuration: {e}"))?;
-        Config::read(&path).map_err(|e| e.message.to_string())?;
-        let mut next = self.settings.clone();
-        next.config_path = path.to_string_lossy().into_owned();
-        // Check persistence before touching the running daemon.
-        next.try_save()
-            .map_err(|e| format!("Cannot save settings: {e}"))?;
-        if let Some(previous) = self.controller.daemon_status().cloned() {
-            if let Err(mut error) = self.controller.try_start(&path, next.log_path()) {
-                if let Err(save_error) = self.settings.try_save() {
-                    error.push_str(&format!("; cannot restore saved settings: {save_error}"));
-                }
-                if self.controller.daemon_status().is_none() {
-                    match self
-                        .controller
-                        .try_start(&previous.config_path, previous.log_path)
-                    {
-                        Ok(()) => error.push_str("; previous configuration restored"),
-                        Err(restore_error) => error.push_str(&format!(
-                            "; previous configuration could not restart: {restore_error}"
-                        )),
-                    }
-                }
-                self.invalidate_config();
-                return Err(error);
-            }
-            self.started_stamp = Some(file_stamp(&path));
-        }
-        self.settings = next;
-        self.logs.set_path(self.settings.log_path());
+    /// Replaces the configuration with a validated YAML file; a running proxy
+    /// picks it up on restart.
+    pub fn import_config(&mut self, source: &Path) -> Result<(), String> {
+        let result = replace_config(source, &self.config_path());
         self.invalidate_config();
-        Ok(())
+        result
     }
 
     pub fn set_launch_at_login(&mut self, enable: bool) -> Result<(), String> {
@@ -285,7 +261,6 @@ impl Core {
         let port = self.port();
         let stats = self.logs.stats();
         let base = format!("http://127.0.0.1:{port}");
-        let (checking, check) = self.controller.check_state();
         let changed_since_start = self.controller.is_running()
             && self
                 .started_stamp
@@ -348,7 +323,6 @@ impl Core {
                 base,
             },
             config: ConfigDto {
-                path: self.config_path().display().to_string(),
                 exists: self.config.exists,
                 error: match &self.config.parsed {
                     Some(Err(e)) if self.config.exists => Some(e.clone()),
@@ -357,17 +331,12 @@ impl Core {
                 changed_since_start,
                 details: self.loaded_config().map(|c| details(c, &probes)),
             },
-            check: CheckDto {
-                running: checking,
-                ok: check.as_ref().map(|c| c.ok),
-                message: check.map(|c| c.message),
-            },
             settings: SettingsDto {
                 appearance: self.settings.appearance,
                 start_proxy_on_launch: self.settings.start_proxy_on_launch,
                 keep_proxy_running_on_quit: self.settings.keep_proxy_running_on_quit,
                 launch_at_login: self.launch_at_login,
-                log_path: self.settings.log_path().display().to_string(),
+                log_bytes: std::fs::metadata(self.logs.path()).ok().map(|m| m.len()),
             },
         }
     }
@@ -517,7 +486,6 @@ pub struct Snapshot {
     routes: Vec<RouteReport>,
     urls: Urls,
     config: ConfigDto,
-    check: CheckDto,
     settings: SettingsDto,
 }
 
@@ -579,7 +547,6 @@ struct Urls {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigDto {
-    path: String,
     exists: bool,
     error: Option<String>,
     changed_since_start: bool,
@@ -651,20 +618,14 @@ struct Fallback {
 }
 
 #[derive(Serialize)]
-struct CheckDto {
-    running: bool,
-    ok: Option<bool>,
-    message: Option<String>,
-}
-
-#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsDto {
     appearance: crate::settings::Appearance,
     start_proxy_on_launch: bool,
     keep_proxy_running_on_quit: bool,
     launch_at_login: bool,
-    log_path: String,
+    /// Size of the request log in use, if it exists yet.
+    log_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -708,7 +669,7 @@ impl From<Entry> for EntryDto {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_config;
+    use super::{parse_config, replace_config};
 
     const EXAMPLE: &str = include_str!("../../config.example.yaml");
 
@@ -728,5 +689,32 @@ mod tests {
             assert!(parse_config(&text).is_ok());
             assert!(coport::config::Config::read(&path).is_ok());
         }
+    }
+
+    #[test]
+    fn import_replaces_only_with_a_valid_configuration_and_keeps_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cache/config.yaml");
+        let source = dir.path().join("picked.yml");
+        std::fs::write(&source, "listen_port: [").unwrap();
+        assert!(replace_config(&source, &target).is_err());
+        assert!(!target.exists());
+        // Line endings and comments are copied as they are, on every platform.
+        for newline in ["\n", "\r\n"] {
+            let text = format!(
+                "# imported{newline}listen_port: 9797{newline}request_timeout_seconds: 30{newline}"
+            );
+            std::fs::write(&source, &text).unwrap();
+            replace_config(&source, &target).unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), text);
+            assert_eq!(
+                coport::config::Config::read(&target).unwrap().listen_port,
+                9797
+            );
+        }
+        std::fs::write(&source, "listen_port: 0\nrequest_timeout_seconds: 30\n").unwrap();
+        assert!(replace_config(&source, &target).is_err());
+        assert!(std::fs::read_to_string(&target).unwrap().contains("9797"));
+        assert!(replace_config(&dir.path().join("missing.yaml"), &target).is_err());
     }
 }
