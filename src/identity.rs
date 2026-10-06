@@ -925,11 +925,11 @@ mod tests {
             )
             .unwrap();
         }
-        // Home b keeps its login in the keyring; its auth.json is stale.
+        // Home b uses the direct keyring on every platform; its auth.json is stale.
         let b = dir.path().join("b");
         std::fs::write(
             b.join("config.toml"),
-            "cli_auth_credentials_store = \"keyring\"\n",
+            "cli_auth_credentials_store = \"keyring\"\n[features]\nsecret_auth_storage = false\n",
         )
         .unwrap();
         crate::keychain::set_test_entry(
@@ -969,7 +969,7 @@ mod tests {
         let home = dir.path();
         let token = |value: Value| value["tokens"]["access_token"].as_str().map(String::from);
         let set_store = |store: &str| {
-            std::fs::write(home.join("config.toml"), format!("model = \"x\"\ncli_auth_credentials_store = \"{store}\"\n[features]\nother = true\n")).unwrap()
+            std::fs::write(home.join("config.toml"), format!("model = \"x\"\ncli_auth_credentials_store = \"{store}\"\n[features]\nother = true\nsecret_auth_storage = false\n")).unwrap()
         };
         let keyring = |value: Option<&str>| {
             crate::keychain::set_test_entry(KEYRING_SERVICE, &keyring_account(home), value)
@@ -1029,6 +1029,25 @@ mod tests {
         assert!(saved_auth(home).await.is_err());
         set_store("unknown");
         assert!(saved_auth(home).await.is_err());
+    }
+
+    #[test]
+    fn secret_auth_storage_defaults_and_overrides() {
+        // Both an absent features table and an unrelated feature retain the
+        // platform default; explicit settings override it on every platform.
+        for config in ["", "[features]\nother = true\n"] {
+            let settings: AuthSettings = toml::from_str(config).unwrap();
+            assert_eq!(settings.features.secret_auth_storage, cfg!(windows));
+        }
+        assert_eq!(
+            AuthSettings::default().features.secret_auth_storage,
+            cfg!(windows)
+        );
+        for enabled in [false, true] {
+            let settings: AuthSettings =
+                toml::from_str(&format!("[features]\nsecret_auth_storage = {enabled}\n")).unwrap();
+            assert_eq!(settings.features.secret_auth_storage, enabled);
+        }
     }
 
     #[test]
