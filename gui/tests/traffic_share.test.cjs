@@ -132,3 +132,14 @@ test('review menu offers current configurations and Unidentified for each change
   assert.doesNotMatch(context.trafficReview({ ...group, sources: [group.sources[1]] }, targets), /traffic-review review/);
   assert.equal(context.trafficReview(credential('main', 3), targets), '');
 });
+test('Models charts of calls without reported usage show no zero token peak', () => {
+  const context = setup('model');
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
+  const html = context.chart(failed, 'model', true);
+  assert.doesNotMatch(html, /chart-peak/);
+  assert.match(html, /No reported tokens · 2 calls/);
+  assert.equal((html.match(/class="err"/g) || []).length, 2);
+  assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
+  assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
+});

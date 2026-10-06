@@ -445,7 +445,7 @@ function chart(stats, scope, showPeak = false) {
   values.forEach((v, i) => {
     const x = (i * (bar + gap)).toFixed(2);
     const bh = v ? Math.max(2.5, (v / max) * h) : calls[i] ? 2.5 : 1;
-    const title = model ? `${v.toLocaleString("en-US")} tokens · ${calls[i].toLocaleString("en-US")} calls` : `${v.toLocaleString("en-US")} requests`;
+    const title = model ? `${v ? `${v.toLocaleString("en-US")} tokens` : "No reported tokens"} · ${calls[i].toLocaleString("en-US")} calls` : `${v.toLocaleString("en-US")} requests`;
     bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"><title>${title}</title></rect>`;
     if (errors[i]) {
       const eh = (bh * errors[i]) / calls[i];
@@ -453,8 +453,9 @@ function chart(stats, scope, showPeak = false) {
     }
   });
   const plot = `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
-  if (!showPeak) return plot;
   const peak = Math.max(0, ...values);
+  // Failed calls report no usage; without any, there is no token peak to show.
+  if (!showPeak || (model && !peak)) return plot;
   const index = values.indexOf(peak);
   const position = ((index * (bar + gap) + bar / 2) / w) * 100;
   // Align edge labels inward so the first/last bucket cannot clip the value.
