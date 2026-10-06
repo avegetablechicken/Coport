@@ -243,6 +243,11 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
         assert!(fixture.requests.try_recv().is_err());
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!log.contains("url-route-secret"));
+        assert!(
+            log.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|row| row["upstream_base_url"] == "https://upstream.invalid/v1")
+        );
     }
 }
 

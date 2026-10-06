@@ -618,6 +618,7 @@ impl Server {
         let (route, choice) = if let Some(r) = &claude_route {
             log.field("service", "claude");
             log.field("provider", &r.label);
+            log.field("upstream_base_url", &r.upstream);
             if let Some(identity) = &r.identity {
                 log.field("account_id", &identity.account_id);
                 if let Some(label) = crate::identity::routing_account_label(
@@ -663,6 +664,7 @@ impl Server {
             (Some(r), p)
         };
         if let Some(r) = &route {
+            log.field("upstream_base_url", &r.upstream);
             if let Some(label) = &r.account_label {
                 log.field("account_label", label);
             }
