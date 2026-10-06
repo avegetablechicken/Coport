@@ -62,7 +62,11 @@ fn replace_config(source: &Path, target: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("Cannot read the selected file: {e}"))?;
     Config::parse(&text).map_err(|e| e.message.to_string())?;
-    crate::settings::write_private(target, text.as_bytes())
+    // Replace the link target, as editing does, so a linked configuration stays linked.
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    crate::settings::write_private(&target, text.as_bytes())
         .map_err(|e| format!("Cannot replace the configuration: {e}"))
 }
 
@@ -880,5 +884,23 @@ mod tests {
         assert!(replace_config(&source, &target).is_err());
         assert!(std::fs::read_to_string(&target).unwrap().contains("9797"));
         assert!(replace_config(&dir.path().join("missing.yaml"), &target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_writes_through_a_linked_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("dotfiles.yaml");
+        let target = dir.path().join("config.yaml");
+        let source = dir.path().join("picked.yml");
+        std::fs::write(&linked, "listen_port: 8787\nrequest_timeout_seconds: 30\n").unwrap();
+        std::os::unix::fs::symlink(&linked, &target).unwrap();
+        std::fs::write(&source, "listen_port: 9797\nrequest_timeout_seconds: 30\n").unwrap();
+        replace_config(&source, &target).unwrap();
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            coport::config::Config::read(&linked).unwrap().listen_port,
+            9797
+        );
     }
 }
