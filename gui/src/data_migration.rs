@@ -195,6 +195,7 @@ mod tests {
 
     #[test]
     fn live_daemon_lock_prevents_migration_even_without_discovery() {
+        let _guard = crate::daemon::spawn_guard();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("cache");
         let target = dir.path().join("support");

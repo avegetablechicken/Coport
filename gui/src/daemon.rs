@@ -396,12 +396,24 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
     result.and(stopped)
 }
 
+/// A child forked by `start` shares every open file until it execs, including
+/// lock handles a parallel test has just dropped. Tests that spawn a daemon or
+/// expect a released lock to be free at once hold this guard.
+#[cfg(test)]
+pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn unreachable_daemon_is_stopped_only_after_its_lock_is_released() {
+        let _guard = spawn_guard();
         let dir = tempfile::tempdir().unwrap();
         let lock = lock_file(&dir.path().join("daemon.lock")).unwrap();
         lock.try_lock().unwrap();
@@ -422,6 +434,7 @@ mod tests {
 
     #[test]
     fn daemon_lock_excludes_another_handle_until_released() {
+        let _guard = spawn_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
         let first = lock_file(&path).unwrap();

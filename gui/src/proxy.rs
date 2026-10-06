@@ -368,6 +368,7 @@ mod tests {
 
     #[test]
     fn missing_helper_reports_failure_without_starting_in_process() {
+        let _guard = crate::daemon::spawn_guard();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.yaml");
         std::fs::write(&config, include_str!("../../config.example.yaml")).unwrap();
