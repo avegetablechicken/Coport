@@ -93,6 +93,8 @@ impl App {
         for key in ["HOME", "USERPROFILE", "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
             env.insert(key.into(), dir.path().to_string_lossy().into_owned());
         }
+        // A missing key must not run the developer's login shell to look it up.
+        env.insert("SHELL".into(), "/bin/false".into());
         Self {
             dir,
             port: port(),
