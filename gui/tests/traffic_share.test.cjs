@@ -70,3 +70,31 @@ test('sectors are closed paths and vanish when too narrow', () => {
   assert.match(ringSector(0, 0.75, 42, 26), / A 42 42 0 1 1 /);
   assert.equal(ringSector(0, 0.0001, 42, 26), '');
 });
+test('traffic data keeps the category it was read for', async () => {
+  const pending = [];
+  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, page: 'main' };
+  const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
+  const load = context.loadTraffic();
+  // The selector already shows the new category while the old data renders.
+  ui.trafficScope = 'model';
+  pending[0].resolve({ credentials: [] });
+  await load;
+  assert.equal(pending[0].query.scope, 'all');
+  assert.equal(ui.traffic.scope, 'all');
+});
+test('home traffic keeps the category it was read for', async () => {
+  const pending = [];
+  const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'activity' };
+  const context = { ui, render() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('async function loadHomeTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
+  const load = context.loadHomeTraffic();
+  ui.trafficScope = 'model';
+  pending[0].resolve({ summary: { requests: 3 } });
+  await load;
+  assert.equal(pending[0].query.scope, 'all');
+  assert.equal(ui.homeTraffic.scope, 'all');
+  assert.equal(ui.homeTraffic.requests, 3);
+});

@@ -461,10 +461,12 @@ async function loadHomeTraffic(force = false) {
   if (ui.homeTrafficLoading && !force) return;
   const request = ++ui.homeTrafficRequest;
   ui.homeTrafficLoading = true;
+  // As on the Activity page, stats follow the category their data was read for.
+  const scope = ui.trafficScope;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes, scope: ui.trafficScope });
+    const traffic = await invoke("get_traffic", { minutes: ui.homeTrafficMinutes, scope });
     if (request !== ui.homeTrafficRequest) return;
-    ui.homeTraffic = traffic.summary;
+    ui.homeTraffic = { ...traffic.summary, scope };
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
   } catch (error) {
@@ -494,11 +496,11 @@ function trafficBlock() {
      ${ui.homeTrafficError ? `<span class="traffic-update-error" title="${esc(ui.homeTrafficError)}">Update failed</span>` : ""}
      ${chart(st.counts, st.errorCounts)}
      <div class="strip">
-       ${stat(ui.trafficScope === "model" ? "Calls" : "Requests", st.requests)}
+       ${stat(st.scope === "model" ? "Calls" : "Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(st.avgMs))}
        ${stat("Received", fmtBytes(st.bytes))}
-     </div>${modelTokenStats(st)}</div>`
+     </div>${modelTokenStats(st, st.scope)}</div>`
   );
 }
 
@@ -859,10 +861,13 @@ async function loadTraffic() {
   const request = ++ui.trafficRequest;
   ui.trafficLoading = true;
   $("activity-traffic")?.setAttribute("aria-busy", "true");
+  // Charts follow the category their data was read for, so a switch keeps
+  // the previous charts consistent until the replacement arrives.
+  const scope = ui.trafficScope;
   try {
-    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes, scope: ui.trafficScope });
+    const traffic = await invoke("get_traffic", { minutes: ui.trafficMinutes, scope });
     if (request !== ui.trafficRequest) return;
-    ui.traffic = traffic;
+    ui.traffic = { ...traffic, scope };
     ui.trafficError = "";
   } catch (error) {
     if (request !== ui.trafficRequest) return;
@@ -873,8 +878,8 @@ async function loadTraffic() {
   if (ui.page === "activity") renderActivityTraffic();
 }
 
-function modelTokenStats(stats) {
-  if (ui.trafficScope !== "model") return "";
+function modelTokenStats(stats, scope) {
+  if (scope !== "model") return "";
   const tokens = (n) => n == null ? "—" : n.toLocaleString();
   return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
@@ -992,6 +997,7 @@ function renderActivityTraffic() {
   const el = $("activity-traffic");
   if (!el) return;
   const traffic = ui.traffic;
+  const scope = traffic?.scope ?? ui.trafficScope;
   el.setAttribute("aria-busy", String(ui.trafficLoading));
   const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const rows = traffic?.credentials.map((c) => {
@@ -999,13 +1005,13 @@ function renderActivityTraffic() {
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
       ${chart(c.counts, c.errorCounts, true)}
-      <div class="strip">${stat(ui.trafficScope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c)}
+      <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
   }).join("");
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
     "Sorted by received traffic, largest first. Red indicates errors; each chart uses its own scale.",
-    `${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
+    `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
   ].join("\n\n");
   const minutes = traffic?.bucketMinutes;
@@ -1018,7 +1024,7 @@ function renderActivityTraffic() {
     <span class="info-tip" data-tip="${esc(notes)}" aria-label="${esc(notes)}">${ICON.info}</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
-    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, ui.trafficScope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
+    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
   queueFit();
 }
 
