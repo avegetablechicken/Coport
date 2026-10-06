@@ -460,11 +460,16 @@ impl Server {
                 log.event("upstream_response");
                 let headers = filtered_headers(upstream.headers());
                 let mut observer = log.fields.contains_key("model_call_id").then(|| {
+                    crate::model_calls::record_response_encoding(&mut log, &headers);
+                    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
                     crate::model_calls::HttpObserver::new(
-                        headers
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .is_some_and(|v| v.starts_with("text/event-stream")),
+                        header("content-type").is_some_and(|v| {
+                            v.trim()
+                                .to_ascii_lowercase()
+                                .starts_with("text/event-stream")
+                        }),
+                        header("content-encoding"),
+                        &mut log,
                     )
                 });
                 let no_body =

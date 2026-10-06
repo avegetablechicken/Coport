@@ -1071,6 +1071,14 @@ New model calls are read from explicit `model_call_*` events with a `model_call_
 Historical HTTP generation/compaction requests also count as one call each;
 requests already carrying a call ID are excluded from this fallback to avoid double
 counting. WebSocket connection records are never used to infer calls.
+HTTP model calls also record `response_content_type` and `response_content_encoding`
+when present. Compressed responses (`gzip`, `deflate`, `br`, `zstd`) are decoded
+incrementally as they stream through, keeping only the fields above; forwarded bytes
+are unchanged and no body is stored. Compressed request bodies are forwarded without
+decoding, so the model is taken from the response. Event streams are recognized by
+their content even without a `text/event-stream` content type. When a response
+cannot be observed, `model_observation` records why: `unsupported_encoding`,
+`decode_error` or `message_limit`.
 Token totals include only reported usage; missing usage displays as unknown, not zero.
 These totals are not provider quota or billing measurements. No prompts, generated
 text, or tool arguments are written to these logs.

@@ -36,7 +36,8 @@ async fn read_request(io: &mut TestIo) -> std::io::Result<String> {
         .unwrap_or(0);
     let mut body = vec![0; length];
     io.read_exact(&mut body).await?;
-    Ok(head + &String::from_utf8(body).unwrap())
+    // Compressed model request bodies are binary.
+    Ok(head + &String::from_utf8_lossy(&body))
 }
 async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
     let certified = rcgen::generate_simple_self_signed(vec![
@@ -141,6 +142,12 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                 else if response_mode=="delayed_headers" {
                     let _ = io.read_u8().await;
                     let _ = tx.send("DISCONNECTED".into());
+                }
+                else if response_mode=="zstd_sse" || response_mode=="untyped_sse" {
+                    // ChatGPT-style responses: compressed, or an event stream without its content type.
+                    let (head, body) = model_stream_body(response_mode);
+                    io.write_all(format!("HTTP/1.1 200 OK\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    io.write_all(&body).await.unwrap();
                 }
                 else if response_mode=="redirect" { io.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else {
@@ -2332,6 +2339,84 @@ async fn read_test_ws_message<R: AsyncRead + Unpin>(reader: &mut R, masked: bool
         }
     }
     payload
+}
+const MODEL_STREAM: &str = concat!(
+    "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\r\n\r\n",
+    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
+);
+fn model_stream_body(mode: &str) -> (&'static str, Vec<u8>) {
+    if mode == "zstd_sse" {
+        (
+            "Content-Type: text/event-stream\r\nContent-Encoding: zstd\r\n",
+            zstd::encode_all(MODEL_STREAM.as_bytes(), 0).unwrap(),
+        )
+    } else {
+        ("", MODEL_STREAM.as_bytes().to_vec())
+    }
+}
+#[tokio::test]
+async fn http_model_calls_observe_compressed_and_untyped_streams_without_changing_them() {
+    for mode in ["zstd_sse", "untyped_sse"] {
+        let mut fixture = fixture("direct", mode).await;
+        let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+        trust(&running, &fixture, "none");
+        // Codex compresses request bodies with zstd when signed in with ChatGPT. They
+        // are forwarded untouched and not decoded; the model comes from the response.
+        let request = zstd::encode_all(
+            &br#"{"model":"gpt-request","input":"PRIVATE PROMPT"}"#[..],
+            0,
+        )
+        .unwrap();
+        let response = http()
+            .post(format!("{}/responses", running.url))
+            .bearer_auth("model-secret")
+            .header("content-encoding", "zstd")
+            .body(request.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            model_stream_body(mode).1,
+            "{mode}"
+        );
+        let forwarded = fixture.requests.recv().await.unwrap();
+        let forwarded = forwarded.to_ascii_lowercase();
+        assert!(forwarded.contains("content-encoding: zstd"), "{mode}");
+        assert!(
+            forwarded.contains(&format!("content-length: {}", request.len())),
+            "{mode}"
+        );
+        let path = running._temp.path().join("proxy.log");
+        let call = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                assert!(!raw.contains("PRIVATE PROMPT"));
+                if let Some(row) = raw
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .find(|row| row["event"] == "model_call_finished")
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(call["model_outcome"], "finished", "{mode}");
+        assert_eq!(call["input_tokens"], "12", "{mode}");
+        assert_eq!(call["output_tokens"], "3", "{mode}");
+        assert_eq!(call["cached_input_tokens"], "4", "{mode}");
+        assert_eq!(call["model"], "gpt-test", "{mode}");
+        assert!(call.get("request_content_encoding").is_none(), "{mode}");
+        if mode == "zstd_sse" {
+            assert_eq!(call["response_content_encoding"], "zstd");
+            assert_eq!(call["response_content_type"], "text/event-stream");
+        } else {
+            assert!(call.get("response_content_type").is_none());
+        }
+    }
 }
 #[tokio::test]
 async fn responses_websocket_records_two_model_calls_while_connection_stays_open() {

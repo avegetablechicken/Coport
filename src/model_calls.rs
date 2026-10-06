@@ -196,6 +196,8 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
 }
 
 pub(crate) fn observe_request(bytes: &[u8], log: &mut RequestLog) {
+    // Compressed bodies are forwarded as they are and not decoded; the response
+    // reports the model as well.
     if let Ok(event) = serde_json::from_slice::<Envelope>(bytes) {
         if let Some(model) = event.model.filter(|s| safe_label(s)) {
             log.field("model", model);
@@ -203,38 +205,181 @@ pub(crate) fn observe_request(bytes: &[u8], log: &mut RequestLog) {
     }
 }
 
+/// Records how a model response was framed and encoded, never its content, so an
+/// unobserved stream can be explained.
+pub(crate) fn record_response_encoding(log: &mut RequestLog, headers: &hyper::HeaderMap) {
+    for (name, key) in [
+        ("content-type", "response_content_type"),
+        ("content-encoding", "response_content_encoding"),
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| safe_label(v))
+        {
+            log.field(key, value);
+        }
+    }
+}
+
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+
+/// A corrupt or truncated compressed body.
+struct DecodeError;
+
+/// Decodes a compressed response chunk by chunk as it streams through, for
+/// observation only; forwarded bytes are untouched and nothing is kept.
+enum BodyDecoder {
+    Identity,
+    Gzip(flate2::write::GzDecoder<Vec<u8>>),
+    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
+    Brotli(Box<brotli_decompressor::DecompressorWriter<Vec<u8>>>),
+    Zstd(Box<zstd::stream::write::Decoder<'static, Vec<u8>>>),
+}
+impl BodyDecoder {
+    fn new(encoding: Option<&str>) -> Result<Self, &'static str> {
+        Ok(
+            match encoding.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+                None | Some("" | "identity") => Self::Identity,
+                Some("gzip" | "x-gzip") => Self::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+                Some("deflate") => Self::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
+                Some("br") => Self::Brotli(Box::new(brotli_decompressor::DecompressorWriter::new(
+                    Vec::new(),
+                    4096,
+                ))),
+                Some("zstd") => Self::Zstd(Box::new(
+                    zstd::stream::write::Decoder::new(Vec::new()).map_err(|_| "decode_error")?,
+                )),
+                _ => return Err("unsupported_encoding"),
+            },
+        )
+    }
+    fn output(&mut self) -> &mut Vec<u8> {
+        match self {
+            Self::Identity => unreachable!("identity bodies are not copied"),
+            Self::Gzip(d) => d.get_mut(),
+            Self::Deflate(d) => d.get_mut(),
+            Self::Brotli(d) => d.get_mut(),
+            Self::Zstd(d) => d.get_mut(),
+        }
+    }
+    fn writer(&mut self) -> &mut dyn std::io::Write {
+        match self {
+            Self::Identity => unreachable!("identity bodies are not copied"),
+            Self::Gzip(d) => d,
+            Self::Deflate(d) => d,
+            Self::Brotli(d) => d.as_mut(),
+            Self::Zstd(d) => d.as_mut(),
+        }
+    }
+    /// Bytes decoded from `bytes`, a compressed piece of the body.
+    fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        let writer = self.writer();
+        writer.write_all(bytes).map_err(|_| DecodeError)?;
+        writer.flush().map_err(|_| DecodeError)?;
+        Ok(std::mem::take(self.output()))
+    }
+    /// Bytes still held by the decoder at the end of the body.
+    fn finish(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let done = match self {
+            Self::Identity => return Ok(Vec::new()),
+            Self::Gzip(d) => d.try_finish(),
+            Self::Deflate(d) => d.try_finish(),
+            Self::Brotli(d) => d.close(),
+            Self::Zstd(d) => std::io::Write::flush(d.as_mut()),
+        };
+        done.map_err(|_| DecodeError)?;
+        Ok(std::mem::take(self.output()))
+    }
+}
+
+/// Whether a body is an event stream, judged by its first field; `None` until
+/// enough bytes have arrived.
+fn sniff_sse(body: &[u8]) -> Option<bool> {
+    let body = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
+    let start = &body[body.iter().position(|b| !b.is_ascii_whitespace())?..];
+    for field in [&b"data:"[..], b"event:", b"id:", b"retry:", b":"] {
+        if start.starts_with(field) {
+            return Some(true);
+        }
+        if field.starts_with(start) {
+            return None;
+        }
+    }
+    Some(false)
+}
 
 /// Incrementally observes SSE lines or a bounded JSON body without changing it.
 pub(crate) struct HttpObserver {
-    sse: bool,
+    /// Undecided until the body shows whether an undeclared stream is SSE.
+    sse: Option<bool>,
+    decoder: BodyDecoder,
     buffer: Vec<u8>,
     data: Vec<u8>,
     disabled: bool,
 }
 impl HttpObserver {
-    pub fn new(sse: bool) -> Self {
+    /// `sse` reflects the response Content-Type; `encoding` is its Content-Encoding.
+    pub fn new(sse: bool, encoding: Option<&str>, log: &mut RequestLog) -> Self {
+        let (decoder, disabled) = match BodyDecoder::new(encoding) {
+            Ok(decoder) => (decoder, false),
+            Err(reason) => {
+                log.field("model_observation", reason);
+                (BodyDecoder::Identity, true)
+            }
+        };
         Self {
-            sse,
+            sse: sse.then_some(true),
+            decoder,
             buffer: Vec::new(),
             data: Vec::new(),
-            disabled: false,
+            disabled,
         }
     }
     pub fn feed(&mut self, bytes: &[u8], log: &mut RequestLog) {
         if self.disabled {
             return;
         }
+        if matches!(self.decoder, BodyDecoder::Identity) {
+            return self.observe(bytes, log);
+        }
+        // Decompressed size is not limited. Small input pieces hand each decoded
+        // part to the parser at once, so the body is never held whole.
+        for piece in bytes.chunks(4096) {
+            match self.decoder.decode(piece) {
+                Ok(decoded) => self.observe(&decoded, log),
+                Err(DecodeError) => return self.stop("decode_error", log),
+            }
+            if self.disabled {
+                return;
+            }
+        }
+    }
+    fn stop(&mut self, reason: &str, log: &mut RequestLog) {
+        self.disabled = true;
+        self.buffer.clear();
+        self.data.clear();
+        log.field("model_observation", reason);
+    }
+    fn observe(&mut self, bytes: &[u8], log: &mut RequestLog) {
+        self.parse(bytes, log);
+        if self.sse.is_none() && !self.disabled {
+            self.sse = sniff_sse(&self.buffer);
+            if self.sse == Some(true) {
+                // Replay what was held while the stream kind was unknown.
+                let pending = std::mem::take(&mut self.buffer);
+                self.parse(&pending, log);
+            }
+        }
+    }
+    fn parse(&mut self, bytes: &[u8], log: &mut RequestLog) {
         for chunk in bytes.split_inclusive(|b| *b == b'\n') {
             if self.buffer.len() + chunk.len() > MAX_MESSAGE {
-                self.disabled = true;
-                self.buffer.clear();
-                self.data.clear();
-                log.field("model_observation", "message_limit");
+                self.stop("message_limit", log);
                 return;
             }
             self.buffer.extend_from_slice(chunk);
-            if self.sse && self.buffer.last() == Some(&b'\n') {
+            if self.sse == Some(true) && self.buffer.last() == Some(&b'\n') {
                 let line = self
                     .buffer
                     .strip_suffix(b"\n")
@@ -247,9 +392,7 @@ impl HttpObserver {
                 } else if let Some(data) = line.strip_prefix(b"data:") {
                     let data = data.strip_prefix(b" ").unwrap_or(data);
                     if self.data.len() + data.len() + 1 > MAX_MESSAGE {
-                        self.disabled = true;
-                        self.data.clear();
-                        log.field("model_observation", "message_limit");
+                        self.stop("message_limit", log);
                     } else {
                         if !self.data.is_empty() {
                             self.data.push(b'\n');
@@ -268,8 +411,16 @@ impl HttpObserver {
         if self.disabled {
             return;
         }
-        if self.sse {
-            self.feed(b"\n\n", log);
+        match self.decoder.finish() {
+            Ok(rest) if !rest.is_empty() => self.observe(&rest, log),
+            Ok(_) => {}
+            Err(DecodeError) => return self.stop("decode_error", log),
+        }
+        if self.disabled {
+            return;
+        }
+        if self.sse == Some(true) {
+            self.parse(b"\n\n", log);
         } else {
             observe_http_json(&self.buffer, log);
         }
@@ -287,9 +438,31 @@ fn observe_http_json(bytes: &[u8], log: &mut RequestLog) {
         }
         return;
     }
-    let Ok(event) = serde_json::from_slice::<Envelope>(bytes) else {
-        return;
-    };
+    match serde_json::from_slice::<Envelope>(bytes) {
+        Ok(event) => observe_event(event, log),
+        // Several complete events can arrive in one message. Like sub2api, read
+        // them only when every part is a typed event, and at most 16 of them.
+        Err(_) => {
+            let events: Result<Vec<Envelope>, _> = serde_json::Deserializer::from_slice(bytes)
+                .into_iter()
+                .take(MAX_CONCATENATED_EVENTS + 1)
+                .collect();
+            if let Ok(events) = events {
+                if (2..=MAX_CONCATENATED_EVENTS).contains(&events.len())
+                    && events.iter().all(|e| !e.kind.trim().is_empty())
+                {
+                    for event in events {
+                        observe_event(event, log);
+                    }
+                }
+            }
+        }
+    }
+}
+
+const MAX_CONCATENATED_EVENTS: usize = 16;
+
+fn observe_event(event: Envelope, log: &mut RequestLog) {
     event.apply(&mut log.fields);
     if (event.kind.starts_with("response.")
         || event.kind == "message_start"
@@ -1095,7 +1268,7 @@ mod tests {
             log.field("model_call_id", "http");
             log.field("model_transport", "http");
             log.event("request_received");
-            let mut observer = HttpObserver::new(true);
+            let mut observer = HttpObserver::new(true, None, &mut log);
             let sse = concat!(
                 "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"model\":\"claude\",\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\r\n\r\n",
                 "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n\n",
@@ -1117,19 +1290,164 @@ mod tests {
             1
         );
         let mut log = log_at(&path);
-        let mut observer = HttpObserver::new(false);
+        let mut observer = HttpObserver::new(false, None, &mut log);
         observer.feed(
             br#"{"model":"gpt","usage":{"prompt_tokens":7,"completion_tokens":2}}"#,
             &mut log,
         );
         observer.finish(&mut log);
         assert_eq!(log.fields["input_tokens"], "7");
-        let mut observer = HttpObserver::new(true);
+        let mut observer = HttpObserver::new(true, None, &mut log);
         observer.feed(
             b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"failed\"}}\n\n",
             &mut log,
         );
         assert_eq!(log.fields["model_outcome"], "failed");
+    }
+    fn compress(encoding: &str, body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        match encoding {
+            "gzip" => {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(body).unwrap();
+                e.finish().unwrap()
+            }
+            "deflate" => {
+                let mut e =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(body).unwrap();
+                e.finish().unwrap()
+            }
+            "br" => {
+                let mut out = Vec::new();
+                brotli::BrotliCompress(&mut &body[..], &mut out, &Default::default()).unwrap();
+                out
+            }
+            "zstd" => zstd::encode_all(body, 0).unwrap(),
+            _ => body.to_vec(),
+        }
+    }
+    #[test]
+    fn http_observer_decodes_compressed_and_untyped_event_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        for newline in ["\n", "\r\n"] {
+            let stream = [
+                ": keep-alive",
+                "",
+                "event: response.created",
+                r#"data: {"type":"response.created","response":{"id":"r","model":"gpt"}}"#,
+                "",
+                "event: response.completed",
+                r#"data: {"type":"response.completed","response":{"id":"r","usage":{"input_tokens":9,"output_tokens":2}}}"#,
+                "",
+                "",
+            ]
+            .join(newline);
+            for encoding in ["identity", "gzip", "deflate", "br", "zstd"] {
+                // Declared and undeclared streams must read the same.
+                for declared in [true, false] {
+                    let body = compress(encoding, stream.as_bytes());
+                    let mut log = log_at(&path);
+                    let mut observer = HttpObserver::new(declared, Some(encoding), &mut log);
+                    for byte in &body {
+                        observer.feed(&[*byte], &mut log);
+                    }
+                    observer.finish(&mut log);
+                    let case = format!("{encoding} declared={declared} newline={newline:?}");
+                    assert_eq!(log.fields["input_tokens"], "9", "{case}");
+                    assert_eq!(log.fields["output_tokens"], "2", "{case}");
+                    assert_eq!(log.fields["model"], "gpt", "{case}");
+                    assert_eq!(log.fields["model_outcome"], "finished", "{case}");
+                    assert!(!log.fields.contains_key("model_observation"), "{case}");
+                }
+            }
+        }
+        // An undeclared JSON body is still read whole.
+        let mut log = log_at(&path);
+        let body = compress(
+            "gzip",
+            br#"{"model":"gpt","usage":{"input_tokens":5,"output_tokens":1}}"#,
+        );
+        let mut observer = HttpObserver::new(false, Some("GZIP"), &mut log);
+        observer.feed(&body, &mut log);
+        observer.finish(&mut log);
+        assert_eq!(log.fields["input_tokens"], "5");
+    }
+    #[test]
+    fn http_observer_stops_on_bad_or_unknown_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        for (encoding, body, reason) in [
+            ("zstd", b"not zstd at all".to_vec(), "decode_error"),
+            ("gzip", b"not gzip".to_vec(), "decode_error"),
+            ("compress", b"data: {}\n\n".to_vec(), "unsupported_encoding"),
+        ] {
+            let mut log = log_at(&path);
+            let mut observer = HttpObserver::new(true, Some(encoding), &mut log);
+            observer.feed(&body, &mut log);
+            observer.finish(&mut log);
+            assert_eq!(log.fields["model_observation"], reason, "{encoding}");
+            assert!(!log.fields.contains_key("model_outcome"), "{encoding}");
+        }
+    }
+    #[test]
+    fn http_observer_decompresses_without_a_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        // More decoded bytes than the per-message limit, in small events.
+        let mut stream = ": keep-alive\n\n".repeat(MAX_MESSAGE / 14 + 1);
+        stream.push_str(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        assert!(stream.len() > MAX_MESSAGE);
+        let mut log = log_at(&path);
+        let mut observer = HttpObserver::new(true, Some("zstd"), &mut log);
+        for chunk in compress("zstd", stream.as_bytes()).chunks(16 * 1024) {
+            observer.feed(chunk, &mut log);
+        }
+        observer.finish(&mut log);
+        assert!(!log.fields.contains_key("model_observation"));
+        assert_eq!(log.fields["model_outcome"], "finished");
+    }
+    #[test]
+    fn concatenated_events_in_one_message_are_each_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let created = r#"{"type":"response.created","response":{"id":"r","model":"gpt"}}"#;
+        let completed = r#"{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":8,"output_tokens":2}}}"#;
+        let mut log = log_at(&path);
+        let mut observer = HttpObserver::new(true, None, &mut log);
+        observer.feed(
+            format!("data: {created}{completed}\n\n").as_bytes(),
+            &mut log,
+        );
+        observer.finish(&mut log);
+        assert_eq!(log.fields["model"], "gpt");
+        assert_eq!(log.fields["input_tokens"], "8");
+        assert_eq!(log.fields["model_outcome"], "finished");
+        // Anything other than complete typed events is left alone.
+        for payload in [
+            format!("{created}{{\"usage\":{{\"input_tokens\":1}}}}"),
+            format!("{created}{{\"type\":"),
+            created.repeat(MAX_CONCATENATED_EVENTS + 1),
+        ] {
+            let mut log = log_at(&path);
+            let mut observer = HttpObserver::new(true, None, &mut log);
+            observer.feed(format!("data: {payload}\n\n").as_bytes(), &mut log);
+            assert!(!log.fields.contains_key("model"), "{payload}");
+        }
+    }
+    #[test]
+    fn sse_sniffing_waits_for_a_whole_field_name() {
+        assert_eq!(sniff_sse(b""), None);
+        assert_eq!(sniff_sse(b"\r\n  "), None);
+        assert_eq!(sniff_sse(b"da"), None);
+        assert_eq!(sniff_sse(b"\xef\xbb\xbfevent: x"), Some(true));
+        assert_eq!(sniff_sse(b"data:{}"), Some(true));
+        assert_eq!(sniff_sse(b": ping"), Some(true));
+        assert_eq!(sniff_sse(b"{\"model\""), Some(false));
+        assert_eq!(sniff_sse(b"dax"), Some(false));
     }
     #[test]
     fn http_incomplete_response_is_not_a_failure() {
@@ -1139,7 +1457,7 @@ mod tests {
             let mut log = log_at(&path);
             log.status = 200;
             log.field("model_call_id", "http");
-            let mut observer = HttpObserver::new(true);
+            let mut observer = HttpObserver::new(true, None, &mut log);
             observer.feed(
                 b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"cut\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
                 &mut log,
