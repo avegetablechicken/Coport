@@ -283,6 +283,8 @@ async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credenti
         assert!(!request.to_lowercase().contains("authorization"));
         assert!(!request.contains("access-secret"));
         assert!(!request.contains("private-cookie"));
+        // Without a client Accept-Encoding the proxy adds none of its own.
+        assert!(!request.to_lowercase().contains("accept-encoding"));
         assert!(request.ends_with(body));
         fixture.release.notify_one();
         assert_eq!(
@@ -2371,6 +2373,7 @@ async fn http_model_calls_observe_compressed_and_untyped_streams_without_changin
             .post(format!("{}/responses", running.url))
             .bearer_auth("model-secret")
             .header("content-encoding", "zstd")
+            .header("accept-encoding", "zstd, gzip")
             .body(request.clone())
             .send()
             .await
@@ -2383,6 +2386,8 @@ async fn http_model_calls_observe_compressed_and_untyped_streams_without_changin
         let forwarded = fixture.requests.recv().await.unwrap();
         let forwarded = forwarded.to_ascii_lowercase();
         assert!(forwarded.contains("content-encoding: zstd"), "{mode}");
+        // The client's Accept-Encoding goes upstream as it is.
+        assert!(forwarded.contains("accept-encoding: zstd, gzip"), "{mode}");
         assert!(
             forwarded.contains(&format!("content-length: {}", request.len())),
             "{mode}"

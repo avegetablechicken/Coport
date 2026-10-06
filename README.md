@@ -1071,6 +1071,8 @@ New model calls are read from explicit `model_call_*` events with a `model_call_
 Historical HTTP generation/compaction requests also count as one call each;
 requests already carrying a call ID are excluded from this fallback to avoid double
 counting. WebSocket connection records are never used to infer calls.
+The client's `Accept-Encoding` is forwarded unchanged, so responses arrive compressed
+as the client negotiated and `received_bytes` counts the bytes actually transferred.
 HTTP model calls also record `response_content_type` and `response_content_encoding`
 when present. Compressed responses (`gzip`, `deflate`, `br`, `zstd`) are decoded
 incrementally as they stream through, keeping only the fields above; forwarded bytes

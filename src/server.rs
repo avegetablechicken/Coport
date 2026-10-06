@@ -211,6 +211,7 @@ impl Server {
                 .get(url)
                 .bearer_auth(&route.token)
                 .header("accept", "application/json")
+                // The proxy reads this profile itself and does not decompress it.
                 .header("accept-encoding", "identity")
                 .header("anthropic-beta", "oauth-2025-04-20")
                 .build()
@@ -748,6 +749,7 @@ impl Server {
         if docs {
             let allowed = [
                 "accept",
+                "accept-encoding",
                 "content-type",
                 "mcp-session-id",
                 "mcp-protocol-version",
@@ -787,7 +789,9 @@ impl Server {
                 headers.insert(name, parts.headers[name].clone());
             }
         }
-        headers.insert("accept-encoding", "identity".parse().unwrap());
+        // The client's Accept-Encoding is forwarded, so responses arrive as the
+        // client negotiated and are relayed byte for byte; model calls are
+        // observed by decoding them as they stream through.
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
@@ -878,9 +882,6 @@ impl Server {
         .unwrap();
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = filtered_headers(&parts.headers);
-        request
-            .headers_mut()
-            .insert("accept-encoding", "identity".parse().unwrap());
         *request.body_mut() = Some(bytes.into());
         self.send_via(
             &choice,
@@ -1204,7 +1205,6 @@ pub fn filtered_headers(source: &HeaderMap) -> HeaderMap {
         "api-key",
         "chatgpt-account-id",
         "cookie",
-        "accept-encoding",
     ]
     .into_iter()
     .map(String::from)
