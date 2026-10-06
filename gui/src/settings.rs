@@ -68,6 +68,11 @@ pub fn log_path() -> PathBuf {
     app_dir().join("logs/proxy.log")
 }
 
+/// Choices for traffic logged under configurations that changed since.
+pub fn traffic_compatibility_path() -> PathBuf {
+    app_dir().join("traffic-compatibility.json")
+}
+
 pub(crate) fn legacy_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .expect("Cannot locate the current user's application cache directory")

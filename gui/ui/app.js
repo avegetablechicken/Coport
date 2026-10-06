@@ -830,7 +830,9 @@ function showMenu(trigger, last = false) {
   menu.className = "select-menu action-menu";
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
-  menu.innerHTML = JSON.parse(trigger.dataset.menu).map((item) => item
+  menu.innerHTML = JSON.parse(trigger.dataset.menu).map((item) => item?.heading
+    ? `<div class="menu-heading" role="presentation"><strong>${esc(item.heading)}</strong>${item.detail ? `<span>${esc(item.detail)}</span>` : ""}</div>`
+    : item
     ? `<button type="button" role="${item.checked == null ? "menuitem" : "menuitemradio"}" tabindex="-1" data-action="${esc(item.action)}"${
       item.target ? ` data-target="${esc(item.target)}"` : ""}${item.checked == null ? "" : ` aria-checked="${item.checked}"`}>${esc(item.label)}</button>`
     : '<div class="menu-separator" role="separator"></div>').join("");
@@ -1001,6 +1003,51 @@ function trafficShare(credentials, scope) {
     <div class="share-legend">${legend}</div></div>`;
 }
 
+const MATCH_REASONS = {
+  renamed: "Same base URL, different name",
+  baseChanged: "Same name, different base URL",
+  legacy: "Logged before base URLs were recorded",
+  ambiguous: "Several configurations use this base URL or name",
+  unmatched: "No configuration has this name or base URL",
+};
+
+/// Logged configurations counted here without an exact match. Each can be
+/// assigned to a current configuration or to Unidentified; the logs stay as they are.
+function trafficReview(c, targets) {
+  if (!c.sources?.length) return "";
+  const review = c.sources.some((s) => s.reason);
+  const unit = ui.traffic?.scope === "model" ? "call" : "request";
+  const items = c.sources.flatMap((s, i) => {
+    const choose = (target, automatic = false) => JSON.stringify({ service: c.service, name: s.name, base: s.base ?? null, target, automatic });
+    const where = [s.name || "No name", s.base?.replace(/^https?:\/\//, "") ?? "No base URL"].join(" · ");
+    return [
+      i ? null : undefined,
+      { heading: where, detail: `${s.reason ? MATCH_REASONS[s.reason] : "Assigned by you"} · ${s.requests} ${unit}${s.requests === 1 ? "" : "s"}` },
+      ...targets.filter((t) => t.service === c.service).map((t) => ({
+        label: t.label, action: "traffic-assign", target: choose({ name: t.name, base: t.base }), checked: c.credential === t.label,
+      })),
+      { label: "Unidentified", action: "traffic-assign", target: choose(null), checked: c.credential === "Unidentified" },
+      !s.reason && { label: "Match Automatically", action: "traffic-assign", target: choose(null, true) },
+    ];
+  }).filter((item) => item !== undefined && item !== false);
+  const label = review
+    ? "Some requests here were matched to a renamed, changed or unknown configuration. Choose where they belong."
+    : "Requests here were assigned by you.";
+  return `<button type="button" class="icon-btn more traffic-review${review ? " review" : ""}" data-menu="${esc(JSON.stringify(items))}"
+    aria-label="${esc(label)}" title="${esc(label)}" aria-haspopup="menu" aria-expanded="false">${review ? ICON.warning : ICON.more}</button>`;
+}
+
+async function assignTraffic(choice) {
+  try {
+    await invoke("set_traffic_assignment", choice);
+  } catch (error) {
+    ui.trafficError = String(error);
+    renderActivityTraffic();
+    return;
+  }
+  await Promise.all([loadTraffic(), refresh()]);
+}
+
 function renderActivityTraffic() {
   if (openSelect) { selectRenderPending = true; return; }
   closeSelect();
@@ -1013,16 +1060,17 @@ function renderActivityTraffic() {
   const rows = traffic?.credentials.map((c) => {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
-      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
+      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong>${trafficReview(c, traffic.targets)}</div>
       ${chart(c, scope, true)}
       <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
   }).join("");
+  const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
     "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
     `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
-    "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
+    "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Requests from a renamed configuration, one with a changed base URL, or logged before base URLs were recorded are merged and marked for review. Unidentified requests have no logged credential, or match no single current configuration. Logs are never rewritten.",
   ].join("\n\n");
   const minutes = traffic?.bucketMinutes;
   const bucketLabel = minutes >= 1440 && minutes % 1440 === 0
@@ -1032,6 +1080,7 @@ function renderActivityTraffic() {
       : `${minutes} min`;
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic</span>
     <span class="info-tip" data-tip="${esc(notes)}" aria-label="${esc(notes)}">${ICON.info}</span>
+    ${reviews ? `<button type="button" class="traffic-review-all" data-action="traffic-review" title="Requests from ${reviews} renamed, changed or unknown ${reviews === 1 ? "configuration need" : "configurations need"} review">${ICON.warning}Review</button>` : ""}
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
     ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
@@ -1241,6 +1290,16 @@ function filesBlock() {
     null,
     { label: REVEAL_LABEL, action: "open", target: "log-reveal" },
   ];
+  const compat = settings.trafficCompatibility;
+  const compatStatus = compat.error ? status("failed", "Invalid")
+    : compat.choices ? status("", `${compat.choices} ${compat.choices === 1 ? "choice" : "choices"}`)
+    : status("", "No choices");
+  const compatMenu = [
+    compat.exists && { label: "Open", action: "open", target: "traffic-compatibility" },
+    compat.exists && { label: "Clear Choices…", action: "clear-traffic-compatibility" },
+    compat.exists && null,
+    { label: REVEAL_LABEL, action: "open", target: "traffic-compatibility-reveal" },
+  ].filter((item) => item !== false);
   const row = (name, value, items) => `<div class="row"><span class="row-label row-name">${name}</span>${value}
     <button type="button" class="icon-btn more" data-menu="${esc(JSON.stringify(items))}" aria-label="${name} actions"
       aria-haspopup="menu" aria-expanded="false">${ICON.more}</button></div>`;
@@ -1249,7 +1308,8 @@ function filesBlock() {
     "",
     `${config.error ? message("bad", esc(config.error)) : ""}
      ${row("Configuration", configStatus, configMenu)}
-     ${row("Request Log", status("", settings.logBytes == null ? "Empty" : fmtBytes(settings.logBytes)), logMenu)}`
+     ${row("Request Log", status("", settings.logBytes == null ? "Empty" : fmtBytes(settings.logBytes)), logMenu)}
+     ${row("Traffic Compatibility", compatStatus, compatMenu)}`
   );
 }
 
@@ -1399,6 +1459,25 @@ async function act(action, el) {
     case "filter":
       ui.filter = el.dataset.filter;
       await loadActivity();
+      break;
+    case "traffic-assign":
+      await assignTraffic(JSON.parse(el.dataset.target));
+      break;
+    case "traffic-review": {
+      const first = document.querySelector(".traffic-review.review");
+      first?.scrollIntoView({ block: "center", behavior: "smooth" });
+      if (first) setTimeout(() => showMenu(first), 250);
+      break;
+    }
+    case "clear-traffic-compatibility":
+      try {
+        if (await invoke("clear_traffic_compatibility")) {
+          toast("Traffic compatibility choices cleared");
+        }
+      } catch (e) {
+        toast(String(e));
+      }
+      await refresh();
       break;
     case "activity-more":
       el.disabled = true;

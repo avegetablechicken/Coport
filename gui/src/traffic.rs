@@ -1,5 +1,6 @@
 //! Activity traffic is read from retained logs, independently of the capped UI list.
 use crate::logs::Entry;
+use crate::traffic_identity::{Identities, Reason, Resolution, Source, Target, UNIDENTIFIED};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -70,6 +71,19 @@ pub struct Traffic {
     bucket_minutes: u64,
     credentials: Vec<CredentialTraffic>,
     summary: CredentialTraffic,
+    /// Current configurations that historical traffic can be assigned to.
+    targets: Vec<Target>,
+}
+
+/// Logged configuration identity counted in a group without an exact match.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceTraffic {
+    name: String,
+    base: Option<String>,
+    /// `None` when the user's choice applies exactly.
+    reason: Option<Reason>,
+    requests: u64,
 }
 
 #[derive(Default, Serialize)]
@@ -89,6 +103,9 @@ pub struct CredentialTraffic {
     error_counts: Vec<u64>,
     /// Reported input plus output tokens per bucket; calls without usage add nothing.
     token_counts: Vec<u64>,
+    sources: Vec<SourceTraffic>,
+    #[serde(skip)]
+    source_counts: BTreeMap<Source, (Option<Reason>, u64)>,
     #[serde(skip)]
     latency_total: u64,
     #[serde(skip)]
@@ -104,6 +121,7 @@ pub fn read(
     minutes: u64,
     labels: &BTreeMap<(String, String), String>,
     scope: TrafficScope,
+    identities: &Identities,
 ) -> Result<Traffic, String> {
     let bucket_minutes = match minutes {
         30 => 1,
@@ -134,9 +152,14 @@ pub fn read(
                 .service()
                 .or_else(|| entry.get("service"))
                 .unwrap_or("Unknown");
-            labels
-                .entry((service.to_owned(), id.to_owned()))
-                .or_insert_with(|| label.to_owned());
+            if labels
+                .iter()
+                .any(|((s, _), current)| s == service && current == label)
+            {
+                labels
+                    .entry((service.to_owned(), id.to_owned()))
+                    .or_insert_with(|| label.to_owned());
+            }
         }
         if !included_in_scope(&entry, scope)
             || lifecycle_rank(&entry) == 0
@@ -195,7 +218,16 @@ pub fn read(
         {
             continue;
         }
-        aggregate(&mut groups, entry, start, end, bucket_minutes, &labels);
+        let resolved = identities.resolve(entry, entry.service().unwrap_or("Unknown"), &labels);
+        aggregate(
+            &mut groups,
+            entry,
+            start,
+            end,
+            bucket_minutes,
+            &labels,
+            resolved,
+        );
     }
     let mut summary = CredentialTraffic {
         counts: vec![0; bucket_count],
@@ -226,10 +258,19 @@ pub fn read(
     let mut credentials: Vec<_> = groups.into_values().collect();
     for group in &mut credentials {
         group.cache_hit_rate = group.hit_rate();
+        group.sources = std::mem::take(&mut group.source_counts)
+            .into_iter()
+            .map(|(source, (reason, requests))| SourceTraffic {
+                name: source.name,
+                base: source.base,
+                reason,
+                requests,
+            })
+            .collect();
     }
     credentials.sort_by_key(|group| {
         (
-            group.credential == "Unidentified",
+            group.credential == UNIDENTIFIED,
             std::cmp::Reverse(group.bytes),
         )
     });
@@ -240,6 +281,7 @@ pub fn read(
         bucket_minutes,
         credentials,
         summary,
+        targets: identities.targets(),
     })
 }
 
@@ -262,6 +304,7 @@ fn aggregate(
     end: i64,
     bucket_minutes: u64,
     labels: &BTreeMap<(String, String), String>,
+    resolved: Option<Resolution>,
 ) {
     if lifecycle_rank(e) == 0 {
         return;
@@ -277,35 +320,16 @@ fn aggregate(
         .or_else(|| e.get("service"))
         .unwrap_or("Unknown")
         .to_owned();
-    // Resolve account IDs to the exact selector used in routing, without exposing tokens.
-    let credential = e
-        .get("provider")
-        .and_then(|name| labels.get(&(service.clone(), name.to_owned())).cloned())
-        .or_else(|| {
-            e.get("account_id")
-                .and_then(|id| labels.get(&(service.clone(), id.to_owned())).cloned())
-        })
-        .or_else(|| {
-            e.get("account_label")
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            e.get("provider").filter(|s| !s.is_empty()).map(|name| {
-                match name {
-                    "openai-fallback" | "claude-api-key-fallback" => "api_key_fallback",
-                    "claude-account-fallback" => "account_fallback",
-                    _ => name,
-                }
-                .to_owned()
-            })
-        })
-        .or_else(|| {
-            e.get("account_id")
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "Unidentified".into());
+    // Only current configuration mappings can identify a historical name.
+    let credential = ["provider", "account_id", "account_label"]
+        .into_iter()
+        .filter_map(|key| e.get(key))
+        .find_map(|name| labels.get(&(service.clone(), name.to_owned())).cloned())
+        .unwrap_or_else(|| UNIDENTIFIED.into());
+    let (credential, source) = match resolved {
+        Some(Resolution { label, source }) => (label, source),
+        None => (credential, None),
+    };
     let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
     let claude = service == "Claude";
     let group = groups
@@ -318,6 +342,9 @@ fn aggregate(
             token_counts: vec![0; bucket_count],
             ..Default::default()
         });
+    if let Some((source, reason)) = source {
+        group.source_counts.entry(source).or_insert((reason, 0)).1 += 1;
+    }
     let slot = ((time - start) / (bucket_minutes as i64 * 60_000)) as usize;
     group.counts[slot] += 1;
     group.requests += 1;
@@ -438,6 +465,267 @@ mod tests {
     use super::*;
 
     #[test]
+    fn changed_configurations_merge_with_reasons_and_unmatched_requests_are_unidentified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[model_providers.myServer]\nbase_url = 'https://api.example.com/v1'\nenv_key = 'TEST_KEY'\n[model_providers.twinA]\nbase_url = 'https://shared.example.com/v1'\nenv_key = 'TEST_KEY'\n[model_providers.twinB]\nbase_url = 'https://shared.example.com/v1'\nenv_key = 'TEST_KEY'\n").unwrap();
+        std::fs::write(dir.path().join("newSettings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.example.com/v1","ANTHROPIC_API_KEY":"test-only"}}"#).unwrap();
+        let home = serde_json::to_string(dir.path()).unwrap();
+        let config = coport::config::Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{home}]\n  routing:\n    api_key: {{myServer: none, twinA: none, twinB: none}}\nclaude:\n  config_dirs: [{home}]\n  routing:\n    api_key: {{newSettings: none}}\n")).unwrap();
+        let identities = Identities::from_config(&config, &[]);
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let row = |id, service, provider, base: Option<&str>| {
+            let mut row = serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":id, "service":service, "provider":provider, "method":"POST", "path":"/v1/responses", "status":"200", "received_bytes":"10"});
+            if let Some(base) = base {
+                row["upstream_base_url"] = base.into();
+            }
+            row.to_string()
+        };
+        let current = [
+            row(
+                "new",
+                "codex",
+                "myServer",
+                Some("https://api.example.com/v1"),
+            ),
+            row(
+                "claude",
+                "claude",
+                "oldSettings",
+                Some("https://api.example.com/v1"),
+            ),
+            row(
+                "different-path",
+                "codex",
+                "myServer",
+                Some("https://api.example.com/v2"),
+            ),
+            row("missing", "codex", "my", None),
+            row("existing-name", "codex", "myServer", None),
+            row(
+                "deleted",
+                "codex",
+                "deleted",
+                Some("https://deleted.example.com/v1"),
+            ),
+            row(
+                "invalid",
+                "codex",
+                "myServer",
+                Some("https://api.example.com/v1?secret=no"),
+            ),
+            row(
+                "twin",
+                "codex",
+                "twinA",
+                Some("https://shared.example.com/v1"),
+            ),
+            row(
+                "shared",
+                "codex",
+                "gone",
+                Some("https://shared.example.com/v1"),
+            ),
+        ];
+        for newline in ["\n", "\r\n"] {
+            let path = dir.path().join("proxy.log");
+            let backup = dir.path().join("proxy.log.1");
+            let current = current.join(newline) + newline;
+            let old = row(
+                "old",
+                "codex",
+                "my",
+                Some("https://API.example.com:443/v1/"),
+            ) + newline;
+            std::fs::write(&path, &current).unwrap();
+            std::fs::write(&backup, &old).unwrap();
+            let labels = configured(&["myServer"]);
+            for scope in [TrafficScope::All, TrafficScope::Model] {
+                let traffic = super::read(&path, 30, &labels, scope, &identities).unwrap();
+                assert_eq!(traffic.summary.requests, 10);
+                assert_eq!(traffic.summary.bytes, 100);
+                assert_eq!(traffic.credentials.len(), 4);
+                assert_eq!(traffic.targets.len(), 4);
+                use Reason::*;
+                let api = || Some("https://api.example.com/v1");
+                for (service, label, count, sources) in [
+                    (
+                        "Codex",
+                        "myServer",
+                        4,
+                        vec![
+                            ("my", api(), Some(Renamed)),
+                            ("myServer", None, Some(Legacy)),
+                            (
+                                "myServer",
+                                Some("https://api.example.com/v2"),
+                                Some(BaseChanged),
+                            ),
+                        ],
+                    ),
+                    (
+                        "Claude",
+                        "newSettings",
+                        1,
+                        vec![("oldSettings", api(), Some(Renamed))],
+                    ),
+                    ("Codex", "twinA", 1, vec![]),
+                    (
+                        "Codex",
+                        "Unidentified",
+                        4,
+                        vec![
+                            (
+                                "deleted",
+                                Some("https://deleted.example.com/v1"),
+                                Some(Unmatched),
+                            ),
+                            (
+                                "gone",
+                                Some("https://shared.example.com/v1"),
+                                Some(Ambiguous),
+                            ),
+                            ("my", None, Some(Unmatched)),
+                        ],
+                    ),
+                ] {
+                    let group = traffic
+                        .credentials
+                        .iter()
+                        .find(|g| g.service == service && g.credential == label)
+                        .unwrap();
+                    assert_eq!(group.requests, count);
+                    assert_eq!(group.counts.iter().sum::<u64>(), count);
+                    assert_eq!(logged_sources(group), sources);
+                }
+            }
+            let unknown = super::read(
+                &path,
+                30,
+                &BTreeMap::new(),
+                TrafficScope::All,
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(unknown.summary.requests, 10);
+            assert!(
+                unknown
+                    .credentials
+                    .iter()
+                    .all(|g| g.credential == "Unidentified")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), current.as_bytes());
+            assert_eq!(std::fs::read(&backup).unwrap(), old.as_bytes());
+        }
+    }
+
+    fn logged_sources(group: &CredentialTraffic) -> Vec<(&str, Option<&str>, Option<Reason>)> {
+        group
+            .sources
+            .iter()
+            .map(|s| (s.name.as_str(), s.base.as_deref(), s.reason))
+            .collect()
+    }
+
+    #[test]
+    fn user_assignments_override_inference_until_their_target_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "[model_providers.main]\nbase_url = 'https://api.example.com/v1'\nenv_key = 'TEST_KEY'\n[model_providers.twinA]\nbase_url = 'https://shared.example.com/v1'\nenv_key = 'TEST_KEY'\n[model_providers.twinB]\nbase_url = 'https://shared.example.com/v1'\nenv_key = 'TEST_KEY'\n").unwrap();
+        let home = serde_json::to_string(dir.path()).unwrap();
+        let config = coport::config::Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{home}]\n  routing:\n    api_key: {{main: none, twinA: none, twinB: none}}\n")).unwrap();
+        let assign = |name: &str, base: Option<&str>, target: Option<(&str, &str)>| {
+            crate::traffic_identity::TrafficAssignment {
+                service: "Codex".into(),
+                name: name.into(),
+                base: base.map(Into::into),
+                target: target.map(|(name, base)| crate::traffic_identity::TrafficTarget {
+                    name: name.into(),
+                    base: base.into(),
+                }),
+            }
+        };
+        let (api, shared) = (
+            "https://api.example.com/v1",
+            "https://shared.example.com/v1",
+        );
+        let identities = Identities::from_config(
+            &config,
+            &[
+                assign("gone", Some(shared), Some(("twinB", shared))),
+                assign("renamed", Some(api), None),
+                assign(
+                    "deleted",
+                    Some("https://deleted.example.com"),
+                    Some(("main", api)),
+                ),
+                assign(
+                    "legacy",
+                    None,
+                    Some(("removed", "https://removed.example.com")),
+                ),
+            ],
+        );
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let row = |provider: &str, base: Option<&str>| {
+            let mut row = serde_json::json!({"event":"request_finished", "timestamp":timestamp, "service":"codex", "provider":provider, "method":"POST", "path":"/v1/responses", "status":"200"});
+            if let Some(base) = base {
+                row["upstream_base_url"] = base.into();
+            }
+            format!("{row}\n")
+        };
+        let path = dir.path().join("proxy.log");
+        std::fs::write(
+            &path,
+            [
+                row("gone", Some(shared)),
+                row("renamed", Some(api)),
+                row("deleted", Some("https://deleted.example.com")),
+                row("legacy", None),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let labels = BTreeMap::new();
+        let traffic = super::read(&path, 30, &labels, TrafficScope::All, &identities).unwrap();
+        let sources = |label| {
+            let group = traffic
+                .credentials
+                .iter()
+                .find(|g| g.credential == label)
+                .unwrap();
+            logged_sources(group)
+        };
+        assert_eq!(sources("twinB"), [("gone", Some(shared), None)]);
+        assert_eq!(
+            sources("main"),
+            [("deleted", Some("https://deleted.example.com"), None)]
+        );
+        // A choice whose target no longer exists is reviewed again.
+        assert_eq!(
+            sources("Unidentified"),
+            [
+                ("legacy", None, Some(Reason::Unmatched)),
+                ("renamed", Some(api), None),
+            ]
+        );
+    }
+
+    fn configured(names: &[&str]) -> BTreeMap<(String, String), String> {
+        names
+            .iter()
+            .map(|name| (("Codex".into(), (*name).into()), (*name).into()))
+            .collect()
+    }
+
+    fn read(
+        path: &Path,
+        minutes: u64,
+        labels: &BTreeMap<(String, String), String>,
+        scope: TrafficScope,
+    ) -> Result<Traffic, String> {
+        super::read(path, minutes, labels, scope, &Default::default())
+    }
+
+    #[test]
     fn historical_http_calls_survive_rotation_without_double_counting_new_calls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
@@ -459,7 +747,17 @@ mod tests {
         let raw = records.iter().map(|r| format!("{r}\n")).collect::<String>();
         std::fs::write(&path, &raw).unwrap();
         std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
-        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let model = read(
+            &path,
+            30,
+            &BTreeMap::from([
+                (("Codex".into(), "old".into()), "old".into()),
+                (("Codex".into(), "new".into()), "new".into()),
+                (("Claude".into(), "old".into()), "old".into()),
+            ]),
+            TrafficScope::Model,
+        )
+        .unwrap();
         assert_eq!(model.summary.requests, 5);
         assert_eq!(model.summary.errors, 1);
         assert_eq!(model.summary.bytes, 100);
@@ -563,7 +861,13 @@ mod tests {
         });
         let history = format!("{received}\n{routed}\n{response}\n");
         std::fs::write(&path, &history).unwrap();
-        let active = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let active = read(
+            &path,
+            30,
+            &configured(&["model-account"]),
+            TrafficScope::Model,
+        )
+        .unwrap();
         assert_eq!(active.summary.requests, 1);
         assert_eq!(active.summary.errors, 0);
         assert_eq!(active.summary.avg_ms, None);
@@ -578,7 +882,13 @@ mod tests {
             "received_bytes":"128", "duration_ms":"60000",
         });
         std::fs::write(&path, format!("{finished}\n{history}{finished}\n")).unwrap();
-        let completed = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let completed = read(
+            &path,
+            30,
+            &configured(&["model-account"]),
+            TrafficScope::Model,
+        )
+        .unwrap();
         assert_eq!(completed.summary.requests, 1);
         assert_eq!(completed.summary.errors, 1);
         assert_eq!(completed.summary.bytes, 128);
@@ -700,8 +1010,20 @@ mod tests {
             ),
         )
         .unwrap();
-        let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
-        let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
+        let all = read(
+            &path,
+            30,
+            &configured(&["model", "management"]),
+            TrafficScope::All,
+        )
+        .unwrap();
+        let model = read(
+            &path,
+            30,
+            &configured(&["model", "management"]),
+            TrafficScope::Model,
+        )
+        .unwrap();
         assert_eq!(all.summary.requests, 6);
         assert_eq!(all.credentials.len(), 2);
         assert_eq!(model.summary.requests, 3);
@@ -736,7 +1058,7 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let result = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
+        let result = read(&path, 30, &configured(&["account"]), TrafficScope::All).unwrap();
         assert_eq!(result.summary.requests, 3);
         assert_eq!(result.credentials.len(), 2);
         assert!(
@@ -816,7 +1138,7 @@ mod tests {
             (10080, 360, 28),
             (43200, 1440, 30),
         ] {
-            let traffic = read(&path, range, &BTreeMap::new(), TrafficScope::All).unwrap();
+            let traffic = read(&path, range, &configured(&["a", "b"]), TrafficScope::All).unwrap();
             assert_eq!(traffic.bucket_minutes, bucket_minutes);
             assert_eq!(traffic.summary.counts.len(), bars);
             assert_eq!(traffic.summary.error_counts.len(), bars);
@@ -840,12 +1162,12 @@ mod tests {
             assert_eq!(a.avg_ms, Some(20));
             assert_eq!(traffic.credentials[1].errors, 1);
         }
-        assert!(read(&path, 31, &BTreeMap::new(), TrafficScope::All).is_err());
+        assert!(read(&path, 31, &configured(&["a", "b"]), TrafficScope::All).is_err());
         assert!(
             read(
                 &dir.path().join("missing"),
                 30,
-                &BTreeMap::new(),
+                &configured(&["a", "b"]),
                 TrafficScope::All
             )
             .unwrap()
@@ -884,7 +1206,7 @@ mod tests {
             ("codex", "opaque-id", "MY_API_KEY"),
         ] {
             let e = Entry { seq: 0, time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)), event: "request_finished".into(), fields: serde_json::from_value(serde_json::json!({"service": service, "account_id": account, "provider": provider})).unwrap() };
-            aggregate(&mut groups, &e, 0, 1_800_000, 1, &labels);
+            aggregate(&mut groups, &e, 0, 1_800_000, 1, &labels, None);
         }
         assert!(groups.contains_key(&("Codex".into(), "default".into())));
         assert!(groups.contains_key(&("Codex".into(), "MY_API_KEY".into())));
@@ -914,7 +1236,13 @@ mod tests {
             line(2, "codex", "123456", "") + &line(2, "claude", "123456", ""),
         )
         .unwrap();
-        let traffic = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
+        let traffic = read(
+            &path,
+            30,
+            &configured(&["user@example.test"]),
+            TrafficScope::All,
+        )
+        .unwrap();
         let codex = traffic
             .credentials
             .iter()
@@ -929,7 +1257,7 @@ mod tests {
                 .find(|g| g.service == "Claude")
                 .unwrap()
                 .credential,
-            "123456"
+            "Unidentified"
         );
         let labels = BTreeMap::from([(("Codex".into(), "123456".into()), "current-name".into())]);
         let traffic = read(&path, 30, &labels, TrafficScope::All).unwrap();
@@ -964,10 +1292,10 @@ mod tests {
                 )
                 .unwrap(),
             };
-            aggregate(&mut groups, &e, 0, 1_800_000, 1, &BTreeMap::new());
+            aggregate(&mut groups, &e, 0, 1_800_000, 1, &BTreeMap::new(), None);
         }
         assert_eq!(groups.len(), 2);
-        let codex = &groups[&("Codex".into(), "key".into())];
+        let codex = &groups[&("Codex".into(), "Unidentified".into())];
         assert_eq!(codex.counts[0], 2);
         assert_eq!(codex.counts[29], 1);
         assert_eq!(codex.errors, 3);

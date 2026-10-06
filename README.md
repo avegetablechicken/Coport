@@ -1047,6 +1047,20 @@ be shown if the source logs still exist. Unix files use mode `0600`; Windows fil
 inherit directory ACLs, so keep them in your private user directory. If archiving
 fails, logging continues in the current file; failures are also reported on stderr.
 
+Traffic groups API configurations by service and the logged `upstream_base_url`,
+matching the complete base (including its path and port) against the current
+configuration; account identities remain separate. A logged name and base that
+match one configuration count under it. Records from a renamed configuration
+(same base), one whose base URL changed (same name), or records logged before
+base URLs were recorded (name only) are merged into the current configuration
+and marked for review in the panel. Records whose base is used by several
+configurations, or whose name and base match none, count as `Unidentified` and
+are also marked. For each marked name and base, the panel can assign the
+records to a current configuration or to `Unidentified`. These choices are
+stored in `traffic-compatibility.json` beside the GUI settings (Settings →
+Files → Traffic Compatibility); deleting it restores automatic matching. This
+reconciliation is read-only and never rewrites retained logs.
+
 | Event | Meaning |
 | --- | --- |
 | `current_route` | Account ID and proxy configured at startup; not a connectivity test. |

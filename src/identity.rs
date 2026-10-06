@@ -674,8 +674,22 @@ impl Config {
             ("Codex", &self.codex.routing),
             ("Claude", &self.claude.routing),
         ] {
-            for name in routing.api_key.keys() {
+            for name in routing.api_key.keys().chain(routing.account.keys()) {
                 labels.insert((service.into(), name.clone()), name.clone());
+            }
+            if routing.api_key_fallback.is_some() {
+                let provider = if service == "Codex" {
+                    "openai-fallback"
+                } else {
+                    "claude-api-key-fallback"
+                };
+                labels.insert((service.into(), provider.into()), "api_key_fallback".into());
+            }
+            if routing.account_fallback.is_some() && service == "Claude" {
+                labels.insert(
+                    (service.into(), "claude-account-fallback".into()),
+                    "account_fallback".into(),
+                );
             }
         }
         labels

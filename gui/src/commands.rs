@@ -7,6 +7,7 @@ use crate::{
     core::{ActivityDto, Snapshot},
     panel, platform,
     settings::Appearance,
+    traffic_identity::{Compatibility, TrafficTarget},
     tray,
 };
 use serde::Deserialize;
@@ -127,15 +128,77 @@ pub async fn get_traffic(
         core.refresh_config();
         (core.logs.path(), core.loaded_config().cloned())
     };
+    // An unreadable file leaves every changed configuration to be reviewed.
+    let assignments =
+        Compatibility::load(&crate::settings::traffic_compatibility_path()).unwrap_or_default();
+    let assignments = assignments.assignments;
+    let identities = config
+        .as_ref()
+        .map(|config| crate::traffic_identity::Identities::from_config(config, &assignments))
+        .unwrap_or_default();
     let labels = match config {
         Some(config) => config.traffic_credential_labels().await,
         None => Default::default(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::traffic::read(&path, minutes, &labels, scope.unwrap_or_default())
+        crate::traffic::read(
+            &path,
+            minutes,
+            &labels,
+            scope.unwrap_or_default(),
+            &identities,
+        )
     })
     .await
     .map_err(|_| "Cannot load traffic history".to_owned())?
+}
+
+/// Records where traffic logged under `name` and `base` is counted: a current
+/// configuration, Unidentified without `target`, or the automatic match.
+#[tauri::command]
+pub fn set_traffic_assignment(
+    state: State<AppState>,
+    service: String,
+    name: String,
+    base: Option<String>,
+    target: Option<TrafficTarget>,
+    automatic: bool,
+) -> Result {
+    // The panel's lock serializes read-modify-write of the file.
+    let _core = state.core.lock().unwrap();
+    let path = crate::settings::traffic_compatibility_path();
+    let mut file = Compatibility::load(&path)?;
+    file.assign(service, name, base, (!automatic).then_some(target));
+    file.save(&path)
+}
+
+/// Removes every traffic compatibility choice after confirmation. Returns
+/// false when cancelled.
+#[tauri::command]
+pub async fn clear_traffic_compatibility(app: AppHandle) -> Result<bool> {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let confirmed = panel::with_modal(&app, || {
+        app.dialog()
+            .message("Requests from renamed or changed configurations will be matched automatically again and marked for review. Request logs are not changed.")
+            .title("Clear Traffic Compatibility Choices?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Clear".into(),
+                "Cancel".into(),
+            ))
+            .blocking_show()
+    });
+    if !confirmed {
+        return Ok(false);
+    }
+    let state = app.state::<AppState>();
+    let _core = state.core.lock().unwrap();
+    match std::fs::remove_file(crate::settings::traffic_compatibility_path()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err("Cannot clear the traffic compatibility file".to_owned())
+        }
+        _ => Ok(true),
+    }
 }
 
 #[tauri::command]
@@ -260,14 +323,17 @@ pub fn create_example_config(state: State<AppState>) -> Result {
 }
 
 /// Opens or reveals a file: `config` (in the editor), `config-reveal`,
-/// `log` or `log-reveal`. The log is the one the panel is reading.
+/// `log`, `log-reveal`, `traffic-compatibility` or its `-reveal`. The log is the one the panel is reading.
 #[tauri::command]
 pub fn open_path(state: State<AppState>, target: String) {
     let (config, log) = {
         let core = state.core.lock().unwrap();
         (core.config_path(), core.logs.path())
     };
+    let compatibility = crate::settings::traffic_compatibility_path();
     match target.as_str() {
+        "traffic-compatibility" => platform::edit(&compatibility),
+        "traffic-compatibility-reveal" => platform::reveal(&compatibility),
         "config" => platform::edit(&config),
         "config-reveal" => platform::reveal(&config),
         "log" if log.is_file() => platform::open(&log),

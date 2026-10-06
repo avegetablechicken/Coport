@@ -1173,7 +1173,7 @@ details.disclosure[open] summary svg {
 .credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }
 .traffic-identity {
   display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(0, 1fr) auto;
   align-items: start;
   gap: 8px;
   margin-bottom: 8px;
@@ -1185,6 +1185,10 @@ details.disclosure[open] summary svg {
   overflow-wrap: anywhere;
   font-weight: 500;
 }
+.traffic-review { width: 18px; height: 18px; }
+.traffic-review.review { color: var(--orange); }
+.traffic-review-all { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--orange); }
+.traffic-review-all svg { width: 12px; height: 12px; }
 .credential-traffic .chart { height: 48px; }
 /* Request share per credential: a ring after OpenQuota's spend ring, with a legend. */
 .traffic-share { display: flex; align-items: center; gap: 16px; padding: 6px 0 4px; }
@@ -1325,6 +1329,15 @@ details.disclosure[open] summary svg {
 .select-menu button[aria-selected="true"],
 .select-menu button[aria-checked="true"] { font-weight: 600; }
 .action-menu { min-width: 150px; }
+.menu-heading {
+  display: flex;
+  flex-direction: column;
+  max-width: 260px;
+  padding: 4px 8px 2px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.menu-heading span { color: var(--secondary); font-size: 10px; }
 .menu-separator {
   height: 1px;
   margin: 4px 2px;

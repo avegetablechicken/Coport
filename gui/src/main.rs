@@ -15,6 +15,7 @@ mod placement;
 mod platform;
 mod single_instance;
 mod traffic;
+mod traffic_identity;
 mod tray;
 
 use coport_gui::{proxy, settings};
@@ -87,6 +88,8 @@ fn main() {
             commands::get_state,
             commands::get_activity,
             commands::get_traffic,
+            commands::set_traffic_assignment,
+            commands::clear_traffic_compatibility,
             commands::set_running,
             commands::restart_proxy,
             commands::probe_proxy,

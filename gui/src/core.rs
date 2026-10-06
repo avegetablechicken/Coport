@@ -340,6 +340,7 @@ impl Core {
                 keep_proxy_running_on_quit: self.settings.keep_proxy_running_on_quit,
                 launch_at_login: self.launch_at_login,
                 log_bytes: std::fs::metadata(self.logs.path()).ok().map(|m| m.len()),
+                traffic_compatibility: TrafficCompatibilityDto::read(),
             },
         }
     }
@@ -678,6 +679,27 @@ struct SettingsDto {
     launch_at_login: bool,
     /// Size of the request log in use, if it exists yet.
     log_bytes: Option<u64>,
+    traffic_compatibility: TrafficCompatibilityDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficCompatibilityDto {
+    exists: bool,
+    choices: usize,
+    error: Option<String>,
+}
+
+impl TrafficCompatibilityDto {
+    fn read() -> Self {
+        let path = crate::settings::traffic_compatibility_path();
+        let loaded = crate::traffic_identity::Compatibility::load(&path);
+        Self {
+            exists: path.is_file(),
+            choices: loaded.as_ref().map_or(0, |file| file.assignments.len()),
+            error: loaded.err(),
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -108,3 +108,27 @@ test('Models adds output to input, which already holds cached tokens', () => {
   assert.equal(shareTokens(credential('silent', 1, 'Claude', { cachedInputTokens: 5 })), null);
   assert.match(trafficShare([credential('c', 1, 'Claude', { inputTokens: 1000, outputTokens: 20, cachedInputTokens: 900 })], 'model'), /Claude · c: 1,020 tokens/);
 });
+test('review menu offers current configurations and Unidentified for each changed source', () => {
+  const context = setup('all');
+  context.ICON = { warning: '!', more: '…' };
+  context.esc = (v) => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  const targets = [{ service: 'Codex', name: 'main', base: 'https://api.example.com/v1', label: 'main' }, { service: 'Claude', name: 'x', base: 'https://x.test', label: 'x' }];
+  const group = { ...credential('main', 3), sources: [
+    { name: 'old', base: 'https://api.example.com/v1', reason: 'renamed', requests: 2 },
+    { name: 'kept', base: null, reason: null, requests: 1 },
+  ] };
+  const html = context.trafficReview(group, targets);
+  assert.match(html, /class="icon-btn more traffic-review review"/);
+  const items = JSON.parse(html.match(/data-menu="([^"]*)"/)[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+  assert.deepEqual(items.map((i) => i && (i.heading ?? i.label)), [
+    'old · api.example.com/v1', 'main', 'Unidentified', null, 'kept · No base URL', 'main', 'Unidentified', 'Match Automatically',
+  ]);
+  assert.equal(items[0].detail, 'Same base URL, different name · 2 requests');
+  assert.equal(items[1].checked, true);
+  assert.deepEqual(JSON.parse(items[2].target), { service: 'Codex', name: 'old', base: 'https://api.example.com/v1', target: null, automatic: false });
+  assert.deepEqual(JSON.parse(items[5].target).target, { name: 'main', base: 'https://api.example.com/v1' });
+  assert.equal(JSON.parse(items[7].target).automatic, true);
+  // Choices already made show no warning; groups without sources show nothing.
+  assert.doesNotMatch(context.trafficReview({ ...group, sources: [group.sources[1]] }, targets), /traffic-review review/);
+  assert.equal(context.trafficReview(credential('main', 3), targets), '');
+});
