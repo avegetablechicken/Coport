@@ -879,6 +879,113 @@ function modelTokenStats(stats) {
   return `<div class="strip">${stat("Input Tokens", tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
 
+const SHARE_SERVICES = ["Codex", "Claude"];
+const SHARE_SHADES = 3;
+
+/// Credentials grouped by service, each group in one hue. `measure` gives a
+/// credential's amount, or null when it is unknown. Within a group the largest
+/// credentials take the shades, the rest fold into "Others", and unidentified
+/// requests come last; both are drawn without a hue.
+function shareGroups(credentials, measure) {
+  const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
+  const used = credentials.filter((c) => c.requests > 0);
+  const services = [...new Set(used.map((c) => c.service))];
+  const rank = (service) => (SHARE_SERVICES.includes(service) ? SHARE_SERVICES.indexOf(service) : SHARE_SERVICES.length);
+  services.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  return services.map((service) => {
+    const own = used.filter((c) => c.service === service);
+    const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
+    const hue = SHARE_SERVICES.includes(service) ? service.toLowerCase() : "other";
+    const slices = named.slice(0, SHARE_SHADES).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
+    const rest = named.slice(SHARE_SHADES);
+    if (rest.length) slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true });
+    for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true });
+    return { service, value: sum(own), slices };
+  });
+}
+
+/// A donut sector between fractions `from` and `to` of the turn, starting at
+/// 12 o'clock, with rounded corners and a gap to its neighbors.
+function ringSector(from, to, outer, inner, gap = 1.6, radius = 3) {
+  const top = -Math.PI / 2;
+  const halfGap = gap / outer / 2;
+  const start = top + from * Math.PI * 2 + halfGap;
+  const end = top + to * Math.PI * 2 - halfGap;
+  const width = end - start;
+  if (width <= 0.001) return "";
+  // Shrink the corners so they fit narrow slices.
+  const sine = Math.sin(Math.min(width / 2, Math.PI / 2));
+  let corner = Math.min(radius, (outer - inner) / 2, (outer * sine) / (1 + sine));
+  if (sine < 1) corner = Math.min(corner, (inner * sine) / (1 - sine));
+  const at = (r, angle) => `${(outer + r * Math.cos(angle)).toFixed(3)} ${(outer + r * Math.sin(angle)).toFixed(3)}`;
+  const large = width > Math.PI ? 1 : 0;
+  if (corner < 0.25) {
+    return `M ${at(outer, start)} A ${outer} ${outer} 0 ${large} 1 ${at(outer, end)} L ${at(inner, end)} A ${inner} ${inner} 0 ${large} 0 ${at(inner, start)} Z`;
+  }
+  const outerBeta = Math.asin(Math.min(1, corner / (outer - corner)));
+  const innerBeta = Math.asin(Math.min(1, corner / (inner + corner)));
+  return [
+    `M ${at(outer, start + outerBeta)}`,
+    `A ${outer} ${outer} 0 ${large} 1 ${at(outer, end - outerBeta)}`,
+    `Q ${at(outer, end)} ${at(outer - corner, end)}`,
+    `L ${at(inner + corner, end)}`,
+    `Q ${at(inner, end)} ${at(inner, end - innerBeta)}`,
+    `A ${inner} ${inner} 0 ${large} 0 ${at(inner, start + innerBeta)}`,
+    `Q ${at(inner, start)} ${at(inner + corner, start)}`,
+    `L ${at(outer - corner, start)}`,
+    `Q ${at(outer, start)} ${at(outer, start + outerBeta)}`,
+    "Z",
+  ].join(" ");
+}
+
+/// Input plus output tokens, or null when neither was reported.
+function shareTokens(c) {
+  return c.inputTokens == null && c.outputTokens == null ? null : (c.inputTokens ?? 0) + (c.outputTokens ?? 0);
+}
+
+/// Model calls are measured in tokens, other traffic in requests.
+function shareMeasure(scope) {
+  if (scope !== "model") return { unit: "requests", measure: (c) => c.requests, format: (n) => n.toLocaleString("en-US") };
+  const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+  return {
+    unit: "tokens",
+    measure: shareTokens,
+    format: (n) => compact.format(n),
+  };
+}
+
+/// Each credential's part of the traffic in the range, as a ring and a legend
+/// grouped by service.
+function trafficShare(credentials, scope) {
+  const { unit, measure, format } = shareMeasure(scope);
+  const groups = shareGroups(credentials, measure);
+  const total = groups.reduce((sum, g) => sum + (g.value ?? 0), 0);
+  if (!total) return "";
+  const size = 84;
+  const value = (n) => (n == null ? "—" : format(n));
+  // Unknown and zero amounts stay in the legend but take no slice.
+  const slices = groups.flatMap((g) => g.slices.filter((s) => s.value > 0).map((s) => ({ ...s, service: g.service })));
+  // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
+  const widths = slices.map((s) => Math.max(s.value / total, 0.025));
+  const turn = widths.reduce((sum, w) => sum + w, 0);
+  const color = (s) => (s.muted ? "var(--track)" : `var(${s.color})`);
+  const label = (s) => `${s.service} · ${s.name}: ${s.value == null ? "no reported usage" : `${s.value.toLocaleString("en-US")} ${unit}`}`;
+  let cursor = 0;
+  const paths = slices.map((s, i) => {
+    const from = cursor;
+    cursor += widths[i] / turn;
+    return `<path style="--slice:${color(s)}" d="${ringSector(from, cursor, size / 2, (size / 2) * 0.618)}"><title>${esc(label(s))}</title></path>`;
+  }).join("");
+  const legend = groups.map((g) => `<div class="share-group">
+    <div class="share-service" title="${esc(label({ service: g.service, name: "Total", value: g.value }))}">${serviceMark(g.service)}<span>${esc(g.service)}</span><span>${value(g.value)}</span></div>
+    ${g.slices.map((s) => `<div class="share-item${s.muted ? " muted" : ""}" title="${esc(label({ ...s, service: g.service }))}">
+      <i style="--slice:${color(s)}"></i><span>${esc(s.name)}</span><span>${value(s.value)}</span></div>`).join("")}</div>`).join("");
+  return `<div class="traffic-share">
+    <div class="share-ring" title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
+      <div class="share-total"><strong>${format(total)}</strong><span>${unit}</span></div></div>
+    <div class="share-legend">${legend}</div></div>`;
+}
+
 function renderActivityTraffic() {
   if (openSelect) { selectRenderPending = true; return; }
   closeSelect();
@@ -896,6 +1003,7 @@ function renderActivityTraffic() {
     </div>`;
   }).join("");
   const notes = [
+    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; beyond three per service, the rest are grouped as Others.",
     "Sorted by received traffic, largest first. Red indicates errors; each chart uses its own scale.",
     `${ui.trafficScope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Unidentified requests have no logged credential.",
@@ -910,7 +1018,7 @@ function renderActivityTraffic() {
     <span class="info-tip" data-tip="${esc(notes)}" aria-label="${esc(notes)}">${ICON.info}</span>
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
-    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows || '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
+    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, ui.trafficScope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
   queueFit();
 }
 

@@ -26,6 +26,16 @@
   --teal: #30b0c7;
   --indigo: #5856d6;
   --brown: #a2845e;
+  /* Traffic share hues: Codex gray, Claude orange; fainter shades rank lower. */
+  --codex-1: #3a3a3c;
+  --codex-2: #707075;
+  --codex-3: #a5a5aa;
+  --claude-1: #e8622c;
+  --claude-2: #f28a5c;
+  --claude-3: #f7b292;
+  --other-1: #9b51e0;
+  --other-2: #b67ff0;
+  --other-3: #d0aef7;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
@@ -54,6 +64,9 @@
     --teal: #40c8e0;
     --indigo: #5e5ce6;
     --brown: #ac8e68;
+    --codex-1: #f2f2f7;
+    --codex-2: #c2c2c7;
+    --codex-3: #8e8e93;
   }
 }
 
@@ -1173,6 +1186,25 @@ details.disclosure[open] summary svg {
   font-weight: 500;
 }
 .credential-traffic .chart { height: 48px; }
+/* Request share per credential: a ring after OpenQuota's spend ring, with a legend. */
+.traffic-share { display: flex; align-items: center; gap: 16px; padding: 6px 0 4px; }
+.share-ring { position: relative; display: grid; place-items: center; flex: none; width: 84px; height: 84px; }
+.share-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.share-ring path { fill: var(--slice); }
+.share-total { position: relative; display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+.share-total strong { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.share-total span { font-size: 9px; color: var(--secondary); }
+.share-legend { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
+.share-group { display: flex; flex-direction: column; gap: 3px; }
+.share-service, .share-item { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+.share-service { font-weight: 600; }
+.share-service .service-mark { width: 12px; height: 12px; }
+.share-item { padding-left: 10px; }
+.share-item i { justify-self: center; width: 7px; height: 7px; border-radius: 50%; background: var(--slice); }
+.share-item.muted { color: var(--tertiary); }
+.share-item.muted i { box-shadow: inset 0 0 0 1px var(--tertiary); }
+.share-service span, .share-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.share-item span:last-child { color: var(--secondary); }
 /* Explanatory notes kept out of the layout; opens downward so the first block is not clipped. */
 .info-tip { display: inline-grid; place-items: center; width: 16px; height: 16px; margin-left: -4px; color: var(--tertiary); cursor: default; }
 .info-tip:hover { color: var(--secondary); }
