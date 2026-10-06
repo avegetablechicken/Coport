@@ -145,7 +145,7 @@ fn private_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn lock_file(path: &Path) -> io::Result<File> {
+pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     // Windows cannot lock an append-only handle. Keep write access without
     // truncating the file, since another daemon may already hold its lock.

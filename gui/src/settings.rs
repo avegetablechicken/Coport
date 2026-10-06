@@ -51,7 +51,7 @@ impl Settings {
 pub fn app_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("coport")
+        .join(BUNDLE_IDENTIFIER)
 }
 
 fn settings_file() -> PathBuf {
@@ -60,15 +60,15 @@ fn settings_file() -> PathBuf {
 
 /// The GUI's only configuration file, independent of its working directory.
 pub fn config_path() -> PathBuf {
-    cache_dir().join("config.yaml")
+    app_dir().join("config.yaml")
 }
 
 /// The GUI's request log, beside its configuration.
 pub fn log_path() -> PathBuf {
-    cache_dir().join("logs/proxy.log")
+    app_dir().join("logs/proxy.log")
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn legacy_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .expect("Cannot locate the current user's application cache directory")
         .join(BUNDLE_IDENTIFIER)
@@ -99,16 +99,16 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(config["identifier"], BUNDLE_IDENTIFIER);
         assert_eq!(
-            cache_dir(),
+            legacy_cache_dir(),
             dirs::cache_dir().unwrap().join(BUNDLE_IDENTIFIER)
         );
     }
 
     #[test]
-    fn paths_are_fixed_in_the_application_cache() {
-        let cache = dirs::cache_dir().unwrap().join("io.github.coport.gui");
-        assert_eq!(config_path(), cache.join("config.yaml"));
-        assert_eq!(log_path(), cache.join("logs/proxy.log"));
+    fn paths_are_fixed_in_the_application_support_directory() {
+        let support = dirs::config_dir().unwrap().join(BUNDLE_IDENTIFIER);
+        assert_eq!(config_path(), support.join("config.yaml"));
+        assert_eq!(log_path(), support.join("logs/proxy.log"));
         // Paths saved by older versions are ignored and not written back.
         let settings: Settings = serde_json::from_str(
             r#"{"config_path":"/custom/config.yaml","log_path":"/custom.log","appearance":"Dark"}"#,

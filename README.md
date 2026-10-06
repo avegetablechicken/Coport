@@ -455,13 +455,13 @@ sudo update-ca-certificates
 ```
 
 On macOS, add it to the System keychain as a trusted root (the GUI's default
-configuration lives in `~/Library/Caches/io.github.coport.gui/`, the service's in
+configuration lives in `~/Library/Application Support/io.github.coport.gui/`, the service's in
 `~/Library/Application Support/coport-rust/`):
 
 ```sh
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \
-  ~/Library/Caches/io.github.coport.gui/tls/ca.pem
-security verify-cert -c ~/Library/Caches/io.github.coport.gui/tls/ca.pem
+  "$HOME/Library/Application Support/io.github.coport.gui/tls/ca.pem"
+security verify-cert -c "$HOME/Library/Application Support/io.github.coport.gui/tls/ca.pem"
 ```
 
 The serving certificate is valid for one year from each start, within Apple's
@@ -790,17 +790,25 @@ the warning icon to indicate the missing local match; a failed probe shows
 changing the token or configuration triggers a new check. Without a token, a
 probe cannot authenticate and the account remains inactive.
 
-The GUI uses one fixed configuration file, `io.github.coport.gui/config.yaml` in
-the user's application cache directory: `~/Library/Caches/io.github.coport.gui/config.yaml` on macOS,
-`$XDG_CACHE_HOME/io.github.coport.gui/config.yaml` (normally `~/.cache/io.github.coport.gui/config.yaml`)
-on Linux, or `%LOCALAPPDATA%/io.github.coport.gui/config.yaml` on Windows. The GUI never
-searches the working directory for configuration. It offers to create a missing
-configuration from `config.example.yaml` or to import a YAML file (`.yaml` or
-`.yml`). Paths saved by earlier versions are ignored; a daemon still running another
-file is reported as out of date until restarted. GUI preferences and daemon
-discovery stay in the per-user configuration directory. The CLI's default remains
-`./config.yaml`. GUI logs are written to `io.github.coport.gui/logs/proxy.log` in
-the same application cache directory. The CLI continues to log beside its
+The GUI keeps its configuration, certificates, logs, preferences and daemon discovery
+in the persistent per-user `io.github.coport.gui` directory: `~/Library/Application Support/io.github.coport.gui/`
+on macOS, `$XDG_CONFIG_HOME/io.github.coport.gui/` (normally `~/.config/io.github.coport.gui/`) on Linux, or
+`%APPDATA%/io.github.coport.gui/` on Windows. Its fixed configuration is `config.yaml`, its
+certificate and private key are in `tls/`, and request logs are in `logs/proxy.log`
+(with rotated history alongside them). These files are application data, not disposable caches.
+The GUI never searches the working directory for configuration. It offers to create a
+missing configuration from `config.example.yaml` or to import a YAML file (`.yaml` or
+`.yml`). Paths saved by earlier versions are ignored. The CLI's default remains `./config.yaml`.
+
+On the first upgrade from the old `io.github.coport.gui` cache directory, stop the
+proxy in the old app and quit it before opening the new version. The GUI copies
+`config.yaml`, `tls/` and `logs/` to the persistent directory without deleting the
+originals or changing the CA identity. An active daemon or conflicting destination
+files stop migration with an error; matching files permit retry after interruption.
+Later launches do not reimport the old copy. Data already removed by cache cleanup
+cannot be restored by this migration.
+
+The CLI continues to log beside its
 configuration unless `--log-file` is supplied. Opening the app shows the
 panel; Launch at Login starts it with `--background`. Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the

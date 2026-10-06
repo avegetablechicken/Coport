@@ -106,6 +106,16 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            if let Err(error) = coport_gui::data_migration::prepare() {
+                use tauri_plugin_dialog::DialogExt;
+                app.dialog()
+                    .message(format!("Cannot migrate Coport data: {error}"))
+                    .title("Coport data migration")
+                    .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                    .show(|_| std::process::exit(1));
+                app.manage(Mutex::new(instance));
+                return Ok(());
+            }
             let handle = app.handle().clone();
             let notify = tray_notifier(handle);
             let appearance = settings.appearance;
@@ -155,6 +165,9 @@ fn main() {
         }
     };
     app.run(|app, event| {
+        if app.try_state::<AppState>().is_none() {
+            return; // Startup migration error: only the error dialog is active.
+        }
         match event {
             RunEvent::ExitRequested { api, .. } => {
                 let result = {
