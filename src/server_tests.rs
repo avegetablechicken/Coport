@@ -2512,6 +2512,7 @@ async fn tls_and_plain_http_share_the_listening_port() {
     let _task = tokio::spawn(server.serve(listener, std::future::pending()));
     let ca = std::fs::read(temp.path().join(crate::local_tls::CA_FILE)).unwrap();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .use_rustls_tls()
         .tls_built_in_root_certs(false)
         .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
@@ -2532,6 +2533,7 @@ async fn tls_and_plain_http_share_the_listening_port() {
     // A client without the CA is refused rather than served in plain text.
     assert!(
         reqwest::Client::builder()
+            .no_proxy()
             .use_rustls_tls()
             .tls_built_in_root_certs(false)
             .build()
