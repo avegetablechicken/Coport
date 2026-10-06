@@ -205,7 +205,7 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(refresh, 120);
 }
 
-/// Lists the chosen range oldest first; `more` appends the next page. The range
+/// Lists the chosen range newest first; `more` appends the next, older page. The range
 /// is read once by the backend, then filters, searches and pages reuse it.
 async function loadActivity(more = false) {
   if (ui.activityTo == null) resolveActivityRange();

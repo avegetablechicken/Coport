@@ -751,7 +751,7 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 
 | Page | Content |
 | --- | --- |
-| Activity | Traffic charts, and a searchable log for a time range chosen in the Log header (Last hour, Last 6 hours, Today, Yesterday or a custom From–To range; oldest first, 500 rows per page with Load More; the range is read once and reused by filters and searches); click a request for all fields |
+| Activity | Traffic charts, and a searchable log for a time range chosen in the Log header (Last hour, Last 6 hours, Today, Yesterday or a custom From–To range; newest first, 500 rows per page with Load More for older entries; the range is read once and reused by filters and searches); click a request for all fields |
 | Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the

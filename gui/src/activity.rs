@@ -1,12 +1,13 @@
 //! The Activity list: a chosen time range of the logs, read once and then
-//! filtered, searched and paged in memory, oldest first.
+//! filtered, searched and paged in memory, newest first.
 use crate::logs::Entry;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Rows per page.
 pub const PAGE: usize = 500;
-/// Entries kept from one read. Paging past them reads the range further.
+/// Entries kept from one read (the newest). Paging past them reads the range
+/// further back.
 const CAPACITY: usize = 20_000;
 
 /// What the Activity list shows: a filter and search within `[from, to)`
@@ -20,7 +21,7 @@ pub struct Query {
     pub needle: String,
 }
 
-/// A position in oldest-first order; the next page starts after it.
+/// A position in newest-first order; the next page holds older entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cursor {
     pub time: i64,
@@ -34,14 +35,15 @@ pub fn cursor(entry: &Entry) -> Option<Cursor> {
     })
 }
 
-/// The entries of `[from, to)` (epoch milliseconds) after `begin`, oldest first.
+/// The entries of `[from, to)` (epoch milliseconds) older than `begin`,
+/// newest first.
 pub struct Scan {
     path: PathBuf,
     from: i64,
     to: i64,
     begin: Option<Cursor>,
     entries: Vec<Entry>,
-    /// The range has more entries after the last one kept.
+    /// The range has older entries than the last one kept.
     truncated: bool,
 }
 
@@ -53,16 +55,16 @@ impl Scan {
             let Some(key) = cursor(&entry) else {
                 return;
             };
-            if key.time < from || key.time >= to || begin.is_some_and(|begin| key <= begin) {
+            if key.time < from || key.time >= to || begin.is_some_and(|begin| key >= begin) {
                 return;
             }
             entries.push(entry);
             // Files are not read in time order; trim in batches.
             if entries.len() >= CAPACITY * 2 {
-                truncated |= keep_oldest(&mut entries, CAPACITY);
+                truncated |= keep_newest(&mut entries, CAPACITY);
             }
         })?;
-        truncated |= keep_oldest(&mut entries, CAPACITY);
+        truncated |= keep_newest(&mut entries, CAPACITY);
         Ok(Self {
             path: path.to_owned(),
             from,
@@ -80,13 +82,13 @@ impl Scan {
             && self.to == to
             && match (self.begin, after) {
                 (None, _) => true,
-                (Some(begin), Some(after)) => after >= begin,
+                (Some(begin), Some(after)) => after <= begin,
                 (Some(_), None) => false,
             }
     }
 
-    /// Up to `limit` kept entries after `after`, oldest first, and where to
-    /// continue reading when this read ended before `limit` were found.
+    /// Up to `limit` kept entries older than `after`, newest first, and where
+    /// to continue reading when this read ended before `limit` were found.
     pub fn page(
         &self,
         after: Option<Cursor>,
@@ -95,7 +97,7 @@ impl Scan {
     ) -> (Vec<Entry>, Option<Cursor>) {
         let start = after.map_or(0, |after| {
             self.entries
-                .partition_point(|e| cursor(e).is_some_and(|key| key <= after))
+                .partition_point(|e| cursor(e).is_some_and(|key| key >= after))
         });
         let rows: Vec<Entry> = self.entries[start..]
             .iter()
@@ -110,10 +112,10 @@ impl Scan {
     }
 }
 
-/// Sorts oldest first, drops lines read twice (a rotation can race a read),
+/// Sorts newest first, drops lines read twice (a rotation can race a read),
 /// and keeps `limit`; returns whether any were dropped for the limit.
-fn keep_oldest(entries: &mut Vec<Entry>, limit: usize) -> bool {
-    entries.sort_by_key(cursor);
+fn keep_newest(entries: &mut Vec<Entry>, limit: usize) -> bool {
+    entries.sort_by_key(|e| std::cmp::Reverse(cursor(e)));
     entries.dedup_by_key(|e| cursor(e));
     let cut = entries.len() > limit;
     entries.truncate(limit);
@@ -144,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_only_the_range_oldest_first_across_rotated_files() {
+    fn reads_only_the_range_newest_first_across_rotated_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let now = Local::now();
@@ -158,18 +160,18 @@ mod tests {
         let scan = Scan::read(&path, now - 35 * 60_000, now - 7 * 60_000, None).unwrap();
         let (rows, resume) = scan.page(None, 10, |_| true);
         // The same line in both files is listed once.
-        assert_eq!(ids(&rows), ["a", "b", "c"]);
+        assert_eq!(ids(&rows), ["c", "b", "a"]);
         assert_eq!(resume, None);
         let (rows, _) = scan.page(cursor(&rows[0]), 1, |_| true);
         assert_eq!(ids(&rows), ["b"]);
         let (rows, _) = scan.page(None, 10, |e| e.get("request_id") != Some("b"));
-        assert_eq!(ids(&rows), ["a", "c"]);
+        assert_eq!(ids(&rows), ["c", "a"]);
         assert!(scan.covers(&path, now - 35 * 60_000, now - 7 * 60_000, None));
         assert!(!scan.covers(&path, now - 36 * 60_000, now - 7 * 60_000, None));
     }
 
     #[test]
-    fn a_read_kept_to_capacity_resumes_after_its_last_entry() {
+    fn a_read_kept_to_capacity_resumes_before_its_oldest_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let now = Local::now();
@@ -187,7 +189,10 @@ mod tests {
         let scan = Scan::read(&path, from, to, None).unwrap();
         let (rows, resume) = scan.page(None, CAPACITY + 10, |_| true);
         assert_eq!(rows.len(), CAPACITY);
-        let resume = resume.expect("more entries follow");
+        // The newest entries are kept; older ones follow.
+        assert_eq!(rows[0].fields["n"].as_u64(), Some(CAPACITY as u64 + 2));
+        assert_eq!(rows.last().unwrap().fields["n"].as_u64(), Some(3));
+        let resume = resume.expect("older entries follow");
         assert_eq!(Some(resume), cursor(rows.last().unwrap()));
         let rest = Scan::read(&path, from, to, Some(resume)).unwrap();
         assert!(rest.covers(&path, from, to, Some(resume)));
@@ -197,10 +202,7 @@ mod tests {
             .iter()
             .map(|e| e.fields["n"].as_u64().unwrap())
             .collect();
-        assert_eq!(
-            numbers,
-            [CAPACITY as u64, CAPACITY as u64 + 1, CAPACITY as u64 + 2]
-        );
+        assert_eq!(numbers, [2, 1, 0]);
         assert_eq!(resume, None);
     }
 }

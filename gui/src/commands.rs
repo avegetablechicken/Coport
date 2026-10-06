@@ -44,7 +44,7 @@ pub struct ActivityRange {
 }
 
 /// Without `range`, the newest live events. With it, the range's entries
-/// oldest first, a page at a time after `after`; the range is read once and
+/// newest first, a page at a time older than `after`; the range is read once and
 /// later filters, searches and pages reuse that read.
 #[tauri::command]
 pub async fn get_activity(
