@@ -153,7 +153,9 @@ const ui = {
   searchMode: "keyword",
   activityRequest: 0,
   rows: [],
-  // Activity list range, in epoch milliseconds; `to` is an inclusive minute.
+  // Activity list range: a preset re-resolved when chosen or the page opens,
+  // or "custom". Epoch milliseconds; `to` is an inclusive minute.
+  activityPreset: "hour",
   activityFrom: null,
   activityTo: null,
   activityNext: null,
@@ -206,10 +208,7 @@ function scheduleRefresh() {
 /// Lists the chosen range oldest first; `more` appends the next page. The range
 /// is read once by the backend, then filters, searches and pages reuse it.
 async function loadActivity(more = false) {
-  if (ui.activityTo == null) {
-    ui.activityTo = currentMinute();
-    ui.activityFrom = ui.activityTo - 60 * 60 * 1000;
-  }
+  if (ui.activityTo == null) resolveActivityRange();
   const request = ++ui.activityRequest;
   const query = {
     filter: ui.filter, search: ui.search, searchMode: ui.searchMode,
@@ -753,11 +752,12 @@ function showMenu(trigger, last = false) {
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
   menu.innerHTML = JSON.parse(trigger.dataset.menu).map((item) => item
-    ? `<button type="button" role="menuitem" tabindex="-1" data-action="${esc(item.action)}"${item.target ? ` data-target="${esc(item.target)}"` : ""}>${esc(item.label)}</button>`
+    ? `<button type="button" role="${item.checked == null ? "menuitem" : "menuitemradio"}" tabindex="-1" data-action="${esc(item.action)}"${
+      item.target ? ` data-target="${esc(item.target)}"` : ""}${item.checked == null ? "" : ` aria-checked="${item.checked}"`}>${esc(item.label)}</button>`
     : '<div class="menu-separator" role="separator"></div>').join("");
   placeMenu(trigger, menu);
   const items = menuItems(menu);
-  (last ? items.at(-1) : items[0])?.focus();
+  (last ? items.at(-1) : items.find((el) => el.getAttribute("aria-checked") === "true") ?? items[0])?.focus();
   // Close before the document's click handler runs the item's action.
   menu.addEventListener("click", (event) => {
     if (event.target.closest("[data-action]")) closeSelect(true);
@@ -770,6 +770,8 @@ function menuItems(menu) {
 
 document.addEventListener("pointerdown", (event) => {
   if (openSelect && !openSelect.menu.contains(event.target) && !openSelect.trigger.contains(event.target)) closeSelect();
+  const editor = $("range-editor");
+  if (editor && !editor.hidden && !editor.contains(event.target) && !event.target.closest?.(".select-menu")) showRangeEditor(false);
 });
 document.addEventListener("scroll", (event) => {
   if (openSelect && !openSelect.menu.contains(event.target)) closeSelect();
@@ -844,22 +846,96 @@ function renderActivityTraffic() {
   queueFit();
 }
 
-const SEARCH_MODES = [["keyword", "Keyword"], ["path", "Path"], ["proxy", "Proxy"], ["status", "Status code"]];
+const SEARCH_MODES = [["keyword", "Keyword"], ["path", "Path"], ["proxy", "Proxy"], ["status", "Status"]];
 function searchPlaceholder() {
   return { keyword: "Search log fields", path: "Path contains…", proxy: "Exact proxy name or direct", status: "HTTP status, e.g. 429" }[ui.searchMode];
+}
+
+const RANGE_PRESETS = [["hour", "Last hour"], ["6h", "Last 6 hours"], ["today", "Today"], ["yesterday", "Yesterday"]];
+
+/// Sets the Activity range from its preset, relative to the current time.
+function resolveActivityRange() {
+  if (ui.activityPreset === "custom" && ui.activityTo != null) return;
+  const now = currentMinute();
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const yesterday = new Date(midnight);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const hour = 60 * 60 * 1000;
+  [ui.activityFrom, ui.activityTo] = {
+    "6h": [now - 6 * hour, now],
+    today: [midnight.getTime(), now],
+    // `to` is an inclusive minute: the last minute before midnight.
+    yesterday: [yesterday.getTime(), midnight.getTime() - 60 * 1000],
+  }[ui.activityPreset] ?? [now - hour, now];
+}
+
+function rangeLabel() {
+  const preset = RANGE_PRESETS.find(([key]) => key === ui.activityPreset);
+  if (preset) return preset[1];
+  const day = (ms) => new Date(ms).toDateString() === new Date().toDateString()
+    ? "Today" : new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  const time = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const from = `${day(ui.activityFrom)} ${time(ui.activityFrom)}`;
+  return day(ui.activityFrom) === day(ui.activityTo)
+    ? `${from} – ${time(ui.activityTo)}` : `${from} – ${day(ui.activityTo)} ${time(ui.activityTo)}`;
+}
+
+function renderActivityRange() {
+  const el = $("activity-range");
+  if (!el) return;
+  const items = [
+    ...RANGE_PRESETS.map(([key, label]) => ({ label, action: "activity-preset", target: key, checked: ui.activityPreset === key })),
+    null,
+    { label: "Custom Range…", action: "range-edit", checked: ui.activityPreset === "custom" },
+  ];
+  el.innerHTML = `<button type="button" class="select range-select" data-menu="${esc(JSON.stringify(items))}"
+    aria-haspopup="menu" aria-expanded="false" aria-label="Log time range">${esc(rangeLabel())}</button>`;
+}
+
+function showRangeEditor(open) {
+  const editor = $("range-editor");
+  if (!editor) return;
+  editor.hidden = !open;
+  if (!open) return;
+  $("activity-from").value = localInput(ui.activityFrom);
+  $("activity-to").value = localInput(ui.activityTo);
+  $("range-error").hidden = true;
+  $("activity-from").focus();
+}
+
+async function applyRangeEditor() {
+  const from = new Date($("activity-from").value).getTime();
+  const to = new Date($("activity-to").value).getTime();
+  // `to` is an inclusive minute, so a single-minute range is allowed.
+  if (Number.isNaN(from) || Number.isNaN(to) || from > to) {
+    $("range-error").hidden = false;
+    return;
+  }
+  ui.activityPreset = "custom";
+  ui.activityFrom = from;
+  ui.activityTo = to;
+  showRangeEditor(false);
+  renderActivityRange();
+  await loadActivity();
 }
 
 function activityShell() {
   return `<div class="page">
     <section class="block" id="activity-traffic"></section>
-    <section class="block">
-      <div class="block-head"><span class="block-title">Log</span></div>
-      <div class="activity-range">
+    <section class="block log-block">
+      <div class="block-head"><span class="block-title">Log</span><span class="block-aside" id="activity-range"></span></div>
+      <div class="range-editor" id="range-editor" role="dialog" aria-label="Custom log range" hidden>
         <label class="range-row"><span class="range-label">From</span>
-          <input class="field" id="activity-from" type="datetime-local" value="${localInput(ui.activityFrom ?? currentMinute() - 3600000)}" aria-label="Start of the log range" /></label>
+          <input class="field" id="activity-from" type="datetime-local" aria-label="Start of the log range" /></label>
         <label class="range-row"><span class="range-label">To</span>
-          <input class="field" id="activity-to" type="datetime-local" value="${localInput(ui.activityTo ?? currentMinute())}" aria-label="End of the log range" />
-          <button type="button" class="text-link" data-action="activity-now">Now</button></label>
+          <input class="field" id="activity-to" type="datetime-local" aria-label="End of the log range" />
+          <button type="button" class="text-link" data-action="range-now">Now</button></label>
+        <div class="range-error" id="range-error" hidden>The start must be before the end.</div>
+        <div class="range-actions">
+          <button type="button" class="btn" data-action="range-cancel">Cancel</button>
+          <button type="button" class="btn primary" data-action="range-apply">Apply</button>
+        </div>
       </div>
       <div class="activity-search">
         ${panelSelect("search-mode", SEARCH_MODES, ui.searchMode, "Search condition")}
@@ -875,6 +951,7 @@ function activityShell() {
 function renderActivityList() {
   const filters = $("filters");
   if (!filters) return;
+  renderActivityRange();
   filters.innerHTML = [
     ["requests", "Requests"],
     ["models", "Models"],
@@ -1088,6 +1165,8 @@ async function act(action, el) {
       ui.page = el.dataset.page;
       if (ui.page === "activity") {
         loadTraffic();
+        // Presets follow the clock; a custom range stays as chosen.
+        resolveActivityRange();
         await loadActivity(false);
       }
       if (ui.page === "main") loadHomeTraffic();
@@ -1133,10 +1212,23 @@ async function act(action, el) {
       el.disabled = true;
       await loadActivity(true);
       break;
-    case "activity-now":
-      ui.activityTo = currentMinute();
-      $("activity-to").value = localInput(ui.activityTo);
+    case "activity-preset":
+      ui.activityPreset = el.dataset.target;
+      resolveActivityRange();
+      renderActivityRange();
       await loadActivity();
+      break;
+    case "range-edit":
+      showRangeEditor(true);
+      break;
+    case "range-now":
+      $("activity-to").value = localInput(currentMinute());
+      break;
+    case "range-cancel":
+      showRangeEditor(false);
+      break;
+    case "range-apply":
+      await applyRangeEditor();
       break;
     case "open":
       await invoke("open_path", { target: el.dataset.target });
@@ -1234,14 +1326,6 @@ document.addEventListener("change", async (event) => {
     await loading;
     return;
   }
-  if (event.target.id === "activity-from" || event.target.id === "activity-to") {
-    const value = new Date(event.target.value).getTime();
-    if (Number.isNaN(value)) return;
-    if (event.target.id === "activity-from") ui.activityFrom = value;
-    else ui.activityTo = value;
-    await loadActivity();
-    return;
-  }
   if (event.target.id === "traffic-range") {
     ui.trafficMinutes = Number(event.target.value);
     ui.trafficError = "";
@@ -1264,6 +1348,13 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  const editor = $("range-editor");
+  if (editor && !editor.hidden && editor.contains(event.target) && (event.key === "Escape" || event.key === "Enter")) {
+    event.preventDefault();
+    if (event.key === "Escape") showRangeEditor(false);
+    else applyRangeEditor();
+    return;
+  }
   if (openSelect) {
     const { menu } = openSelect;
     const items = menuItems(menu);

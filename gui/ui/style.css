@@ -600,18 +600,67 @@ input.field::placeholder {
   color: var(--tertiary);
 }
 
+/* The search condition sits inside the search field as a quiet prefix, as
+   wide as the first filter tab below it. */
 .activity-search {
   display: flex;
   align-items: center;
-  gap: 8px;
+  height: 22px;
+  border-radius: 5px;
+  background: var(--block);
+  box-shadow: 0 0 0 0.5px var(--control-border);
 }
-.activity-search .select { flex-shrink: 0; }
+.activity-search:focus-within {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.activity-search .select {
+  flex-shrink: 0;
+  /* The filter tabs below have 2px padding and four equal tabs. */
+  width: calc(25% + 1px);
+  height: 22px;
+  overflow: hidden;
+  border-right: 0.5px solid var(--separator);
+  border-radius: 5px 0 0 5px;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--secondary);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-search .search input.field,
+.activity-search .search input.field:focus {
+  background: transparent;
+  box-shadow: none;
+}
 
-/* Activity log range: From/To rows above the search. */
-.activity-range {
+/* Activity log range: a preset menu in the Log header; Custom Range… opens
+   this editor below it. */
+.range-select {
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.log-block {
+  position: relative;
+}
+.range-editor {
+  position: absolute;
+  z-index: 20;
+  top: 32px;
+  right: 10px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+  width: 260px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--window);
+  box-shadow: 0 0 0 1px var(--control-border), 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+.range-editor[hidden] {
+  display: none;
 }
 .range-row {
   display: flex;
@@ -630,10 +679,25 @@ input.field::placeholder {
 .range-row .text-link {
   flex: none;
 }
-/* The To row's Now link; From keeps the same input width. */
+/* From keeps the input width of To, which ends with its Now link. */
 .range-row:first-child::after {
   content: "Now";
   visibility: hidden;
+}
+.range-error {
+  color: var(--text-red);
+  font-size: 10px;
+}
+.range-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 2px;
+}
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: none;
 }
 .list-more {
   display: flex;
@@ -1226,7 +1290,8 @@ details.disclosure[open] summary svg {
   text-align: left;
   white-space: nowrap;
 }
-.select-menu button[aria-selected="true"] { font-weight: 600; }
+.select-menu button[aria-selected="true"],
+.select-menu button[aria-checked="true"] { font-weight: 600; }
 .action-menu { min-width: 150px; }
 .menu-separator {
   height: 1px;

@@ -751,14 +751,14 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 
 | Page | Content |
 | --- | --- |
-| Activity | Traffic charts, and a searchable log for a chosen From–To range (oldest first, 500 rows per page with Load More; the range is read once and reused by filters and searches); click a request for all fields |
+| Activity | Traffic charts, and a searchable log for a time range chosen in the Log header (Last hour, Last 6 hours, Today, Yesterday or a custom From–To range; oldest first, 500 rows per page with Load More; the range is read once and reused by filters and searches); click a request for all fields |
 | Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the
 search condition dropdown for Keyword (all string fields), Path (contains),
-Proxy (exact name, or `direct` for a direct connection), or Status code (exact
+Proxy (exact name, or `direct` for a direct connection), or Status (exact
 three-digit HTTP status). Searches ignore case and surrounding whitespace; an
-empty search shows all entries in the selected tab and retained list window.
+empty search shows all entries in the selected tab and time range.
 
 Enable **Settings → General → Keep proxy running after quit** to leave the
 independent proxy daemon running when choosing Quit (including the tray menu and
