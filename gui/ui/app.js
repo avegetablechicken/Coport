@@ -1486,7 +1486,12 @@ async function act(action, el) {
       await refresh();
       break;
     case "copy": {
-      await invoke("copy_text", { text: el.dataset.text });
+      try {
+        await invoke("copy_text", { text: el.dataset.text });
+      } catch (e) {
+        toast(String(e));
+        break;
+      }
       const before = el.innerHTML;
       el.innerHTML = ICON.check;
       el.classList.add("done");
