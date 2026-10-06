@@ -254,7 +254,8 @@ not mutate the process environment or affect Claude credentials or other homes.
 The parser/quoted-line code is adapted from dotenvy under its MIT license so that
 variable interpolation uses the simulated environment. No helper process is
 used. An absent credential still uses the proxy's existing login-shell lookup
-where supported; an explicitly empty value is an error and never triggers fallback.
+where supported, whose result (found or not) is reused for 30 seconds; an
+explicitly empty value is an error and never triggers fallback.
 Saved provider authentication is the login Codex saved for the same listed home,
 read from its configured credential store as described above:
 `auth_mode = "apikey"` selects `OPENAI_API_KEY`, and

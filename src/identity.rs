@@ -438,7 +438,7 @@ pub(crate) async fn environment_key(name: &str) -> Result<String> {
 pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Result<String> {
     let raw = match std::env::var(name) {
         Ok(value) => value,
-        Err(_) if shell => shell_value(name).await?,
+        Err(_) if shell => cached_shell_value(name, shell_value).await?,
         Err(_) => {
             return Err(Error::config(
                 "API Key environment variable is unavailable.",
@@ -476,6 +476,40 @@ impl Codex {
         ))
     }
 }
+/// Login-shell lookups, failures included, are reused briefly: each one runs
+/// the user's shell startup files and can take seconds, once per request.
+const SHELL_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+type ShellLookups = BTreeMap<String, (std::time::Instant, Result<String>)>;
+
+async fn cached_shell_value<'a, F, Fut>(name: &'a str, lookup: F) -> Result<String>
+where
+    F: FnOnce(&'a str) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    static CACHE: std::sync::Mutex<ShellLookups> = std::sync::Mutex::new(BTreeMap::new());
+    // Concurrent requests for a missing key wait for one shell, not one each.
+    static LOOKUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let cached = || {
+        let mut cache = CACHE.lock().unwrap();
+        cache.retain(|_, (at, _)| at.elapsed() < SHELL_LOOKUP_TTL);
+        cache.get(name).map(|(_, value)| value.clone())
+    };
+    if let Some(value) = cached() {
+        return value;
+    }
+    let _lookup = LOOKUP.lock().await;
+    if let Some(value) = cached() {
+        return value;
+    }
+    let value = lookup(name).await;
+    CACHE
+        .lock()
+        .unwrap()
+        .insert(name.to_owned(), (std::time::Instant::now(), value.clone()));
+    value
+}
+
 #[cfg(unix)]
 async fn shell_value(name: &str) -> Result<String> {
     use std::{os::unix::process::CommandExt, process::Stdio};
@@ -765,6 +799,33 @@ pub(crate) fn routing_account_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shell_lookups_are_reused_including_failures_and_not_duplicated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        async fn lookup(name: &str) -> Result<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if name.ends_with("_MISSING") {
+                Err(Error::config("missing"))
+            } else {
+                Ok(format!("{name}-value"))
+            }
+        }
+        let found = "COPORT_TEST_SHELL_FOUND";
+        let (a, b) = tokio::join!(
+            cached_shell_value(found, lookup),
+            cached_shell_value(found, lookup)
+        );
+        assert_eq!(a.unwrap(), "COPORT_TEST_SHELL_FOUND-value");
+        assert_eq!(b.unwrap(), "COPORT_TEST_SHELL_FOUND-value");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        let missing = "COPORT_TEST_SHELL_MISSING";
+        assert!(cached_shell_value(missing, lookup).await.is_err());
+        assert!(cached_shell_value(missing, lookup).await.is_err());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn route_activation_tracks_saved_logins_and_file_only_mode() {
