@@ -15,6 +15,15 @@ const CAPACITY: usize = 5000;
 /// How much existing history to load when a log file is first opened.
 const BACKFILL: u64 = 512 * 1024;
 
+/// A stable row key for a log line: the same line read by the tailer or by a
+/// traffic scan gets the same key. Kept within JavaScript's exact integers.
+pub fn line_key(line: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut hasher);
+    hasher.finish() & ((1 << 53) - 1)
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub seq: u64,
@@ -54,6 +63,15 @@ impl Entry {
             .and_then(|b| b.parse().ok())
             .unwrap_or(0)
     }
+    /// Whether the entry belongs to an Activity list filter.
+    pub fn matches_filter(&self, filter: &str) -> bool {
+        match filter {
+            "errors" => self.is_error(),
+            "models" => self.is_model_call_end(),
+            "all" => true,
+            _ => self.is_request_end(),
+        }
+    }
     pub fn is_error(&self) -> bool {
         if self.event.starts_with("model_call_") {
             return self.event == "model_call_failed";
@@ -89,7 +107,6 @@ impl Entry {
 struct Store {
     path: PathBuf,
     entries: VecDeque<Entry>,
-    next_seq: u64,
     /// Bumped when the file changes identity so the tailer restarts.
     generation: u64,
 }
@@ -125,10 +142,6 @@ impl LogFeed {
 
     pub fn path(&self) -> PathBuf {
         self.store.lock().unwrap().path.clone()
-    }
-
-    pub fn clear(&self) {
-        self.store.lock().unwrap().entries.clear();
     }
 
     /// Snapshot of entries matching `keep`, newest last.
@@ -272,10 +285,8 @@ impl LogFeed {
                 .and_then(|t| t.as_str().map(str::to_owned))
                 .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                 .map(|t| t.with_timezone(&Local));
-            let seq = s.next_seq;
-            s.next_seq += 1;
             s.entries.push_back(Entry {
-                seq,
+                seq: line_key(line),
                 time,
                 event,
                 fields,

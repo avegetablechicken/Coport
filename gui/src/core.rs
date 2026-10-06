@@ -29,6 +29,8 @@ pub struct Core {
     notify: Notify,
     /// Config file modification time when the proxy last started.
     started_stamp: Option<Option<SystemTime>>,
+    /// The Activity list's last read of its time range.
+    activity_scan: Option<crate::activity::Scan>,
 }
 
 #[derive(Default)]
@@ -100,6 +102,7 @@ impl Core {
             account_states_pending: false,
             notify,
             started_stamp,
+            activity_scan: None,
         }
     }
 
@@ -347,20 +350,37 @@ impl Core {
         search: &str,
         search_mode: &str,
         limit: usize,
-    ) -> Vec<EntryDto> {
+    ) -> Vec<Entry> {
         let needle = search.trim().to_lowercase();
-        let mut rows = self.logs.entries(|e| {
-            let keep = match filter {
-                "errors" => e.is_error(),
-                "models" => e.is_model_call_end(),
-                "all" => true,
-                _ => e.is_request_end(),
-            };
-            keep && (needle.is_empty() || matches_search(e, search_mode, &needle))
-        });
+        let mut rows = self
+            .logs
+            .entries(|e| e.matches_filter(filter) && matches_search(e, search_mode, &needle));
         rows.reverse();
         rows.truncate(limit);
-        rows.into_iter().map(EntryDto::from).collect()
+        rows
+    }
+}
+
+impl Core {
+    /// A page of the Activity range from the last read, if that read covers
+    /// it; see `activity::Scan::page`.
+    pub fn activity_page(
+        &self,
+        query: &crate::activity::Query,
+        after: Option<crate::activity::Cursor>,
+        limit: usize,
+    ) -> Option<(Vec<Entry>, Option<crate::activity::Cursor>)> {
+        let scan = self
+            .activity_scan
+            .as_ref()
+            .filter(|scan| scan.covers(&self.logs.path(), query.from, query.to, after))?;
+        Some(scan.page(after, limit, |e| {
+            e.matches_filter(&query.filter) && matches_search(e, &query.search_mode, &query.needle)
+        }))
+    }
+
+    pub fn store_activity_scan(&mut self, scan: crate::activity::Scan) {
+        self.activity_scan = Some(scan);
     }
 }
 
@@ -652,6 +672,23 @@ struct SettingsDto {
     launch_at_login: bool,
     /// Size of the request log in use, if it exists yet.
     log_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityDto {
+    rows: Vec<EntryDto>,
+    /// Where the next page starts, when there is one.
+    next: Option<crate::activity::Cursor>,
+}
+
+impl ActivityDto {
+    pub fn new(rows: Vec<Entry>, next: Option<crate::activity::Cursor>) -> Self {
+        Self {
+            rows: rows.into_iter().map(EntryDto::from).collect(),
+            next,
+        }
+    }
 }
 
 #[derive(Serialize)]

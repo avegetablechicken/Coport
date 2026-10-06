@@ -3,6 +3,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod activity;
 mod commands;
 mod config_edit;
 mod core;
@@ -96,7 +97,6 @@ fn main() {
             commands::create_example_config,
             commands::open_path,
             commands::copy_text,
-            commands::clear_activity,
             commands::fit_panel,
             commands::hide_panel,
             commands::quit_app,

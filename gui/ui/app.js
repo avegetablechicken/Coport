@@ -61,7 +61,26 @@ function fmtUptime(secs) {
 }
 
 function fmtTime(ms) {
-  return ms == null ? "" : new Date(ms).toLocaleTimeString("en-GB", { hour12: false });
+  if (ms == null) return "";
+  const date = new Date(ms);
+  const time = date.toLocaleTimeString("en-GB", { hour12: false });
+  // Activity ranges can span days; other days carry their date.
+  return date.toDateString() === new Date().toDateString()
+    ? time
+    : `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })} ${time}`;
+}
+
+/// Epoch milliseconds as a local `datetime-local` value, to the minute.
+function localInput(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function currentMinute() {
+  const d = new Date();
+  d.setSeconds(0, 0);
+  return d.getTime();
 }
 
 function statusClass(status) {
@@ -134,6 +153,11 @@ const ui = {
   searchMode: "keyword",
   activityRequest: 0,
   rows: [],
+  // Activity list range, in epoch milliseconds; `to` is an inclusive minute.
+  activityFrom: null,
+  activityTo: null,
+  activityNext: null,
+  activityError: "",
   recent: [],
   trafficMinutes: 30,
   trafficScope: "model",
@@ -164,13 +188,12 @@ async function refresh() {
   ]);
   if (request !== ui.refreshRequest) return;
   ui.snap = snap;
-  ui.recent = recent.slice(0, 5);
+  ui.recent = recent.rows.slice(0, 5);
   const proxies = snap.config.details?.proxies ?? [];
   ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
-  if (ui.page === "activity") await loadActivity(false);
-  else if (ui.page === "main" && Date.now() - ui.homeTrafficFetchedAt >= 15000) loadHomeTraffic();
+  if (ui.page === "main" && Date.now() - ui.homeTrafficFetchedAt >= 15000) loadHomeTraffic();
   render();
 }
 
@@ -180,14 +203,37 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(refresh, 120);
 }
 
-async function loadActivity(rerender = true) {
+/// Lists the chosen range oldest first; `more` appends the next page. The range
+/// is read once by the backend, then filters, searches and pages reuse it.
+async function loadActivity(more = false) {
+  if (ui.activityTo == null) {
+    ui.activityTo = currentMinute();
+    ui.activityFrom = ui.activityTo - 60 * 60 * 1000;
+  }
   const request = ++ui.activityRequest;
-  const query = { filter: ui.filter, search: ui.search, searchMode: ui.searchMode, minutes: ui.trafficMinutes };
-  const activity = await invoke("get_activity", query);
-  if (request !== ui.activityRequest || query.filter !== ui.filter || query.search !== ui.search
-      || query.searchMode !== ui.searchMode || query.minutes !== ui.trafficMinutes) return;
-  ui.rows = activity;
-  if (rerender) renderActivityList();
+  const query = {
+    filter: ui.filter, search: ui.search, searchMode: ui.searchMode,
+    range: { from: ui.activityFrom, to: ui.activityTo + 60 * 1000 },
+    after: more ? ui.activityNext : null,
+  };
+  const current = () => request === ui.activityRequest && query.filter === ui.filter && query.search === ui.search
+    && query.searchMode === ui.searchMode && query.range.from === ui.activityFrom && query.range.to === ui.activityTo + 60 * 1000;
+  let activity;
+  try {
+    activity = await invoke("get_activity", query);
+  } catch (error) {
+    if (!current()) return;
+    ui.rows = [];
+    ui.activityNext = null;
+    ui.activityError = String(error);
+    renderActivityList();
+    return;
+  }
+  if (!current()) return;
+  ui.activityError = "";
+  ui.rows = more ? ui.rows.concat(activity.rows) : activity.rows;
+  ui.activityNext = activity.next;
+  renderActivityList();
 }
 
 function uptime() {
@@ -221,7 +267,6 @@ function renderTop() {
   const tools =
     ui.page === "activity"
       ? `<nav class="links">
-          <button class="icon-btn" data-action="clear-activity" data-tip="Clear list" aria-label="Clear list">${ICON.trash}</button>
           <button class="icon-btn" data-action="open" data-target="log" data-tip="Open log file" aria-label="Open log file">${ICON.folder}</button>
         </nav>`
       : "";
@@ -809,6 +854,13 @@ function activityShell() {
     <section class="block" id="activity-traffic"></section>
     <section class="block">
       <div class="block-head"><span class="block-title">Log</span></div>
+      <div class="activity-range">
+        <label class="range-row"><span class="range-label">From</span>
+          <input class="field" id="activity-from" type="datetime-local" value="${localInput(ui.activityFrom ?? currentMinute() - 3600000)}" aria-label="Start of the log range" /></label>
+        <label class="range-row"><span class="range-label">To</span>
+          <input class="field" id="activity-to" type="datetime-local" value="${localInput(ui.activityTo ?? currentMinute())}" aria-label="End of the log range" />
+          <button type="button" class="text-link" data-action="activity-now">Now</button></label>
+      </div>
       <div class="activity-search">
         ${panelSelect("search-mode", SEARCH_MODES, ui.searchMode, "Search condition")}
         <label class="search">${ICON.search}
@@ -831,9 +883,12 @@ function renderActivityList() {
   ]
     .map(([f, label]) => `<button aria-pressed="${ui.filter === f}" data-action="filter" data-filter="${f}">${label}</button>`)
     .join("");
-  $("activity-list").innerHTML = ui.rows.length
-    ? ui.rows.map((e) => requestRow(e, true) + (ui.expanded.has(e.seq) ? detail(e) : "")).join("")
-    : `<div class="placeholder">${ui.snap.phase.state === "running" ? "No matching entries." : "The proxy is stopped."}</div>`;
+  $("activity-list").innerHTML = ui.activityError
+    ? `<div class="placeholder">${esc(ui.activityError)}</div>`
+    : ui.rows.length
+      ? ui.rows.map((e) => requestRow(e, true) + (ui.expanded.has(e.seq) ? detail(e) : "")).join("")
+        + (ui.activityNext ? '<div class="list-more"><button type="button" class="btn" data-action="activity-more">Load More</button></div>' : "")
+      : '<div class="placeholder">No matching entries in this range.</div>';
   queueFit();
 }
 
@@ -1074,9 +1129,13 @@ async function act(action, el) {
       ui.filter = el.dataset.filter;
       await loadActivity();
       break;
-    case "clear-activity":
-      await invoke("clear_activity");
-      ui.expanded.clear();
+    case "activity-more":
+      el.disabled = true;
+      await loadActivity(true);
+      break;
+    case "activity-now":
+      ui.activityTo = currentMinute();
+      $("activity-to").value = localInput(ui.activityTo);
       await loadActivity();
       break;
     case "open":
@@ -1173,6 +1232,14 @@ document.addEventListener("change", async (event) => {
     const loading = loadHomeTraffic(true);
     render();
     await loading;
+    return;
+  }
+  if (event.target.id === "activity-from" || event.target.id === "activity-to") {
+    const value = new Date(event.target.value).getTime();
+    if (Number.isNaN(value)) return;
+    if (event.target.id === "activity-from") ui.activityFrom = value;
+    else ui.activityTo = value;
+    await loadActivity();
     return;
   }
   if (event.target.id === "traffic-range") {

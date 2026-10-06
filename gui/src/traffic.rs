@@ -118,131 +118,72 @@ pub fn read(
     let mut groups = BTreeMap::new();
     let mut entries = Vec::new();
     let mut labels = labels.clone();
-    let backup = path.with_file_name(format!(
-        "{}.1",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    // Open handles before reading so appends and rotations do not restart a scan.
-    let open = |p: &Path| match File::open(p) {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("Cannot read traffic history".to_owned()),
-    };
-    let current = [path, backup.as_path()].map(open);
-    let archives = coport::logger::history_paths(path)
-        .map_err(|_| "Cannot read traffic archives".to_owned())?;
-    // Archived files are immutable. Skip files last written before the selected
-    // window, and open one at a time to avoid exhausting file descriptors.
-    let archives = archives.into_iter().filter(|p| {
-        p.metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_none_or(|t| t.as_millis() as i64 >= start)
-    });
-    let files = current.into_iter().chain(archives.map(|p| open(&p)));
     let mut seen_requests = HashSet::new();
     let mut requests = BTreeMap::<String, Entry>::new();
     let mut explicit_call_requests = HashSet::new();
-    #[cfg(unix)]
-    let mut identities = std::collections::HashSet::new();
-    for file in files {
-        let Some(file) = file? else { continue };
-        #[cfg(unix)]
+    for_each_entry(path, start, |entry| {
+        // Retain safe identity evidence even when the corresponding request is
+        // outside the selected window. Current configuration mappings win.
+        if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
+            && !id.is_empty()
+            && !label.is_empty()
         {
-            use std::os::unix::fs::MetadataExt;
-            let meta = file
-                .metadata()
-                .map_err(|_| "Cannot read traffic history".to_owned())?;
-            // Rotation between the two opens can return the same file twice.
-            if !identities.insert((meta.dev(), meta.ino())) {
-                continue;
+            let service = entry
+                .service()
+                .or_else(|| entry.get("service"))
+                .unwrap_or("Unknown");
+            labels
+                .entry((service.to_owned(), id.to_owned()))
+                .or_insert_with(|| label.to_owned());
+        }
+        if !included_in_scope(&entry, scope)
+            || lifecycle_rank(&entry) == 0
+            || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
+        {
+            return;
+        }
+        if let Some(id) = entry
+            .get(if entry.event.starts_with("model_call_") {
+                "model_call_id"
+            } else {
+                "request_id"
+            })
+            .filter(|id| !id.is_empty())
+        {
+            if entry.event.starts_with("model_call_")
+                && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
+            {
+                explicit_call_requests.insert(request_id.to_owned());
+            }
+            let id = format!(
+                "{}:{id}",
+                if entry.event.starts_with("model_call_") {
+                    "call"
+                } else {
+                    "request"
+                }
+            );
+            if let Some(current) = requests.get_mut(&id) {
+                merge_request(current, entry);
+            } else {
+                requests.insert(id, entry);
+            }
+        } else if entry.is_request_end()
+            && (scope == TrafficScope::All || is_historical_http_call(&entry))
+        {
+            // Uncorrelated connection events can only be counted separately.
+            // New model-call events always require their explicit call ID.
+            let identity = format!(
+                "{}:{:?}:{}",
+                entry.event,
+                entry.time,
+                serde_json::to_string(&entry.fields).unwrap_or_default()
+            );
+            if seen_requests.insert(identity) {
+                entries.push(entry);
             }
         }
-        for line in BufReader::new(file).split(b'\n') {
-            let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
-            let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
-                continue;
-            };
-            let Some(Value::String(event)) = fields.remove("event") else {
-                continue;
-            };
-            let time = fields
-                .remove("timestamp")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                })
-                .map(|t| t.with_timezone(&Local));
-            let entry = Entry {
-                seq: 0,
-                event,
-                time,
-                fields,
-            };
-            // Retain safe identity evidence even when the corresponding request is
-            // outside the selected window. Current configuration mappings win.
-            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
-                && !id.is_empty()
-                && !label.is_empty()
-            {
-                let service = entry
-                    .service()
-                    .or_else(|| entry.get("service"))
-                    .unwrap_or("Unknown");
-                labels
-                    .entry((service.to_owned(), id.to_owned()))
-                    .or_insert_with(|| label.to_owned());
-            }
-            if !included_in_scope(&entry, scope)
-                || lifecycle_rank(&entry) == 0
-                || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
-            {
-                continue;
-            }
-            if let Some(id) = entry
-                .get(if entry.event.starts_with("model_call_") {
-                    "model_call_id"
-                } else {
-                    "request_id"
-                })
-                .filter(|id| !id.is_empty())
-            {
-                if entry.event.starts_with("model_call_")
-                    && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
-                {
-                    explicit_call_requests.insert(request_id.to_owned());
-                }
-                let id = format!(
-                    "{}:{id}",
-                    if entry.event.starts_with("model_call_") {
-                        "call"
-                    } else {
-                        "request"
-                    }
-                );
-                if let Some(current) = requests.get_mut(&id) {
-                    merge_request(current, entry);
-                } else {
-                    requests.insert(id, entry);
-                }
-            } else if entry.is_request_end()
-                && (scope == TrafficScope::All || is_historical_http_call(&entry))
-            {
-                // Uncorrelated connection events can only be counted separately.
-                // New model-call events always require their explicit call ID.
-                let identity = format!(
-                    "{}:{:?}:{}",
-                    entry.event,
-                    entry.time,
-                    serde_json::to_string(&entry.fields).unwrap_or_default()
-                );
-                if seen_requests.insert(identity) {
-                    entries.push(entry);
-                }
-            }
-        }
-    }
+    })?;
     for entry in entries.iter().chain(requests.values()) {
         if scope == TrafficScope::Model
             && is_historical_http_call(entry)
@@ -402,6 +343,78 @@ fn aggregate(
         group.latency_count += 1;
         group.avg_ms = Some(group.latency_total / group.latency_count);
     }
+}
+
+/// Calls `visit` for every entry of the log at `path` and its rotated history,
+/// in file order. Archives last written before `start` (epoch milliseconds)
+/// cannot hold later entries and are skipped.
+pub(crate) fn for_each_entry(
+    path: &Path,
+    start: i64,
+    mut visit: impl FnMut(Entry),
+) -> Result<(), String> {
+    let backup = path.with_file_name(format!(
+        "{}.1",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    // Open handles before reading so appends and rotations do not restart a scan.
+    let open = |p: &Path| match File::open(p) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("Cannot read traffic history".to_owned()),
+    };
+    let current = [path, backup.as_path()].map(open);
+    let archives = coport::logger::history_paths(path)
+        .map_err(|_| "Cannot read traffic archives".to_owned())?;
+    // Archived files are immutable. Skip files last written before the selected
+    // window, and open one at a time to avoid exhausting file descriptors.
+    let archives = archives.into_iter().filter(|p| {
+        p.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_none_or(|t| t.as_millis() as i64 >= start)
+    });
+    let files = current.into_iter().chain(archives.map(|p| open(&p)));
+    #[cfg(unix)]
+    let mut identities = std::collections::HashSet::new();
+    for file in files {
+        let Some(file) = file? else { continue };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file
+                .metadata()
+                .map_err(|_| "Cannot read traffic history".to_owned())?;
+            // Rotation between the two opens can return the same file twice.
+            if !identities.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+        }
+        for line in BufReader::new(file).split(b'\n') {
+            let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
+            let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
+                continue;
+            };
+            let Some(Value::String(event)) = fields.remove("event") else {
+                continue;
+            };
+            let time = fields
+                .remove("timestamp")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                })
+                .map(|t| t.with_timezone(&Local));
+            visit(Entry {
+                seq: crate::logs::line_key(&line),
+                event,
+                time,
+                fields,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

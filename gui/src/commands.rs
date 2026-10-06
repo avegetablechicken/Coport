@@ -3,7 +3,8 @@
 
 use crate::{
     AppState,
-    core::{EntryDto, Snapshot},
+    activity::{self, Cursor},
+    core::{ActivityDto, Snapshot},
     panel, platform,
     settings::Appearance,
     tray,
@@ -36,19 +37,76 @@ pub async fn get_state(app: AppHandle, state: State<'_, AppState>) -> Result<Sna
     Ok(snapshot)
 }
 
+#[derive(Deserialize)]
+pub struct ActivityRange {
+    from: i64,
+    to: i64,
+}
+
+/// Without `range`, the newest live events. With it, the range's entries
+/// oldest first, a page at a time after `after`; the range is read once and
+/// later filters, searches and pages reuse that read.
 #[tauri::command]
-pub fn get_activity(
-    state: State<AppState>,
+pub async fn get_activity(
+    state: State<'_, AppState>,
     filter: String,
     search: String,
     search_mode: Option<String>,
-) -> Vec<EntryDto> {
-    state.core.lock().unwrap().activity(
-        &filter,
-        &search,
-        search_mode.as_deref().unwrap_or("keyword"),
-        300,
-    )
+    range: Option<ActivityRange>,
+    after: Option<Cursor>,
+) -> Result<ActivityDto> {
+    let search_mode = search_mode.unwrap_or_else(|| "keyword".into());
+    let Some(range) = range else {
+        let rows = state
+            .core
+            .lock()
+            .unwrap()
+            .activity(&filter, &search, &search_mode, 300);
+        return Ok(ActivityDto::new(rows, None));
+    };
+    if range.from >= range.to {
+        return Err("The start must be before the end.".into());
+    }
+    let query = activity::Query {
+        from: range.from,
+        to: range.to,
+        filter,
+        search_mode,
+        needle: search.trim().to_lowercase(),
+    };
+    let mut rows = Vec::new();
+    let mut after = after;
+    loop {
+        // One extra row tells whether another page follows.
+        let (page, path) = {
+            let core = state.core.lock().unwrap();
+            let page = core.activity_page(&query, after, activity::PAGE + 1 - rows.len());
+            (page, core.logs.path())
+        };
+        let begin = match page {
+            Some((found, resume)) => {
+                rows.extend(found);
+                match resume {
+                    Some(resume) if rows.len() <= activity::PAGE => Some(resume),
+                    _ => break,
+                }
+            }
+            None => after,
+        };
+        let (from, to) = (query.from, query.to);
+        let scan = tauri::async_runtime::spawn_blocking(move || {
+            activity::Scan::read(&path, from, to, begin)
+        })
+        .await
+        .map_err(|_| "Cannot read the log".to_owned())??;
+        state.core.lock().unwrap().store_activity_scan(scan);
+        after = begin;
+    }
+    let next = (rows.len() > activity::PAGE)
+        .then(|| rows.get(activity::PAGE - 1).and_then(activity::cursor))
+        .flatten();
+    rows.truncate(activity::PAGE);
+    Ok(ActivityDto::new(rows, next))
 }
 
 #[tauri::command]
@@ -215,11 +273,6 @@ pub fn open_path(state: State<AppState>, target: String) {
 #[tauri::command]
 pub fn copy_text(text: String) -> Result {
     platform::copy_text(&text)
-}
-
-#[tauri::command]
-pub fn clear_activity(state: State<AppState>) {
-    state.core.lock().unwrap().logs.clear();
 }
 
 #[tauri::command]

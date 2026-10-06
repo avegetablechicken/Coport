@@ -751,7 +751,7 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 
 | Page | Content |
 | --- | --- |
-| Activity | Live, searchable request log from `logs/proxy.log`; click a request for all fields |
+| Activity | Traffic charts, and a searchable log for a chosen From–To range (oldest first, 500 rows per page with Load More; the range is read once and reused by filters and searches); click a request for all fields |
 | Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the

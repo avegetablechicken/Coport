@@ -606,6 +606,40 @@ input.field::placeholder {
   gap: 8px;
 }
 .activity-search .select { flex-shrink: 0; }
+
+/* Activity log range: From/To rows above the search. */
+.activity-range {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.range-label {
+  width: 30px;
+  color: var(--secondary);
+}
+.range-row input.field {
+  flex: 1;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.range-row .text-link {
+  flex: none;
+}
+/* The To row's Now link; From keeps the same input width. */
+.range-row:first-child::after {
+  content: "Now";
+  visibility: hidden;
+}
+.list-more {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 2px;
+}
 .activity-search .search { flex: 1; min-width: 0; }
 
 .search {
