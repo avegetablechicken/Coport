@@ -219,14 +219,24 @@ impl LogFeed {
             let meta = std::fs::metadata(&path).ok();
             let identity = meta.as_ref().map(file_identity);
             let len = meta.as_ref().map_or(0, |m| m.len());
-            let reopen = match (&file, identity) {
-                (None, Some(_)) => true,
-                (Some((_, id)), Some(new_id)) => *id != new_id || len < offset,
-                (Some(_), None) => {
-                    file = None;
-                    false
+            // Lines written just before a rotation are read through the old handle.
+            if let Some((mut f, id)) = file.take() {
+                if identity == Some(id) {
+                    file = Some((f, id));
+                } else {
+                    let mut buf = Vec::new();
+                    if f.seek(SeekFrom::Start(offset)).is_ok() && f.read_to_end(&mut buf).is_ok() {
+                        partial.extend_from_slice(&buf);
+                        if self.ingest(&mut partial) {
+                            notify();
+                        }
+                    }
                 }
-                (None, None) => false,
+            }
+            // A file still open here has the current identity.
+            let reopen = match &file {
+                None => identity.is_some(),
+                Some(_) => len < offset,
             };
             if reopen && let Ok(f) = std::fs::File::open(&path) {
                 // First open backfills history; later reopens mean rotation.
@@ -386,10 +396,14 @@ mod tests {
             Some("Claude")
         );
 
-        // Rotation: the logger renames to `.1` and starts a fresh file.
+        // Rotation: the logger renames to `.1` and starts a fresh file. A line
+        // written just before is still read from the rotated file.
+        f.write_all(line("request_finished", 200).as_bytes())
+            .unwrap();
+        f.flush().unwrap();
         std::fs::rename(&path, dir.path().join("proxy.log.1")).unwrap();
         std::fs::write(&path, line("request_failed", 502)).unwrap();
-        wait_for(|| feed.stats().requests == 3);
+        wait_for(|| feed.stats().requests == 4);
         assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 3);
     }
 
