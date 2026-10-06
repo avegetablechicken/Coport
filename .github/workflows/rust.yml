@@ -53,6 +53,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test "gui/tests/*.test.cjs"
       - run: cargo clippy --locked -p coport-gui --all-targets -- -D warnings
       - run: cargo test --locked -p coport-gui
       - run: cargo build --locked --release -p coport-gui
