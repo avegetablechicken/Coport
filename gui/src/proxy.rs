@@ -47,7 +47,9 @@ const TRACE_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
 struct Shared {
     phase: Option<Phase>,
     generation: u64,
-    probes: BTreeMap<String, (Probe, SystemTime)>,
+    /// Each result with when its test started: monotonic time for its age,
+    /// wall-clock time to order it against logged observations.
+    probes: BTreeMap<String, (Probe, Instant, SystemTime)>,
 }
 
 struct Running {
@@ -261,7 +263,7 @@ impl Controller {
             return;
         };
         self.set_probe(name, Probe::Pending);
-        let started = SystemTime::now();
+        let started = (Instant::now(), SystemTime::now());
         let shared = self.shared.clone();
         let notify = self.notify.clone();
         let name = name.to_owned();
@@ -272,7 +274,11 @@ impl Controller {
             } else {
                 connect(addr).await
             };
-            shared.lock().unwrap().probes.insert(name, (probe, started));
+            shared
+                .lock()
+                .unwrap()
+                .probes
+                .insert(name, (probe, started.0, started.1));
             notify();
         });
     }
@@ -284,9 +290,14 @@ impl Controller {
         max_age: Duration,
     ) {
         for (name, endpoint) in proxies {
-            let stale = self.lock().probes.get(name).is_none_or(|(probe, at)| {
-                !matches!(probe, Probe::Pending) && at.elapsed().unwrap_or_default() > max_age
-            });
+            // A wall clock set back would make every result look new.
+            let stale = self
+                .lock()
+                .probes
+                .get(name)
+                .is_none_or(|(probe, started, _)| {
+                    !matches!(probe, Probe::Pending) && started.elapsed() > max_age
+                });
             if stale {
                 self.probe(name, endpoint);
             }
@@ -296,11 +307,15 @@ impl Controller {
     fn set_probe(&self, name: &str, probe: Probe) {
         self.lock()
             .probes
-            .insert(name.to_owned(), (probe, SystemTime::now()));
+            .insert(name.to_owned(), (probe, Instant::now(), SystemTime::now()));
     }
 
     pub fn probes(&self) -> BTreeMap<String, (Probe, SystemTime)> {
-        self.lock().probes.clone()
+        self.lock()
+            .probes
+            .iter()
+            .map(|(name, (probe, _, at))| (name.clone(), (probe.clone(), *at)))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
@@ -390,7 +405,7 @@ fn host_port(endpoint: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, Exit, Phase, host_port, is_local, parse_trace};
+    use super::{Controller, Exit, Phase, Probe, host_port, is_local, parse_trace};
     use std::sync::Arc;
 
     fn wait_for(mut predicate: impl FnMut() -> bool) {
@@ -438,6 +453,31 @@ mod tests {
         daemon.join().unwrap().unwrap();
         assert!(crate::daemon::Client::discover(dir.path()).is_none());
         assert!(matches!(controller.phase(), Phase::Stopped));
+    }
+
+    #[test]
+    fn results_age_by_monotonic_time_even_if_the_wall_clock_is_set_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("missing-daemon"),
+        );
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
+        // Recorded an hour "ahead", as after the wall clock was set back.
+        let recorded = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        controller.lock().probes.insert(
+            "proxy".into(),
+            (Probe::Unreachable("timed out".into()), started, recorded),
+        );
+        let (name, endpoint) = ("proxy".to_owned(), "not a proxy URL".to_owned());
+        controller.probe_stale([(&name, &endpoint)], std::time::Duration::from_secs(1));
+        assert!(matches!(
+            &controller.probes()["proxy"].0,
+            Probe::Unreachable(error) if error == "Invalid proxy URL"
+        ));
     }
 
     #[test]
