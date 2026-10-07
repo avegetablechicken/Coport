@@ -165,13 +165,15 @@ impl BackgroundController {
             }),
             exit,
         };
+        // Clear the old error before publishing the job. A fast failure may
+        // already have stored the new error when try_send returns.
+        replace_cache(&self.error, None);
         if self.jobs.try_send(job).is_err() {
             if exit {
                 self.closing.store(false, Ordering::Release);
             }
             return Err("The proxy control worker is unavailable.".into());
         }
-        replace_cache(&self.error, None);
         (self.notify)();
         Ok(receive)
     }
@@ -352,6 +354,29 @@ mod tests {
             daemon.join().unwrap().unwrap();
             assert!(crate::daemon::Client::discover(dir.path()).is_none());
         }
+    }
+
+    #[test]
+    fn a_fast_failure_remains_visible_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = BackgroundController::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let result = controller
+            .operation(Box::new(|_| Err("cannot restart".into())), false)
+            .unwrap()
+            .blocking_recv()
+            .unwrap();
+        assert_eq!(result, Err("cannot restart".into()));
+        assert_eq!(controller.error().as_deref(), Some("cannot restart"));
+        controller
+            .on_app_exit(true)
+            .unwrap()
+            .blocking_recv()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
