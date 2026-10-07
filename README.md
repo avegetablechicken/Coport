@@ -853,7 +853,11 @@ The service runs the native executable directly; Python is not required.
 | Windows | Task Scheduler task at user logon | `%LOCALAPPDATA%/coport-rust` |
 
 The Windows task runs in the logged-in user's session; it is not a system service
-that runs before login. Linux requires an available systemd user manager. On all
+that runs before login. The runtime copy of `coport.exe` is marked as a Windows
+GUI-subsystem program (as `editbin /SUBSYSTEM:WINDOWS` does), so the task opens no
+console window that could be closed to stop it; run CLI commands with the original
+executable, since the runtime copy prints no console output. Linux requires an
+available systemd user manager. On all
 platforms, manage mihomo/Clash separately; the Rust service manager does not start
 an external proxy core. The Linux registration retains systemd 245-compatible
 path quoting. An opt-in Linux test covers the complete service lifecycle;

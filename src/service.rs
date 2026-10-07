@@ -3,7 +3,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, ValueEnum};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -398,6 +398,9 @@ fn stage(runtime: &Path, source: &Path, config: &Path, platform: Platform) -> Re
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o700))?;
     }
+    if matches!(platform, Platform::Windows) {
+        windows_gui_subsystem(staged.as_file_mut())?;
+    }
     staged.as_file().sync_all()?;
     staged.persist(destination).map_err(|e| {
         format!("Cannot replace executable (stop the task before updating on Windows): {e}")
@@ -406,6 +409,48 @@ fn stage(runtime: &Path, source: &Path, config: &Path, platform: Platform) -> Re
         private_write(&destination_config, &fs::read(config)?)?;
     }
     private_dir(&runtime.join("logs"))?;
+    Ok(())
+}
+
+/// Marks the staged copy as a GUI-subsystem program, as `editbin /SUBSYSTEM:WINDOWS`
+/// does. Windows then creates no console for the logon task: no window appears,
+/// and none can be closed to kill the proxy. The original executable stays a
+/// console program for CLI use.
+fn windows_gui_subsystem(file: &mut fs::File) -> Result<()> {
+    const CONSOLE: u16 = 3;
+    const GUI: u16 = 2;
+    let invalid = || "The executable is not a Windows console program";
+    let mut read = |offset: u64, buf: &mut [u8]| -> Result<()> {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf).map_err(|_| invalid())?;
+        Ok(())
+    };
+    let mut dos = [0; 64];
+    read(0, &mut dos)?;
+    if &dos[..2] != b"MZ" {
+        return Err(invalid().into());
+    }
+    let pe = u64::from(u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]));
+    let mut signature = [0; 4];
+    read(pe, &mut signature)?;
+    // The optional header follows the 4-byte signature and the 20-byte COFF
+    // header; Subsystem is at offset 68 in both PE32 and PE32+ layouts.
+    let optional = pe + 24;
+    let mut magic = [0; 2];
+    read(optional, &mut magic)?;
+    if &signature != b"PE\0\0" || !matches!(u16::from_le_bytes(magic), 0x10b | 0x20b) {
+        return Err(invalid().into());
+    }
+    let mut subsystem = [0; 2];
+    read(optional + 68, &mut subsystem)?;
+    match u16::from_le_bytes(subsystem) {
+        GUI => {}
+        CONSOLE => {
+            file.seek(SeekFrom::Start(optional + 68))?;
+            file.write_all(&GUI.to_le_bytes())?;
+        }
+        _ => return Err(invalid().into()),
+    }
     Ok(())
 }
 
@@ -447,6 +492,94 @@ mod tests {
             fs::read(s.runtime.join("coport")).unwrap(),
             b"new executable"
         );
+    }
+    /// Minimal PE image header with the given optional-header magic and subsystem.
+    fn pe_image(magic: u16, subsystem: u16) -> Vec<u8> {
+        let mut image = vec![0; 0x80 + 24 + 96];
+        image[..2].copy_from_slice(b"MZ");
+        image[60..64].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x98..0x9a].copy_from_slice(&magic.to_le_bytes());
+        image[0x98 + 68..0x98 + 70].copy_from_slice(&subsystem.to_le_bytes());
+        image
+    }
+    fn subsystem_of(image: &[u8]) -> u16 {
+        u16::from_le_bytes([image[0x98 + 68], image[0x98 + 69]])
+    }
+    #[test]
+    fn windows_staging_hides_console_only_in_the_runtime_copy() {
+        for magic in [0x10b, 0x20b] {
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = dir.path().join("runtime");
+            let source = dir.path().join("coport.exe");
+            let config = dir.path().join("config.yaml");
+            fs::write(&source, pe_image(magic, 3)).unwrap();
+            fs::write(&config, "listen_port: 7889\n").unwrap();
+            stage(&runtime, &source, &config, Platform::Windows).unwrap();
+            let staged = fs::read(runtime.join("coport.exe")).unwrap();
+            assert_eq!(subsystem_of(&staged), 2);
+            assert_eq!(subsystem_of(&fs::read(&source).unwrap()), 3);
+            assert_eq!(staged, pe_image(magic, 2));
+            // Restaging an already converted copy (e.g. as --binary) is accepted.
+            stage(
+                &runtime,
+                &runtime.join("coport.exe"),
+                &config,
+                Platform::Windows,
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn windows_staging_rejects_non_console_executables() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let config = dir.path().join("config.yaml");
+        fs::write(&config, "listen_port: 7889\n").unwrap();
+        let mut bad_signature = pe_image(0x20b, 3);
+        bad_signature[0x80] = b'X';
+        for image in [
+            b"not an executable".to_vec(),
+            bad_signature,
+            pe_image(0x107, 3),
+            pe_image(0x20b, 10),
+            pe_image(0x20b, 3)[..0x98 + 60].to_vec(),
+        ] {
+            let source = dir.path().join("coport.exe");
+            fs::write(&source, image).unwrap();
+            assert!(stage(&runtime, &source, &config, Platform::Windows).is_err());
+            assert!(!runtime.join("coport.exe").exists());
+        }
+    }
+    /// The test harness is itself a console executable, so this checks the
+    /// header layout against a real linker output and that Windows loads it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_staged_copy_of_a_real_executable_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let config = dir.path().join("config.yaml");
+        fs::write(&config, "listen_port: 7889\n").unwrap();
+        let source = std::env::current_exe().unwrap();
+        stage(&runtime, &source, &config, Platform::Windows).unwrap();
+        let staged = runtime.join("coport.exe");
+        let output = Command::new(&staged)
+            .args([
+                "--list",
+                "--exact",
+                "service::tests::windows_staging_rejects_non_console_executables",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("rejects_non_console"));
+        let mut image = fs::File::open(&staged).unwrap();
+        let mut header = [0; 4096];
+        image.read_exact(&mut header).unwrap();
+        let pe = u32::from_le_bytes(header[60..64].try_into().unwrap()) as usize;
+        assert_eq!(&header[pe..pe + 4], b"PE\0\0");
+        assert_eq!(u16::from_le_bytes([header[pe + 92], header[pe + 93]]), 2);
     }
     #[test]
     fn registrations_escape_paths_and_launch_native_binary() {
