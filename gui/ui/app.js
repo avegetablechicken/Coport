@@ -216,13 +216,18 @@ function scheduleRefresh() {
 /// Otherwise the backend reuses its last read of the range for filters, searches and pages.
 async function loadActivity(mode) {
   if (ui.activityTo == null) resolveActivityRange();
-  const request = ++ui.activityRequest;
   const query = {
     filter: ui.filter, search: ui.search, searchMode: ui.searchMode,
     range: { from: ui.activityFrom, to: ui.activityTo + 60 * 1000 },
     after: mode === "more" ? ui.activityNext : null,
     fresh: mode === "live",
   };
+  // A live refresh must not invalidate a scan of the same query still running.
+  const key = JSON.stringify([query.filter, query.search, query.searchMode, query.range, query.after]);
+  if (mode === "live" && ui.activityLoadingKey === key && ui.activityLoadingRequest === ui.activityRequest) return;
+  const request = ++ui.activityRequest;
+  ui.activityLoadingKey = key;
+  ui.activityLoadingRequest = request;
   const current = () => request === ui.activityRequest && query.filter === ui.filter && query.search === ui.search
     && query.searchMode === ui.searchMode && query.range.from === ui.activityFrom && query.range.to === ui.activityTo + 60 * 1000;
   if (mode === "more") ui.activityLoadingMore = true;
@@ -244,6 +249,7 @@ async function loadActivity(mode) {
     renderActivityList();
     return;
   } finally {
+    if (ui.activityLoadingRequest === request) ui.activityLoadingKey = null;
     if (mode === "more") ui.activityLoadingMore = false;
   }
   if (!current()) return;

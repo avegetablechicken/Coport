@@ -102,3 +102,38 @@ test('a failed live read keeps the list', async () => {
   assert.deepEqual(seqs(ui.rows), [1]);
   assert.equal(ui.activityError, undefined);
 });
+
+test('live refresh reuses a pending scan and accepts its result', async () => {
+  const { ui, pending, load } = setup();
+  const first = load('live');
+  await load('live');
+  assert.equal(pending.length, 1);
+  pending[0].resolve({ rows: [row(20, 2)], next: null });
+  await first;
+  assert.deepEqual(seqs(ui.rows), [2]);
+  const next = load('live');
+  assert.equal(pending.length, 2);
+  pending[1].resolve(Promise.reject(new Error('busy')));
+  await next;
+  const retry = load('live');
+  assert.equal(pending.length, 3);
+  pending[2].resolve({ rows: [row(30, 3)], next: null });
+  await retry;
+  assert.deepEqual(seqs(ui.rows), [3]);
+});
+test('live refresh waits for the same initial query but a changed query starts immediately', async () => {
+  const { ui, pending, load } = setup();
+  const first = load();
+  await load('live');
+  assert.equal(pending.length, 1);
+  ui.search = 'changed';
+  const changed = load('live');
+  assert.equal(pending.length, 2);
+  pending[0].resolve({ rows: [row(10, 1)], next: null });
+  await first;
+  await load('live');
+  assert.equal(pending.length, 2, 'stale completion must not clear the current scan');
+  pending[1].resolve({ rows: [row(20, 2)], next: null });
+  await changed;
+  assert.deepEqual(seqs(ui.rows), [2]);
+});
