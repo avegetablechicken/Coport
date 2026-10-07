@@ -14,9 +14,7 @@ struct Cleanup(Service);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if self.0.registration.exists() {
-            let _ = self
-                .0
-                .manage(Action::Uninstall, Path::new(""), Path::new(""));
+            let _ = self.0.manage(Action::Uninstall, Path::new(""), None);
         }
     }
 }
@@ -75,7 +73,10 @@ fn isolated_service_lifecycle() {
     )
     .unwrap();
     let binary = common::binary().canonicalize().unwrap();
-    assert_eq!(s.manage(Action::Install, &binary, &config).unwrap(), 0);
+    assert_eq!(
+        s.manage(Action::Install, &binary, Some(&config)).unwrap(),
+        0
+    );
     ready(port);
     assert_eq!(
         common::request(port, None, None, "/responses", "GET").0,
@@ -91,10 +92,13 @@ fn isolated_service_lifecycle() {
     );
     let preserved = fs::read(s.runtime.join("config.yaml")).unwrap();
     fs::write(&config, "invalid checkout settings\n").unwrap();
-    assert_eq!(s.manage(Action::Update, &binary, &config).unwrap(), 0);
+    assert_eq!(s.manage(Action::Update, &binary, Some(&config)).unwrap(), 0);
     assert_eq!(fs::read(s.runtime.join("config.yaml")).unwrap(), preserved);
     assert_eq!(pid(&unit), before);
-    assert_eq!(s.manage(Action::Restart, &binary, &config).unwrap(), 0);
+    assert_eq!(
+        s.manage(Action::Restart, &binary, Some(&config)).unwrap(),
+        0
+    );
     ready(port);
     let after = pid(&unit);
     assert_ne!(after, "0");
@@ -107,9 +111,12 @@ fn isolated_service_lifecycle() {
             & 0o777,
         0o600
     );
-    assert_eq!(s.manage(Action::Stop, &binary, &config).unwrap(), 0);
+    assert_eq!(s.manage(Action::Stop, &binary, Some(&config)).unwrap(), 0);
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
-    assert_eq!(s.manage(Action::Uninstall, &binary, &config).unwrap(), 0);
+    assert_eq!(
+        s.manage(Action::Uninstall, &binary, Some(&config)).unwrap(),
+        0
+    );
     assert!(!s.registration.exists());
     assert_eq!(fs::read(s.runtime.join("config.yaml")).unwrap(), preserved);
 }

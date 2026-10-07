@@ -868,7 +868,9 @@ listener on the configured port before installing. The service command manages o
 own service registration and runtime directory.
 Use `--binary /path/to/executable` and `--config /path/to/config.yaml` to install
 from other locations. By default, installation uses the executable running
-the command and `config.yaml` in the current directory.
+the command and `config.yaml` in the current directory. Installation validates
+the configuration first. A runtime copy retained by an earlier install is kept;
+a different `--config` is refused until that copy is edited or removed.
 
 Edit the runtime copy of `config.yaml`, then restart to apply changes. Updates
 preserve that copy. Configure allowed credential directories in YAML. Linux services can load exported API Keys from a private `service.env` file beside

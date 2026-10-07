@@ -39,7 +39,11 @@ async fn main() {
     if let Some(Subcommand::Service(service)) = args.command.take() {
         let result = (|| -> std::result::Result<i32, Box<dyn std::error::Error>> {
             let binary = service.binary.unwrap_or(std::env::current_exe()?);
-            coport::service::Service::current()?.manage(service.action, &binary, &service.config)
+            coport::service::Service::current()?.manage(
+                service.action,
+                &binary,
+                service.config.as_deref(),
+            )
         })();
         match result {
             Ok(code) => std::process::exit(code),
@@ -140,7 +144,10 @@ mod tests {
             service.binary.unwrap(),
             std::path::PathBuf::from("build/coport")
         );
-        assert_eq!(service.config, std::path::PathBuf::from("private.yaml"));
+        assert_eq!(
+            service.config.unwrap(),
+            std::path::PathBuf::from("private.yaml")
+        );
         assert!(
             Args::try_parse_from(["coport", "--config", "ignored.yaml", "service", "install"])
                 .is_err()

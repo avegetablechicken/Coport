@@ -27,8 +27,9 @@ pub struct ServiceArgs {
     /// Executable to install (defaults to this executable).
     #[arg(long)]
     pub binary: Option<PathBuf>,
-    #[arg(long, default_value = "config.yaml")]
-    pub config: PathBuf,
+    /// Configuration to install (defaults to `config.yaml` in the current directory).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,7 +87,7 @@ impl Service {
         })
     }
 
-    pub fn manage(&self, action: Action, source: &Path, config: &Path) -> Result<i32> {
+    pub fn manage(&self, action: Action, source: &Path, config: Option<&Path>) -> Result<i32> {
         self.manage_with(action, source, config, &mut |program, args, quiet| {
             let mut command = Command::new(program);
             command.args(args);
@@ -101,9 +102,10 @@ impl Service {
         &self,
         action: Action,
         source: &Path,
-        config: &Path,
+        explicit: Option<&Path>,
         run: &mut impl FnMut(&str, &[String], bool) -> io::Result<i32>,
     ) -> Result<i32> {
+        let config = explicit.unwrap_or(Path::new("config.yaml"));
         if matches!(action, Action::Install | Action::Update) {
             let exists = match self.platform {
                 Platform::Windows => {
@@ -120,6 +122,10 @@ impl Service {
             }
             if action == Action::Update && !exists {
                 return Err("Service is not installed; use install first".into());
+            }
+            if action == Action::Install {
+                let retained = self.runtime.join("config.yaml");
+                check_install_config(&retained, config, explicit.is_some())?;
             }
             stage(&self.runtime, source, config, self.platform)?;
             if action == Action::Update {
@@ -375,6 +381,37 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     file.persist(path)?;
     Ok(())
 }
+/// An install runs with the configuration retained by an earlier install, if
+/// any, but never silently in place of a different one; either way it must be valid.
+fn check_install_config(retained: &Path, config: &Path, explicit: bool) -> Result<()> {
+    let chosen = if retained.exists() {
+        if config.is_file() && fs::read(config)? != fs::read(retained)? {
+            return Err(format!(
+                "{} is retained from an earlier install and differs from {}; edit or remove it, then install again",
+                retained.display(),
+                config.display()
+            )
+            .into());
+        }
+        if explicit && !config.is_file() {
+            return Err(format!("Configuration not found: {}", config.display()).into());
+        }
+        if !config.is_file() {
+            println!("Using {} from an earlier install.", retained.display());
+        }
+        retained
+    } else if config.is_file() {
+        config
+    } else if explicit {
+        return Err(format!("Configuration not found: {}", config.display()).into());
+    } else {
+        return Err("Create config.yaml first or pass --config".into());
+    };
+    crate::config::Config::read(chosen)
+        .map_err(|e| format!("Invalid configuration {}: {}", chosen.display(), e.message))?;
+    Ok(())
+}
+
 fn stage(runtime: &Path, source: &Path, config: &Path, platform: Platform) -> Result<()> {
     if !source.is_file() {
         return Err("Executable not found; build first or pass --binary".into());
@@ -478,7 +515,7 @@ mod tests {
             s.manage_with(
                 Action::Update,
                 &binary,
-                &dir.path().join("missing"),
+                Some(&dir.path().join("missing")),
                 &mut |_, _, _| panic!("update invoked service manager")
             )
             .unwrap(),
@@ -620,16 +657,49 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let s = service(dir.path());
             private_write(&s.registration, b"invalid unit").unwrap();
-            let result = s.manage_with(
-                Action::Uninstall,
-                Path::new(""),
-                Path::new(""),
-                &mut |_, args, _| Ok(if args[1] == "stop" { code } else { 0 }),
-            );
+            let result =
+                s.manage_with(Action::Uninstall, Path::new(""), None, &mut |_, args, _| {
+                    Ok(if args[1] == "stop" { code } else { 0 })
+                });
             assert_eq!(result.is_ok(), code == 5);
             assert_eq!(s.registration.exists(), code != 5);
         }
     }
+    const VALID: &str = "listen_port: 7889\nrequest_timeout_seconds: 30\n";
+
+    #[test]
+    fn install_validates_and_never_silently_keeps_another_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = service(dir.path());
+        let binary = dir.path().join("binary");
+        fs::write(&binary, "executable").unwrap();
+        let config = dir.path().join("new.yaml");
+        let install = |config: Option<&Path>| {
+            s.manage_with(Action::Install, &binary, config, &mut |_, _, _| Ok(0))
+        };
+        // Invalid or misspelled configurations are not installed.
+        fs::write(&config, "listen_port: [").unwrap();
+        assert!(install(Some(&config)).is_err());
+        assert!(install(Some(&dir.path().join("missing.yaml"))).is_err());
+        assert!(!s.registration.exists());
+        assert!(!s.runtime.join("config.yaml").exists());
+
+        // After uninstall the runtime copy remains: a different --config is
+        // refused rather than ignored, the same one is accepted.
+        fs::create_dir_all(&s.runtime).unwrap();
+        fs::write(s.runtime.join("config.yaml"), VALID).unwrap();
+        fs::write(&config, "listen_port: 9000\nrequest_timeout_seconds: 30\n").unwrap();
+        assert!(install(Some(&config)).is_err());
+        assert!(install(Some(&dir.path().join("missing.yaml"))).is_err());
+        assert!(!s.registration.exists());
+        fs::write(&config, VALID).unwrap();
+        assert_eq!(install(Some(&config)).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(s.runtime.join("config.yaml")).unwrap(),
+            VALID
+        );
+    }
+
     #[test]
     fn install_is_private_and_does_not_overwrite_registration() {
         let dir = tempfile::tempdir().unwrap();
@@ -637,17 +707,27 @@ mod tests {
         let binary = dir.path().join("binary");
         let config = dir.path().join("config");
         fs::write(&binary, "executable").unwrap();
-        fs::write(&config, "settings").unwrap();
+        fs::write(&config, VALID).unwrap();
         let mut calls = vec![];
-        s.manage_with(Action::Install, &binary, &config, &mut |_, args, _| {
-            calls.push(args.to_vec());
-            Ok(0)
-        })
+        s.manage_with(
+            Action::Install,
+            &binary,
+            Some(&config),
+            &mut |_, args, _| {
+                calls.push(args.to_vec());
+                Ok(0)
+            },
+        )
         .unwrap();
         assert_eq!(calls.len(), 2);
         assert!(
-            s.manage_with(Action::Install, &binary, &config, &mut |_, _, _| panic!())
-                .is_err()
+            s.manage_with(
+                Action::Install,
+                &binary,
+                Some(&config),
+                &mut |_, _, _| panic!()
+            )
+            .is_err()
         );
         #[cfg(unix)]
         {
