@@ -129,7 +129,7 @@ fn load_or_create_ca(dir: &Path) -> std::io::Result<KeyPair> {
         return Ok(key);
     }
     std::fs::create_dir_all(dir)?;
-    let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE))?;
+    let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE), Duration::from_secs(30))?;
     // Another instance may have created the pair while this one waited.
     if let Some(key) = load_ca(dir) {
         return Ok(key);
@@ -155,52 +155,62 @@ fn load_ca(dir: &Path) -> Option<KeyPair> {
         .then_some(key)
 }
 
-/// An exclusively created file, removed on drop. One left by a process that
-/// died while creating the CA is taken over once it is clearly stale.
-struct CreationLock(PathBuf);
+/// An operating system lock on a file beside the CA, held while the CA is
+/// created. The system releases it when its holder exits, however it ends,
+/// so the file is never removed and no holder can release another's lock.
+struct CreationLock {
+    _file: std::fs::File,
+}
 
 impl CreationLock {
-    fn acquire(path: &Path) -> std::io::Result<Self> {
-        const STALE: Duration = Duration::from_secs(30);
-        let deadline = Instant::now() + STALE + Duration::from_secs(5);
+    fn acquire(path: &Path, wait: Duration) -> std::io::Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Without sharing, a second open fails while the first is held.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let deadline = Instant::now() + wait;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(_) => return Ok(Self(path.to_owned())),
-                // Windows refuses to create a file whose previous holder is
-                // still deleting it, just as when it exists.
-                Err(e)
-                    if e.kind() != std::io::ErrorKind::AlreadyExists
-                        && !(cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied) =>
-                {
-                    return Err(e);
+            match options.open(path).and_then(lock_exclusively) {
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(e) if is_held(&e) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => {
-                    let stale = std::fs::metadata(path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|at| at.elapsed().ok())
-                        .is_some_and(|age| age > STALE);
-                    if stale {
-                        let _ = std::fs::remove_file(path);
-                    } else if Instant::now() > deadline {
-                        return Err(e);
-                    } else {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                }
+                Err(e) => return Err(e),
             }
         }
     }
 }
 
-impl Drop for CreationLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+#[cfg(unix)]
+fn lock_exclusively(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: the descriptor belongs to `file`, which is open during the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusively(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    Ok(file)
+}
+
+/// Whether another holder has the lock: a refused flock, or on Windows a
+/// sharing or lock violation.
+fn is_held(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)))
 }
 
 fn persist(dir: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -231,7 +241,6 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
-        assert!(!dir.path().join(CA_LOCK_FILE).exists());
     }
 
     #[test]
@@ -276,15 +285,24 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_creation_lock_is_taken_over() {
+    fn a_lock_file_left_behind_does_not_block_creation() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join(CA_LOCK_FILE);
-        let file = std::fs::File::create(&lock).unwrap();
-        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
-            .unwrap();
-        drop(file);
+        std::fs::write(dir.path().join(CA_LOCK_FILE), b"").unwrap();
         load_or_create_ca(dir.path()).unwrap();
         assert!(load_ca(dir.path()).is_some());
-        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_creation_lock_is_released_only_by_its_own_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CA_LOCK_FILE);
+        let first = CreationLock::acquire(&path, Duration::ZERO).unwrap();
+        assert!(CreationLock::acquire(&path, Duration::ZERO).is_err());
+        drop(first);
+        let second = CreationLock::acquire(&path, Duration::ZERO).unwrap();
+        // However long the first holder took, it has nothing left to release.
+        assert!(CreationLock::acquire(&path, Duration::ZERO).is_err());
+        drop(second);
+        CreationLock::acquire(&path, Duration::ZERO).unwrap();
     }
 }
