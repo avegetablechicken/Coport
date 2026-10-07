@@ -893,8 +893,14 @@ function trafficControls(prefix, minutes, label) {
 }
 
 async function loadTraffic() {
+  // Long ranges can take longer to read than the refresh interval; a read of
+  // the same range and category that is still current is not started twice.
+  const key = `${ui.trafficMinutes}:${ui.trafficScope}`;
+  if (ui.trafficLoading && ui.trafficLoadingKey === key && ui.trafficLoadingRequest === ui.trafficRequest) return;
   const request = ++ui.trafficRequest;
   ui.trafficLoading = true;
+  ui.trafficLoadingKey = key;
+  ui.trafficLoadingRequest = request;
   $("activity-traffic")?.setAttribute("aria-busy", "true");
   // Charts follow the category their data was read for, so a switch keeps
   // the previous charts consistent until the replacement arrives.

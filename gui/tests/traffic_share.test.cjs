@@ -86,6 +86,28 @@ test('traffic data keeps the category it was read for', async () => {
   assert.equal(pending[0].query.scope, 'all');
   assert.equal(ui.traffic.scope, 'all');
 });
+test('a traffic read still running is not started again', async () => {
+  const pending = [];
+  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 43200, page: 'activity' };
+  const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
+  const first = context.loadTraffic();
+  context.loadTraffic();
+  assert.equal(pending.length, 1);
+  // Another range starts at once, and so does any read after a switch.
+  ui.trafficMinutes = 30;
+  const second = context.loadTraffic();
+  assert.equal(pending.length, 2);
+  ui.trafficMinutes = 43200;
+  ++ui.trafficRequest;
+  const third = context.loadTraffic();
+  assert.equal(pending.length, 3);
+  for (const { resolve } of pending) resolve({ credentials: [] });
+  await Promise.all([first, second, third]);
+  context.loadTraffic();
+  assert.equal(pending.length, 4);
+});
 test('home traffic keeps the category it was read for', async () => {
   const pending = [];
   const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'activity' };
