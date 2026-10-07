@@ -1,5 +1,5 @@
-//! Commands invoked by the panel's frontend. They run on the main thread, so
-//! proxy start/stop (which briefly blocks on the proxy's own runtime) is safe.
+//! Commands invoked by the panel. Daemon lifecycle operations run on their own
+//! worker; commands await completion without holding the application-state lock.
 
 use crate::{
     AppState,
@@ -215,23 +215,26 @@ pub async fn clear_traffic_compatibility(app: AppHandle) -> Result<bool> {
 }
 
 #[tauri::command]
-pub fn set_running(app: AppHandle, state: State<AppState>, running: bool) -> Result {
-    {
+pub async fn set_running(app: AppHandle, state: State<'_, AppState>, running: bool) -> Result {
+    let completion = {
         let mut core = state.core.lock().unwrap();
-        if running {
-            core.start();
-        } else {
-            core.stop()?;
-        }
-    }
+        if running { core.start()? } else { core.stop()? }
+    };
+    let result = completion
+        .await
+        .map_err(|_| "The proxy control worker stopped.".to_owned())?;
     tray::sync(&app);
-    Ok(())
+    result
 }
 
 #[tauri::command]
-pub fn restart_proxy(app: AppHandle, state: State<AppState>) {
-    state.core.lock().unwrap().start();
+pub async fn restart_proxy(app: AppHandle, state: State<'_, AppState>) -> Result {
+    let completion = state.core.lock().unwrap().start()?;
+    let result = completion
+        .await
+        .map_err(|_| "The proxy control worker stopped.".to_owned())?;
     tray::sync(&app);
+    result
 }
 
 /// Tests one proxy, or all of them when `name` is absent. With `stale_only`,

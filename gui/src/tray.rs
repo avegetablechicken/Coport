@@ -25,6 +25,7 @@ struct View {
     headline: String,
     stats: String,
     running: bool,
+    busy: bool,
 }
 
 pub struct Tray {
@@ -77,10 +78,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 if core.controller.is_running() {
                     let _ = core.stop();
                 } else {
-                    core.start();
+                    let _ = core.start();
                 }
             }
-            "restart" => app.state::<AppState>().core.lock().unwrap().start(),
+            "restart" => {
+                let _ = app.state::<AppState>().core.lock().unwrap().start();
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -171,6 +174,7 @@ pub fn sync(app: &AppHandle) {
             headline,
             stats,
             running: matches!(phase, Phase::Running { .. }),
+            busy: core.controller.busy(),
         }
     };
     let mut last = tray.view.lock().unwrap();
@@ -190,13 +194,14 @@ pub fn sync(app: &AppHandle) {
         let _ = tray.stats.set_text(&view.stats);
     }
     let relabel = old.is_none();
-    if relabel || old.map(|v| v.running) != Some(view.running) {
+    if relabel || old.map(|v| (v.running, v.busy)) != Some((view.running, view.busy)) {
         let _ = tray.toggle.set_text(if view.running {
             "Stop Proxy"
         } else {
             "Start Proxy"
         });
-        let _ = tray.restart.set_enabled(view.running);
+        let _ = tray.toggle.set_enabled(!view.busy);
+        let _ = tray.restart.set_enabled(view.running && !view.busy);
     }
     if relabel {
         let _ = tray.open.set_text("Open Panel");

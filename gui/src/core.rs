@@ -5,7 +5,7 @@ use crate::{
     describe,
     logs::{Entry, LogFeed},
     platform,
-    proxy::{Controller, Notify, Phase, Probe},
+    proxy::{BackgroundController as Controller, Completion, Notify, Phase, Probe},
     settings::Settings,
 };
 use coport::config::{Choice, Config, Routing, redacted_endpoint};
@@ -29,6 +29,7 @@ pub struct Core {
     notify: Notify,
     /// Config file modification time when the proxy last started.
     started_stamp: Option<Option<SystemTime>>,
+    attached_pid: Option<u32>,
     /// The Activity list's last read of its time range.
     activity_scan: Option<crate::activity::Scan>,
 }
@@ -96,14 +97,14 @@ impl Core {
             let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
             canonical(path) == canonical(&crate::settings::config_path())
         };
-        let started_stamp = attached.map(|status| {
+        let started_stamp = attached.as_ref().map(|status| {
             if same_file(&status.config_path) {
                 status.config_modified
             } else {
                 Some(SystemTime::UNIX_EPOCH)
             }
         });
-        let log_path = attached.map(|status| status.log_path.clone());
+        let log_path = attached.as_ref().map(|status| status.log_path.clone());
         Self {
             logs: LogFeed::new(
                 log_path.unwrap_or_else(crate::settings::log_path),
@@ -118,6 +119,7 @@ impl Core {
             account_states_pending: false,
             notify,
             started_stamp,
+            attached_pid: attached.map(|s| s.pid),
             activity_scan: None,
         }
     }
@@ -230,16 +232,40 @@ impl Core {
         }
     }
 
-    pub fn start(&mut self) {
-        self.logs.set_path(crate::settings::log_path());
-        self.started_stamp = Some(file_stamp(&self.config_path()));
-        self.controller
+    pub fn start(&mut self) -> Result<Completion, String> {
+        let result = self
+            .controller
             .start(&self.config_path(), crate::settings::log_path());
         self.invalidate_config();
+        result
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
+    pub fn start_if_stopped(&self) -> Result<Completion, String> {
+        self.controller
+            .start_if_stopped(&self.config_path(), crate::settings::log_path())
+    }
+
+    pub fn stop(&mut self) -> Result<Completion, String> {
         self.controller.stop()
+    }
+
+    fn sync_daemon(&mut self) {
+        let status = self.controller.daemon_status();
+        let pid = status.as_ref().map(|s| s.pid);
+        if pid != self.attached_pid {
+            if let Some(status) = status {
+                let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                self.started_stamp = Some(
+                    if canonical(&status.config_path) == canonical(&self.config_path()) {
+                        status.config_modified
+                    } else {
+                        Some(SystemTime::UNIX_EPOCH)
+                    },
+                );
+                self.logs.set_path(status.log_path);
+            }
+            self.attached_pid = pid;
+        }
     }
 
     /// Replaces the configuration with a validated YAML file; a running proxy
@@ -276,6 +302,7 @@ impl Core {
 
     pub fn snapshot(&mut self) -> Snapshot {
         self.refresh_config();
+        self.sync_daemon();
         let phase = self.controller.phase();
         let port = self.port();
         let stats = self.logs.stats();
@@ -289,18 +316,21 @@ impl Core {
             version: env!("CARGO_PKG_VERSION"),
             phase: match &phase {
                 Phase::Running { port, since } => PhaseDto {
+                    busy: self.controller.busy(),
                     state: "running",
                     port: *port,
                     uptime_secs: since.elapsed().as_secs(),
-                    error: None,
+                    error: self.controller.error(),
                 },
                 Phase::Stopped => PhaseDto {
+                    busy: self.controller.busy(),
                     state: "stopped",
                     port,
                     uptime_secs: 0,
-                    error: None,
+                    error: self.controller.error(),
                 },
                 Phase::Failed(message) => PhaseDto {
+                    busy: self.controller.busy(),
                     state: "failed",
                     port,
                     uptime_secs: 0,
@@ -638,6 +668,7 @@ impl Snapshot {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PhaseDto {
+    busy: bool,
     state: &'static str,
     port: u16,
     uptime_secs: u64,

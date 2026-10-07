@@ -25,6 +25,12 @@ use std::{
 };
 use tauri::{Emitter, Manager, RunEvent};
 
+#[derive(Default)]
+struct ExitState {
+    pending: std::sync::atomic::AtomicBool,
+    ready: std::sync::atomic::AtomicBool,
+}
+
 pub struct AppState {
     pub core: Mutex<core::Core>,
 }
@@ -84,6 +90,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(panel::PanelState::default())
         .manage(platform::Clipboard::default())
+        .manage(ExitState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::get_activity,
@@ -127,8 +134,8 @@ fn main() {
             let mut core = core::Core::new(settings.clone(), notify);
             let start = settings.start_proxy_on_launch && core.config_exists();
             open |= !core.config_exists();
-            if start && !core.controller.is_running() {
-                core.start();
+            if start {
+                let _ = core.start_if_stopped();
             }
             app.manage(AppState {
                 core: Mutex::new(core),
@@ -175,28 +182,52 @@ fn main() {
         }
         match event {
             RunEvent::ExitRequested { api, .. } => {
-                let result = {
-                    let state = app.state::<AppState>();
-                    let mut core = state.core.lock().unwrap();
-                    let keep = core.settings.keep_proxy_running_on_quit;
-                    core.controller.on_app_exit(keep)
-                };
-                if let Err(error) = result {
-                    // A failed stop must remain visible and retryable.
-                    eprintln!("{error}");
-                    api.prevent_exit();
-                    panel::show(app, None);
+                use std::sync::atomic::Ordering;
+                let exit = app.state::<ExitState>();
+                if exit.ready.load(Ordering::Acquire) {
+                    return;
                 }
+                api.prevent_exit();
+                if exit.pending.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let completion = {
+                    let state = app.state::<AppState>();
+                    let core = state.core.lock().unwrap();
+                    core.controller
+                        .on_app_exit(core.settings.keep_proxy_running_on_quit)
+                };
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = match completion {
+                        Ok(completion) => completion
+                            .await
+                            .unwrap_or_else(|_| Err("The proxy control worker stopped.".into())),
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => {
+                            handle
+                                .state::<ExitState>()
+                                .ready
+                                .store(true, Ordering::Release);
+                            handle.exit(0);
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            handle
+                                .state::<ExitState>()
+                                .pending
+                                .store(false, Ordering::Release);
+                            let h = handle.clone();
+                            let _ = handle.run_on_main_thread(move || panel::show(&h, None));
+                        }
+                    }
+                });
             }
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => panel::show(app, None),
-            RunEvent::Exit => {
-                app.state::<platform::Clipboard>().clear();
-                let state = app.state::<AppState>();
-                let mut core = state.core.lock().unwrap();
-                let keep = core.settings.keep_proxy_running_on_quit;
-                let _ = core.controller.on_app_exit(keep);
-            }
+            RunEvent::Exit => app.state::<platform::Clipboard>().clear(),
             _ => {}
         }
     });

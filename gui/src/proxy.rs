@@ -10,6 +10,10 @@ use std::{
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
+#[path = "background.rs"]
+mod background;
+pub use background::{BackgroundController, Completion};
+
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -80,6 +84,15 @@ impl Controller {
     }
 
     pub fn with_daemon(notify: Notify, daemon_dir: PathBuf, daemon_binary: PathBuf) -> Self {
+        Self::with_shared(notify, daemon_dir, daemon_binary, Default::default())
+    }
+
+    fn with_shared(
+        notify: Notify,
+        daemon_dir: PathBuf,
+        daemon_binary: PathBuf,
+        shared: Arc<Mutex<Shared>>,
+    ) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -88,7 +101,7 @@ impl Controller {
             .expect("Tokio runtime");
         let mut controller = Self {
             rt,
-            shared: Default::default(),
+            shared,
             running: None,
             notify,
             daemon_dir,

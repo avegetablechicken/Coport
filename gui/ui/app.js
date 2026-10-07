@@ -429,9 +429,9 @@ function message(kind, text, actions = "") {
 function proxyBlock() {
   const s = ui.snap;
   const state = s.phase.state;
-  const label = { running: "Running", stopped: "Stopped", failed: "Failed to start" }[state];
+  const label = s.phase.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Failed to start" }[state];
   const head = `<span class="state"><span class="dot ${state}"></span>${label}</span>
-    <button class="switch" role="switch" aria-checked="${state === "running"}" data-action="power" aria-label="Start or stop the proxy"></button>`;
+    <button class="switch" role="switch" aria-checked="${state === "running"}" data-action="power" ${s.phase.busy ? "disabled" : ""} aria-label="Start or stop the proxy"></button>`;
   let messages = "";
   if (!s.config.exists) {
     messages += message(
@@ -442,7 +442,7 @@ function proxyBlock() {
     );
   } else if (s.config.error) {
     messages += message("bad", esc(s.config.error), `<button class="btn" data-action="open" data-target="config">Edit Configuration</button>`);
-  } else if (state === "failed") {
+  } else if (s.phase.error) {
     messages += message("bad", esc(s.phase.error));
   }
   if (s.config.changedSinceStart) {
@@ -1495,8 +1495,12 @@ async function act(action, el) {
       await refresh();
       break;
     case "restart":
-      await invoke("restart_proxy");
-      toast("Proxy restarted");
+      try {
+        await invoke("restart_proxy");
+        toast("Proxy restarted");
+      } catch (e) {
+        toast(String(e));
+      }
       await refresh();
       break;
     case "copy": {

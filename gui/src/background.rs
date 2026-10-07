@@ -1,0 +1,368 @@
+//! The panel never waits on daemon I/O while holding its application-state lock.
+use super::{Controller, Notify, Phase, Probe, Shared, daemon};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, SystemTime},
+};
+
+pub type Completion = tokio::sync::oneshot::Receiver<Result<(), String>>;
+const INITIALIZING: usize = 1 << (usize::BITS - 1);
+
+type Operation = Box<dyn FnOnce(&mut Controller) -> Result<(), String> + Send>;
+struct Pending {
+    count: Arc<AtomicUsize>,
+    notify: Notify,
+    amount: usize,
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.amount, Ordering::AcqRel);
+        (self.notify)();
+    }
+}
+struct Job {
+    run: Operation,
+    reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pending: Option<Pending>,
+    exit: bool,
+}
+
+/// A single worker owns the controller and runtime. UI reads never lock it.
+pub struct BackgroundController {
+    jobs: mpsc::SyncSender<Job>,
+    shared: Arc<Mutex<Shared>>,
+    status: Arc<Mutex<Option<daemon::Status>>>,
+    error: Arc<Mutex<Option<String>>>,
+    pending: Arc<AtomicUsize>,
+    submission: Mutex<()>,
+    closing: Arc<AtomicBool>,
+    notify: Notify,
+}
+// These are display caches, replaced completely from the controller's state.
+// No partially updated control state is reused after poison.
+fn replace_cache<T>(cache: &Mutex<T>, value: T) {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = value;
+    cache.clear_poison();
+}
+impl BackgroundController {
+    pub fn new(notify: Notify) -> Self {
+        Self::with_daemon(
+            notify,
+            crate::settings::app_dir(),
+            daemon::binary_path().unwrap_or_default(),
+        )
+    }
+    fn with_daemon(notify: Notify, dir: PathBuf, binary: PathBuf) -> Self {
+        let (jobs, receiver) = mpsc::sync_channel::<Job>(16);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let status = Arc::new(Mutex::new(None));
+        let error = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(INITIALIZING));
+        let closing = Arc::new(AtomicBool::new(false));
+        let result = Self {
+            jobs,
+            shared: shared.clone(),
+            status: status.clone(),
+            error: error.clone(),
+            pending: pending.clone(),
+            submission: Mutex::new(()),
+            closing: closing.clone(),
+            notify: notify.clone(),
+        };
+        std::thread::Builder::new()
+            .name("proxy-control".into())
+            .spawn(move || {
+                let initial = Pending {
+                    count: pending,
+                    notify: notify.clone(),
+                    amount: INITIALIZING,
+                };
+                let mut controller = Controller::with_shared(notify.clone(), dir, binary, shared);
+                replace_cache(&status, controller.daemon_status().cloned());
+                drop(initial);
+                while let Ok(Job {
+                    run,
+                    reply,
+                    pending,
+                    exit,
+                }) = receiver.recv()
+                {
+                    let result = run(&mut controller);
+                    replace_cache(&status, controller.daemon_status().cloned());
+                    if pending.is_some() {
+                        replace_cache(&error, result.as_ref().err().cloned());
+                    } else {
+                        notify();
+                    }
+                    let finished = exit && result.is_ok();
+                    if exit && !finished {
+                        closing.store(false, Ordering::Release);
+                    }
+                    drop(pending);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+            })
+            .expect("proxy control thread");
+        result
+    }
+    fn operation(&self, run: Operation, exit: bool) -> Result<Completion, String> {
+        let _submission = self
+            .submission
+            .lock()
+            .map_err(|_| "The proxy operation queue is unavailable.".to_owned())?;
+        if exit {
+            if self.closing.swap(true, Ordering::AcqRel) {
+                return Err("Proxy shutdown is already in progress.".into());
+            }
+            self.pending.fetch_add(1, Ordering::AcqRel);
+        } else {
+            if self.closing.load(Ordering::Acquire) {
+                return Err("The application is closing.".into());
+            }
+            // Initialization and the operation count share one atomic value,
+            // so completing discovery cannot lose the queued auto-start.
+            let mut count = self.pending.load(Ordering::Acquire);
+            loop {
+                if count != 0 && count != INITIALIZING {
+                    return Err("A proxy operation is already in progress.".into());
+                }
+                match self.pending.compare_exchange_weak(
+                    count,
+                    count + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => count = current,
+                }
+            }
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = Job {
+            run,
+            reply: Some(reply),
+            pending: Some(Pending {
+                count: self.pending.clone(),
+                notify: self.notify.clone(),
+                amount: 1,
+            }),
+            exit,
+        };
+        if self.jobs.try_send(job).is_err() {
+            if exit {
+                self.closing.store(false, Ordering::Release);
+            }
+            return Err("The proxy control worker is unavailable.".into());
+        }
+        replace_cache(&self.error, None);
+        (self.notify)();
+        Ok(receive)
+    }
+    pub fn start(&self, config: &Path, log: PathBuf) -> Result<Completion, String> {
+        let config = config.to_owned();
+        self.operation(Box::new(move |c| c.try_start(&config, log)), false)
+    }
+    pub fn start_if_stopped(&self, config: &Path, log: PathBuf) -> Result<Completion, String> {
+        let config = config.to_owned();
+        self.operation(
+            Box::new(move |c| {
+                if c.is_running() {
+                    Ok(())
+                } else {
+                    c.try_start(&config, log)
+                }
+            }),
+            false,
+        )
+    }
+    pub fn stop(&self) -> Result<Completion, String> {
+        self.operation(Box::new(Controller::stop), false)
+    }
+    pub fn on_app_exit(&self, keep: bool) -> Result<Completion, String> {
+        self.operation(Box::new(move |c| c.on_app_exit(keep)), true)
+    }
+    pub fn busy(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
+    }
+    pub fn phase(&self) -> Phase {
+        self.shared
+            .lock()
+            .map(|s| s.phase.clone().unwrap_or(Phase::Stopped))
+            .unwrap_or_else(|_| {
+                Phase::Failed("Proxy status is unavailable; reopen the application.".into())
+            })
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self.phase(), Phase::Running { .. })
+    }
+    pub fn daemon_status(&self) -> Option<daemon::Status> {
+        self.status.lock().ok().and_then(|s| s.clone())
+    }
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|s| s.clone())
+    }
+    pub fn probes(&self) -> BTreeMap<String, (Probe, SystemTime)> {
+        self.shared
+            .lock()
+            .map(|s| {
+                s.probes
+                    .iter()
+                    .map(|(name, (probe, _, at))| (name.clone(), (probe.clone(), *at)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn diagnostic(&self, run: Operation) {
+        if !self.busy() && !self.closing.load(Ordering::Acquire) {
+            let _ = self.jobs.try_send(Job {
+                run,
+                reply: None,
+                pending: None,
+                exit: false,
+            });
+        }
+    }
+    pub fn probe(&self, name: &str, endpoint: &str) {
+        let (name, endpoint) = (name.to_owned(), endpoint.to_owned());
+        self.diagnostic(Box::new(move |c| {
+            c.probe(&name, &endpoint);
+            Ok(())
+        }));
+    }
+    pub fn probe_stale<'a>(
+        &self,
+        proxies: impl IntoIterator<Item = (&'a String, &'a String)>,
+        age: Duration,
+    ) {
+        let proxies: Vec<_> = proxies
+            .into_iter()
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .collect();
+        self.diagnostic(Box::new(move |c| {
+            c.probe_stale(proxies.iter().map(|(n, p)| (n, p)), age);
+            Ok(())
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_control_operations_leave_status_readable_and_quit_is_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = BackgroundController::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let operation = controller
+            .operation(
+                Box::new(move |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                }),
+                false,
+            )
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(controller.busy());
+        assert!(matches!(controller.phase(), Phase::Stopped));
+        assert!(controller.daemon_status().is_none());
+        assert!(controller.probes().is_empty());
+        assert!(
+            controller.stop().is_err(),
+            "a second operation must not race the first"
+        );
+        let mut exiting = controller.on_app_exit(true).unwrap();
+        assert!(matches!(
+            exiting.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        operation.blocking_recv().unwrap().unwrap();
+        exiting.blocking_recv().unwrap().unwrap();
+        assert!(!controller.busy());
+        assert!(
+            controller.stop().is_err(),
+            "no operation starts after exit was accepted"
+        );
+    }
+
+    #[test]
+    fn background_exit_preserves_or_stops_the_daemon_as_requested() {
+        let _guard = crate::daemon::spawn_guard();
+        for keep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_signal, daemon) = crate::daemon::tests::serve_in_thread(dir.path());
+            let (client, status) = crate::daemon::tests::wait_for_daemon(dir.path());
+            let controller = BackgroundController::with_daemon(
+                Arc::new(|| {}),
+                dir.path().into(),
+                dir.path().join("missing-daemon"),
+            );
+            // Auto-start queues behind discovery and must not restart a daemon
+            // it discovers there (the replacement helper deliberately does not exist).
+            controller
+                .start_if_stopped(
+                    &dir.path().join("config.yaml"),
+                    dir.path().join("proxy.log"),
+                )
+                .unwrap()
+                .blocking_recv()
+                .unwrap()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while controller.busy() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(controller.daemon_status().unwrap().pid, status.pid);
+            controller
+                .on_app_exit(keep)
+                .unwrap()
+                .blocking_recv()
+                .unwrap()
+                .unwrap();
+            if keep {
+                assert_eq!(client.status().unwrap().pid, status.pid);
+                client.stop().unwrap();
+            }
+            daemon.join().unwrap().unwrap();
+            assert!(crate::daemon::Client::discover(dir.path()).is_none());
+        }
+    }
+
+    #[test]
+    fn poisoned_display_cache_is_replaced_in_full() {
+        let cache = Arc::new(Mutex::new(Some("old")));
+        let copy = cache.clone();
+        let _ = std::thread::spawn(move || {
+            let mut value = copy.lock().unwrap();
+            *value = Some("partial");
+            panic!("interrupted cache replacement");
+        })
+        .join();
+        replace_cache(&cache, Some("complete"));
+        assert!(!cache.is_poisoned());
+        assert_eq!(*cache.lock().unwrap(), Some("complete"));
+    }
+}
