@@ -120,6 +120,9 @@ impl BackgroundController {
         result
     }
     fn operation(&self, run: Operation, exit: bool) -> Result<Completion, String> {
+        if self.shared.is_poisoned() {
+            return Err("Proxy control state is unavailable; reopen the application.".into());
+        }
         let _submission = self
             .submission
             .lock()
@@ -227,7 +230,7 @@ impl BackgroundController {
             .unwrap_or_default()
     }
     fn diagnostic(&self, run: Operation) {
-        if !self.busy() && !self.closing.load(Ordering::Acquire) {
+        if !self.busy() && !self.closing.load(Ordering::Acquire) && !self.shared.is_poisoned() {
             let _ = self.jobs.try_send(Job {
                 run,
                 reply: None,
@@ -349,6 +352,35 @@ mod tests {
             daemon.join().unwrap().unwrap();
             assert!(crate::daemon::Client::discover(dir.path()).is_none());
         }
+    }
+
+    #[test]
+    fn poisoned_control_state_is_reported_without_reusing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = BackgroundController::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        // Queue a harmless action behind discovery so no worker operation is active.
+        controller
+            .operation(Box::new(|_| Ok(())), false)
+            .unwrap()
+            .blocking_recv()
+            .unwrap()
+            .unwrap();
+        let shared = controller.shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _state = shared.lock().unwrap();
+            panic!("interrupted control update");
+        })
+        .join();
+        assert!(matches!(controller.phase(), Phase::Failed(_)));
+        assert!(controller.stop().is_err());
+        assert!(
+            controller.shared.is_poisoned(),
+            "control state must not be silently recovered"
+        );
     }
 
     #[test]

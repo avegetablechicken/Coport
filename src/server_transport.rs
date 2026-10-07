@@ -385,8 +385,22 @@ impl Server {
         .await;
     }
 
+    /// Health is a disposable observation cache. Rebuild it after a poisoned
+    /// update so list routes probe again; never reuse potentially partial data.
+    fn health_cache(&self) -> std::sync::MutexGuard<'_, HashMap<ProbeKey, ProbeState>> {
+        match self.probes.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                self.probes.clear_poison();
+                cache
+            }
+        }
+    }
+
     fn health_state(&self, key: &ProbeKey) -> ProbeState {
-        let mut probes = self.probes.lock().unwrap();
+        let mut probes = self.health_cache();
         if probes.len() >= 256 && !probes.contains_key(key) {
             if let Some(old) = probes.keys().next().cloned() {
                 probes.remove(&old);
@@ -412,9 +426,7 @@ impl Server {
 
     pub(super) async fn refresh_probes(&self) {
         let entries: Vec<_> = self
-            .probes
-            .lock()
-            .unwrap()
+            .health_cache()
             .iter()
             .map(|(key, state)| (key.clone(), state.clone()))
             .collect();
@@ -611,6 +623,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn poisoned_health_cache_is_discarded_without_changing_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:9000\ncodex:\n  homes: []\n  routing:\n    api_key_fallback: selected\nclaude:\n  config_dirs: []\n").unwrap();
+        let server = Arc::new(Server::new(
+            config,
+            Arc::new(Logger::new(dir.path().join("proxy.log"))),
+        ));
+        let key = ProbeKey::http(
+            "http://127.0.0.1:9000",
+            &Url::parse("https://example.invalid/").unwrap(),
+            false,
+        );
+        let state = server.health_state(&key);
+        state.try_lock().unwrap().observe(ProbeResult::HardFailure);
+        let copy = server.clone();
+        let _ = std::thread::spawn(move || {
+            let _cache = copy.probes.lock().unwrap();
+            panic!("interrupted health update");
+        })
+        .join();
+        let rebuilt = server.health_state(&key);
+        assert!(!Arc::ptr_eq(&state, &rebuilt));
+        assert!(!rebuilt.try_lock().unwrap().initialized);
+        assert!(!server.probes.is_poisoned());
+        assert_eq!(
+            server
+                .config
+                .codex
+                .routing
+                .api_key_fallback
+                .as_ref()
+                .unwrap()
+                .label(),
+            "selected"
+        );
+    }
 
     #[tokio::test]
     async fn cold_probe_does_not_block_requests_or_overwrite_their_success() {
