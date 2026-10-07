@@ -1359,9 +1359,10 @@ mod tests {
         let path = dir.path().join("proxy.log");
         let history = dir.path().join("history");
         std::fs::create_dir(&history).unwrap();
+        let timestamp = (Local::now() - chrono::Duration::days(2)).to_rfc3339();
         let row = |status: &str, id: &str| {
             serde_json::json!({
-                "timestamp": (Local::now() - chrono::Duration::days(2)).to_rfc3339(),
+                "timestamp": timestamp,
                 "event":"request_finished", "service":"claude", "request_id":id,
                 "status":status, "received_bytes":"100"
             })
@@ -1369,7 +1370,10 @@ mod tests {
                 + "\n"
         };
         let archive = history.join("proxy.log.1.archived.jsonl");
-        std::fs::write(&archive, row("200", "a")).unwrap();
+        let original = row("200", "a");
+        let changed = row("500", "a");
+        assert_eq!(original.len(), changed.len());
+        std::fs::write(&archive, &original).unwrap();
         let modified = std::fs::metadata(&archive).unwrap().modified().unwrap();
         let errors = || {
             read(&path, 43200, &BTreeMap::new(), TrafficScope::All)
@@ -1380,10 +1384,13 @@ mod tests {
         assert_eq!(errors(), 0);
         // Rotated files never change in place, so the summary is reused: an
         // edit keeping the length and modification time is not read.
-        std::fs::write(&archive, row("500", "a")).unwrap();
+        std::fs::write(&archive, &changed).unwrap();
         let file = std::fs::File::options().write(true).open(&archive).unwrap();
         file.set_modified(modified).unwrap();
         drop(file);
+        let unchanged = std::fs::metadata(&archive).unwrap();
+        assert_eq!(unchanged.len(), original.len() as u64);
+        assert_eq!(unchanged.modified().unwrap(), modified);
         assert_eq!(errors(), 0);
         // A different stamp is a different file.
         std::fs::write(&archive, row("500", "ab")).unwrap();
