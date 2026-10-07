@@ -1742,8 +1742,6 @@ document.addEventListener("keydown", (event) => {
     invoke("quit_app");
   } else if (mod && event.key === ",") {
     act("page", { dataset: { page: "settings" } });
-  } else if (event.key === "Enter" && event.target.id === "config-path") {
-    act("apply-path");
   }
 });
 
