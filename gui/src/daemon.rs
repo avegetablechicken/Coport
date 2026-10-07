@@ -453,6 +453,47 @@ pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) mod tests {
     use super::*;
 
+    /// A control endpoint registered in `dir` that answers status requests
+    /// while `up` is set and otherwise drops them, like a daemon that stalls.
+    pub(crate) fn fake_daemon(dir: &Path, up: Arc<std::sync::atomic::AtomicBool>) -> u16 {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = Endpoint {
+            port,
+            token: "fake".into(),
+        };
+        std::fs::write(dir.join(ENDPOINT), serde_json::to_vec(&endpoint).unwrap()).unwrap();
+        let dir = dir.to_owned();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                if !up.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let mut length = [0; 4];
+                if stream.read_exact(&mut length).is_err() {
+                    continue;
+                }
+                let mut request = vec![0; u32::from_be_bytes(length) as usize];
+                if stream.read_exact(&mut request).is_err() {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(&Response::Status(Status {
+                    pid: 1,
+                    port,
+                    uptime_ms: 0,
+                    config_path: dir.join("config.yaml"),
+                    log_path: dir.join("proxy.log"),
+                    config_modified: None,
+                }))
+                .unwrap();
+                let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
+                let _ = stream.write_all(&bytes);
+            }
+        });
+        port
+    }
+
     /// Serves `dir` in-process until the returned sender fires or a Stop request arrives.
     pub(crate) fn serve_in_thread(
         dir: &Path,

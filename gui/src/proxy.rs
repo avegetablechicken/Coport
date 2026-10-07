@@ -159,28 +159,61 @@ impl Controller {
         let notify = self.notify.clone();
         let monitor_client = client.clone();
         let monitor = self.rt.spawn(async move {
+            // One slow reply is not a lost daemon, and contact may come back.
+            const LOST_AFTER: u32 = 3;
+            let mut failures = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let client = monitor_client.clone();
                 let result = tokio::task::spawn_blocking(move || client.status()).await;
-                if !matches!(result, Ok(Ok(_))) {
-                    let mut shared = shared.lock().unwrap();
-                    if shared.generation != generation {
-                        break;
-                    }
-                    shared.phase = Some(Phase::Failed(
-                        "Lost contact with the proxy daemon. Restart to reconnect.".into(),
-                    ));
-                    drop(shared);
-                    notify();
+                let mut shared = shared.lock().unwrap();
+                if shared.generation != generation {
                     break;
                 }
+                match result {
+                    Ok(Ok(status)) => {
+                        let lost = matches!(shared.phase, Some(Phase::Failed(_)));
+                        failures = 0;
+                        if !lost {
+                            continue;
+                        }
+                        shared.phase = Some(Phase::Running {
+                            port: status.port,
+                            since: Instant::now()
+                                .checked_sub(Duration::from_millis(status.uptime_ms))
+                                .unwrap_or_else(Instant::now),
+                        });
+                    }
+                    _ => {
+                        failures += 1;
+                        if failures != LOST_AFTER {
+                            continue;
+                        }
+                        shared.phase = Some(Phase::Failed(
+                            "Lost contact with the proxy daemon. Restart to reconnect.".into(),
+                        ));
+                    }
+                }
+                drop(shared);
+                notify();
             }
         });
         self.running = Some(Running { client, monitor });
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        // A daemon this GUI lost track of, such as one that answered discovery
+        // too slowly at launch, would otherwise keep its port and never stop.
+        if self.running.is_none()
+            && let Some((client, status)) = daemon::Client::discover(&self.daemon_dir)
+        {
+            self.attach(client, status);
+        }
+        self.stop_attached()
+    }
+
+    /// Stops only the daemon this controller is attached to, if any.
+    fn stop_attached(&mut self) -> Result<(), String> {
         if let Some(running) = self.running.as_ref() {
             if let Err(error) = running.client.stop() {
                 let message = format!("Cannot stop proxy daemon: {error}");
@@ -284,7 +317,8 @@ impl Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // A detached daemon was deliberately kept running.
+        let _ = self.stop_attached();
     }
 }
 
@@ -365,6 +399,53 @@ fn host_port(endpoint: &str) -> Option<(String, u16)> {
 mod tests {
     use super::{Controller, Exit, Phase, host_port, is_local, parse_trace};
     use std::sync::Arc;
+
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !predicate() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn a_stalled_daemon_is_lost_only_after_repeated_failures_and_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(AtomicBool::new(true));
+        crate::daemon::tests::fake_daemon(dir.path(), up.clone());
+        let controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("missing-daemon"),
+        );
+        assert!(controller.is_running());
+        up.store(false, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(controller.is_running(), "{:?}", controller.phase());
+        wait_for(|| matches!(controller.phase(), Phase::Failed(_)));
+        up.store(true, Ordering::SeqCst);
+        wait_for(|| controller.is_running());
+    }
+
+    #[test]
+    fn stop_finds_a_daemon_that_was_not_attached() {
+        let _guard = crate::daemon::spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("missing-daemon"),
+        );
+        assert!(controller.daemon_status().is_none());
+        let (_signal, daemon) = crate::daemon::tests::serve_in_thread(dir.path());
+        crate::daemon::tests::wait_for_daemon(dir.path());
+        controller.stop().unwrap();
+        wait_for(|| daemon.is_finished());
+        daemon.join().unwrap().unwrap();
+        assert!(crate::daemon::Client::discover(dir.path()).is_none());
+        assert!(matches!(controller.phase(), Phase::Stopped));
+    }
 
     #[test]
     fn missing_helper_reports_failure_without_starting_in_process() {
