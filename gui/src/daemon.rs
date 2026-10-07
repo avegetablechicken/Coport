@@ -267,6 +267,37 @@ async fn respond(stream: &mut tokio::net::TcpStream, response: Response) -> io::
     stream.write_all(&bytes).await
 }
 
+/// Answers one control connection. Each runs in its own task, so a peer that
+/// connects and never sends cannot delay requests on other connections.
+async fn handle_control(
+    mut stream: tokio::net::TcpStream,
+    token: Arc<str>,
+    status: Arc<Status>,
+    started: Instant,
+    stops: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
+) {
+    let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
+    let Ok(Ok(request)) = request else {
+        return;
+    };
+    let response = if request.token != *token {
+        Response::Error("Unauthorized".into())
+    } else {
+        match request.action {
+            Action::Status => Response::Status(Status {
+                uptime_ms: started.elapsed().as_millis() as u64,
+                ..Status::clone(&status)
+            }),
+            // The serve loop acknowledges once the listener has been released.
+            Action::Stop => {
+                let _ = stops.send(stream);
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, response)).await;
+}
+
 async fn termination() {
     #[cfg(unix)]
     {
@@ -282,6 +313,15 @@ async fn termination() {
 
 /// Runs without Tauri, a WebView, a tray icon, or any GUI lifecycle hooks.
 pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
+    serve_until(dir, config, log, termination()).await
+}
+
+async fn serve_until(
+    dir: &Path,
+    config: &Path,
+    log: &Path,
+    signal: impl std::future::Future<Output = ()>,
+) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let lock = lock_file(&dir.join("daemon.lock"))?;
     lock.try_lock().map_err(|error| match error {
@@ -336,7 +376,16 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(&registration.path).map_err(|e| e.error)?;
 
-    let signal = termination();
+    let token: Arc<str> = endpoint.token.into();
+    let status = Arc::new(Status {
+        pid: std::process::id(),
+        port,
+        uptime_ms: 0,
+        config_path,
+        log_path,
+        config_modified,
+    });
+    let (stops, mut stop_requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::pin!(signal);
     let mut stop_client = None;
     let result = loop {
@@ -348,23 +397,10 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
                 logger.write("server_stopped", Default::default());
                 return result.map_err(io::Error::other)?;
             }
+            Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
             accepted = control.accept() => {
-                let (mut stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
-                let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
-                let Ok(Ok(request)) = request else { continue; };
-                if request.token != endpoint.token {
-                    let _ = tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, Response::Error("Unauthorized".into()))).await;
-                    continue;
-                }
-                match request.action {
-                    Action::Status => {
-                        let status = Status { pid: std::process::id(), port,
-                            uptime_ms: started.elapsed().as_millis() as u64,
-                            config_path: config_path.clone(), log_path: log_path.clone(), config_modified };
-                        let _ = tokio::time::timeout(Duration::from_millis(500), respond(&mut stream, Response::Status(status))).await;
-                    }
-                    Action::Stop => { stop_client = Some(stream); break Ok(()); }
-                }
+                let (stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
+                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, stops.clone()));
             }
         }
     };
@@ -385,7 +421,13 @@ pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
     // Remove discovery and unlock before acknowledging, so an immediate restart works.
     drop(control);
     drop(registration);
-    if let Some(mut stream) = stop_client {
+    // Stop requests that raced the first one get the same answer.
+    stop_requests.close();
+    let mut stop_clients: Vec<_> = stop_client.into_iter().collect();
+    while let Ok(stream) = stop_requests.try_recv() {
+        stop_clients.push(stream);
+    }
+    for mut stream in stop_clients {
         let response = match &stopped {
             Ok(()) => Response::Stopped,
             Err(e) => Response::Error(e.to_string()),
@@ -408,8 +450,75 @@ pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Serves `dir` in-process until the returned sender fires or a Stop request arrives.
+    pub(crate) fn serve_in_thread(
+        dir: &Path,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n"
+            ),
+        )
+        .unwrap();
+        let (signal, terminated) = tokio::sync::oneshot::channel::<()>();
+        let dir = dir.to_owned();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(serve_until(&dir, &config, &dir.join("proxy.log"), async {
+                    let _ = terminated.await;
+                }))
+        });
+        (signal, thread)
+    }
+
+    pub(crate) fn wait_for_daemon(dir: &Path) -> (Client, Status) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(found) = Client::discover(dir) {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "Daemon did not become ready");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn idle_control_connections_do_not_delay_status_or_stop() {
+        let _guard = spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (_signal, daemon) = serve_in_thread(dir.path());
+        let (client, status) = wait_for_daemon(dir.path());
+        // Each would hold a one-at-a-time control loop for its full read timeout.
+        let idle: Vec<_> = (0..3)
+            .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, client.endpoint.port)).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..3 {
+            assert_eq!(client.status().unwrap().pid, status.pid);
+        }
+        client.stop().unwrap();
+        daemon.join().unwrap().unwrap();
+        assert!(Client::discover(dir.path()).is_none());
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, status.port)).unwrap();
+        drop(idle);
+    }
 
     #[test]
     fn unreachable_daemon_is_stopped_only_after_its_lock_is_released() {
