@@ -50,6 +50,9 @@ struct Shared {
     /// Each result with when its test started: monotonic time for its age,
     /// wall-clock time to order it against logged observations.
     probes: BTreeMap<String, (Probe, Instant, SystemTime)>,
+    /// Tests still running, by proxy. A background refresh keeps the last
+    /// result shown meanwhile instead of a pending state.
+    testing: BTreeMap<String, usize>,
 }
 
 struct Running {
@@ -254,16 +257,29 @@ impl Controller {
         }
     }
 
-    /// Tests an outbound proxy. Proxies on this machine (typically local
-    /// clients that switch nodes) get a request through them to learn the
-    /// exit address; other proxies get a TCP connection check.
+    /// Tests an outbound proxy, showing it as pending until the result.
+    /// Proxies on this machine (typically local clients that switch nodes)
+    /// get a request through them to learn the exit address; other proxies
+    /// get a TCP connection check.
     pub fn probe(&self, name: &str, endpoint: &str) {
+        self.test(name, endpoint, true);
+    }
+
+    fn test(&self, name: &str, endpoint: &str, show_progress: bool) {
         let Some(addr) = host_port(endpoint) else {
             self.set_probe(name, Probe::Unreachable("Invalid proxy URL".into()));
             return;
         };
-        self.set_probe(name, Probe::Pending);
         let started = (Instant::now(), SystemTime::now());
+        {
+            let mut shared = self.lock();
+            *shared.testing.entry(name.to_owned()).or_default() += 1;
+            if show_progress {
+                shared
+                    .probes
+                    .insert(name.to_owned(), (Probe::Pending, started.0, started.1));
+            }
+        }
         let shared = self.shared.clone();
         let notify = self.notify.clone();
         let name = name.to_owned();
@@ -274,32 +290,45 @@ impl Controller {
             } else {
                 connect(addr).await
             };
-            shared
-                .lock()
-                .unwrap()
+            let mut shared = shared.lock().unwrap();
+            if let Some(running) = shared.testing.get_mut(&name) {
+                *running -= 1;
+                if *running == 0 {
+                    shared.testing.remove(&name);
+                }
+            }
+            // A test started later, such as a manual one, has the newer result.
+            if shared
                 .probes
-                .insert(name, (probe, started.0, started.1));
+                .get(&name)
+                .is_none_or(|(_, at, _)| *at <= started.0)
+            {
+                shared.probes.insert(name, (probe, started.0, started.1));
+            }
+            drop(shared);
             notify();
         });
     }
 
-    /// Probes proxies without a result newer than `max_age`.
+    /// Tests, in the background, proxies without a result newer than
+    /// `max_age`; the last result stays shown until the new one arrives.
     pub fn probe_stale<'a>(
         &self,
         proxies: impl IntoIterator<Item = (&'a String, &'a String)>,
         max_age: Duration,
     ) {
         for (name, endpoint) in proxies {
-            // A wall clock set back would make every result look new.
-            let stale = self
-                .lock()
-                .probes
-                .get(name)
-                .is_none_or(|(probe, started, _)| {
-                    !matches!(probe, Probe::Pending) && started.elapsed() > max_age
-                });
+            let stale = {
+                let shared = self.lock();
+                // A wall clock set back would make every result look new.
+                !shared.testing.contains_key(name)
+                    && shared
+                        .probes
+                        .get(name)
+                        .is_none_or(|(_, started, _)| started.elapsed() > max_age)
+            };
             if stale {
-                self.probe(name, endpoint);
+                self.test(name, endpoint, false);
             }
         }
     }
@@ -478,6 +507,45 @@ mod tests {
             &controller.probes()["proxy"].0,
             Probe::Unreachable(error) if error == "Invalid proxy URL"
         ));
+    }
+
+    #[test]
+    fn background_refreshes_keep_the_last_result_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("missing-daemon"),
+        );
+        // A local proxy that accepts but never answers keeps a test running.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", silent.local_addr().unwrap());
+        let name = "local".to_owned();
+        let earlier = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
+        let reachable = Probe::Reachable {
+            latency: std::time::Duration::from_millis(5),
+            exit: None,
+        };
+        controller.lock().probes.insert(
+            name.clone(),
+            (reachable, earlier, std::time::SystemTime::now()),
+        );
+        let refresh =
+            || controller.probe_stale([(&name, &endpoint)], std::time::Duration::from_secs(1));
+        refresh();
+        assert!(matches!(
+            controller.probes()[&name].0,
+            Probe::Reachable { .. }
+        ));
+        // A refresh already running is not started again.
+        refresh();
+        assert_eq!(controller.lock().testing[&name], 1);
+        // A manual test still shows its progress.
+        controller.probe(&name, &endpoint);
+        assert!(matches!(controller.probes()[&name].0, Probe::Pending));
+        assert_eq!(controller.lock().testing[&name], 2);
     }
 
     #[test]
