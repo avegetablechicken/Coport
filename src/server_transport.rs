@@ -23,6 +23,8 @@ pub(super) struct ProbeHealth {
     pub(super) next_check: Option<Instant>,
     pub(super) revision: u64,
     pub(super) monitored: bool,
+    // Serialize cold probes without holding the health state across network I/O.
+    initial_probe: Arc<tokio::sync::Mutex<()>>,
 }
 impl ProbeHealth {
     pub(super) fn observe(&mut self, result: ProbeResult) {
@@ -250,8 +252,22 @@ impl Server {
             let mut cached = deadline.run(state.lock()).await?;
             cached.monitored = true;
             if !cached.initialized {
-                cached.observe(deadline.run(self.probe(&key)).await?);
-                self.log_health(&key, &cached, "probe");
+                let gate = cached.initial_probe.clone();
+                drop(cached);
+                let _probe = deadline.run(gate.lock()).await?;
+                cached = deadline.run(state.lock()).await?;
+                // Another cold probe or a real request may have initialized it.
+                if !cached.initialized {
+                    let revision = cached.revision;
+                    drop(cached);
+                    let result = deadline.run(self.probe(&key)).await?;
+                    cached = deadline.run(state.lock()).await?;
+                    // As with background probes, newer request evidence wins.
+                    if cached.revision == revision {
+                        cached.observe(result);
+                        self.log_health(&key, &cached, "probe");
+                    }
+                }
             }
             let available = !cached.unavailable;
             drop(cached);
@@ -587,5 +603,115 @@ impl Server {
         Err(Error::config(
             "No configured CONNECT route could establish a tunnel.",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cold_probe_does_not_block_requests_or_overwrite_their_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let heads = Arc::new(AtomicUsize::new(0));
+        let (began, released, count) = (started.clone(), release.clone(), heads.clone());
+        let upstream = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (began, released, count) = (began.clone(), released.clone(), count.clone());
+                tasks.spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match socket.read_u8().await {
+                            Ok(byte) => head.push(byte),
+                            Err(_) => return,
+                        }
+                    }
+                    let status = if head.starts_with(b"HEAD ") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        began.notify_one();
+                        released.notified().await;
+                        "407 Proxy Authentication Required"
+                    } else {
+                        "200 OK"
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let server = Arc::new(Server::new(
+            config,
+            Arc::new(Logger::new(dir.path().join("proxy.log"))),
+        ));
+        let log = || RequestLog {
+            logger: server.logger.clone(),
+            fields: Default::default(),
+            started: Instant::now(),
+            status: 200,
+            bytes: 0,
+            outcome: "test_finished",
+        };
+        let cold = |mut log| {
+            let (server, url) = (server.clone(), url.clone());
+            tokio::spawn(async move {
+                server
+                    .select_transport(
+                        &Choice::List(vec!["none".into()]),
+                        &url,
+                        &mut log,
+                        false,
+                        Deadline::new(3.0),
+                    )
+                    .await
+            })
+        };
+        let first = cold(log());
+        started.notified().await;
+        let second = cold(log());
+        // A scalar choice skips probing. Its already-successful response must
+        // return while the cold HEAD is still waiting for the release signal.
+        let mut request_log = log();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            server.send_via(
+                &Choice::direct(),
+                reqwest::Request::new(hyper::Method::GET, url.clone()),
+                false,
+                Deadline::new(3.0),
+                &mut request_log,
+            ),
+        )
+        .await;
+        release.notify_one();
+        let selected = first.await.unwrap();
+        let also_selected = second.await.unwrap();
+        upstream.abort();
+        assert_eq!(
+            response
+                .expect("response waited behind the cold probe")
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(selected.unwrap(), "none");
+        assert_eq!(also_selected.unwrap(), "none");
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "cold requests must share a probe"
+        );
+        let state = server.health_state(&ProbeKey::http("none", &url, false));
+        assert!(
+            !state.lock().await.unavailable,
+            "late 407 probe must not replace the successful request"
+        );
     }
 }
