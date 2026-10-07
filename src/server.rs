@@ -524,11 +524,10 @@ impl Server {
         target: &str,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        if incoming
-            .headers()
-            .keys()
-            .any(|name| incoming.headers().get_all(name).iter().count() > 1)
-        {
+        if incoming.headers().keys().any(|name| {
+            !repeatable_request_header(name.as_str())
+                && incoming.headers().get_all(name).iter().count() > 1
+        }) {
             return Err(Error::new(400, "Duplicate request header."));
         }
         if incoming
@@ -1119,6 +1118,21 @@ async fn read_body(body: Incoming) -> Result<Bytes> {
     })?
     .to_bytes())
 }
+// Only known list-valued request fields may repeat. Authentication, routing,
+// Host and message framing remain single-valued; unknown duplicates fail closed.
+fn repeatable_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "connection"
+            | "pragma"
+            | "via"
+    )
+}
+
 // Reject ambiguity before Hyper normalizes duplicate Content-Length or TE+CL.
 // Buffered bytes (including any body prefix) are then passed to Hyper unchanged.
 async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Bytes> {
@@ -1146,7 +1160,7 @@ async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<B
                     .split_once(':')
                     .ok_or(Error::new(400, "Invalid request header."))?;
                 let name = name.to_ascii_lowercase();
-                if !names.insert(name.clone()) {
+                if !names.insert(name.clone()) && !repeatable_request_header(&name) {
                     return Err(Error::new(400, "Duplicate request header."));
                 }
                 if name == "transfer-encoding" && !value.trim().eq_ignore_ascii_case("chunked") {

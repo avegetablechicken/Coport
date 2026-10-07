@@ -2607,3 +2607,38 @@ async fn rejected_requests_with_unread_bodies_receive_a_complete_response() {
         );
     }
 }
+
+#[tokio::test]
+async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_rejected() {
+    let mut fixture = fixture("direct", "redirect").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket.write_all(b"GET /models HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nAccept: application/json\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\nConnection: x-test-hop\r\nx-test-hop: remove-me\r\n\r\n").await.unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 302"));
+    let forwarded = fixture.requests.recv().await.unwrap().to_lowercase();
+    assert!(forwarded.contains("accept: application/json"));
+    assert!(forwarded.contains("accept: text/event-stream"));
+    assert!(!forwarded.contains("x-test-hop"));
+    for extra in [
+        "Host: other\r\n",
+        "Authorization: Bearer other\r\n",
+        "x-api-key: first\r\nx-api-key: second\r\n",
+        "chatgpt-account-id: first\r\nchatgpt-account-id: second\r\n",
+        "Content-Length: 0\r\nContent-Length: 0\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket.write_all(format!("GET /models HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\n{extra}\r\n").as_bytes()).await.unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+}
