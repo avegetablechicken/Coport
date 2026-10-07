@@ -449,49 +449,48 @@ fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
     }
 }
 
-/// Mirror newer daemon observations without adding a separate refresh schedule.
+/// Mirrors daemon observations newer than a proxy's standalone test, without
+/// a separate refresh schedule. The daemon tracks each destination of a proxy
+/// separately: any that works shows the proxy available, and the proxy fails
+/// only when every destination observed since has failed.
 fn sync_route_health(
     details: &mut ConfigDetails,
     probes: &BTreeMap<String, (Probe, SystemTime)>,
-    health: &BTreeMap<String, Entry>,
+    health: &BTreeMap<(String, String, String), Entry>,
     now: SystemTime,
 ) {
     for proxy in &mut details.proxies {
-        let Some(entry) = health.get(&proxy.endpoint) else {
-            continue;
-        };
-        let Some(time) = entry.time.map(SystemTime::from) else {
-            continue;
-        };
-        if time > now
-            || probes
-                .get(&proxy.name)
-                .is_some_and(|(_, checked)| *checked >= time)
-        {
-            continue;
-        }
-        match entry.get("available") {
-            Some("true") => {
-                // Runtime observations carry no latency or exit-IP measurement.
-                // Preserve measurements from a successful standalone test.
-                if !proxy.probe.as_ref().is_some_and(|p| p.state == "ok") {
-                    proxy.probe = Some(ProbeDto {
-                        state: "ok",
-                        ..Default::default()
-                    });
-                }
-            }
-            Some("false") => {
+        let checked = probes.get(&proxy.name).map(|(_, checked)| *checked);
+        let newer: Vec<&Entry> = health
+            .range((proxy.endpoint.clone(), String::new(), String::new())..)
+            .take_while(|((endpoint, _, _), _)| *endpoint == proxy.endpoint)
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                entry
+                    .time
+                    .map(SystemTime::from)
+                    .is_some_and(|time| time <= now && checked.is_none_or(|checked| checked < time))
+            })
+            .collect();
+        if newer.iter().any(|e| e.get("available") == Some("true")) {
+            // Runtime observations carry no latency or exit-IP measurement.
+            // Preserve measurements from a successful standalone test.
+            if !proxy.probe.as_ref().is_some_and(|p| p.state == "ok") {
                 proxy.probe = Some(ProbeDto {
-                    state: "error",
-                    error: Some(format!(
-                        "Backend route unavailable: {}",
-                        entry.get("origin").unwrap_or("unknown destination")
-                    )),
+                    state: "ok",
                     ..Default::default()
                 });
             }
-            _ => {}
+        } else if !newer.is_empty() && newer.iter().all(|e| e.get("available") == Some("false")) {
+            let origins: Vec<_> = newer
+                .iter()
+                .map(|e| e.get("origin").unwrap_or("unknown destination"))
+                .collect();
+            proxy.probe = Some(ProbeDto {
+                state: "error",
+                error: Some(format!("Backend route unavailable: {}", origins.join(", "))),
+                ..Default::default()
+            });
         }
     }
 }
@@ -864,8 +863,13 @@ mod tests {
             ),
         ]);
         let endpoint = "http://127.0.0.1:12345".to_owned();
-        let mut health = BTreeMap::from([(
+        let route = (
             endpoint.clone(),
+            "https://api.openai.com".to_owned(),
+            "connect".to_owned(),
+        );
+        let mut health = BTreeMap::from([(
+            route.clone(),
             Entry {
                 seq: 1,
                 time: Some(now.into()),
@@ -945,7 +949,7 @@ mod tests {
         // newer unavailable result must also reach the GUI, without a test.
         for (available, expected) in [("false", "error"), ("true", "ok")] {
             health
-                .get_mut(&endpoint)
+                .get_mut(&route)
                 .unwrap()
                 .fields
                 .insert("available".into(), serde_json::json!(available));
@@ -977,7 +981,7 @@ mod tests {
             (None, old),
             (Some(now), now + Duration::from_secs(1)),
         ] {
-            let entry = health.get_mut(&endpoint).unwrap();
+            let entry = health.get_mut(&route).unwrap();
             entry.time = time.map(Into::into);
             probes.insert(
                 "used".into(),
@@ -998,6 +1002,82 @@ mod tests {
                 "error"
             );
         }
+    }
+
+    #[test]
+    fn one_failing_destination_does_not_make_a_working_proxy_unreachable() {
+        use super::{details, sync_route_health};
+        use crate::proxy::Probe;
+        use std::{
+            collections::BTreeMap,
+            time::{Duration, SystemTime},
+        };
+
+        let config = parse_config(
+            "listen_port: 8787\nrequest_timeout_seconds: 30\nproxies:\n  used: http://127.0.0.1:12345\n",
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        let probes = BTreeMap::from([(
+            "used".to_owned(),
+            (
+                Probe::Unreachable("timed out".into()),
+                now - Duration::from_secs(10),
+            ),
+        )]);
+        let observation = |origin: &str, available: &str, age: u64| {
+            (
+                (
+                    "http://127.0.0.1:12345".to_owned(),
+                    origin.to_owned(),
+                    "connect".to_owned(),
+                ),
+                Entry {
+                    seq: 1,
+                    time: Some((now - Duration::from_secs(age)).into()),
+                    event: "route_health".into(),
+                    fields: serde_json::from_value(serde_json::json!({
+                        "proxy_endpoint": "http://127.0.0.1:12345", "origin": origin,
+                        "available": available
+                    }))
+                    .unwrap(),
+                },
+            )
+        };
+        let shown = |health: &BTreeMap<_, _>| {
+            let mut result = details(&config, &probes);
+            sync_route_health(&mut result, &probes, health, now);
+            result.proxies[0].probe.take().unwrap()
+        };
+        // A destination the exit cannot reach, observed last, leaves the
+        // proxy available while another destination works through it.
+        let mixed = BTreeMap::from([
+            observation("https://a.example", "true", 2),
+            observation("https://b.example", "false", 1),
+        ]);
+        assert_eq!(shown(&mixed).state, "ok");
+        // Every destination failing makes it unavailable, naming them.
+        let failing = BTreeMap::from([
+            observation("https://a.example", "false", 2),
+            observation("https://b.example", "false", 1),
+        ]);
+        let probe = shown(&failing);
+        assert_eq!(probe.state, "error");
+        assert_eq!(
+            probe.error.as_deref(),
+            Some("Backend route unavailable: https://a.example, https://b.example")
+        );
+        // A success older than the standalone test does not count.
+        let stale = BTreeMap::from([
+            observation("https://a.example", "true", 20),
+            observation("https://b.example", "false", 1),
+        ]);
+        let probe = shown(&stale);
+        assert_eq!(probe.state, "error");
+        assert_eq!(
+            probe.error.as_deref(),
+            Some("Backend route unavailable: https://b.example")
+        );
     }
 
     #[test]

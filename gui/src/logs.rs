@@ -167,7 +167,12 @@ impl LogFeed {
                 "current_route" | "route_unavailable" => stats.routes.push(e.clone()),
                 "route_health" => {
                     if let Some(endpoint) = e.get("proxy_endpoint") {
-                        stats.route_health.insert(endpoint.to_owned(), e.clone());
+                        let route = (
+                            endpoint.to_owned(),
+                            e.get("origin").unwrap_or_default().to_owned(),
+                            e.get("transport").unwrap_or_default().to_owned(),
+                        );
+                        stats.route_health.insert(route, e.clone());
                     }
                 }
                 _ => {}
@@ -344,7 +349,9 @@ pub struct Stats {
     pub per_minute: [u32; SPARK_MINUTES],
     pub errors_per_minute: [u32; SPARK_MINUTES],
     pub routes: Vec<Entry>,
-    pub route_health: BTreeMap<String, Entry>,
+    /// The latest health of each route since the server started, by proxy
+    /// endpoint, destination origin and transport, as the daemon tracks it.
+    pub route_health: BTreeMap<(String, String, String), Entry>,
 }
 
 #[cfg(test)]
@@ -357,11 +364,16 @@ mod tests {
             let feed = LogFeed {
                 store: Arc::new(Mutex::new(Store::default())),
             };
+            let health = |endpoint: &str, origin: &str, health: &str| {
+                serde_json::json!({"event":"route_health", "proxy_endpoint":endpoint,
+                    "origin":origin, "transport":"connect", "health":health})
+            };
             let events = [
-                serde_json::json!({"event":"route_health", "proxy_endpoint":"old", "health":"healthy"}),
+                health("old", "https://a.example", "healthy"),
                 serde_json::json!({"event":"server_started"}),
-                serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"unavailable"}),
-                serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"healthy"}),
+                health("used", "https://a.example", "unavailable"),
+                health("used", "https://a.example", "healthy"),
+                health("used", "https://b.example", "unavailable"),
             ];
             let mut lines = events
                 .iter()
@@ -369,13 +381,26 @@ mod tests {
                 .collect::<String>()
                 .into_bytes();
             assert!(feed.ingest(&mut lines));
+            let route = |origin: &str| ("used".to_owned(), origin.to_owned(), "connect".to_owned());
             let stats = feed.stats();
-            assert_eq!(stats.route_health.len(), 1);
-            assert_eq!(stats.route_health["used"].get("health"), Some("healthy"));
-            let mut failure = format!("{}{newline}", serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"unavailable"})).into_bytes();
+            // Each destination keeps its own latest observation.
+            assert_eq!(stats.route_health.len(), 2);
+            assert_eq!(
+                stats.route_health[&route("https://a.example")].get("health"),
+                Some("healthy")
+            );
+            assert_eq!(
+                stats.route_health[&route("https://b.example")].get("health"),
+                Some("unavailable")
+            );
+            let mut failure = format!(
+                "{}{newline}",
+                health("used", "https://a.example", "unavailable")
+            )
+            .into_bytes();
             feed.ingest(&mut failure);
             assert_eq!(
-                feed.stats().route_health["used"].get("health"),
+                feed.stats().route_health[&route("https://a.example")].get("health"),
                 Some("unavailable")
             );
         }
