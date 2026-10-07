@@ -960,7 +960,7 @@ impl Server {
                 };
                 use tokio::io::AsyncWriteExt;
                 let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
-                let _ = socket.shutdown().await;
+                close_http(&mut socket).await;
                 return;
             }
         };
@@ -968,7 +968,7 @@ impl Server {
         // Keep Hyper's upgrade handshake intact. Disabling keep-alive
         // overwrites Connection: Upgrade with Connection: close.
         // Ordinary HTTP responses explicitly send Connection: close.
-        let _ = http1::Builder::new()
+        let mut connection = http1::Builder::new()
             .max_buf_size(65536)
             .timer(TokioTimer::new())
             .header_read_timeout(Duration::from_secs(30))
@@ -976,12 +976,31 @@ impl Server {
                 TokioIo::new(PrefixedSocket { prefix, socket }),
                 service_fn(move |r| self.clone().handle(r, relay_tx.clone())),
             )
-            .with_upgrades()
-            .await;
+            .with_upgrades();
+        let _ = (&mut connection).await;
+        if let Some(parts) = connection.into_parts() {
+            close_http(&mut parts.io.into_inner()).await;
+        }
         if let Ok(relay) = relay_rx.try_recv() {
             relay.await;
         }
     }
+}
+
+/// Send FIN before discarding unread input. Closing a socket with a rejected
+/// request body still queued can reset TCP and erase the response at the peer.
+/// Drain only briefly and within the inbound size bound; upgrades never enter here.
+async fn close_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(socket: &mut S) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = tokio::time::timeout(Duration::from_millis(250), async {
+        socket.shutdown().await?;
+        tokio::io::copy(
+            &mut socket.take(32 * 1024 * 1024 + 65536),
+            &mut tokio::io::sink(),
+        )
+        .await
+    })
+    .await;
 }
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {

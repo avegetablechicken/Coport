@@ -2552,3 +2552,40 @@ async fn tls_and_plain_http_share_the_listening_port() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn rejected_requests_with_unread_bodies_receive_a_complete_response() {
+    let running = running("codex:\n  homes: []\nclaude:\n  config_dirs: []\n").await;
+    for path in ["/responses", "/health"] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let body = vec![b'x'; 64 * 1024];
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: local\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        socket.write_all(&request).await.unwrap();
+        let mut response = Vec::new();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+                .await
+                .unwrap();
+        assert!(result.is_ok(), "{path}: {result:?}");
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with(if path == "/health" {
+                "HTTP/1.1 200"
+            } else {
+                "HTTP/1.1 401"
+            }),
+            "{response}"
+        );
+        assert!(
+            response.contains("{\"ok\":true}")
+                || response.contains("A configured Bearer token is required.")
+        );
+    }
+}
