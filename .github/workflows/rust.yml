@@ -6,8 +6,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   msrv:
+    timeout-minutes: 20
     # Platform-specific dependencies (keyring backends, security-framework,
     # windows-sys, schannel) are only compiled on their own OS.
     strategy:
@@ -17,10 +22,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.85.1
       - run: cargo check --locked --all-targets
 
   test:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -28,8 +36,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -45,6 +54,7 @@ jobs:
           if-no-files-found: error
 
   gui:
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -52,8 +62,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: clippy
       - if: runner.os == 'Linux'
         run: |
