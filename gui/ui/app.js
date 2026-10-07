@@ -261,9 +261,11 @@ async function loadActivity(mode) {
     renderActivityList();
     return;
   }
-  // Older pages loaded below the first stay, minus what left a rolling range.
+  // Keep older pages only when the new page reaches the already loaded rows.
+  // Otherwise a burst larger than one page would leave an unpageable gap.
   const last = activity.rows.at(-1);
-  const older = mode === "live" && ui.activityPaged && activity.next
+  const overlaps = last && ui.rows.some((e) => e.time === last.time && e.seq === last.seq);
+  const older = mode === "live" && ui.activityPaged && activity.next && overlaps
     ? ui.rows.filter((e) => e.time >= ui.activityFrom && (e.time < last.time || (e.time === last.time && e.seq < last.seq)))
     : [];
   const update = () => {

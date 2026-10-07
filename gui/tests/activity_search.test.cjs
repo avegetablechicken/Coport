@@ -75,9 +75,9 @@ test('live keeps older pages below the new first page', async () => {
   const more = load('more');
   pending[1].resolve({ rows: [row(20, 2), row(10, 1)], next: { time: 10, seq: 1 } });
   await more;
-  // Two lines were written; the first page now ends one row newer.
+  // The refreshed page overlaps the previous first page.
   const live = load('live');
-  pending[2].resolve({ rows: [row(60, 6), row(50, 5)], next: { time: 50, seq: 5 } });
+  pending[2].resolve({ rows: [row(60, 6), row(50, 5), row(40, 4)], next: { time: 40, seq: 4 } });
   await live;
   assert.deepEqual(seqs(ui.rows), [6, 5, 4, 3, 2, 1]);
   assert.equal(JSON.stringify(ui.activityNext), '{"time":10,"seq":1}');
@@ -136,4 +136,22 @@ test('live refresh waits for the same initial query but a changed query starts i
   pending[1].resolve({ rows: [row(20, 2)], next: null });
   await changed;
   assert.deepEqual(seqs(ui.rows), [2]);
+});
+
+test('a live burst larger than a page resets pagination instead of skipping a gap', async () => {
+  const { ui, pending, load } = setup();
+  const rows = (from, count) => Array.from({ length: count }, (_, i) => row(from - i, from - i));
+  ui.rows = rows(2000, 1000);
+  ui.activityPaged = true;
+  ui.activityNext = { time: 1001, seq: 1001 };
+  const live = load('live');
+  pending[0].resolve({ rows: rows(3000, 500), next: { time: 2501, seq: 2501 } });
+  await live;
+  assert.equal(ui.rows.length, 500);
+  assert.equal(ui.activityPaged, false);
+  const more = load('more');
+  assert.equal(pending[1].query.after.seq, 2501);
+  pending[1].resolve({ rows: rows(2500, 500), next: { time: 2001, seq: 2001 } });
+  await more;
+  assert.deepEqual(seqs(ui.rows), seqs(rows(3000, 1000)));
 });
