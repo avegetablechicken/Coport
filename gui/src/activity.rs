@@ -12,6 +12,7 @@ const CAPACITY: usize = 20_000;
 
 /// What the Activity list shows: a filter and search within `[from, to)`
 /// (epoch milliseconds).
+#[derive(Clone)]
 pub struct Query {
     pub from: i64,
     pub to: i64,
@@ -19,6 +20,24 @@ pub struct Query {
     pub search_mode: String,
     /// Lowercased search text; empty matches everything.
     pub needle: String,
+}
+
+impl Query {
+    fn matching(&self) -> Matching {
+        Matching {
+            filter: self.filter.clone(),
+            search_mode: self.search_mode.clone(),
+            needle: self.needle.clone(),
+        }
+    }
+}
+
+/// The filter and search a read kept only the matches of.
+#[derive(Clone, PartialEq, Eq)]
+struct Matching {
+    filter: String,
+    search_mode: String,
+    needle: String,
 }
 
 /// A position in newest-first order; the next page holds older entries.
@@ -45,10 +64,36 @@ pub struct Scan {
     entries: Vec<Entry>,
     /// The range has older entries than the last one kept.
     truncated: bool,
+    /// Set when only the matches of one query were kept.
+    matching: Option<Matching>,
 }
 
 impl Scan {
+    /// Keeps every entry, so later filters and searches reuse the read.
     pub fn read(path: &Path, from: i64, to: i64, begin: Option<Cursor>) -> Result<Self, String> {
+        Self::read_where(path, from, to, begin, None, |_| true)
+    }
+
+    /// Keeps only the entries `keep` accepts for `query`, so a sparse filter or
+    /// search fills a page from one read instead of a read per capacity.
+    pub fn read_matching(
+        path: &Path,
+        query: &Query,
+        begin: Option<Cursor>,
+        keep: impl Fn(&Entry) -> bool,
+    ) -> Result<Self, String> {
+        let matching = Some(query.matching());
+        Self::read_where(path, query.from, query.to, begin, matching, keep)
+    }
+
+    fn read_where(
+        path: &Path,
+        from: i64,
+        to: i64,
+        begin: Option<Cursor>,
+        matching: Option<Matching>,
+        keep: impl Fn(&Entry) -> bool,
+    ) -> Result<Self, String> {
         let mut entries = Vec::new();
         let mut truncated = false;
         crate::traffic::for_each_entry(path, from, |entry| {
@@ -56,6 +101,9 @@ impl Scan {
                 return;
             };
             if key.time < from || key.time >= to || begin.is_some_and(|begin| key >= begin) {
+                return;
+            }
+            if !keep(&entry) {
                 return;
             }
             entries.push(entry);
@@ -72,14 +120,19 @@ impl Scan {
             begin,
             entries,
             truncated,
+            matching,
         })
     }
 
-    /// Whether this read can list the range of `path` after `after`.
-    pub fn covers(&self, path: &Path, from: i64, to: i64, after: Option<Cursor>) -> bool {
+    /// Whether this read can list `query`'s range of `path` after `after`.
+    pub fn covers(&self, path: &Path, query: &Query, after: Option<Cursor>) -> bool {
         self.path == path
-            && self.from == from
-            && self.to == to
+            && self.from == query.from
+            && self.to == query.to
+            && self
+                .matching
+                .as_ref()
+                .is_none_or(|matching| *matching == query.matching())
             && match (self.begin, after) {
                 (None, _) => true,
                 (Some(begin), Some(after)) => after <= begin,
@@ -166,8 +219,15 @@ mod tests {
         assert_eq!(ids(&rows), ["b"]);
         let (rows, _) = scan.page(None, 10, |e| e.get("request_id") != Some("b"));
         assert_eq!(ids(&rows), ["c", "a"]);
-        assert!(scan.covers(&path, now - 35 * 60_000, now - 7 * 60_000, None));
-        assert!(!scan.covers(&path, now - 36 * 60_000, now - 7 * 60_000, None));
+        let query = |from: i64| Query {
+            from,
+            to: now - 7 * 60_000,
+            filter: "all".into(),
+            search_mode: "keyword".into(),
+            needle: String::new(),
+        };
+        assert!(scan.covers(&path, &query(now - 35 * 60_000), None));
+        assert!(!scan.covers(&path, &query(now - 36 * 60_000), None));
     }
 
     #[test]
@@ -195,8 +255,15 @@ mod tests {
         let resume = resume.expect("older entries follow");
         assert_eq!(Some(resume), cursor(rows.last().unwrap()));
         let rest = Scan::read(&path, from, to, Some(resume)).unwrap();
-        assert!(rest.covers(&path, from, to, Some(resume)));
-        assert!(!rest.covers(&path, from, to, None));
+        let query = Query {
+            from,
+            to,
+            filter: "all".into(),
+            search_mode: "keyword".into(),
+            needle: String::new(),
+        };
+        assert!(rest.covers(&path, &query, Some(resume)));
+        assert!(!rest.covers(&path, &query, None));
         let (rows, resume) = rest.page(Some(resume), 10, |_| true);
         let numbers: Vec<_> = rows
             .iter()
@@ -204,5 +271,55 @@ mod tests {
             .collect();
         assert_eq!(numbers, [2, 1, 0]);
         assert_eq!(resume, None);
+    }
+
+    #[test]
+    fn a_sparse_query_is_filled_by_one_read_of_its_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let now = Local::now();
+        let total = CAPACITY * 3;
+        let lines: String = (0..total)
+            .map(|i| {
+                let time = (now - Duration::seconds((total - i) as i64)).to_rfc3339();
+                let id = if i % 20_000 == 7 { "rare" } else { "common" };
+                format!(
+                    "{}\n",
+                    serde_json::json!({"event":"x","timestamp":time,"request_id":id,"n":i})
+                )
+            })
+            .collect();
+        std::fs::write(&path, lines).unwrap();
+        let query = Query {
+            from: now.timestamp_millis() - 70_000_000,
+            to: now.timestamp_millis(),
+            filter: "all".into(),
+            search_mode: "keyword".into(),
+            needle: "rare".into(),
+        };
+        let rare = |e: &Entry| e.get("request_id") == Some("rare");
+        // The newest read of every entry holds a single match and stops short.
+        let all = Scan::read(&path, query.from, query.to, None).unwrap();
+        let (rows, resume) = all.page(None, PAGE, rare);
+        assert_eq!(rows.len(), 1);
+        let resume = resume.expect("older entries follow");
+        // One read of the matches older than that finds the rest of them.
+        let matches = Scan::read_matching(&path, &query, Some(resume), rare).unwrap();
+        let (rows, resume) = matches.page(Some(resume), PAGE, rare);
+        let numbers: Vec<_> = rows
+            .iter()
+            .map(|e| e.fields["n"].as_u64().unwrap())
+            .collect();
+        assert_eq!(numbers, [20_007, 7]);
+        assert_eq!(resume, None);
+        // That read serves only its own query.
+        let older = cursor(&rows[0]);
+        assert!(matches.covers(&path, &query, older));
+        let other = Query {
+            needle: "common".into(),
+            ..query.clone()
+        };
+        assert!(!matches.covers(&path, &other, older));
+        assert!(all.covers(&path, &other, None));
     }
 }

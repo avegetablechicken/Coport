@@ -81,6 +81,10 @@ pub async fn get_activity(
     let mut after = after;
     // A fresh listing re-reads the log for lines written since the last read.
     let mut cached = !fresh.unwrap_or(false);
+    // A first read keeps every entry for later filters and searches. Once a
+    // read runs out before a page is full, the next keeps only matches, so a
+    // sparse query does not reread the range once per capacity of entries.
+    let mut narrow = false;
     loop {
         // One extra row tells whether another page follows.
         let (page, path) = {
@@ -94,15 +98,24 @@ pub async fn get_activity(
             Some((found, resume)) => {
                 rows.extend(found);
                 match resume {
-                    Some(resume) if rows.len() <= activity::PAGE => Some(resume),
+                    Some(resume) if rows.len() <= activity::PAGE => {
+                        narrow = true;
+                        Some(resume)
+                    }
                     _ => break,
                 }
             }
             None => after,
         };
-        let (from, to) = (query.from, query.to);
+        let query = query.clone();
         let scan = tauri::async_runtime::spawn_blocking(move || {
-            activity::Scan::read(&path, from, to, begin)
+            if narrow {
+                activity::Scan::read_matching(&path, &query, begin, |e| {
+                    crate::core::activity_matches(&query, e)
+                })
+            } else {
+                activity::Scan::read(&path, query.from, query.to, begin)
+            }
         })
         .await
         .map_err(|_| "Cannot read the log".to_owned())??;

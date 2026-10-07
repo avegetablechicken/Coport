@@ -378,15 +378,18 @@ impl Core {
         let scan = self
             .activity_scan
             .as_ref()
-            .filter(|scan| scan.covers(&self.logs.path(), query.from, query.to, after))?;
-        Some(scan.page(after, limit, |e| {
-            e.matches_filter(&query.filter) && matches_search(e, &query.search_mode, &query.needle)
-        }))
+            .filter(|scan| scan.covers(&self.logs.path(), query, after))?;
+        Some(scan.page(after, limit, |e| activity_matches(query, e)))
     }
 
     pub fn store_activity_scan(&mut self, scan: crate::activity::Scan) {
         self.activity_scan = Some(scan);
     }
+}
+
+/// Whether `e` is listed for the Activity `query`.
+pub fn activity_matches(query: &crate::activity::Query, e: &Entry) -> bool {
+    e.matches_filter(&query.filter) && matches_search(e, &query.search_mode, &query.needle)
 }
 
 fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
