@@ -4,7 +4,7 @@ use crate::proxy::Notify;
 use chrono::{DateTime, Local};
 use serde_json::{Map, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -165,6 +165,11 @@ impl LogFeed {
         for e in s.entries.range(start..) {
             match e.event.as_str() {
                 "current_route" | "route_unavailable" => stats.routes.push(e.clone()),
+                "route_health" => {
+                    if let Some(endpoint) = e.get("proxy_endpoint") {
+                        stats.route_health.insert(endpoint.to_owned(), e.clone());
+                    }
+                }
                 _ => {}
             }
             if !e.is_request_end() {
@@ -339,11 +344,42 @@ pub struct Stats {
     pub per_minute: [u32; SPARK_MINUTES],
     pub errors_per_minute: [u32; SPARK_MINUTES],
     pub routes: Vec<Entry>,
+    pub route_health: BTreeMap<String, Entry>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_health_uses_latest_observation_from_current_server() {
+        for newline in ["\n", "\r\n"] {
+            let feed = LogFeed {
+                store: Arc::new(Mutex::new(Store::default())),
+            };
+            let events = [
+                serde_json::json!({"event":"route_health", "proxy_endpoint":"old", "health":"healthy"}),
+                serde_json::json!({"event":"server_started"}),
+                serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"unavailable"}),
+                serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"healthy"}),
+            ];
+            let mut lines = events
+                .iter()
+                .map(|e| format!("{e}{newline}"))
+                .collect::<String>()
+                .into_bytes();
+            assert!(feed.ingest(&mut lines));
+            let stats = feed.stats();
+            assert_eq!(stats.route_health.len(), 1);
+            assert_eq!(stats.route_health["used"].get("health"), Some("healthy"));
+            let mut failure = format!("{}{newline}", serde_json::json!({"event":"route_health", "proxy_endpoint":"used", "health":"unavailable"})).into_bytes();
+            feed.ingest(&mut failure);
+            assert_eq!(
+                feed.stats().route_health["used"].get("health"),
+                Some("unavailable")
+            );
+        }
+    }
 
     #[test]
     fn tails_appended_and_rotated_lines() {

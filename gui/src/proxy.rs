@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -47,7 +47,7 @@ const TRACE_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
 struct Shared {
     phase: Option<Phase>,
     generation: u64,
-    probes: BTreeMap<String, (Probe, Instant)>,
+    probes: BTreeMap<String, (Probe, SystemTime)>,
 }
 
 struct Running {
@@ -261,6 +261,7 @@ impl Controller {
             return;
         };
         self.set_probe(name, Probe::Pending);
+        let started = SystemTime::now();
         let shared = self.shared.clone();
         let notify = self.notify.clone();
         let name = name.to_owned();
@@ -271,11 +272,7 @@ impl Controller {
             } else {
                 connect(addr).await
             };
-            shared
-                .lock()
-                .unwrap()
-                .probes
-                .insert(name, (probe, Instant::now()));
+            shared.lock().unwrap().probes.insert(name, (probe, started));
             notify();
         });
     }
@@ -288,7 +285,7 @@ impl Controller {
     ) {
         for (name, endpoint) in proxies {
             let stale = self.lock().probes.get(name).is_none_or(|(probe, at)| {
-                !matches!(probe, Probe::Pending) && at.elapsed() > max_age
+                !matches!(probe, Probe::Pending) && at.elapsed().unwrap_or_default() > max_age
             });
             if stale {
                 self.probe(name, endpoint);
@@ -299,15 +296,11 @@ impl Controller {
     fn set_probe(&self, name: &str, probe: Probe) {
         self.lock()
             .probes
-            .insert(name.to_owned(), (probe, Instant::now()));
+            .insert(name.to_owned(), (probe, SystemTime::now()));
     }
 
-    pub fn probes(&self) -> BTreeMap<String, Probe> {
-        self.lock()
-            .probes
-            .iter()
-            .map(|(name, (probe, _))| (name.clone(), probe.clone()))
-            .collect()
+    pub fn probes(&self) -> BTreeMap<String, (Probe, SystemTime)> {
+        self.lock().probes.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {

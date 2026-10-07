@@ -336,7 +336,18 @@ impl Core {
                     _ => None,
                 },
                 changed_since_start,
-                details: self.loaded_config().map(|c| details(c, &probes)),
+                details: self.loaded_config().map(|c| {
+                    let mut result = details(c, &probes);
+                    if matches!(phase, Phase::Running { .. }) && !changed_since_start {
+                        sync_route_health(
+                            &mut result,
+                            &probes,
+                            &stats.route_health,
+                            SystemTime::now(),
+                        );
+                    }
+                    result
+                }),
             },
             settings: SettingsDto {
                 appearance: self.settings.appearance,
@@ -426,7 +437,54 @@ fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
     }
 }
 
-fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
+/// Mirror newer daemon observations without adding a separate refresh schedule.
+fn sync_route_health(
+    details: &mut ConfigDetails,
+    probes: &BTreeMap<String, (Probe, SystemTime)>,
+    health: &BTreeMap<String, Entry>,
+    now: SystemTime,
+) {
+    for proxy in &mut details.proxies {
+        let Some(entry) = health.get(&proxy.endpoint) else {
+            continue;
+        };
+        let Some(time) = entry.time.map(SystemTime::from) else {
+            continue;
+        };
+        if time > now
+            || probes
+                .get(&proxy.name)
+                .is_some_and(|(_, checked)| *checked >= time)
+        {
+            continue;
+        }
+        match entry.get("available") {
+            Some("true") => {
+                // Runtime observations carry no latency or exit-IP measurement.
+                // Preserve measurements from a successful standalone test.
+                if !proxy.probe.as_ref().is_some_and(|p| p.state == "ok") {
+                    proxy.probe = Some(ProbeDto {
+                        state: "ok",
+                        ..Default::default()
+                    });
+                }
+            }
+            Some("false") => {
+                proxy.probe = Some(ProbeDto {
+                    state: "error",
+                    error: Some(format!(
+                        "Backend route unavailable: {}",
+                        entry.get("origin").unwrap_or("unknown destination")
+                    )),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> ConfigDetails {
     ConfigDetails {
         listen_port: config.listen_port,
         timeout_secs: config.request_timeout_seconds,
@@ -438,7 +496,7 @@ fn details(config: &Config, probes: &BTreeMap<String, Probe>) -> ConfigDetails {
                 name: name.clone(),
                 endpoint: redacted_endpoint(endpoint),
                 local: crate::proxy::is_local(endpoint),
-                probe: probes.get(name).map(|p| match p {
+                probe: probes.get(name).map(|(p, _)| match p {
                     Probe::Pending => ProbeDto {
                         state: "pending",
                         ..Default::default()
@@ -770,6 +828,165 @@ impl From<Entry> for EntryDto {
 mod tests {
     use super::{Urls, matches_search, parse_config, replace_config};
     use crate::logs::Entry;
+
+    #[test]
+    fn runtime_health_recovers_gui_without_manual_refresh() {
+        use super::{details, sync_route_health};
+        use crate::proxy::{Exit, Probe};
+        use std::{
+            collections::BTreeMap,
+            time::{Duration, SystemTime},
+        };
+
+        let config = parse_config(
+            "listen_port: 8787\nrequest_timeout_seconds: 30\nproxies:\n  used: http://127.0.0.1:12345\n  other: http://127.0.0.1:12346\n",
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10);
+        let mut probes = BTreeMap::from([
+            ("used".into(), (Probe::Unreachable("timed out".into()), old)),
+            (
+                "other".into(),
+                (Probe::Unreachable("timed out".into()), old),
+            ),
+        ]);
+        let endpoint = "http://127.0.0.1:12345".to_owned();
+        let mut health = BTreeMap::from([(
+            endpoint.clone(),
+            Entry {
+                seq: 1,
+                time: Some(now.into()),
+                event: "route_health".into(),
+                fields: serde_json::from_value(serde_json::json!({
+                    "proxy_endpoint": endpoint, "health": "healthy", "available": "true", "source": "request"
+                }))
+                .unwrap(),
+            },
+        )]);
+        let mut result = details(&config, &probes);
+        sync_route_health(&mut result, &probes, &health, now);
+        let used = result
+            .proxies
+            .iter()
+            .find(|p| p.name == "used")
+            .unwrap()
+            .probe
+            .as_ref()
+            .unwrap();
+        assert_eq!(used.state, "ok");
+        assert_eq!(used.ms, None);
+        assert_eq!(used.error, None);
+        assert_eq!(
+            result
+                .proxies
+                .iter()
+                .find(|p| p.name == "other")
+                .unwrap()
+                .probe
+                .as_ref()
+                .unwrap()
+                .state,
+            "error"
+        );
+
+        // Pending and late-finishing standalone tests retain their start time,
+        // so a newer successful request wins without inventing latency.
+        probes.get_mut("used").unwrap().0 = Probe::Pending;
+        let mut result = details(&config, &probes);
+        sync_route_health(&mut result, &probes, &health, now);
+        assert_eq!(
+            result
+                .proxies
+                .iter()
+                .find(|p| p.name == "used")
+                .unwrap()
+                .probe
+                .as_ref()
+                .unwrap()
+                .state,
+            "ok"
+        );
+
+        // A real latency/exit measurement is preserved.
+        probes.get_mut("used").unwrap().0 = Probe::Reachable {
+            latency: Duration::from_millis(42),
+            exit: Some(Exit {
+                ip: "192.0.2.1".into(),
+                country: Some("US".into()),
+            }),
+        };
+        let mut result = details(&config, &probes);
+        sync_route_health(&mut result, &probes, &health, now);
+        let used = result
+            .proxies
+            .iter()
+            .find(|p| p.name == "used")
+            .unwrap()
+            .probe
+            .as_ref()
+            .unwrap();
+        assert_eq!(used.ms, Some(42));
+        assert_eq!(used.exit_ip.as_deref(), Some("192.0.2.1"));
+
+        // Backend state persists until another observation replaces it. A
+        // newer unavailable result must also reach the GUI, without a test.
+        for (available, expected) in [("false", "error"), ("true", "ok")] {
+            health
+                .get_mut(&endpoint)
+                .unwrap()
+                .fields
+                .insert("available".into(), serde_json::json!(available));
+            let mut result = details(&config, &probes);
+            sync_route_health(
+                &mut result,
+                &probes,
+                &health,
+                now + Duration::from_secs(121),
+            );
+            assert_eq!(
+                result
+                    .proxies
+                    .iter()
+                    .find(|p| p.name == "used")
+                    .unwrap()
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .state,
+                expected
+            );
+        }
+
+        // Future/undated observations and observations older than a manual
+        // test cannot override it.
+        for (time, checked) in [
+            (Some(now + Duration::from_secs(1)), old),
+            (None, old),
+            (Some(now), now + Duration::from_secs(1)),
+        ] {
+            let entry = health.get_mut(&endpoint).unwrap();
+            entry.time = time.map(Into::into);
+            probes.insert(
+                "used".into(),
+                (Probe::Unreachable("failed".into()), checked),
+            );
+            let mut result = details(&config, &probes);
+            sync_route_health(&mut result, &probes, &health, now);
+            assert_eq!(
+                result
+                    .proxies
+                    .iter()
+                    .find(|p| p.name == "used")
+                    .unwrap()
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .state,
+                "error"
+            );
+        }
+    }
 
     #[test]
     fn activity_search_modes_target_only_the_selected_field() {

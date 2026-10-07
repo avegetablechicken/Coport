@@ -582,7 +582,7 @@ function proxiesBlock() {
           const dot = { ok: "running", error: "failed" }[state] ?? "";
           let value = `<span class="faint">—</span>`;
           if (state === "pending") value = `<span class="spinner"></span>`;
-          else if (state === "ok") value = `${probe.ms} ms`;
+          else if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
           else if (state === "error") value = `<span class="bad">Unreachable</span>`;
           // Plain HTTP is the common case; other schemes stay visible.
           const shown = p.endpoint.replace(/^http:\/\//, "");
