@@ -316,6 +316,7 @@ pub(crate) struct HttpObserver {
     /// Undecided until the body shows whether an undeclared stream is SSE.
     sse: Option<bool>,
     decoder: BodyDecoder,
+    prefix: Option<Vec<u8>>,
     buffer: Vec<u8>,
     data: Vec<u8>,
     disabled: bool,
@@ -333,6 +334,7 @@ impl HttpObserver {
         Self {
             sse: sse.then_some(true),
             decoder,
+            prefix: Some(Vec::with_capacity(3)),
             buffer: Vec::new(),
             data: Vec::new(),
             disabled,
@@ -364,6 +366,21 @@ impl HttpObserver {
         log.field("model_observation", reason);
     }
     fn observe(&mut self, bytes: &[u8], log: &mut RequestLog) {
+        // Strip exactly one leading UTF-8 BOM, even when split across reads.
+        const BOM: &[u8] = b"\xef\xbb\xbf";
+        if let Some(prefix) = &mut self.prefix {
+            let count = (BOM.len() - prefix.len()).min(bytes.len());
+            prefix.extend_from_slice(&bytes[..count]);
+            if prefix.len() < BOM.len() && BOM.starts_with(prefix) {
+                return;
+            }
+            let prefix = self.prefix.take().unwrap();
+            if prefix != BOM {
+                self.observe(&prefix, log);
+            }
+            self.observe(&bytes[count..], log);
+            return;
+        }
         self.parse(bytes, log);
         if self.sse.is_none() && !self.disabled {
             self.sse = sniff_sse(&self.buffer);
@@ -420,6 +437,9 @@ impl HttpObserver {
         }
         if self.disabled {
             return;
+        }
+        if let Some(prefix) = self.prefix.take() {
+            self.observe(&prefix, log);
         }
         if self.sse == Some(true) {
             self.parse(b"\n\n", log);
@@ -1476,6 +1496,38 @@ mod tests {
             assert!(!log.fields.contains_key("model"), "{payload}");
         }
     }
+    #[test]
+    fn leading_sse_bom_preserves_first_event_across_reads_and_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"\xef\xbb\xbfdata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model\",\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":4}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
+        for encoding in [
+            None,
+            Some("gzip"),
+            Some("deflate"),
+            Some("br"),
+            Some("zstd"),
+        ] {
+            let bytes = encoding.map_or_else(|| body.to_vec(), |e| compress(e, body));
+            for declared in [false, true] {
+                for chunk_size in [1, 2, 3, 7, bytes.len()] {
+                    let mut log = log_at(&dir.path().join("proxy.log"));
+                    let mut observer = HttpObserver::new(declared, encoding, &mut log);
+                    for chunk in bytes.chunks(chunk_size) {
+                        observer.feed(chunk, &mut log);
+                    }
+                    observer.finish(&mut log);
+                    assert_eq!(
+                        log.fields["input_tokens"], "17",
+                        "{encoding:?}, {declared}, {chunk_size}"
+                    );
+                    assert_eq!(log.fields["cached_input_tokens"], "4");
+                    assert_eq!(log.fields["model"], "test-model");
+                    assert_eq!(log.fields["model_outcome"], "finished");
+                }
+            }
+        }
+    }
+
     #[test]
     fn sse_sniffing_waits_for_a_whole_field_name() {
         assert_eq!(sniff_sse(b""), None);
