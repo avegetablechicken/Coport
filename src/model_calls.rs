@@ -1,5 +1,6 @@
 //! Content-free model-call observations, separate from HTTP/tunnel lifecycle logs.
 use crate::logger::{Logger, RequestLog};
+use crate::observation_memory::Buffer;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -366,8 +367,8 @@ struct HttpParser {
     /// Undecided until the body shows whether an undeclared stream is SSE.
     sse: Option<bool>,
     prefix: Option<Vec<u8>>,
-    buffer: Vec<u8>,
-    data: Vec<u8>,
+    buffer: Buffer,
+    data: Buffer,
     disabled: bool,
     observation: HttpObservation,
     #[cfg(test)]
@@ -378,8 +379,8 @@ impl HttpParser {
         Self {
             sse: sse.then_some(true),
             prefix: Some(Vec::with_capacity(3)),
-            buffer: Vec::new(),
-            data: Vec::new(),
+            buffer: Buffer::default(),
+            data: Buffer::default(),
             disabled: false,
             observation: HttpObservation {
                 fields: Map::new(),
@@ -391,8 +392,8 @@ impl HttpParser {
     }
     fn stop(&mut self, reason: &str) {
         self.disabled = true;
-        self.buffer.clear();
-        self.data.clear();
+        self.buffer.release();
+        self.data.release();
         self.observation.field("model_observation", reason);
     }
     fn observe(&mut self, bytes: &[u8]) {
@@ -416,7 +417,7 @@ impl HttpParser {
             self.sse = sniff_sse(&self.buffer);
             if self.sse == Some(true) {
                 // Replay what was held while the stream kind was unknown.
-                let pending = std::mem::take(&mut self.buffer);
+                let pending = self.buffer.take();
                 self.parse(&pending);
             }
         }
@@ -427,7 +428,10 @@ impl HttpParser {
                 self.stop("message_limit");
                 return;
             }
-            self.buffer.extend_from_slice(chunk);
+            if self.buffer.extend_from_slice(chunk).is_err() {
+                self.stop("memory_budget");
+                return;
+            }
             if self.sse == Some(true) && self.buffer.last() == Some(&b'\n') {
                 let line = self
                     .buffer
@@ -443,10 +447,14 @@ impl HttpParser {
                     if self.data.len() + data.len() + 1 > MAX_MESSAGE {
                         self.stop("message_limit");
                     } else {
-                        if !self.data.is_empty() {
-                            self.data.push(b'\n');
+                        if !self.data.is_empty() && self.data.push(b'\n').is_err() {
+                            self.stop("memory_budget");
+                            return;
                         }
-                        self.data.extend_from_slice(data);
+                        if self.data.extend_from_slice(data).is_err() {
+                            self.stop("memory_budget");
+                            return;
+                        }
                     }
                 }
                 self.buffer.clear();
@@ -640,6 +648,8 @@ impl WsCalls {
                 }
             }
             if !self.observing {
+                self.client.message.release();
+                self.upstream.message.release();
                 break;
             }
         }
@@ -838,7 +848,7 @@ impl Drop for WsCalls {
 // An observer only: it never writes frames, changes masking, or alters flow control.
 // Buffers are bounded, including inflated data and fragmented messages.
 enum FrameEvent {
-    Message(Vec<u8>),
+    Message(Buffer),
     Close,
 }
 struct FrameObserver {
@@ -850,7 +860,7 @@ struct FrameObserver {
     fin: bool,
     fragmented: bool,
     compressed: bool,
-    message: Vec<u8>,
+    message: Buffer,
     allow_compression: bool,
     reset_compression: bool,
     inflater: flate2::Decompress,
@@ -866,7 +876,7 @@ impl FrameObserver {
             fin: false,
             fragmented: false,
             compressed: false,
-            message: Vec::new(),
+            message: Buffer::default(),
             allow_compression,
             reset_compression,
             inflater: flate2::Decompress::new(false),
@@ -940,12 +950,14 @@ impl FrameObserver {
         }
         let n = self.remaining.min(input.len() as u64) as usize;
         if self.opcode < 8 {
-            self.message.extend(
-                input[..n]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| b ^ self.mask.map(|m| m[(self.offset + i) % 4]).unwrap_or(0)),
-            );
+            self.message
+                .extend(
+                    input[..n]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| b ^ self.mask.map(|m| m[(self.offset + i) % 4]).unwrap_or(0)),
+                )
+                .map_err(|_| "memory_budget")?;
         }
         self.offset += n;
         self.remaining -= n as u64;
@@ -961,17 +973,18 @@ impl FrameObserver {
             return Ok(None);
         }
         self.fragmented = false;
-        let message = std::mem::take(&mut self.message);
+        let message = self.message.take();
         if !self.compressed {
             return Ok(Some(FrameEvent::Message(message)));
         }
         let inflated = self.inflate(message)?;
         Ok(Some(FrameEvent::Message(inflated)))
     }
-    fn inflate(&mut self, mut data: Vec<u8>) -> Result<Vec<u8>, &'static str> {
-        data.extend_from_slice(&[0, 0, 255, 255]);
+    fn inflate(&mut self, mut data: Buffer) -> Result<Buffer, &'static str> {
+        data.extend_from_slice(&[0, 0, 255, 255])
+            .map_err(|_| "memory_budget")?;
         let mut input = data.as_slice();
-        let mut output = Vec::new();
+        let mut output = data.empty_sibling();
         loop {
             let mut chunk = [0; 8192];
             let before_in = self.inflater.total_in();
@@ -984,7 +997,9 @@ impl FrameObserver {
             if output.len() + written > MAX_MESSAGE {
                 return Err("websocket_inflated_limit");
             }
-            output.extend_from_slice(&chunk[..written]);
+            output
+                .extend_from_slice(&chunk[..written])
+                .map_err(|_| "memory_budget")?;
             input = &input[consumed..];
             if written < chunk.len() && input.is_empty() {
                 break;
@@ -1489,6 +1504,55 @@ mod tests {
             drop(log);
             assert_eq!(records(&path).last().unwrap()["event"], expected);
         }
+    }
+
+    #[test]
+    fn http_observers_share_a_budget_and_release_it_when_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = Arc::new(crate::observation_memory::Budget::new(2048));
+        let observer = || {
+            let mut log = log_at(&dir.path().join("proxy.log"));
+            let mut observer = HttpObserver::new(false, None, &mut log);
+            observer.decoder.parser().buffer = Buffer::with_budget(budget.clone());
+            observer.decoder.parser().data = Buffer::with_budget(budget.clone());
+            (observer, log)
+        };
+        let (mut first, mut a) = observer();
+        let (mut second, mut b) = observer();
+        first.feed(&vec![b'x'; 600], &mut a);
+        second.feed(&vec![b'x'; 600], &mut b);
+        assert!(!a.fields.contains_key("model_observation"));
+        assert!(!b.fields.contains_key("model_observation"));
+        let (mut rejected, mut c) = observer();
+        rejected.feed(b"data: {}", &mut c);
+        assert_eq!(c.fields["model_observation"], "memory_budget");
+        // Failing to grow an observer frees its already-allocated buffers too.
+        first.feed(&vec![b'x'; 1500], &mut a);
+        assert_eq!(a.fields["model_observation"], "memory_budget");
+        let (mut replacement, mut d) = observer();
+        replacement.feed(&vec![b'x'; 600], &mut d);
+        assert!(!d.fields.contains_key("model_observation"));
+    }
+
+    #[test]
+    fn websocket_message_charge_lives_until_the_delivered_message_is_dropped() {
+        let budget = Arc::new(crate::observation_memory::Budget::new(2048));
+        let parser = || {
+            let mut parser = FrameObserver::new(false, false);
+            parser.message = Buffer::with_budget(budget.clone());
+            parser
+        };
+        let wire = frame(1, true, false, false, &vec![b'x'; 1500]);
+        let mut first = parser();
+        let message = first.next(&mut wire.as_slice()).unwrap().unwrap();
+        let mut second = parser();
+        assert_eq!(
+            second.next(&mut wire.as_slice()).err(),
+            Some("memory_budget")
+        );
+        drop(message);
+        let mut replacement = parser();
+        assert!(replacement.next(&mut wire.as_slice()).unwrap().is_some());
     }
 
     #[test]

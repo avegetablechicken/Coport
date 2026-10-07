@@ -1108,7 +1108,7 @@ are unchanged and no body is stored. Compressed request bodies are forwarded wit
 decoding, so the model is taken from the response. Event streams are recognized by
 their content even without a `text/event-stream` content type. When a response
 cannot be observed, `model_observation` records why: `unsupported_encoding`,
-`decode_error` or `message_limit`.
+`decode_error`, `message_limit` or `memory_budget`.
 Token totals include only reported usage; missing usage displays as unknown, not zero.
 These totals are not provider quota or billing measurements. No prompts, generated
 text, or tool arguments are written to these logs.
@@ -1132,6 +1132,12 @@ The WebSocket observer handles masking, fragmentation and negotiated
 `permessage-deflate` (including context takeover). Frames and reconstructed or
 inflated messages are limited to 32 MiB. Exceeding observation limits records a gap
 and closes the model WebSocket; it does not silently fabricate successful calls.
+HTTP observation buffers, WebSocket frames and reconstructed/inflated messages
+share a process-wide 128 MiB allocation budget. HTTP observation stops and releases
+its buffers when that budget is exhausted; forwarded bytes are unchanged.
+A model WebSocket closes in a controlled way instead of disabling its phase timers:
+frame allocation exhaustion uses close code 1013, and observation exhaustion records
+a gap before closing. This budget covers these buffers, not total process RSS.
 
 The GUI's exit-IP lookup and proxy-port diagnostic are display-only checks.
 They do not feed the daemon's per-destination route-health cache; a reachable

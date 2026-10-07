@@ -8,6 +8,7 @@ mod keychain;
 pub mod local_tls;
 pub mod logger;
 pub mod model_calls;
+mod observation_memory;
 pub mod routing;
 pub mod server;
 pub mod service;

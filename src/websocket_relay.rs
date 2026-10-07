@@ -1,5 +1,10 @@
 //! Responses WebSocket relay with protocol-phase deadlines. CONNECT uses relay.rs.
-use crate::{config::WebSocketTimeouts, logger::RequestLog, model_calls::WsCalls};
+use crate::{
+    config::WebSocketTimeouts,
+    logger::RequestLog,
+    model_calls::WsCalls,
+    observation_memory::{Buffer, Exhausted},
+};
 use std::{
     io,
     sync::{Arc, Mutex},
@@ -40,10 +45,16 @@ struct Exit {
 impl Exit {
     fn failure(stage: &'static str, client: bool, error: io::Error, frame_bytes: usize) -> Self {
         Self {
-            stage,
+            stage: if error.get_ref().is_some_and(|e| e.is::<Exhausted>()) {
+                "websocket_memory_budget"
+            } else {
+                stage
+            },
             client,
             code: if error.get_ref().is_some_and(|e| e.is::<FrameTooLarge>()) {
                 1009
+            } else if error.get_ref().is_some_and(|e| e.is::<Exhausted>()) {
+                1013
             } else if error.kind() == io::ErrorKind::InvalidData {
                 1002
             } else {
@@ -56,12 +67,19 @@ impl Exit {
     }
 }
 struct Frame {
-    wire: Vec<u8>,
+    wire: Buffer,
     opcode: u8,
     fin: bool,
     close_code: Option<u16>,
 }
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, client: bool) -> io::Result<Frame> {
+    read_frame_into(reader, client, Buffer::default()).await
+}
+async fn read_frame_into<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    client: bool,
+    mut wire: Buffer,
+) -> io::Result<Frame> {
     let mut header = [0; 2];
     reader.read_exact(&mut header).await?;
     let opcode = header[0] & 15;
@@ -73,12 +91,12 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, client: bool) -> io::R
             "Invalid WebSocket frame",
         ));
     }
-    let mut wire = header.to_vec();
+    wire.extend_from_slice(&header)?;
     let length = match header[1] & 127 {
         126 => {
             let mut bytes = [0; 2];
             reader.read_exact(&mut bytes).await?;
-            wire.extend_from_slice(&bytes);
+            wire.extend_from_slice(&bytes)?;
             let n = u16::from_be_bytes(bytes) as u64;
             if n < 126 {
                 return Err(io::Error::new(
@@ -91,7 +109,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, client: bool) -> io::R
         127 => {
             let mut bytes = [0; 8];
             reader.read_exact(&mut bytes).await?;
-            wire.extend_from_slice(&bytes);
+            wire.extend_from_slice(&bytes)?;
             let n = u64::from_be_bytes(bytes);
             if n < 65536 {
                 return Err(io::Error::new(
@@ -115,10 +133,10 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, client: bool) -> io::R
     let mut mask = [0; 4];
     if masked {
         reader.read_exact(&mut mask).await?;
-        wire.extend_from_slice(&mask);
+        wire.extend_from_slice(&mask)?;
     }
     let offset = wire.len();
-    wire.resize(offset + length as usize, 0);
+    wire.resize(offset + length as usize, 0)?;
     reader.read_exact(&mut wire[offset..]).await?;
     let close_code = if opcode == 8 {
         let payload: Vec<u8> = wire[offset..]
@@ -410,6 +428,9 @@ pub(super) async fn run<A, B>(
     log.field("client_frames", trace.client_frames);
     log.field("upstream_frames", trace.upstream_frames);
     log.field("reason", exit.stage);
+    if exit.stage == "websocket_memory_budget" {
+        log.field("model_observation", "memory_budget");
+    }
     log.field(
         "error_side",
         if exit.client {
@@ -427,6 +448,9 @@ pub(super) async fn run<A, B>(
     {
         let mut calls = calls.lock().unwrap();
         calls.annotate_pending("failure_stage", exit.stage);
+        if exit.stage == "websocket_memory_budget" {
+            calls.annotate_pending("model_observation", "memory_budget");
+        }
         calls.annotate_pending(
             "error_side",
             if exit.client {
@@ -543,6 +567,21 @@ mod tests {
         server.write_all(&wire).await.unwrap();
         assert_eq!(read_frame(client, false).await.unwrap().wire, wire);
     }
+    #[tokio::test]
+    async fn frame_budget_failure_closes_without_waiting_for_the_payload() {
+        let (mut sender, mut reader) = tokio::io::duplex(64);
+        // An unmasked, 1024-byte frame: the payload need not arrive at all.
+        sender.write_all(&[0x81, 126, 4, 0]).await.unwrap();
+        let buffer = Buffer::with_budget(Arc::new(crate::observation_memory::Budget::new(64)));
+        let error = read_frame_into(&mut reader, false, buffer)
+            .await
+            .err()
+            .unwrap();
+        let exit = Exit::failure("read_upstream", false, error, 0);
+        assert_eq!(exit.stage, "websocket_memory_budget");
+        assert_eq!(exit.code, 1013);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn thinking_survives_old_300_second_idle_then_first_output_times_out_despite_heartbeats()
     {
