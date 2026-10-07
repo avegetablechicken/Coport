@@ -1,6 +1,7 @@
 //! Where the tray panel appears: centered under the tray icon (or above it
 //! when the taskbar is at the bottom), kept inside the monitor. All values
-//! are physical pixels in desktop coordinates.
+//! share one unit in desktop coordinates: points on macOS, where screens of
+//! different scales share one point space, and physical pixels elsewhere.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -11,8 +12,18 @@ pub struct Rect {
 }
 
 impl Rect {
-    fn contains(&self, x: f64, y: f64) -> bool {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn scaled(&self, factor: f64) -> Rect {
+        Rect {
+            x: self.x * factor,
+            y: self.y * factor,
+            w: self.w * factor,
+            h: self.h * factor,
+        }
     }
 
     pub fn center(&self) -> (f64, f64) {
@@ -26,6 +37,32 @@ const MARGIN: f64 = 8.0;
 /// Without a usable icon position the panel sits below the top bar
 /// (macOS menu bar incl. notch, GNOME top bar).
 const TOP_BAR: f64 = 40.0;
+
+/// The status item in points. macOS reports it in physical pixels of its own
+/// screen, so on screens of mixed scale its physical position can fall inside
+/// another screen's physical range. `screens` holds each screen in points with
+/// its scale, primary first; the screen under `pointer` (in points) is the one
+/// clicked, otherwise the first screen whose scale maps the item onto itself.
+#[cfg(any(target_os = "macos", test))]
+pub fn status_item_points(
+    item: Rect,
+    screens: &[(Rect, f64)],
+    pointer: Option<(f64, f64)>,
+) -> Rect {
+    let fits = |(screen, scale): &&(Rect, f64)| {
+        let (x, y) = item.scaled(1.0 / scale).center();
+        screen.contains(x, y)
+    };
+    let under_pointer =
+        |(screen, _): &&(Rect, f64)| pointer.is_some_and(|(x, y)| screen.contains(x, y));
+    let scale = screens
+        .iter()
+        .filter(fits)
+        .find(under_pointer)
+        .or_else(|| screens.iter().find(fits))
+        .map_or(1.0, |(_, scale)| *scale);
+    item.scaled(1.0 / scale)
+}
 
 /// Returns the panel's top-left corner.
 ///
@@ -123,6 +160,70 @@ mod tests {
         let (x, y) = place(Some(hidden), (760.0, 1200.0), SCREEN, 2.0);
         assert_eq!((x, y), (3000.0 - 760.0 - 16.0, 80.0));
         assert_eq!(place(None, (760.0, 1200.0), SCREEN, 2.0), (x, y));
+    }
+
+    /// A 2x built-in display beside a 1x external one, in points.
+    const BUILT_IN: (Rect, f64) = (
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1512.0,
+            h: 982.0,
+        },
+        2.0,
+    );
+    const EXTERNAL: (Rect, f64) = (
+        Rect {
+            x: 1512.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        },
+        1.0,
+    );
+
+    #[test]
+    fn status_items_on_mixed_scale_screens_are_found_in_points() {
+        let screens = [BUILT_IN, EXTERNAL];
+        // At 1300 points on the 2x display the item is at 2600 physical
+        // pixels, inside the external display's physical range as well.
+        let item = Rect {
+            x: 2600.0,
+            y: 0.0,
+            w: 56.0,
+            h: 48.0,
+        };
+        let on_built_in = Rect {
+            x: 1300.0,
+            y: 0.0,
+            w: 28.0,
+            h: 24.0,
+        };
+        assert_eq!(
+            status_item_points(item, &screens, Some((1310.0, 10.0))),
+            on_built_in
+        );
+        assert_eq!(status_item_points(item, &screens, None), on_built_in);
+        // The same pixels clicked on the external display's menu bar.
+        let on_external = status_item_points(item, &screens, Some((2610.0, 10.0)));
+        assert_eq!(on_external, item);
+        let (x, _) = place(Some(on_built_in), (360.0, 600.0), BUILT_IN.0, 1.0);
+        assert!(BUILT_IN.0.contains(x, 0.0) && BUILT_IN.0.contains(x + 359.0, 0.0));
+        let (x, _) = place(Some(on_external), (360.0, 600.0), EXTERNAL.0, 1.0);
+        assert!(EXTERNAL.0.contains(x, 0.0));
+    }
+
+    #[test]
+    fn a_single_screen_status_item_keeps_its_place() {
+        let item = Rect {
+            x: 2000.0,
+            y: 0.0,
+            w: 56.0,
+            h: 48.0,
+        };
+        let points = status_item_points(item, &[BUILT_IN], None);
+        assert_eq!(points.scaled(2.0), item);
+        assert_eq!(status_item_points(item, &[], None), item);
     }
 
     #[test]

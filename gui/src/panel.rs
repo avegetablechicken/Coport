@@ -9,9 +9,12 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, Monitor, WebviewWindow, WindowEvent};
 
 pub const LABEL: &str = "panel";
+/// macOS places windows in points, shared by screens of different scales;
+/// elsewhere layout uses physical pixels.
+const IN_POINTS: bool = cfg!(target_os = "macos");
 /// Panel width in logical points; the height follows the content.
 const WIDTH: f64 = 360.0;
 const MIN_HEIGHT: f64 = 240.0;
@@ -41,8 +44,8 @@ fn state(app: &AppHandle) -> tauri::State<'_, PanelState> {
 pub fn show(app: &AppHandle, anchor: Option<Rect>) {
     let panel = state(app);
     panel.generation.fetch_add(1, Ordering::SeqCst);
-    if anchor.is_some() {
-        *panel.anchor.lock().unwrap() = anchor;
+    if let Some(anchor) = anchor {
+        *panel.anchor.lock().unwrap() = Some(layout_anchor(app, anchor));
     }
     let Some(w) = window(app) else {
         return;
@@ -90,34 +93,65 @@ pub fn fit(app: &AppHandle, height: f64) {
     }
 }
 
+/// The tray's rectangle in layout units, taken while the pointer is still on
+/// the clicked menu bar.
+#[cfg(target_os = "macos")]
+fn layout_anchor(app: &AppHandle, anchor: Rect) -> Rect {
+    let primary = app.primary_monitor().ok().flatten();
+    let mut monitors = app.available_monitors().unwrap_or_default();
+    if let Some(primary) = &primary {
+        monitors.sort_by_key(|m| m.position() != primary.position());
+    }
+    let screens: Vec<_> = monitors
+        .iter()
+        .map(|m| (bounds(m), m.scale_factor()))
+        .collect();
+    // tao reports the pointer in physical pixels of the primary screen.
+    let scale = primary.map_or(1.0, |m| m.scale_factor());
+    let pointer = app
+        .cursor_position()
+        .ok()
+        .map(|p| (p.x / scale, p.y / scale));
+    placement::status_item_points(anchor, &screens, pointer)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn layout_anchor(_: &AppHandle, anchor: Rect) -> Rect {
+    anchor
+}
+
+/// A monitor's rectangle in layout units.
+fn bounds(m: &Monitor) -> Rect {
+    let unit = if IN_POINTS { m.scale_factor() } else { 1.0 };
+    let (p, s) = (m.position(), m.size());
+    Rect {
+        x: p.x as f64 / unit,
+        y: p.y as f64 / unit,
+        w: s.width as f64 / unit,
+        h: s.height as f64 / unit,
+    }
+}
+
 /// Sizes and positions the window on the monitor holding the anchor.
 fn layout(w: &WebviewWindow, panel: &PanelState) {
     let anchor = *panel.anchor.lock().unwrap();
     let monitor = anchor
         .and_then(|a| {
             let (x, y) = a.center();
-            w.available_monitors().ok()?.into_iter().find(|m| {
-                let (p, s) = (m.position(), m.size());
-                x >= p.x as f64
-                    && x < p.x as f64 + s.width as f64
-                    && y >= p.y as f64
-                    && y < p.y as f64 + s.height as f64
-            })
+            w.available_monitors()
+                .ok()?
+                .into_iter()
+                .find(|m| bounds(m).contains(x, y))
         })
         .or_else(|| w.primary_monitor().ok().flatten())
         .or_else(|| w.current_monitor().ok().flatten());
     let Some(m) = monitor else {
         return;
     };
-    let scale = m.scale_factor();
-    let (p, s) = (m.position(), m.size());
-    let screen = Rect {
-        x: p.x as f64,
-        y: p.y as f64,
-        w: s.width as f64,
-        h: s.height as f64,
-    };
-    let max_height = (screen.h / scale * 0.85).max(MIN_HEIGHT);
+    let screen = bounds(&m);
+    // Layout units per logical point.
+    let unit = if IN_POINTS { 1.0 } else { m.scale_factor() };
+    let max_height = (screen.h / unit * 0.85).max(MIN_HEIGHT);
     let height = panel
         .content_height
         .lock()
@@ -125,8 +159,12 @@ fn layout(w: &WebviewWindow, panel: &PanelState) {
         .unwrap_or(560.0)
         .clamp(MIN_HEIGHT, max_height);
     let _ = w.set_size(tauri::LogicalSize::new(WIDTH, height));
-    let (x, y) = placement::place(anchor, (WIDTH * scale, height * scale), screen, scale);
-    let _ = w.set_position(PhysicalPosition::new(x, y));
+    let (x, y) = placement::place(anchor, (WIDTH * unit, height * unit), screen, unit);
+    let _ = if IN_POINTS {
+        w.set_position(tauri::LogicalPosition::new(x, y))
+    } else {
+        w.set_position(tauri::PhysicalPosition::new(x, y))
+    };
 }
 
 pub fn on_window_event(w: &tauri::Window, event: &WindowEvent) {
