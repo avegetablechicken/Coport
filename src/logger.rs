@@ -1,7 +1,7 @@
 use serde_json::{Map, Value, json};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -98,12 +98,41 @@ fn rotate(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Destination for records that cannot reach the log file, and for every record
+/// when the proxy runs interactively.
+type Console = Box<dyn Write + Send>;
+
+/// Writes stderr through the print macros so the unit test harness captures it.
+struct Stderr;
+impl Write for Stderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if cfg!(test) {
+            eprint!("{}", String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        } else {
+            std::io::stderr().write(buf)
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
 pub struct Logger {
     path: PathBuf,
     file: Mutex<Option<File>>,
+    console: Mutex<Console>,
+    /// Background runners redirect stderr to files or journals that do not
+    /// rotate; mirroring there would duplicate proxy.log without bound.
+    mirror: bool,
 }
 impl Logger {
+    /// Records are mirrored to stderr only when it is a terminal, or when the
+    /// log file cannot be opened or written.
     pub fn new(path: PathBuf) -> Self {
+        Self::with_console(path, Box::new(Stderr), std::io::stderr().is_terminal())
+    }
+    fn with_console(path: PathBuf, console: Console, mirror: bool) -> Self {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -117,6 +146,8 @@ impl Logger {
         Self {
             path,
             file: Mutex::new(file),
+            console: Mutex::new(console),
+            mirror,
         }
     }
     pub fn write(&self, event: &str, mut fields: Map<String, Value>) {
@@ -131,12 +162,17 @@ impl Logger {
         );
         let mut line = serde_json::to_vec(&fields).unwrap_or_default();
         line.push(b'\n');
-        #[cfg(not(test))]
-        let _ = std::io::stderr().write_all(&line);
-        #[cfg(test)]
-        eprint!("{}", String::from_utf8_lossy(&line));
+        let written = self.write_file(&line);
+        if self.mirror || !written {
+            if let Ok(mut console) = self.console.lock() {
+                let _ = console.write_all(&line);
+            }
+        }
+    }
+    /// Returns whether the record reached the log file.
+    fn write_file(&self, line: &[u8]) -> bool {
         let Ok(mut file) = self.file.lock() else {
-            return;
+            return false;
         };
         if file
             .as_ref()
@@ -150,12 +186,15 @@ impl Logger {
             }
             *file = open_private(&self.path).ok();
         }
-        if let Some(f) = file.as_mut() {
-            if f.write_all(&line).is_err() {
-                *file = None;
-                eprintln!("Cannot write request log; continuing with stderr logging.");
-            }
+        let Some(f) = file.as_mut() else {
+            return false;
+        };
+        if f.write_all(line).is_err() {
+            *file = None;
+            eprintln!("Cannot write request log; continuing with stderr logging.");
+            return false;
         }
+        true
     }
 }
 pub fn open_private(path: &Path) -> std::io::Result<File> {
@@ -210,6 +249,59 @@ impl Drop for RequestLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn open_log_file_keeps_records_off_noninteractive_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let console = Captured::default();
+        let logger = Logger::with_console(path.clone(), Box::new(console.clone()), false);
+        logger.write("server_started", Map::new());
+        assert!(console.text().is_empty());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"event\":\"server_started\"")
+        );
+    }
+
+    #[test]
+    fn records_reach_stderr_when_interactive_or_without_a_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let interactive = Captured::default();
+        let path = dir.path().join("proxy.log");
+        Logger::with_console(path.clone(), Box::new(interactive.clone()), true)
+            .write("mirrored", Map::new());
+        assert!(interactive.text().contains("\"event\":\"mirrored\""));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("mirrored"));
+
+        // A directory in place of the file makes the log impossible to open.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let fallback = Captured::default();
+        Logger::with_console(blocked, Box::new(fallback.clone()), false)
+            .write("fallback", Map::new());
+        let line = fallback.text();
+        assert!(line.ends_with('\n'));
+        assert!(line.contains("\"event\":\"fallback\""));
+    }
 
     #[test]
     fn repeated_rotation_archives_every_previous_backup() {

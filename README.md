@@ -1034,7 +1034,11 @@ Reference: [mihomo listener fields](https://wiki.metacubex.one/en/config/inbound
 
 ## Logs
 
-Logs are written to stderr and to `logs/proxy.log` beside the application configuration file. Override the file location with `--log-file /path/to/proxy.log`.
+Logs are written to `logs/proxy.log` beside the application configuration file. Override the file location with `--log-file /path/to/proxy.log`.
+Records are also mirrored to stderr when it is a terminal, so a foreground run
+shows them as before. Background runners (launchd, systemd, the desktop daemon)
+and redirected stderr receive records only while the log file cannot be opened
+or written; startup errors and log maintenance failures always go to stderr.
 
 ```sh
 tail -F logs/proxy.log
