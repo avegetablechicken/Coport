@@ -2,7 +2,7 @@
 use crate::{Error, Result};
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, PoisonError},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -16,20 +16,25 @@ const FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 static FAILURES: Mutex<BTreeMap<Key, Instant>> = Mutex::new(BTreeMap::new());
 
 /// The stored secret, or `None` when the store has no such entry.
+///
+/// Reads are serialized: concurrent requests must not raise several prompts.
+/// Waiting for the gate holds no thread. The gate then moves into the read,
+/// so a caller that gives up mid-prompt neither lets another read start nor
+/// loses a denial, and the store never occupies more than one blocking thread.
 pub(crate) async fn read(service: &str, account: &str) -> Result<Option<String>> {
+    static GATE: LazyLock<Arc<tokio::sync::Mutex<()>>> = LazyLock::new(Default::default);
+    let gate = GATE.clone().lock_owned().await;
     let key = (service.to_owned(), account.to_owned());
-    tokio::task::spawn_blocking(move || read_blocking(key))
-        .await
-        .unwrap_or(Err(()))
-        .map_err(|_| Error::config("Cannot read the OS credential store."))
+    tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        read_blocking(key)
+    })
+    .await
+    .unwrap_or(Err(()))
+    .map_err(|_| Error::config("Cannot read the OS credential store."))
 }
 
-/// Reads are serialized: concurrent requests must not raise several prompts.
-/// The gate and the failure record live on the blocking thread, so a caller
-/// that gives up mid-prompt neither lets another read start nor loses a denial.
 fn read_blocking(key: Key) -> std::result::Result<Option<String>, ()> {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _gate = GATE.lock().unwrap_or_else(PoisonError::into_inner);
     {
         let mut failures = FAILURES.lock().unwrap();
         failures.retain(|_, at| at.elapsed() < FAILURE_COOLDOWN);
@@ -74,9 +79,11 @@ static TEST_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 #[cfg(test)]
 fn load(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
-    if service == "keychain-test-slow" {
+    if service.starts_with("keychain-test-slow") {
         // Stands in for a system prompt the user has not answered yet.
-        TEST_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if service == "keychain-test-slow" {
+            TEST_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         std::thread::sleep(Duration::from_millis(300));
     }
     match TEST_ENTRIES
@@ -131,5 +138,32 @@ mod tests {
         // its denial cools the entry down instead of prompting again.
         assert!(read("keychain-test-slow", "denied").await.is_err());
         assert_eq!(TEST_LOADS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiting_reads_hold_no_blocking_threads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            set_test_entry("keychain-test-slow-pool", "prompt", Some("secret"));
+            let reads: Vec<_> = (0..4)
+                .map(|_| tokio::spawn(read("keychain-test-slow-pool", "prompt")))
+                .collect();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Reads waiting behind an unanswered prompt leave the pool free.
+            let other = tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::task::spawn_blocking(|| ()),
+            )
+            .await;
+            assert!(other.is_ok());
+            for read in reads {
+                assert_eq!(read.await.unwrap().unwrap().as_deref(), Some("secret"));
+            }
+        });
     }
 }
