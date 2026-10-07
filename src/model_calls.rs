@@ -182,7 +182,9 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
                 "model_call_incomplete"
             } else if outcome == Some("cancelled") || event == "request_cancelled" {
                 "model_call_cancelled"
-            } else if event == "request_finished" && outcome == Some("running") {
+            } else if event == "request_finished"
+                && (outcome == Some("running") || log.fields.contains_key("model_observation"))
+            {
                 "model_call_unknown"
             } else if event == "request_finished" {
                 "model_call_finished"
@@ -1375,7 +1377,7 @@ mod tests {
         assert_eq!(log.fields["input_tokens"], "5");
     }
     #[test]
-    fn http_observer_stops_on_bad_or_unknown_encodings() {
+    fn unobserved_http_responses_have_unknown_model_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         for (encoding, body, reason) in [
@@ -1384,13 +1386,49 @@ mod tests {
             ("compress", b"data: {}\n\n".to_vec(), "unsupported_encoding"),
         ] {
             let mut log = log_at(&path);
+            log.status = 200;
+            log.field("model_call_id", "http");
             let mut observer = HttpObserver::new(true, Some(encoding), &mut log);
             observer.feed(&body, &mut log);
             observer.finish(&mut log);
             assert_eq!(log.fields["model_observation"], reason, "{encoding}");
             assert!(!log.fields.contains_key("model_outcome"), "{encoding}");
+            drop(log);
+            assert_eq!(
+                records(&path).last().unwrap()["event"],
+                "model_call_unknown"
+            );
         }
     }
+    #[test]
+    fn observation_limit_is_unknown_without_a_terminal_and_preserves_known_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let oversized = vec![b'x'; MAX_MESSAGE + 1];
+        for (terminal, expected) in [
+            (None, "model_call_unknown"),
+            (Some("response.completed"), "model_call_finished"),
+            (Some("response.failed"), "model_call_failed"),
+            (Some("response.incomplete"), "model_call_incomplete"),
+        ] {
+            let mut log = log_at(&path);
+            log.status = 200;
+            log.field("model_call_id", "http");
+            let mut observer = HttpObserver::new(true, None, &mut log);
+            if let Some(kind) = terminal {
+                observer.feed(
+                    format!("data: {}\n\n", json!({"type": kind})).as_bytes(),
+                    &mut log,
+                );
+            }
+            observer.feed(&oversized, &mut log);
+            observer.finish(&mut log);
+            assert_eq!(log.fields["model_observation"], "message_limit");
+            drop(log);
+            assert_eq!(records(&path).last().unwrap()["event"], expected);
+        }
+    }
+
     #[test]
     fn http_observer_decompresses_without_a_size_limit() {
         let dir = tempfile::tempdir().unwrap();
