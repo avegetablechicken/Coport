@@ -8,7 +8,13 @@ permissions:
 
 jobs:
   msrv:
-    runs-on: ubuntu-latest
+    # Platform-specific dependencies (keyring backends, security-framework,
+    # windows-sys, schannel) are only compiled on their own OS.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.1
