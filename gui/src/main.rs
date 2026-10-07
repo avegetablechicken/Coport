@@ -83,6 +83,7 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(panel::PanelState::default())
+        .manage(platform::Clipboard::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::get_activity,
@@ -190,6 +191,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => panel::show(app, None),
             RunEvent::Exit => {
+                app.state::<platform::Clipboard>().clear();
                 let state = app.state::<AppState>();
                 let mut core = state.core.lock().unwrap();
                 let keep = core.settings.keep_proxy_running_on_quit;

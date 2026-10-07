@@ -365,8 +365,8 @@ pub fn open_path(state: State<AppState>, target: String) {
 }
 
 #[tauri::command]
-pub fn copy_text(text: String) -> Result {
-    platform::copy_text(&text)
+pub fn copy_text(clipboard: State<'_, platform::Clipboard>, text: String) -> Result {
+    clipboard.copy_text(&text)
 }
 
 #[tauri::command]

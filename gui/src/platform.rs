@@ -48,10 +48,72 @@ pub fn edit(path: &Path) {
     let _ = Command::new("xdg-open").arg(path).spawn();
 }
 
-pub fn copy_text(text: &str) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
-        .map_err(|e| e.to_string())
+trait TextClipboard: Send {
+    fn set_text(&mut self, text: String) -> Result<(), arboard::Error>;
+}
+impl TextClipboard for arboard::Clipboard {
+    fn set_text(&mut self, text: String) -> Result<(), arboard::Error> {
+        arboard::Clipboard::set_text(self, text)
+    }
+}
+
+/// Linux serves clipboard contents from their owner until another app takes over.
+/// Keep that owner in application state, and release it when the app exits.
+#[derive(Default)]
+pub struct Clipboard {
+    inner: std::sync::Mutex<Option<Box<dyn TextClipboard>>>,
+}
+impl Clipboard {
+    pub fn copy_text(&self, text: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.is_none() {
+            *inner = Some(Box::new(
+                arboard::Clipboard::new().map_err(|e| e.to_string())?,
+            ));
+        }
+        inner
+            .as_mut()
+            .unwrap()
+            .set_text(text.to_owned())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().take();
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct OwnedText(Arc<Mutex<Option<String>>>);
+    impl TextClipboard for OwnedText {
+        fn set_text(&mut self, text: String) -> Result<(), arboard::Error> {
+            *self.0.lock().unwrap() = Some(text);
+            Ok(())
+        }
+    }
+    impl Drop for OwnedText {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn copied_text_remains_owned_until_application_exit() {
+        let contents = Arc::new(Mutex::new(None));
+        let clipboard = Clipboard {
+            inner: Mutex::new(Some(Box::new(OwnedText(contents.clone())))),
+        };
+        for text in ["first", "replacement"] {
+            clipboard.copy_text(text).unwrap();
+            assert_eq!(contents.lock().unwrap().as_deref(), Some(text));
+        }
+        clipboard.clear();
+        assert!(contents.lock().unwrap().is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
