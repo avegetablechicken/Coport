@@ -1045,6 +1045,11 @@ Records are also mirrored to stderr when it is a terminal, so a foreground run
 shows them as before. Background runners (launchd, systemd, the desktop daemon)
 and redirected stderr receive records only while the log file cannot be opened
 or written; startup errors and log maintenance failures always go to stderr.
+File writes, rotation and pruning run on a dedicated logging thread. Producers do
+not wait for disk I/O. Queues hold at most 1024 records per logger, with an 8 MiB
+process-wide buffer budget and a 256 KiB limit per record. Saturation emits a
+`log_records_dropped` count instead of blocking requests. Normal shutdown drains
+accepted records; forcibly killing a process can lose records still queued.
 
 ```sh
 tail -F logs/proxy.log

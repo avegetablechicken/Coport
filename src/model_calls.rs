@@ -1169,6 +1169,7 @@ mod tests {
             send(&mut calls, false, done.clone());
             send(&mut calls, false, done);
         }
+        log.logger.flush().unwrap();
         let rows = records(&path);
         assert_eq!(
             rows.iter()
@@ -1200,6 +1201,7 @@ mod tests {
             false,
             json!({"type":"response.completed", "response":{"id":"ok", "usage":{"input_tokens":"bad", "output_tokens":3}}}),
         );
+        log.logger.flush().unwrap();
         let rows = records(&path);
         let done = rows
             .iter()
@@ -1229,6 +1231,7 @@ mod tests {
         );
         send(&mut calls, true, json!({"type":"response.create"}));
         calls.feed(true, &frame(8, true, false, true, &[]));
+        log.logger.flush().unwrap();
         let rows = records(&path);
         assert_eq!(
             rows.iter()
@@ -1323,6 +1326,7 @@ mod tests {
             let mut calls = WsCalls::new(&log, "");
             send(&mut calls, true, json!({"type":"response.create"}));
         }
+        log.logger.flush().unwrap();
         let rows = records(&path);
         assert_eq!(
             rows.iter()
@@ -1741,6 +1745,7 @@ mod tests {
             assert_eq!(got, response);
             assert!(!task.is_finished());
         }
+        log.logger.flush().unwrap();
         assert_eq!(
             records(&path)
                 .iter()

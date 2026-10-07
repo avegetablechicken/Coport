@@ -87,6 +87,7 @@ fn account_routing_refresh_startup_snapshot_and_private_logs() {
     fs::remove_file(app.path("config.yaml")).unwrap();
     refused(&app, &a, &b, Some("token-a"), 502);
     assert_eq!(app.request(None, None, "/health", "GET").0, 200);
+    app.stop(); // Drain accepted log records before inspecting the complete run.
     let mut records = vec![];
     let mut terminal = vec![];
     for _ in 0..100 {
@@ -186,6 +187,7 @@ fn api_keys_rotate_without_account_file() {
     );
     fs::remove_file(app.path("home/.env")).unwrap();
     refused(&app, &a, &b, Some("provider-key-two"), 502);
+    app.stop();
     for secret in ["provider-key-one", "provider-key-two"] {
         assert!(!app.log().contains(secret));
     }

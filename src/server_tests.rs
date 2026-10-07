@@ -249,6 +249,7 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
         fixture.release.notify_one();
         assert_eq!(response.text().await.unwrap(), "data: last\n\n");
         assert!(fixture.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!log.contains("url-route-secret"));
         assert!(
@@ -322,6 +323,7 @@ async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credenti
         assert_eq!(response.status(), status, "{method} {body}");
     }
     assert!(fixture.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(log.contains("\"account_id\":\"acct-1\""));
     assert!(!log.contains("refresh-secret"));
@@ -394,6 +396,7 @@ async fn claude_token_refresh_uses_saved_account_proxy_without_injecting_credent
         assert_eq!(response.status(), status, "{method} {body}");
     }
     assert!(fixture.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(log.contains("claude_auth"));
     assert!(!log.contains("refresh-secret"));
@@ -567,6 +570,7 @@ async fn claude_native_auth_paths_and_sse_passthrough() {
         assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
         fixture.release.notify_one();
         assert_eq!(response.text().await.unwrap(), "data: last\n\n");
+        running.server.logger.flush().unwrap();
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(log.contains("claude"));
         assert!(!log.contains("model-secret"));
@@ -779,6 +783,7 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
             "inactive"
         );
         assert!(lookup.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!log.contains("saved-secret") && !log.contains("replacement-secret"));
     }
@@ -928,6 +933,7 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
     assert_eq!(response.status(), 405); // A remotely identified account passes auth, then method validation.
     assert!(lookup.requests.try_recv().is_err());
     assert!(payload.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(log.contains("remote-account"));
     assert!(!log.contains("first-secret"));
@@ -1051,6 +1057,7 @@ async fn tls_connect_and_https_connect_stream_before_completion() {
         assert!(!request.contains("private-hop"));
         assert!(!request.contains("private-cookie"));
         assert!(!request.contains("proxy-authorization"));
+        running.server.logger.flush().unwrap();
         let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         for secret in [
             "model-secret",
@@ -1129,6 +1136,7 @@ async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
     for s in ["authorization", "cookie", "x-private", "model-secret"] {
         assert!(!request.contains(s));
     }
+    running.server.logger.flush().unwrap();
     let logs = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     let route = logs
         .lines()
@@ -1234,6 +1242,7 @@ async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
+                running.server.logger.flush().unwrap();
                 let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
                 if let Some(event) = raw
                     .lines()
@@ -1793,6 +1802,7 @@ async fn disconnect_before_headers_does_not_invent_a_502() {
     let path = running._temp.path().join("proxy.log");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
+            running.server.logger.flush().unwrap();
             let raw = std::fs::read_to_string(&path).unwrap();
             if let Some(event) = raw
                 .lines()
@@ -1851,6 +1861,7 @@ async fn safe_get_retries_transport_failures_on_the_same_route_and_stops_at_thre
                 );
             }
             assert!(fixture.requests.try_recv().is_err());
+            running.server.logger.flush().unwrap();
             let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
             let events: Vec<serde_json::Value> = raw
                 .lines()
@@ -1908,6 +1919,7 @@ async fn unsafe_requests_and_http_errors_are_not_retried() {
         }
         fixture.requests.recv().await.unwrap();
         assert!(fixture.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
         let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!raw.contains("upstream_retry"));
     }
@@ -1934,6 +1946,7 @@ async fn safe_get_retries_share_the_original_timeout_budget() {
         assert!(fixture.requests.recv().await.unwrap().starts_with("GET "));
     }
     assert!(fixture.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert_eq!(raw.matches("\"event\":\"upstream_retry\"").count(), 1);
     assert!(raw.contains("\"transport_error\":\"timeout\""));
@@ -2135,6 +2148,7 @@ async fn profile_uses_shared_safe_get_retry_and_health_feedback() {
     );
     let state = running.server.probes.lock().unwrap()[&key].clone();
     assert_eq!(state.lock().await.failures, 0);
+    running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert_eq!(log.matches("\"event\":\"upstream_retry\"").count(), 2);
     assert!(!log.contains("profile-token"));
@@ -2178,6 +2192,7 @@ async fn refresh_failure_is_not_replayed_and_counts_once() {
     );
     let state = running.server.probes.lock().unwrap()[&key].clone();
     assert_eq!(state.lock().await.failures, 1);
+    running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(!log.contains("upstream_retry"));
     assert!(!log.contains("refresh-secret"));
@@ -2314,6 +2329,7 @@ async fn cold_selection_consumes_the_request_budget_and_logs_eligibility_separat
             false,
         )
         .await;
+    running.server.logger.flush().unwrap();
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(raw.contains("\"event\":\"route_health\""));
     assert!(raw.contains("\"available\":\"true\""));
@@ -2414,6 +2430,7 @@ async fn http_model_calls_observe_compressed_and_untyped_streams_without_changin
         let path = running._temp.path().join("proxy.log");
         let call = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
+                running.server.logger.flush().unwrap();
                 let raw = std::fs::read_to_string(&path).unwrap_or_default();
                 assert!(!raw.contains("PRIVATE PROMPT"));
                 if let Some(row) = raw
@@ -2469,6 +2486,7 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["response"]["id"], id);
     }
+    running.server.logger.flush().unwrap();
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     let rows: Vec<serde_json::Value> = raw
         .lines()

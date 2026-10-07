@@ -530,24 +530,35 @@ mod tests {
     fn log(path: std::path::PathBuf) -> RequestLog {
         RequestLog {logger:Arc::new(Logger::new(path)),fields:serde_json::from_value(json!({"request_id":"ws-connection","path":"/v1/responses","method":"GET","provider":"test","status":"101"})).unwrap(),started:std::time::Instant::now(),status:101,bytes:0,outcome:"request_cancelled"}
     }
-    fn rows(path: &std::path::Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+    struct TestLog {
+        dir: tempfile::TempDir,
+        logger: Arc<Logger>,
+    }
+    impl TestLog {
+        fn rows(&self) -> Vec<Value> {
+            self.logger.flush().unwrap();
+            std::fs::read_to_string(self.dir.path().join("proxy.log"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
     }
     fn start(
         settings: WebSocketTimeouts,
         capacity: usize,
     ) -> (
-        tempfile::TempDir,
+        TestLog,
         DuplexStream,
         DuplexStream,
         tokio::task::JoinHandle<MapResult>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut log = log(dir.path().join("proxy.log"));
+        let dir = TestLog {
+            dir,
+            logger: log.logger.clone(),
+        };
         let (client, down) = tokio::io::duplex(capacity);
         let (up, server) = tokio::io::duplex(capacity);
         let task = tokio::spawn(async move {
@@ -602,7 +613,7 @@ mod tests {
         assert_eq!(close.close_code, Some(1001));
         let result = task.await.unwrap();
         assert_eq!(result.0["reason"], "websocket_first_output_timeout");
-        let records = rows(&dir.path().join("proxy.log"));
+        let records = dir.rows();
         assert_eq!(
             records
                 .iter()
@@ -654,7 +665,7 @@ mod tests {
             create(&mut client, &mut server).await;
             output(&mut server,&mut client,json!({"type":"response.completed","response":{"id":id,"usage":{"input_tokens":5,"output_tokens":3}}})).await;
         }
-        let records = rows(&dir.path().join("proxy.log"));
+        let records = dir.rows();
         assert_eq!(
             records
                 .iter()
@@ -688,7 +699,7 @@ mod tests {
         );
         let result = task.await.unwrap();
         assert_eq!(result.1, "request_finished");
-        let records = rows(&dir.path().join("proxy.log"));
+        let records = dir.rows();
         let failed = records
             .iter()
             .find(|r| r["event"] == "model_call_failed")
@@ -729,7 +740,7 @@ mod tests {
             Some(1011)
         );
         task.await.unwrap();
-        let records = rows(&dir.path().join("proxy.log"));
+        let records = dir.rows();
         assert_eq!(
             records
                 .iter()
@@ -789,7 +800,7 @@ mod tests {
         // response.failed would instead supply its authoritative usage.
         create(&mut client, &mut server).await;
         assert_eq!(
-            rows(&dir.path().join("proxy.log"))
+            dir.rows()
                 .iter()
                 .filter(|r| r["event"] == "model_call_failed")
                 .count(),

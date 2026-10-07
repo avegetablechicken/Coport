@@ -3,7 +3,11 @@ use std::{
     fs::{File, OpenOptions},
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -118,21 +122,137 @@ impl Write for Stderr {
     }
 }
 
+const QUEUE_RECORDS: usize = 1024;
+const MAX_RECORD: usize = 256 * 1024;
+static QUEUE_BUDGET: LazyLock<Arc<crate::observation_memory::Budget>> =
+    LazyLock::new(|| Arc::new(crate::observation_memory::Budget::new(8 * 1024 * 1024)));
+
+struct RecordBytes(crate::observation_memory::Buffer);
+impl Write for RecordBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > MAX_RECORD {
+            return Err(std::io::Error::other("Log record exceeds 256 KiB"));
+        }
+        self.0.extend_from_slice(bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum Message {
+    ReportDrops,
+    Record(crate::observation_memory::Buffer),
+    Flush(mpsc::SyncSender<std::io::Result<()>>),
+}
+
+/// Producers never perform file I/O or wait for a slow disk. Accepted records
+/// are drained by the worker on drop; saturation is reported explicitly.
 pub struct Logger {
-    path: PathBuf,
-    file: Mutex<Option<File>>,
-    console: Mutex<Console>,
-    /// Background runners redirect stderr to files or journals that do not
-    /// rotate; mirroring there would duplicate proxy.log without bound.
-    mirror: bool,
+    sender: Option<mpsc::SyncSender<Message>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    dropped: Arc<AtomicU64>,
 }
 impl Logger {
-    /// Records are mirrored to stderr only when it is a terminal, or when the
-    /// log file cannot be opened or written.
     pub fn new(path: PathBuf) -> Self {
         Self::with_console(path, Box::new(Stderr), std::io::stderr().is_terminal())
     }
     fn with_console(path: PathBuf, console: Console, mirror: bool) -> Self {
+        Self::with_capacity(path, console, mirror, QUEUE_RECORDS)
+    }
+    fn with_capacity(path: PathBuf, console: Console, mirror: bool, capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let lost = dropped.clone();
+        let worker = std::thread::Builder::new()
+            .name("request-log".into())
+            .spawn(move || {
+                let mut sink = FileLog::new(path, console, mirror);
+                while let Ok(message) = receiver.recv() {
+                    sink.report_dropped(&lost);
+                    match message {
+                        Message::ReportDrops => {}
+                        Message::Record(bytes) => sink.write(&bytes),
+                        Message::Flush(reply) => {
+                            let _ = reply.send(sink.flush());
+                        }
+                    }
+                }
+                sink.report_dropped(&lost);
+                let _ = sink.flush();
+            })
+            .expect("request log thread");
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            dropped,
+        }
+    }
+    pub fn write(&self, event: &str, mut fields: Map<String, Value>) {
+        fields.insert("event".into(), json!(event));
+        fields.insert("timestamp".into(), json!(timestamp()));
+        let mut bytes = RecordBytes(crate::observation_memory::Buffer::with_budget(
+            QUEUE_BUDGET.clone(),
+        ));
+        if serde_json::to_writer(&mut bytes, &fields).is_err() || bytes.write_all(b"\n").is_err() {
+            self.report_drop();
+            return;
+        }
+        if self
+            .sender
+            .as_ref()
+            .is_none_or(|sender| sender.try_send(Message::Record(bytes.0)).is_err())
+        {
+            self.report_drop();
+        }
+    }
+    fn report_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(Message::ReportDrops);
+        }
+    }
+    /// Waits for records already accepted by this logger. Intended for explicit
+    /// shutdown/inspection, not the async request path.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let failed = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Log worker stopped");
+        let (send, receive) = mpsc::sync_channel(0);
+        self.sender
+            .as_ref()
+            .ok_or_else(failed)?
+            .send(Message::Flush(send))
+            .map_err(|_| failed())?;
+        receive.recv().map_err(|_| failed())?
+    }
+}
+impl Drop for Logger {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("Request log worker stopped unexpectedly.");
+            }
+        }
+    }
+}
+fn timestamp() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Owned only by the logging thread: rotation and pruning need no shared lock.
+struct FileLog {
+    path: PathBuf,
+    file: Option<File>,
+    length: u64,
+    checked: Instant,
+    console: Console,
+    mirror: bool,
+}
+impl FileLog {
+    fn new(path: PathBuf, console: Console, mirror: bool) -> Self {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -143,58 +263,69 @@ impl Logger {
         if file.is_none() {
             eprintln!("Cannot open request log; continuing with stderr logging.");
         }
+        let length = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map_or(0, |m| m.len());
         Self {
             path,
-            file: Mutex::new(file),
-            console: Mutex::new(console),
+            file,
+            length,
+            checked: Instant::now(),
+            console,
             mirror,
         }
     }
-    pub fn write(&self, event: &str, mut fields: Map<String, Value>) {
-        fields.insert("event".into(), json!(event));
-        fields.insert(
-            "timestamp".into(),
-            json!(
-                time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default()
-            ),
-        );
-        let mut line = serde_json::to_vec(&fields).unwrap_or_default();
-        line.push(b'\n');
-        let written = self.write_file(&line);
+    fn write(&mut self, bytes: &[u8]) {
+        let written = self.write_file(bytes);
         if self.mirror || !written {
-            if let Ok(mut console) = self.console.lock() {
-                let _ = console.write_all(&line);
-            }
+            let _ = self.console.write_all(bytes);
         }
     }
-    /// Returns whether the record reached the log file.
-    fn write_file(&self, line: &[u8]) -> bool {
-        let Ok(mut file) = self.file.lock() else {
-            return false;
-        };
-        if file
-            .as_ref()
-            .and_then(|f| f.metadata().ok())
-            .is_some_and(|m| m.len() + line.len() as u64 > 5 * 1024 * 1024)
-        {
-            *file = None;
+    fn write_file(&mut self, line: &[u8]) -> bool {
+        // Account for external appends periodically, not with a syscall per record.
+        if self.checked.elapsed() >= Duration::from_secs(1) {
+            if let Some(meta) = self.file.as_ref().and_then(|f| f.metadata().ok()) {
+                self.length = meta.len();
+            }
+            self.checked = Instant::now();
+        }
+        if self.file.is_some() && self.length.saturating_add(line.len() as u64) > 5 * 1024 * 1024 {
+            self.file = None;
             if let Err(e) = rotate(&self.path) {
-                // Keep appending to the original file if archiving fails.
                 eprintln!("Cannot rotate request log: {e}");
             }
-            *file = open_private(&self.path).ok();
+            self.file = open_private(&self.path).ok();
+            self.length = self
+                .file
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map_or(0, |m| m.len());
         }
-        let Some(f) = file.as_mut() else {
+        let Some(file) = self.file.as_mut() else {
             return false;
         };
-        if f.write_all(line).is_err() {
-            *file = None;
+        if file.write_all(line).is_err() {
+            self.file = None;
             eprintln!("Cannot write request log; continuing with stderr logging.");
             return false;
         }
+        self.length += line.len() as u64;
         true
+    }
+    fn report_dropped(&mut self, dropped: &AtomicU64) {
+        let count = dropped.swap(0, Ordering::AcqRel);
+        if count > 0 {
+            let mut bytes = serde_json::to_vec(&json!({"event":"log_records_dropped","timestamp":timestamp(),"count":count.to_string(),"reason":"queue_or_record_limit"})).unwrap();
+            bytes.push(b'\n');
+            self.write(&bytes);
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(file) = &mut self.file {
+            file.flush()?;
+        }
+        self.console.flush()
     }
 }
 pub fn open_private(path: &Path) -> std::io::Result<File> {
@@ -249,6 +380,7 @@ impl Drop for RequestLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[derive(Clone, Default)]
     struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
@@ -268,12 +400,126 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_sink_does_not_block_producers_and_reports_overflow() {
+        struct Slow {
+            entered: Option<mpsc::Sender<()>>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Write for Slow {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.resume.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let (entered, ready) = mpsc::channel();
+        let (resume, receive) = mpsc::channel();
+        let logger = Logger::with_capacity(
+            path.clone(),
+            Box::new(Slow {
+                entered: Some(entered),
+                resume: receive,
+            }),
+            true,
+            1,
+        );
+        logger.write("first", Map::new());
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (finished, done) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let logger = &logger;
+            let producer = scope.spawn(move || {
+                logger.write("queued", Map::new());
+                logger.write("dropped", Map::new());
+                finished.send(()).unwrap();
+            });
+            let completed = done.recv_timeout(Duration::from_secs(1));
+            resume.send(()).unwrap();
+            producer.join().unwrap();
+            assert!(completed.is_ok(), "producer blocked behind the slow sink");
+        });
+        logger.flush().unwrap();
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(rows.iter().any(|r| r["event"] == "first"));
+        assert!(rows.iter().any(|r| r["event"] == "queued"));
+        assert!(!rows.iter().any(|r| r["event"] == "dropped"));
+        assert!(
+            rows.iter()
+                .any(|r| r["event"] == "log_records_dropped" && r["count"] == "1")
+        );
+    }
+
+    #[test]
+    fn a_dropped_record_is_reported_even_without_a_later_write() {
+        struct Notify(mpsc::Sender<Vec<u8>>);
+        impl Write for Notify {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (notice, receive) = mpsc::channel();
+        let logger =
+            Logger::with_console(dir.path().join("proxy.log"), Box::new(Notify(notice)), true);
+        logger.write(
+            "too_large",
+            json!({"data":"x".repeat(MAX_RECORD)})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let bytes = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["event"], "log_records_dropped");
+        assert_eq!(value["count"], "1");
+    }
+
+    #[test]
+    fn shutdown_drains_accepted_records_and_oversized_records_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        {
+            let logger = Logger::new(path.clone());
+            for i in 0..100 {
+                logger.write("accepted", json!({"n":i}).as_object().unwrap().clone());
+            }
+            logger.write(
+                "too_large",
+                json!({"value":"x".repeat(MAX_RECORD)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.matches("\"event\":\"accepted\"").count(), 100);
+        assert!(text.contains("log_records_dropped"));
+        assert!(!text.contains("too_large"));
+    }
+
+    #[test]
     fn open_log_file_keeps_records_off_noninteractive_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let console = Captured::default();
         let logger = Logger::with_console(path.clone(), Box::new(console.clone()), false);
         logger.write("server_started", Map::new());
+        logger.flush().unwrap();
         assert!(console.text().is_empty());
         assert!(
             std::fs::read_to_string(&path)
@@ -373,6 +619,7 @@ mod tests {
             .unwrap();
         let logger = Logger::new(path.clone());
         logger.write("still_logged", Map::new());
+        logger.flush().unwrap();
         assert!(std::fs::metadata(path).unwrap().len() > 5 * 1024 * 1024);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("proxy.log.1")).unwrap(),
