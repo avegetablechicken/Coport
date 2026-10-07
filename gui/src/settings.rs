@@ -88,6 +88,16 @@ pub(crate) fn legacy_cache_dir() -> PathBuf {
 
 /// Atomically replaces `path`, creating it with owner-only permissions.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_file(path, bytes, true)
+}
+
+/// Atomically creates `path` with owner-only permissions. Fails with
+/// `AlreadyExists` if anything has the name, even a link to a missing file.
+pub fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_file(path, bytes, false)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8], replace: bool) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -97,13 +107,37 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
+    if replace {
+        temp.persist(path).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(path).map_err(|e| e.error)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creating_never_replaces_a_file_or_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        create_private(&path, b"example").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"example");
+        let error = create_private(&path, b"replacement").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"example");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.yaml");
+            std::os::unix::fs::symlink(dir.path().join("missing.yaml"), &link).unwrap();
+            let error = create_private(&link, b"example").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(!dir.path().join("missing.yaml").exists());
+        }
+    }
 
     #[test]
     fn cache_namespace_matches_the_application_bundle_identifier() {

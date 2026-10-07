@@ -62,10 +62,22 @@ fn replace_config(source: &Path, target: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("Cannot read the selected file: {e}"))?;
     Config::parse(&text).map_err(|e| e.message.to_string())?;
-    // Replace the link target, as editing does, so a linked configuration stays linked.
-    let target = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
+    // Replace the link target, as editing does, so a linked configuration stays
+    // linked. A link to a missing file is reported rather than replaced.
+    let target = match target.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(_)
+            if target
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink()) =>
+        {
+            return Err(format!(
+                "Cannot replace the configuration: {} links to a missing file.",
+                target.display()
+            ));
+        }
+        Err(_) => target.to_path_buf(),
+    };
     crate::settings::write_private(&target, text.as_bytes())
         .map_err(|e| format!("Cannot replace the configuration: {e}"))
 }
@@ -1122,5 +1134,10 @@ mod tests {
             coport::config::Config::read(&linked).unwrap().listen_port,
             9797
         );
+        // A link whose file is missing is kept, not replaced by a copy.
+        std::fs::remove_file(&linked).unwrap();
+        assert!(replace_config(&source, &target).is_err());
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!linked.exists());
     }
 }
