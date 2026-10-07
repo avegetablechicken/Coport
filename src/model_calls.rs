@@ -229,36 +229,36 @@ const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 /// A corrupt or truncated compressed body.
 struct DecodeError;
 
-/// Decodes a compressed response chunk by chunk as it streams through, for
-/// observation only; forwarded bytes are untouched and nothing is kept.
+/// Every decoder writes straight into the bounded parser. Limiting compressed
+/// input chunks cannot bound their expanded size, so no decoded Vec sits here.
 enum BodyDecoder {
-    Identity,
-    Gzip(flate2::write::GzDecoder<Vec<u8>>),
-    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
-    Brotli(Box<brotli_decompressor::DecompressorWriter<Vec<u8>>>),
-    Zstd(Box<zstd::stream::write::Decoder<'static, Vec<u8>>>),
+    Identity(HttpParser),
+    Gzip(flate2::write::GzDecoder<HttpParser>),
+    Deflate(flate2::write::ZlibDecoder<HttpParser>),
+    Brotli(Box<brotli_decompressor::DecompressorWriter<HttpParser>>),
+    Zstd(Box<zstd::stream::write::Decoder<'static, HttpParser>>),
 }
 impl BodyDecoder {
-    fn new(encoding: Option<&str>) -> Result<Self, &'static str> {
+    fn new(sse: bool, encoding: Option<&str>, started: Instant) -> Result<Self, &'static str> {
+        let parser = HttpParser::new(sse, started);
         Ok(
             match encoding.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
-                None | Some("" | "identity") => Self::Identity,
-                Some("gzip" | "x-gzip") => Self::Gzip(flate2::write::GzDecoder::new(Vec::new())),
-                Some("deflate") => Self::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
+                None | Some("" | "identity") => Self::Identity(parser),
+                Some("gzip" | "x-gzip") => Self::Gzip(flate2::write::GzDecoder::new(parser)),
+                Some("deflate") => Self::Deflate(flate2::write::ZlibDecoder::new(parser)),
                 Some("br") => Self::Brotli(Box::new(brotli_decompressor::DecompressorWriter::new(
-                    Vec::new(),
-                    4096,
+                    parser, 4096,
                 ))),
                 Some("zstd") => Self::Zstd(Box::new(
-                    zstd::stream::write::Decoder::new(Vec::new()).map_err(|_| "decode_error")?,
+                    zstd::stream::write::Decoder::new(parser).map_err(|_| "decode_error")?,
                 )),
                 _ => return Err("unsupported_encoding"),
             },
         )
     }
-    fn output(&mut self) -> &mut Vec<u8> {
+    fn parser(&mut self) -> &mut HttpParser {
         match self {
-            Self::Identity => unreachable!("identity bodies are not copied"),
+            Self::Identity(p) => p,
             Self::Gzip(d) => d.get_mut(),
             Self::Deflate(d) => d.get_mut(),
             Self::Brotli(d) => d.get_mut(),
@@ -267,31 +267,27 @@ impl BodyDecoder {
     }
     fn writer(&mut self) -> &mut dyn std::io::Write {
         match self {
-            Self::Identity => unreachable!("identity bodies are not copied"),
+            Self::Identity(p) => p,
             Self::Gzip(d) => d,
             Self::Deflate(d) => d,
             Self::Brotli(d) => d.as_mut(),
             Self::Zstd(d) => d.as_mut(),
         }
     }
-    /// Bytes decoded from `bytes`, a compressed piece of the body.
-    fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    fn decode(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
         let writer = self.writer();
         writer.write_all(bytes).map_err(|_| DecodeError)?;
-        writer.flush().map_err(|_| DecodeError)?;
-        Ok(std::mem::take(self.output()))
+        writer.flush().map_err(|_| DecodeError)
     }
-    /// Bytes still held by the decoder at the end of the body.
-    fn finish(&mut self) -> Result<Vec<u8>, DecodeError> {
-        let done = match self {
-            Self::Identity => return Ok(Vec::new()),
+    fn finish(&mut self) -> Result<(), DecodeError> {
+        match self {
+            Self::Identity(_) => Ok(()),
             Self::Gzip(d) => d.try_finish(),
             Self::Deflate(d) => d.try_finish(),
             Self::Brotli(d) => d.close(),
             Self::Zstd(d) => std::io::Write::flush(d.as_mut()),
-        };
-        done.map_err(|_| DecodeError)?;
-        Ok(std::mem::take(self.output()))
+        }
+        .map_err(|_| DecodeError)
     }
 }
 
@@ -311,61 +307,95 @@ fn sniff_sse(body: &[u8]) -> Option<bool> {
     Some(false)
 }
 
+/// Only extracted metadata survives between decoder writes; never a body copy.
+struct HttpObservation {
+    fields: Map<String, Value>,
+    started: Instant,
+}
+impl HttpObservation {
+    fn field(&mut self, key: &str, value: impl ToString) {
+        field(&mut self.fields, key, value);
+    }
+}
+
 /// Incrementally observes SSE lines or a bounded JSON body without changing it.
 pub(crate) struct HttpObserver {
+    decoder: BodyDecoder,
+}
+impl HttpObserver {
+    pub fn new(sse: bool, encoding: Option<&str>, log: &mut RequestLog) -> Self {
+        let decoder = match BodyDecoder::new(sse, encoding, log.started) {
+            Ok(decoder) => decoder,
+            Err(reason) => {
+                let mut parser = HttpParser::new(sse, log.started);
+                parser.stop(reason);
+                log.field("model_observation", reason);
+                BodyDecoder::Identity(parser)
+            }
+        };
+        Self { decoder }
+    }
+    pub fn feed(&mut self, bytes: &[u8], log: &mut RequestLog) {
+        if self.decoder.parser().disabled {
+            return;
+        }
+        let result = self.decoder.decode(bytes);
+        self.publish(result, log);
+    }
+    pub fn finish(&mut self, log: &mut RequestLog) {
+        if self.decoder.parser().disabled {
+            return;
+        }
+        let result = self.decoder.finish();
+        if result.is_ok() {
+            self.decoder.parser().finish();
+        }
+        self.publish(result, log);
+    }
+    fn publish(&mut self, result: Result<(), DecodeError>, log: &mut RequestLog) {
+        let parser = self.decoder.parser();
+        // A parser limit also interrupts decoding. Keep that more specific reason.
+        if result.is_err() && !parser.disabled {
+            parser.stop("decode_error");
+        }
+        log.fields.extend(parser.observation.fields.clone());
+    }
+}
+
+struct HttpParser {
     /// Undecided until the body shows whether an undeclared stream is SSE.
     sse: Option<bool>,
-    decoder: BodyDecoder,
     prefix: Option<Vec<u8>>,
     buffer: Vec<u8>,
     data: Vec<u8>,
     disabled: bool,
+    observation: HttpObservation,
+    #[cfg(test)]
+    decoded_bytes: usize,
 }
-impl HttpObserver {
-    /// `sse` reflects the response Content-Type; `encoding` is its Content-Encoding.
-    pub fn new(sse: bool, encoding: Option<&str>, log: &mut RequestLog) -> Self {
-        let (decoder, disabled) = match BodyDecoder::new(encoding) {
-            Ok(decoder) => (decoder, false),
-            Err(reason) => {
-                log.field("model_observation", reason);
-                (BodyDecoder::Identity, true)
-            }
-        };
+impl HttpParser {
+    fn new(sse: bool, started: Instant) -> Self {
         Self {
             sse: sse.then_some(true),
-            decoder,
             prefix: Some(Vec::with_capacity(3)),
             buffer: Vec::new(),
             data: Vec::new(),
-            disabled,
+            disabled: false,
+            observation: HttpObservation {
+                fields: Map::new(),
+                started,
+            },
+            #[cfg(test)]
+            decoded_bytes: 0,
         }
     }
-    pub fn feed(&mut self, bytes: &[u8], log: &mut RequestLog) {
-        if self.disabled {
-            return;
-        }
-        if matches!(self.decoder, BodyDecoder::Identity) {
-            return self.observe(bytes, log);
-        }
-        // Decompressed size is not limited. Small input pieces hand each decoded
-        // part to the parser at once, so the body is never held whole.
-        for piece in bytes.chunks(4096) {
-            match self.decoder.decode(piece) {
-                Ok(decoded) => self.observe(&decoded, log),
-                Err(DecodeError) => return self.stop("decode_error", log),
-            }
-            if self.disabled {
-                return;
-            }
-        }
-    }
-    fn stop(&mut self, reason: &str, log: &mut RequestLog) {
+    fn stop(&mut self, reason: &str) {
         self.disabled = true;
         self.buffer.clear();
         self.data.clear();
-        log.field("model_observation", reason);
+        self.observation.field("model_observation", reason);
     }
-    fn observe(&mut self, bytes: &[u8], log: &mut RequestLog) {
+    fn observe(&mut self, bytes: &[u8]) {
         // Strip exactly one leading UTF-8 BOM, even when split across reads.
         const BOM: &[u8] = b"\xef\xbb\xbf";
         if let Some(prefix) = &mut self.prefix {
@@ -376,25 +406,25 @@ impl HttpObserver {
             }
             let prefix = self.prefix.take().unwrap();
             if prefix != BOM {
-                self.observe(&prefix, log);
+                self.observe(&prefix);
             }
-            self.observe(&bytes[count..], log);
+            self.observe(&bytes[count..]);
             return;
         }
-        self.parse(bytes, log);
+        self.parse(bytes);
         if self.sse.is_none() && !self.disabled {
             self.sse = sniff_sse(&self.buffer);
             if self.sse == Some(true) {
                 // Replay what was held while the stream kind was unknown.
                 let pending = std::mem::take(&mut self.buffer);
-                self.parse(&pending, log);
+                self.parse(&pending);
             }
         }
     }
-    fn parse(&mut self, bytes: &[u8], log: &mut RequestLog) {
+    fn parse(&mut self, bytes: &[u8]) {
         for chunk in bytes.split_inclusive(|b| *b == b'\n') {
             if self.buffer.len() + chunk.len() > MAX_MESSAGE {
-                self.stop("message_limit", log);
+                self.stop("message_limit");
                 return;
             }
             self.buffer.extend_from_slice(chunk);
@@ -406,12 +436,12 @@ impl HttpObserver {
                     .strip_suffix(b"\r")
                     .unwrap_or(self.buffer.strip_suffix(b"\n").unwrap());
                 if line.is_empty() {
-                    observe_http_json(&self.data, log);
+                    observe_http_json(&self.data, &mut self.observation);
                     self.data.clear();
                 } else if let Some(data) = line.strip_prefix(b"data:") {
                     let data = data.strip_prefix(b" ").unwrap_or(data);
                     if self.data.len() + data.len() + 1 > MAX_MESSAGE {
-                        self.stop("message_limit", log);
+                        self.stop("message_limit");
                     } else {
                         if !self.data.is_empty() {
                             self.data.push(b'\n');
@@ -426,29 +456,41 @@ impl HttpObserver {
             }
         }
     }
-    pub fn finish(&mut self, log: &mut RequestLog) {
-        if self.disabled {
-            return;
-        }
-        match self.decoder.finish() {
-            Ok(rest) if !rest.is_empty() => self.observe(&rest, log),
-            Ok(_) => {}
-            Err(DecodeError) => return self.stop("decode_error", log),
-        }
+    fn finish(&mut self) {
         if self.disabled {
             return;
         }
         if let Some(prefix) = self.prefix.take() {
-            self.observe(&prefix, log);
+            self.observe(&prefix);
         }
         if self.sse == Some(true) {
-            self.parse(b"\n\n", log);
+            self.parse(b"\n\n");
         } else {
-            observe_http_json(&self.buffer, log);
+            observe_http_json(&self.buffer, &mut self.observation);
         }
     }
 }
-fn observe_http_json(bytes: &[u8], log: &mut RequestLog) {
+impl std::io::Write for HttpParser {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.disabled {
+            #[cfg(test)]
+            {
+                self.decoded_bytes += bytes.len();
+            }
+            self.observe(bytes);
+        }
+        if self.disabled {
+            // Stop an expanding compressed piece as soon as the parser rejects it.
+            Err(std::io::Error::other("Model observation stopped"))
+        } else {
+            Ok(bytes.len())
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn observe_http_json(bytes: &[u8], log: &mut HttpObservation) {
     if bytes == b"[DONE]" {
         if log
             .fields
@@ -484,7 +526,7 @@ fn observe_http_json(bytes: &[u8], log: &mut RequestLog) {
 
 const MAX_CONCATENATED_EVENTS: usize = 16;
 
-fn observe_event(event: Envelope, log: &mut RequestLog) {
+fn observe_event(event: Envelope, log: &mut HttpObservation) {
     event.apply(&mut log.fields);
     if (event.kind.starts_with("response.")
         || event.kind == "message_start"
@@ -1446,6 +1488,31 @@ mod tests {
             assert_eq!(log.fields["model_observation"], "message_limit");
             drop(log);
             assert_eq!(records(&path).last().unwrap()["event"], expected);
+        }
+    }
+
+    #[test]
+    fn highly_compressed_body_stops_decoding_at_the_message_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b' '; 64 * 1024 * 1024];
+        for encoding in ["gzip", "deflate", "br", "zstd"] {
+            let compressed = compress(encoding, &body);
+            if encoding == "zstd" {
+                assert!(compressed.len() < 4096);
+            }
+            let mut log = log_at(&dir.path().join("proxy.log"));
+            let mut observer = HttpObserver::new(true, Some(encoding), &mut log);
+            observer.feed(&compressed, &mut log);
+            observer.finish(&mut log);
+            assert_eq!(log.fields["model_observation"], "message_limit");
+            // Stop decoding before the entire 64 MiB is expanded. The largest
+            // decoder output block is zstd's 128 KiB; no decoded body is retained.
+            let decoded = observer.decoder.parser().decoded_bytes;
+            assert!(decoded > MAX_MESSAGE);
+            assert!(
+                decoded <= MAX_MESSAGE + 128 * 1024,
+                "{encoding}: decoded {decoded} bytes"
+            );
         }
     }
 
