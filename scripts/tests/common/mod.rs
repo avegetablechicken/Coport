@@ -20,12 +20,21 @@ pub fn binary() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_coport")))
 }
+/// A free loopback port for a child process to bind later. It lies below every
+/// platform's ephemeral range, so connections opened by tests running in
+/// parallel cannot take it before the child binds, and is issued only once.
 pub fn port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::hash::BuildHasher;
+    static ISSUED: Mutex<std::collections::BTreeSet<u16>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    let random = std::collections::hash_map::RandomState::new();
+    for attempt in 0..1000u32 {
+        let port = 20000 + (random.hash_one(attempt) % 10000) as u16;
+        if ISSUED.lock().unwrap().insert(port) && TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free loopback port");
 }
 pub fn read_head(stream: &mut TcpStream) -> Vec<u8> {
     let mut data = Vec::new();

@@ -16,12 +16,25 @@ fn controller(dir: &Path) -> Controller {
     Controller::with_daemon(Arc::new(|| {}), dir.to_owned(), helper())
 }
 
+/// A free loopback port for the daemon to bind later. It lies below every
+/// platform's ephemeral range, so connections opened by tests running in
+/// parallel cannot take it before the daemon binds, and is issued only once.
+fn free_port() -> u16 {
+    use std::hash::BuildHasher;
+    static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let random = std::collections::hash_map::RandomState::new();
+    for attempt in 0..1000u32 {
+        let port = 20000 + (random.hash_one(attempt) % 10000) as u16;
+        if ISSUED.lock().unwrap().insert(port) && TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free loopback port");
+}
+
 fn fixture(dir: &Path, upstream: Option<u16>) -> u16 {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let mut config = format!(
         "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n"
     );
