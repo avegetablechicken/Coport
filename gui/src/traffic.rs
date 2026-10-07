@@ -5,10 +5,12 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 /// Endpoint category, not an assertion that the upstream actually charged quota.
@@ -51,15 +53,258 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
     }
 }
 
-fn merge_request(current: &mut Entry, mut incoming: Entry) {
-    let time = current.time.into_iter().chain(incoming.time).min();
-    if lifecycle_rank(&incoming) > lifecycle_rank(current) {
-        std::mem::swap(current, &mut incoming);
+/// The fields traffic reads from log records; file summaries keep only these.
+const FIELDS: [&str; 16] = [
+    "account_id",
+    "account_label",
+    "cache_creation_input_tokens",
+    "cached_input_tokens",
+    "duration_ms",
+    "input_tokens",
+    "method",
+    "model_call_id",
+    "output_tokens",
+    "path",
+    "provider",
+    "received_bytes",
+    "request_id",
+    "service",
+    "status",
+    "upstream_base_url",
+];
+
+/// A request or model call merged from its lifecycle records. The most
+/// advanced stage names the outcome, and each field comes from the most
+/// advanced record holding it, the one read first on a tie. Merging is
+/// associative, so per-file summaries combine to the same result.
+#[derive(Clone)]
+struct Record {
+    time: Option<DateTime<Local>>,
+    rank: u8,
+    event: Arc<str>,
+    /// Index in `FIELDS`, rank of the record supplying it, and value.
+    fields: Vec<(u8, u8, Arc<str>)>,
+}
+
+impl Record {
+    fn new(entry: &Entry, strings: &mut Strings) -> Self {
+        let rank = lifecycle_rank(entry);
+        Self {
+            time: entry.time,
+            rank,
+            event: strings.get(&entry.event),
+            fields: FIELDS
+                .iter()
+                .enumerate()
+                .filter_map(|(key, name)| Some((key as u8, rank, strings.get(entry.get(name)?))))
+                .collect(),
+        }
     }
-    for (key, value) in incoming.fields {
-        current.fields.entry(key).or_insert(value);
+
+    /// Adds a record read after this one.
+    fn merge(&mut self, later: &Record) {
+        self.time = self.time.into_iter().chain(later.time).min();
+        if later.rank > self.rank {
+            self.rank = later.rank;
+            self.event = later.event.clone();
+        }
+        for (key, rank, value) in &later.fields {
+            match self.fields.iter_mut().find(|field| field.0 == *key) {
+                Some(field) if field.1 >= *rank => {}
+                Some(field) => *field = (*key, *rank, value.clone()),
+                None => self.fields.push((*key, *rank, value.clone())),
+            }
+        }
     }
-    current.time = time;
+
+    fn entry(&self) -> Entry {
+        Entry {
+            seq: 0,
+            time: self.time,
+            event: self.event.to_string(),
+            fields: self
+                .fields
+                .iter()
+                .map(|(key, _, value)| {
+                    (
+                        FIELDS[*key as usize].to_owned(),
+                        Value::String(value.to_string()),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Shares the values a file repeats, such as services, paths and upstreams,
+/// so cached summaries stay small.
+#[derive(Default)]
+struct Strings(HashSet<Arc<str>>);
+
+impl Strings {
+    fn get(&mut self, value: &str) -> Arc<str> {
+        if let Some(shared) = self.0.get(value) {
+            return shared.clone();
+        }
+        let shared: Arc<str> = value.into();
+        self.0.insert(shared.clone());
+        shared
+    }
+}
+
+/// What one log file contributes to traffic in one scope, before the time
+/// window and the current configuration apply.
+#[derive(Default)]
+struct FileTraffic {
+    /// Logged account labels by service and ID, each at its first sighting.
+    evidence: Vec<(String, String, String)>,
+    requests: BTreeMap<String, Record>,
+    /// Request ends without an ID, with a hash of the whole logged record so
+    /// a line read from two files counts once.
+    uncorrelated: Vec<(u64, Record)>,
+    explicit_call_requests: HashSet<String>,
+}
+
+impl FileTraffic {
+    fn scan(file: File, scope: TrafficScope, end: i64) -> Result<Self, String> {
+        let mut traffic = Self::default();
+        let mut sighted = HashSet::new();
+        let mut strings = Strings::default();
+        for_each_line(file, |entry| {
+            // Retain safe identity evidence even when the corresponding request is
+            // outside the selected window. Current configuration mappings win.
+            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
+                && !id.is_empty()
+                && !label.is_empty()
+            {
+                let service = entry
+                    .service()
+                    .or_else(|| entry.get("service"))
+                    .unwrap_or("Unknown");
+                let evidence = (service.to_owned(), id.to_owned(), label.to_owned());
+                if sighted.insert(evidence.clone()) {
+                    traffic.evidence.push(evidence);
+                }
+            }
+            if !included_in_scope(&entry, scope)
+                || lifecycle_rank(&entry) == 0
+                || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
+            {
+                return;
+            }
+            let call = entry.event.starts_with("model_call_");
+            if let Some(id) = entry
+                .get(if call { "model_call_id" } else { "request_id" })
+                .filter(|id| !id.is_empty())
+            {
+                if call
+                    && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
+                {
+                    traffic.explicit_call_requests.insert(request_id.to_owned());
+                }
+                let id = format!("{}:{id}", if call { "call" } else { "request" });
+                let record = Record::new(&entry, &mut strings);
+                match traffic.requests.get_mut(&id) {
+                    Some(current) => current.merge(&record),
+                    None => {
+                        traffic.requests.insert(id, record);
+                    }
+                }
+            } else if entry.is_request_end()
+                && (scope == TrafficScope::All || is_historical_http_call(&entry))
+            {
+                // Uncorrelated connection events can only be counted separately.
+                // New model-call events always require their explicit call ID.
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::hash::DefaultHasher::new();
+                (
+                    &entry.event,
+                    entry.time,
+                    serde_json::to_string(&entry.fields).unwrap_or_default(),
+                )
+                    .hash(&mut hash);
+                traffic
+                    .uncorrelated
+                    .push((hash.finish(), Record::new(&entry, &mut strings)));
+            }
+        })?;
+        Ok(traffic)
+    }
+}
+
+/// A log file that no longer changes, by its identity and contents' stamp.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FileStamp {
+    #[cfg(unix)]
+    node: (u64, u64),
+    #[cfg(not(unix))]
+    path: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// Summaries of rotated files, which do not change once written. Unused ones
+/// are dropped, so a long range read once does not stay in memory.
+type Summaries = HashMap<(FileStamp, bool), (Instant, Arc<FileTraffic>)>;
+static SUMMARIES: Mutex<Option<Summaries>> = Mutex::new(None);
+const SUMMARY_TTL: Duration = Duration::from_secs(600);
+
+/// Each file's contribution, in file order; see `for_each_file`. A cached
+/// summary keeps the window end of the read that made it, which a rotated
+/// file, written before then, does not reach.
+fn file_summaries(
+    path: &Path,
+    start: i64,
+    scope: TrafficScope,
+    end: i64,
+) -> Result<Vec<Arc<FileTraffic>>, String> {
+    let model = scope == TrafficScope::Model;
+    let mut summaries = Vec::new();
+    for_each_file(path, start, |file, live, _path| {
+        let meta = file
+            .metadata()
+            .map_err(|_| "Cannot read traffic history".to_owned())?;
+        if live {
+            summaries.push(Arc::new(FileTraffic::scan(file, scope, end)?));
+            return Ok(());
+        }
+        let stamp = FileStamp {
+            #[cfg(unix)]
+            node: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            },
+            #[cfg(not(unix))]
+            path: _path.to_owned(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        };
+        let key = (stamp, model);
+        let cached = {
+            let mut cache = SUMMARIES.lock().unwrap();
+            let cache = cache.get_or_insert_with(HashMap::new);
+            cache.retain(|_, (used, _)| used.elapsed() < SUMMARY_TTL);
+            cache.get_mut(&key).map(|(used, summary)| {
+                *used = Instant::now();
+                summary.clone()
+            })
+        };
+        let summary = match cached {
+            Some(summary) => summary,
+            None => {
+                let summary = Arc::new(FileTraffic::scan(file, scope, end)?);
+                SUMMARIES
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, (Instant::now(), summary.clone()));
+                summary
+            }
+        };
+        summaries.push(summary);
+        Ok(())
+    })?;
+    Ok(summaries)
 }
 
 #[derive(Serialize)]
@@ -140,92 +385,62 @@ pub fn read(
     let end = Local::now().timestamp_millis();
     let start = end - minutes as i64 * 60_000;
     let mut groups = BTreeMap::new();
-    let mut entries = Vec::new();
     let mut labels = labels.clone();
     let mut seen_requests = HashSet::new();
-    let mut requests = BTreeMap::<String, Entry>::new();
+    let files = file_summaries(path, start, scope, end)?;
+    let mut entries = Vec::<&Record>::new();
+    // Most requests lie within one file; only those in several are copied.
+    let mut requests = BTreeMap::<&str, std::borrow::Cow<Record>>::new();
     let mut explicit_call_requests = HashSet::new();
-    for_each_entry(path, start, |entry| {
-        // Retain safe identity evidence even when the corresponding request is
-        // outside the selected window. Current configuration mappings win.
-        if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
-            && !id.is_empty()
-            && !label.is_empty()
-        {
-            let service = entry
-                .service()
-                .or_else(|| entry.get("service"))
-                .unwrap_or("Unknown");
+    for file in &files {
+        for (service, id, label) in &file.evidence {
             if labels
                 .iter()
                 .any(|((s, _), current)| s == service && current == label)
             {
                 labels
-                    .entry((service.to_owned(), id.to_owned()))
-                    .or_insert_with(|| label.to_owned());
+                    .entry((service.clone(), id.clone()))
+                    .or_insert_with(|| label.clone());
             }
         }
-        if !included_in_scope(&entry, scope)
-            || lifecycle_rank(&entry) == 0
-            || !entry.time.is_some_and(|t| t.timestamp_millis() < end)
-        {
-            return;
-        }
-        if let Some(id) = entry
-            .get(if entry.event.starts_with("model_call_") {
-                "model_call_id"
-            } else {
-                "request_id"
-            })
-            .filter(|id| !id.is_empty())
-        {
-            if entry.event.starts_with("model_call_")
-                && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
-            {
-                explicit_call_requests.insert(request_id.to_owned());
-            }
-            let id = format!(
-                "{}:{id}",
-                if entry.event.starts_with("model_call_") {
-                    "call"
-                } else {
-                    "request"
+        for (id, record) in &file.requests {
+            match requests.get_mut(id.as_str()) {
+                Some(current) => current.to_mut().merge(record),
+                None => {
+                    requests.insert(id, std::borrow::Cow::Borrowed(record));
                 }
-            );
-            if let Some(current) = requests.get_mut(&id) {
-                merge_request(current, entry);
-            } else {
-                requests.insert(id, entry);
-            }
-        } else if entry.is_request_end()
-            && (scope == TrafficScope::All || is_historical_http_call(&entry))
-        {
-            // Uncorrelated connection events can only be counted separately.
-            // New model-call events always require their explicit call ID.
-            let identity = format!(
-                "{}:{:?}:{}",
-                entry.event,
-                entry.time,
-                serde_json::to_string(&entry.fields).unwrap_or_default()
-            );
-            if seen_requests.insert(identity) {
-                entries.push(entry);
             }
         }
-    })?;
-    for entry in entries.iter().chain(requests.values()) {
+        for (identity, record) in &file.uncorrelated {
+            if seen_requests.insert(*identity) {
+                entries.push(record);
+            }
+        }
+        explicit_call_requests.extend(file.explicit_call_requests.iter().map(String::as_str));
+    }
+    let in_window = |record: &&Record| {
+        record
+            .time
+            .is_some_and(|t| (start..end).contains(&t.timestamp_millis()))
+    };
+    for entry in entries
+        .into_iter()
+        .chain(requests.values().map(|record| record.as_ref()))
+        .filter(in_window)
+        .map(Record::entry)
+    {
         if scope == TrafficScope::Model
-            && is_historical_http_call(entry)
+            && is_historical_http_call(&entry)
             && entry
                 .get("request_id")
                 .is_some_and(|id| explicit_call_requests.contains(id))
         {
             continue;
         }
-        let resolved = identities.resolve(entry, entry.service().unwrap_or("Unknown"), &labels);
+        let resolved = identities.resolve(&entry, entry.service().unwrap_or("Unknown"), &labels);
         aggregate(
             &mut groups,
-            entry,
+            &entry,
             start,
             end,
             bucket_minutes,
@@ -407,6 +622,17 @@ pub(crate) fn for_each_entry(
     start: i64,
     mut visit: impl FnMut(Entry),
 ) -> Result<(), String> {
+    for_each_file(path, start, |file, _, _| for_each_line(file, &mut visit))
+}
+
+/// Calls `visit` with each file of the log at `path`: the live log first
+/// (marked `true`), then the rotated backup and archives, as for
+/// `for_each_entry`. A file is never visited twice.
+fn for_each_file(
+    path: &Path,
+    start: i64,
+    mut visit: impl FnMut(File, bool, &Path) -> Result<(), String>,
+) -> Result<(), String> {
     let backup = path.with_file_name(format!(
         "{}.1",
         path.file_name().unwrap_or_default().to_string_lossy()
@@ -417,7 +643,7 @@ pub(crate) fn for_each_entry(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err("Cannot read traffic history".to_owned()),
     };
-    let current = [path, backup.as_path()].map(open);
+    let current = [path, backup.as_path()].map(|p| (p.to_owned(), open(p)));
     let archives = coport::logger::history_paths(path)
         .map_err(|_| "Cannot read traffic archives".to_owned())?;
     // Archived files are immutable. Skip files last written before the selected
@@ -429,10 +655,12 @@ pub(crate) fn for_each_entry(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .is_none_or(|t| t.as_millis() as i64 >= start)
     });
-    let files = current.into_iter().chain(archives.map(|p| open(&p)));
+    let files = current
+        .into_iter()
+        .chain(archives.map(|p| (p.clone(), open(&p))));
     #[cfg(unix)]
     let mut identities = std::collections::HashSet::new();
-    for file in files {
+    for (index, (file_path, file)) in files.enumerate() {
         let Some(file) = file? else { continue };
         #[cfg(unix)]
         {
@@ -445,28 +673,33 @@ pub(crate) fn for_each_entry(
                 continue;
             }
         }
-        for line in BufReader::new(file).split(b'\n') {
-            let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
-            let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
-                continue;
-            };
-            let Some(Value::String(event)) = fields.remove("event") else {
-                continue;
-            };
-            let time = fields
-                .remove("timestamp")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                })
-                .map(|t| t.with_timezone(&Local));
-            visit(Entry {
-                seq: crate::logs::line_key(&line),
-                event,
-                time,
-                fields,
-            });
-        }
+        visit(file, index == 0, &file_path)?;
+    }
+    Ok(())
+}
+
+fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String> {
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
+        let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
+            continue;
+        };
+        let Some(Value::String(event)) = fields.remove("event") else {
+            continue;
+        };
+        let time = fields
+            .remove("timestamp")
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            })
+            .map(|t| t.with_timezone(&Local));
+        visit(Entry {
+            seq: crate::logs::line_key(&line),
+            event,
+            time,
+            fields,
+        });
     }
     Ok(())
 }
@@ -1120,6 +1353,79 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn rotated_files_are_summarized_once_until_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let row = |status: &str, id: &str| {
+            serde_json::json!({
+                "timestamp": (Local::now() - chrono::Duration::days(2)).to_rfc3339(),
+                "event":"request_finished", "service":"claude", "request_id":id,
+                "status":status, "received_bytes":"100"
+            })
+            .to_string()
+                + "\n"
+        };
+        let archive = history.join("proxy.log.1.archived.jsonl");
+        std::fs::write(&archive, row("200", "a")).unwrap();
+        let modified = std::fs::metadata(&archive).unwrap().modified().unwrap();
+        let errors = || {
+            read(&path, 43200, &BTreeMap::new(), TrafficScope::All)
+                .unwrap()
+                .summary
+                .errors
+        };
+        assert_eq!(errors(), 0);
+        // Rotated files never change in place, so the summary is reused: an
+        // edit keeping the length and modification time is not read.
+        std::fs::write(&archive, row("500", "a")).unwrap();
+        let file = std::fs::File::options().write(true).open(&archive).unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+        assert_eq!(errors(), 0);
+        // A different stamp is a different file.
+        std::fs::write(&archive, row("500", "ab")).unwrap();
+        assert_eq!(errors(), 1);
+    }
+
+    #[test]
+    fn merged_fields_do_not_depend_on_how_files_split_a_request() {
+        let mut strings = Strings::default();
+        let mut record = |event: &str, fields: serde_json::Value| {
+            let entry = Entry {
+                seq: 0,
+                time: Some(Local::now()),
+                event: event.into(),
+                fields: fields.as_object().unwrap().clone(),
+            };
+            Record::new(&entry, &mut strings)
+        };
+        let records = [
+            record("request_received", serde_json::json!({"provider":"first"})),
+            record("upstream_response", serde_json::json!({})),
+            record("route_selected", serde_json::json!({"provider":"routed"})),
+            record("request_finished", serde_json::json!({"status":"200"})),
+        ];
+        let fold = |records: &[Record]| {
+            let mut merged = records[0].clone();
+            for record in &records[1..] {
+                merged.merge(record);
+            }
+            merged
+        };
+        for split in 1..records.len() {
+            let mut merged = fold(&records[..split]);
+            merged.merge(&fold(&records[split..]));
+            let entry = merged.entry();
+            assert_eq!(entry.event, "request_finished");
+            // The most advanced record holding a field supplies it.
+            assert_eq!(entry.get("provider"), Some("routed"));
+            assert_eq!(entry.get("status"), Some("200"));
+        }
+    }
+
     #[test]
     fn reads_rotated_history_groups_credentials_and_excludes_outside_range() {
         let dir = tempfile::tempdir().unwrap();
