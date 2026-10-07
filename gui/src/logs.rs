@@ -220,8 +220,11 @@ impl LogFeed {
             let identity = meta.as_ref().map(file_identity);
             let len = meta.as_ref().map_or(0, |m| m.len());
             // Lines written just before a rotation are read through the old handle.
+            // Windows gives a file created soon after a rename the old one's
+            // creation time, so a shorter file is also taken as a new one; a
+            // file truncated in place has nothing past the offset to read.
             if let Some((mut f, id)) = file.take() {
-                if identity == Some(id) {
+                if identity == Some(id) && len >= offset {
                     file = Some((f, id));
                 } else {
                     let mut buf = Vec::new();
@@ -233,11 +236,7 @@ impl LogFeed {
                     }
                 }
             }
-            // A file still open here has the current identity.
-            let reopen = match &file {
-                None => identity.is_some(),
-                Some(_) => len < offset,
-            };
+            let reopen = file.is_none() && identity.is_some();
             if reopen && let Ok(f) = std::fs::File::open(&path) {
                 // First open backfills history; later reopens mean rotation.
                 let fresh = generation_is_empty(&self.store);
