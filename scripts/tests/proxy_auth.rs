@@ -52,6 +52,11 @@ impl AuthProbe {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(4)))
                     .unwrap();
+                // The proxy's client may open a connection and close or reset
+                // it unused; only connections that send a request are checked.
+                if !matches!(stream.peek(&mut [0]), Ok(1..)) {
+                    continue;
+                }
                 if scheme == "socks5" {
                     let head = bytes(&mut stream, 2);
                     assert_eq!(head[0], 5);
