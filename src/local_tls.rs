@@ -170,7 +170,14 @@ impl CreationLock {
                 .open(path)
             {
                 Ok(_) => return Ok(Self(path.to_owned())),
-                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+                // Windows refuses to create a file whose previous holder is
+                // still deleting it, just as when it exists.
+                Err(e)
+                    if e.kind() != std::io::ErrorKind::AlreadyExists
+                        && !(cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    return Err(e);
+                }
                 Err(e) => {
                     let stale = std::fs::metadata(path)
                         .and_then(|m| m.modified())
