@@ -778,10 +778,13 @@ input.field::placeholder {
 
 .number-field input.field {
   width: 100%;
-  padding-right: 17px;
   height: 20px;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+.number-field:has(.unit:not(:empty)) input.field {
+  padding-right: 17px;
 }
 
 .number-field .unit {
