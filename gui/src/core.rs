@@ -536,7 +536,7 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             .map(|(name, endpoint)| ProxyDto {
                 name: name.clone(),
                 endpoint: redacted_endpoint(endpoint),
-                local: crate::proxy::is_local(endpoint),
+                local: crate::proxy::is_local_network(endpoint),
                 probe: probes.get(name).map(|(p, _)| match p {
                     Probe::Pending => ProbeDto {
                         state: "pending",
@@ -730,7 +730,7 @@ struct ConfigDetails {
 struct ProxyDto {
     name: String,
     endpoint: String,
-    /// Listens on this machine; its exit address is looked up when probed.
+    /// Loopback or local-network proxy; its exit address is looked up when probed.
     local: bool,
     probe: Option<ProbeDto>,
 }
@@ -870,6 +870,31 @@ impl From<Entry> for EntryDto {
 mod tests {
     use super::{Urls, matches_search, parse_config, replace_config};
     use crate::logs::Entry;
+
+    #[test]
+    fn lan_proxy_details_include_exit_address() {
+        use crate::proxy::{Exit, Probe};
+        use std::{collections::BTreeMap, time::SystemTime};
+
+        let config = parse_config("listen_port: 8787\nrequest_timeout_seconds: 30\nproxies:\n  jp_lab: http://10.156.232.107:10810\n").unwrap();
+        let probes = BTreeMap::from([(
+            "jp_lab".into(),
+            (
+                Probe::Reachable {
+                    latency: std::time::Duration::from_millis(42),
+                    exit: Some(Exit {
+                        ip: "203.0.113.5".into(),
+                        country: Some("JP".into()),
+                    }),
+                },
+                SystemTime::now(),
+            ),
+        )]);
+        let dto = serde_json::to_value(super::details(&config, &probes)).unwrap();
+        assert_eq!(dto["proxies"][0]["local"], true);
+        assert_eq!(dto["proxies"][0]["probe"]["exitIp"], "203.0.113.5");
+        assert_eq!(dto["proxies"][0]["probe"]["country"], "JP");
+    }
 
     #[test]
     fn runtime_health_recovers_gui_without_manual_refresh() {

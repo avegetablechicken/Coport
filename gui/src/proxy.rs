@@ -28,7 +28,7 @@ pub enum Probe {
     Pending,
     Reachable {
         latency: Duration,
-        /// Looked up for proxies on this machine only.
+        /// Looked up for loopback and local-network proxies.
         exit: Option<Exit>,
     },
     Unreachable(String),
@@ -271,8 +271,8 @@ impl Controller {
     }
 
     /// Tests an outbound proxy, showing it as pending until the result.
-    /// Proxies on this machine (typically local clients that switch nodes)
-    /// get a request through them to learn the exit address; other proxies
+    /// Loopback and local-network proxies get a request through them to
+    /// learn the exit address; other proxies
     /// get a TCP connection check.
     pub fn probe(&self, name: &str, endpoint: &str) {
         self.test(name, endpoint, true);
@@ -298,7 +298,7 @@ impl Controller {
         let name = name.to_owned();
         let endpoint = endpoint.to_owned();
         self.rt.spawn(async move {
-            let probe = if is_local(&endpoint) {
+            let probe = if is_local_network(&endpoint) {
                 trace(&endpoint).await
             } else {
                 connect(addr).await
@@ -426,13 +426,19 @@ fn parse_trace(text: &str) -> Option<Exit> {
     Some(Exit { ip, country })
 }
 
-/// A proxy listening on this machine.
-pub fn is_local(endpoint: &str) -> bool {
+/// A proxy on loopback, a private network, or a link-local address.
+pub fn is_local_network(endpoint: &str) -> bool {
     host_port(endpoint).is_some_and(|(host, _)| {
         host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+            || host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+                std::net::IpAddr::V4(ip) => {
+                    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+                }
+                std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+                    || ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+                    |ip| ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+                ),
+            })
     })
 }
 
@@ -447,7 +453,7 @@ fn host_port(endpoint: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, Exit, Phase, Probe, host_port, is_local, parse_trace};
+    use super::{Controller, Exit, Phase, Probe, host_port, is_local_network, parse_trace};
     use std::sync::Arc;
 
     fn wait_for(mut predicate: impl FnMut() -> bool) {
@@ -596,12 +602,37 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_local_proxies() {
-        assert!(is_local("http://127.0.0.1:7890"));
-        assert!(is_local("socks5://user:pw@localhost:1080"));
-        assert!(is_local("http://[::1]:8080"));
-        assert!(!is_local("http://10.156.232.107:10810"));
-        assert!(!is_local("https://proxy.example.com:443"));
+    fn recognizes_loopback_and_local_network_proxies() {
+        for endpoint in [
+            "http://127.0.0.1:7890",
+            "socks5://user:pw@localhost:1080",
+            "http://[::1]:8080",
+            "http://10.156.232.107:10810",
+            "http://172.16.0.1:8080",
+            "http://172.31.255.254:8080",
+            "http://192.168.1.1:8080",
+            "http://169.254.1.1:8080",
+            "http://[fc00::1]:8080",
+            "http://[fd12::1]:8080",
+            "http://[fe80::1]:8080",
+            "http://[::ffff:192.168.1.1]:8080",
+        ] {
+            assert!(is_local_network(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://proxy.example.com:443",
+            "http://172.15.255.255:8080",
+            "http://172.32.0.1:8080",
+            "http://192.169.1.1:8080",
+            "http://8.8.8.8:8080",
+            "http://[2606:4700:4700::1111]:8080",
+            "http://[::ffff:8.8.8.8]:8080",
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "invalid",
+        ] {
+            assert!(!is_local_network(endpoint), "{endpoint}");
+        }
     }
 
     #[test]
