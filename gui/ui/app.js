@@ -477,7 +477,7 @@ function proxyBlock() {
 /// Bars of a stats object's buckets: requests, or with Models reported input
 /// plus output tokens, in the ring's unit. Red marks the share of failed
 /// requests or calls; buckets whose calls reported no usage keep a stub bar.
-function chart(stats, scope, showPeak = false) {
+function chart(stats, scope, showPeak = false, window = stats) {
   const model = scope === "model";
   const values = model ? stats.tokenCounts : stats.counts;
   const calls = stats.counts;
@@ -490,16 +490,25 @@ function chart(stats, scope, showPeak = false) {
   const w = 300;
   const h = 32;
   const bar = (w - gap * (n - 1)) / n;
+  const start = window.start ?? window.windowStart;
+  const end = window.end ?? window.windowEnd;
+  const bucketMs = window.bucketMinutes * 60_000;
+  const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
   let bars = "";
   values.forEach((v, i) => {
     const x = (i * (bar + gap)).toFixed(2);
     const bh = v ? Math.max(2.5, (v / max) * h) : calls[i] ? 2.5 : 1;
-    const title = model ? `${v ? `${v.toLocaleString("en-US")} tokens` : "No reported tokens"} · ${calls[i].toLocaleString("en-US")} calls` : `${v.toLocaleString("en-US")} requests`;
-    bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"><title>${title}</title></rect>`;
+    const title = model ? (v || !calls[i] ? `${v.toLocaleString("en-US")} tokens` : "No reported tokens") : `${v.toLocaleString("en-US")} requests`;
+    const from = start + i * bucketMs;
+    const to = Math.min(from + bucketMs, end);
+    const range = Number.isFinite(from) && Number.isFinite(to) ? `${date(from)} – ${date(to)}\n` : "";
+    bars += `<g class="chart-bar" data-tip="${esc(range + title)}" aria-label="${esc(range + title)}">`;
+    bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"></rect>`;
     if (errors[i]) {
       const eh = (bh * errors[i]) / calls[i];
       bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
     }
+    bars += `<rect class="chart-hit" x="${x}" y="0" width="${bar.toFixed(2)}" height="${h}"></rect></g>`;
   });
   const plot = `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
   const peak = Math.max(0, ...values);
@@ -518,7 +527,7 @@ function chart(stats, scope, showPeak = false) {
 
 function rememberLocalTraffic(traffic, minutes, scope) {
   (ui.localTrafficViews ||= Object.create(null))[`${minutes}:${scope}`] = {
-    ...traffic.summary, credentials: traffic.credentials, scope,
+    ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, scope,
   };
 }
 
@@ -533,7 +542,7 @@ async function loadHomeTraffic(force = false) {
     const traffic = await invoke("get_traffic", { minutes, scope });
     if (request !== ui.homeTrafficRequest) return;
     rememberLocalTraffic(traffic, minutes, scope);
-    ui.homeTraffic = { ...traffic.summary, scope };
+    ui.homeTraffic = { ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, scope };
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
   } catch (error) {
@@ -716,8 +725,8 @@ document.addEventListener("pointerover", (event) => {
   }
 });
 
-// Render account warnings outside the scrolling panel, with viewport-aware
-// placement instead of extending a pseudo-element left of the icon.
+// Render account warnings and bar details outside the scrolling panel,
+// keeping tooltips inside the viewport.
 let routeTooltipTimer;
 let routeTooltipOwner;
 
@@ -751,18 +760,18 @@ function showRouteTooltip(owner) {
     tip.style.top = `${top}px`;
     tip.style.visibility = "visible";
     owner.setAttribute("aria-describedby", "route-tooltip");
-  }, 500);
+  }, owner.matches(".chart-bar") ? 100 : 500);
 }
 
 for (const type of ["pointerover", "focusin"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning");
+    const owner = event.target.closest?.(".route-warning, .chart-bar");
     if (owner) showRouteTooltip(owner);
   });
 }
 for (const type of ["pointerout", "focusout"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning");
+    const owner = event.target.closest?.(".route-warning, .chart-bar");
     if (!owner || owner.contains(event.relatedTarget)) return;
     if (type === "pointerout" && document.activeElement === owner) return;
     if (type === "focusout" && owner.matches(":hover")) return;
@@ -1150,7 +1159,7 @@ function renderActivityTraffic() {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong>${trafficReview(c, traffic.targets)}</div>
-      ${chart(c, scope, true)}
+      ${chart(c, scope, true, traffic)}
       <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
   }).join("");
@@ -1373,15 +1382,15 @@ async function loadMergedData(force = false) {
   }
   finally { if (request === ui.mergedDataRequest) { ui.mergedDataLoading = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
 }
-function deviceTrafficContent(traffic, scope, detailsKey = "merged") {
+function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
   const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
   let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">
-    ${trafficShare(traffic.credentials, scope)}${chart(traffic, scope)}
+    ${trafficShare(traffic.credentials, scope)}${chart(traffic, scope, false, window)}
     <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", traffic.requests)}${stat("Error Rate", rate, traffic.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(traffic.avgMs))}${stat("Received", fmtBytes(traffic.bytes))}</div>
     ${modelTokenStats(traffic, scope)}</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
     <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
-    ${chart(c, scope, true)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
   return body;
 }
 document.addEventListener("toggle", event => {
@@ -1396,7 +1405,7 @@ function mergedDataBlock() {
   if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
   if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
   if (data) {
-    body += deviceTrafficContent(data.traffic, data.scope);
+    body += deviceTrafficContent(data.traffic, data.scope, "merged", data);
     for (const source of data.sources) if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
   }
   return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading ? "disabled" : ""}>Refresh</button>`, body);
@@ -1452,7 +1461,7 @@ function devicesPage() {
   const localScope = data?.scope || ui.trafficScope || "model";
   let cards = block("This Device", "",
     `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.state === "running" ? "Running" : "Stopped"}</span></div>` +
-    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local")}` : `<div class="placeholder">Loading traffic…</div>`));
+    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local", data || localTraffic)}` : `<div class="placeholder">Loading traffic…</div>`));
   for (const device of ui.devices) {
     const source = data?.sources.find(source => source.name === device.name);
     const traffic = source?.traffic;
@@ -1462,7 +1471,7 @@ function devicesPage() {
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : "Loading traffic…"}</div>`));
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : "Loading traffic…"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
@@ -1669,12 +1678,13 @@ const fitObserver = new ResizeObserver(queueFit);
 fitObserver.observe($("content"));
 let observedPage = null;
 new MutationObserver(() => {
+  if (routeTooltipOwner && !routeTooltipOwner.isConnected) hideRouteTooltip();
   const page = $("content").firstElementChild;
   if (page === observedPage) return;
   if (observedPage) fitObserver.unobserve(observedPage);
   if (page) fitObserver.observe(page);
   observedPage = page;
-}).observe($("content"), { childList: true });
+}).observe($("content"), { childList: true, subtree: true });
 
 // ---------------------------------------------------------------- actions
 

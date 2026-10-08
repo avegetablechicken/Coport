@@ -376,6 +376,14 @@ select:focus-visible {
   opacity: 0.9;
 }
 
+.chart rect.chart-hit {
+  fill: transparent;
+  opacity: 1;
+  pointer-events: all;
+}
+
+.chart-bar[data-tip]::after { content: none; }
+
 /* ------------------------------------------------------------------- rows */
 
 .row {

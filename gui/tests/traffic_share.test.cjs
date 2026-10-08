@@ -119,11 +119,16 @@ test('home traffic keeps the category it was read for', async () => {
   vm.runInContext(source.slice(source.indexOf('async function loadHomeTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
   const load = context.loadHomeTraffic();
   ui.trafficScope = 'model';
-  pending[0].resolve({ summary: { requests: 3 } });
+  pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, summary: { requests: 3 } });
   await load;
   assert.equal(pending[0].query.scope, 'all');
   assert.equal(ui.homeTraffic.scope, 'all');
   assert.equal(ui.homeTraffic.requests, 3);
+  for (const stats of [ui.homeTraffic, ui.localTrafficViews['30:all']]) {
+    assert.equal(stats.start, 1000);
+    assert.equal(stats.end, 181000);
+    assert.equal(stats.bucketMinutes, 1);
+  }
 });
 test('Models adds output to input, which already holds cached tokens', () => {
   const { shareTokens, trafficShare } = setup();
@@ -165,7 +170,8 @@ test('Models charts of calls without reported usage show no zero token peak', ()
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
   const html = context.chart(failed, 'model', true);
   assert.doesNotMatch(html, /chart-peak/);
-  assert.match(html, /No reported tokens · 2 calls/);
+  assert.match(html, /No reported tokens/);
+  assert.doesNotMatch(html, /calls|requests/);
   assert.equal((html.match(/class="err"/g) || []).length, 2);
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
@@ -217,4 +223,74 @@ test('Claude Input Tokens explain uncached input and cache writes on hover', () 
   assert.match(html, /=50>/);
   assert.doesNotMatch(context.modelTokenStats({ ...claude, service: 'Codex' }, 'model'), /data-tip/);
   assert.doesNotMatch(context.modelTokenStats({ ...claude, inputTokens: null }, 'model'), /data-tip/);
+});
+
+test('bar tooltips use their own time bucket and only the plotted metric', () => {
+  const context = setup();
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  const start = new Date(2026, 9, 9, 23, 59, 0).getTime();
+  const end = start + 150_000;
+  const stats = { counts: [2, 3, 0], tokenCounts: [1234, 0, 0], errorCounts: [1, 3, 0] };
+  const date = ms => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const ranges = [0, 1, 2].map(i => `${date(start + i * 60_000)} – ${date(Math.min(start + (i + 1) * 60_000, end))}\n`);
+  const tips = html => [...html.matchAll(/data-tip="([^"]*)"/g)].map(m => m[1]);
+  // Local and merged-device payloads use different names for window bounds.
+  for (const window of [{ start, end, bucketMinutes: 1 }, { windowStart: start, windowEnd: end, bucketMinutes: 1 }]) {
+    const requests = context.chart(stats, 'all', false, window);
+    assert.deepEqual(tips(requests), ranges.map((range, i) => `${range}${stats.counts[i]} requests`));
+    const tokens = context.chart(stats, 'model', false, window);
+    assert.deepEqual(tips(tokens), [ranges[0] + '1,234 tokens', ranges[1] + 'No reported tokens', ranges[2] + '0 tokens']);
+    // Even idle or failed bars have a full-height target over the error overlay.
+    const groups = [...tokens.matchAll(/<g class="chart-bar"[^>]*>(.*?)<\/g>/g)].map(m => m[1]);
+    assert.equal(groups.length, 3);
+    for (const group of groups) assert.match(group, /<rect class="chart-hit"[^>]* y="0"[^>]* height="32"><\/rect>$/);
+  }
+});
+
+test('hovering across bars updates the tooltip and leaving hides it', () => {
+  const events = {};
+  const timers = new Map();
+  let timerId = 0;
+  const tip = { hidden: true, style: {}, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
+  const context = {
+    $: () => tip,
+    setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
+    clearTimeout(id) { timers.delete(id); },
+    document: { documentElement: { clientWidth: 320, clientHeight: 480 }, addEventListener(type, fn) { events[type] = fn; } },
+    window: { addEventListener() {} },
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('let routeTooltipTimer;'), source.indexOf('\nfunction routingBlock(')), context);
+  const bar = text => {
+    const owner = {
+      dataset: { tip: text }, isConnected: true,
+      matches: selector => selector === '.chart-bar',
+      contains: target => target?.owner === owner,
+      getBoundingClientRect: () => ({ left: 290, top: 10, bottom: 42 }),
+      setAttribute(name, value) { this[name] = value; },
+      removeAttribute(name) { delete this[name]; },
+    };
+    const target = { owner, closest: selector => selector.includes('.chart-bar') ? owner : null };
+    return { owner, target };
+  };
+  const flush = () => { for (const [id, fn] of timers) { timers.delete(id); fn(); } };
+  const first = bar('10:00 – 10:01\n2 requests');
+  const second = bar('10:01 – 10:02\n5 requests');
+  events.pointerover({ target: first.target });
+  flush();
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, first.owner.dataset.tip);
+  assert.equal(tip.style.left, '128px'); // Right-edge bars stay inside the viewport.
+  events.pointerout({ target: first.target, relatedTarget: second.target });
+  events.pointerover({ target: second.target });
+  flush();
+  assert.equal(tip.textContent, second.owner.dataset.tip);
+  assert.equal(first.owner['aria-describedby'], undefined);
+  events.pointerout({ target: second.target, relatedTarget: null });
+  assert.equal(tip.hidden, true);
+  // A quick pass over a bar must not leave a delayed tooltip behind.
+  events.pointerover({ target: first.target });
+  events.pointerout({ target: first.target, relatedTarget: null });
+  flush();
+  assert.equal(tip.hidden, true);
 });
