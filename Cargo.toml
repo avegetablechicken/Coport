@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform loopback HTTP/SSE proxy with credential-based outbound routing"
+publish = false
+repository = "https://github.com/avegetablechicken/Coport"
 
 [workspace]
 members = ["gui"]
