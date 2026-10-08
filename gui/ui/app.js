@@ -411,7 +411,7 @@ function renderPage() {
     ? document.activeElement : null;
   const typing = focused && { id: focused.id, value: focused.value, start: focused.selectionStart, end: focused.selectionEnd };
   ui.rendering = true;
-  content.innerHTML = `<div class="page">${ui.page === "settings" ? settings() : ui.page === "devices" ? devicesPage() : main()}</div>`;
+  content.innerHTML = `<div class="page${ui.page === "settings" ? " settings-page" : ""}">${ui.page === "settings" ? settings() : ui.page === "devices" ? devicesPage() : main()}</div>`;
   const field = typing && $(typing.id);
   if (field) {
     field.value = typing.value;

@@ -582,16 +582,18 @@ select:focus-visible {
   transform: translateX(11px);
 }
 
-.select {
+.select,
+select.field {
   appearance: none;
   height: 20px;
   padding: 0 20px 0 7px;
   border: 0;
   border-radius: 5px;
-  background: var(--control)
+  background: var(--track)
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='10' viewBox='0 0 8 10'%3E%3Cpath d='M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5' fill='none' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
     no-repeat right 6px center;
-  box-shadow: 0 0 0 0.5px var(--control-border), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+  box-shadow: none;
+  color: var(--secondary);
   font-size: 11px;
 }
 
@@ -601,12 +603,18 @@ input.field {
   padding: 0 7px;
   border: 0;
   border-radius: 5px;
-  background: var(--block);
-  box-shadow: 0 0 0 0.5px var(--control-border);
+  background: var(--track);
+  box-shadow: none;
+  color: var(--secondary);
   outline: none;
   font-size: 11px;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.settings-page .select,
+.settings-page .field {
+  color: var(--label);
 }
 
 input.field:focus {
@@ -624,8 +632,7 @@ input.field::placeholder {
   align-items: center;
   height: 22px;
   border-radius: 5px;
-  background: var(--block);
-  box-shadow: 0 0 0 0.5px var(--control-border);
+  background: var(--track);
 }
 .activity-search:focus-within {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
@@ -762,27 +769,32 @@ input.field::placeholder {
 }
 
 .number-field {
+  position: relative;
   display: flex;
   flex: none;
   align-items: center;
-  gap: 3px;
+  width: 68px;
 }
 
 .number-field input.field {
-  width: 58px;
+  width: 100%;
+  padding-right: 17px;
   height: 20px;
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
 .number-field .unit {
+  position: absolute;
+  right: 7px;
   width: 7px;
-  color: var(--tertiary);
+  color: var(--label);
+  pointer-events: none;
 }
 
-/* Match the numeric input column, leaving its unit column empty. */
+/* Keep Network controls flush with the other settings rows. */
 .config-action-row { display: grid; grid-template-columns: minmax(0, 1fr) 68px; row-gap: 0; }
-.config-action-row .switch { justify-self: end; margin-right: 10px; }
+.config-action-row .switch { justify-self: end; }
 .config-action-row .setting-description { grid-column: 1 / -1; }
 
 /* ---------------------------------------------------------------- requests */
