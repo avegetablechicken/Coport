@@ -302,6 +302,8 @@ fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
     for bytes in [
         br#"{"token":"wrong","action":"Stop"}"#.as_slice(),
         br#"{"token":"wrong","action":{"Probe":{"name":"test"}}}"#.as_slice(),
+        br#"{"token":"wrong","action":"AccountStates"}"#.as_slice(),
+        br#"{"token":"wrong","action":"CredentialLabels"}"#.as_slice(),
     ] {
         let mut control =
             TcpStream::connect(("127.0.0.1", endpoint["port"].as_u64().unwrap() as u16)).unwrap();
@@ -390,7 +392,10 @@ fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
     wait_for(|| matches!(gui.probes()["test"].0, Probe::Unreachable(_)));
     // A config edit must not silently test the daemon's old endpoint.
     std::fs::write(&config_path, "invalid config").unwrap();
-    std::fs::File::open(&config_path)
+    // Windows requires write access when changing file timestamps.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&config_path)
         .unwrap()
         .set_modified(status.config_modified.unwrap() + Duration::from_secs(2))
         .unwrap();
@@ -400,4 +405,84 @@ fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
     );
     gui.on_app_exit(true).unwrap();
     client.stop().unwrap();
+}
+
+#[test]
+fn metadata_uses_daemon_then_local_only_after_daemon_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().into());
+    let port = free_port();
+    let config_path = dir.path().join("config.yaml");
+    let daemon_home = dir.path().join("daemon-home");
+    std::fs::create_dir(&daemon_home).unwrap();
+    let daemon_home_yaml = serde_json::to_string(&daemon_home).unwrap();
+    let daemon_config = format!(
+        "listen_port: {port}\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{daemon_home_yaml}]\n  routing:\n    account: {{daemon-account: none}}\nclaude:\n  config_dirs: []\n"
+    );
+    std::fs::write(&config_path, &daemon_config).unwrap();
+    let (client, status) = daemon::start(
+        &helper(),
+        dir.path(),
+        &config_path,
+        &dir.path().join("proxy.log"),
+    )
+    .unwrap();
+    assert!(status.metadata_supported);
+    // Synthetic local credentials make an accidental local fallback observable.
+    let home = dir.path().join("local-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"tokens":{"account_id":"local-account","access_token":"test-only-token"}}"#,
+    )
+    .unwrap();
+    let local_text = daemon_config
+        .replace("daemon-account", "local-account")
+        .replacen(
+            &format!("homes: [{daemon_home_yaml}]"),
+            &format!("homes: [{}]", serde_json::to_string(&home).unwrap()),
+            1,
+        );
+    let local = coport::config::Config::parse(&local_text).unwrap();
+    let tasks = coport_gui::tasks::Tasks::new(dir.path().into(), config_path.clone(), local);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let states = rt.block_on(tasks.account_states()).unwrap();
+    assert!(states[0].contains_key("daemon-account"));
+    assert!(!states[0].contains_key("local-account"));
+    let labels = rt.block_on(tasks.credential_labels()).unwrap();
+    assert_eq!(
+        labels
+            .get(&("Codex".into(), "daemon-account".into()))
+            .map(String::as_str),
+        Some("daemon-account")
+    );
+    assert!(!labels.contains_key(&("Codex".into(), "local-account".into())));
+    // Windows requires write access when changing file timestamps.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_modified(status.config_modified.unwrap() + Duration::from_secs(2))
+        .unwrap();
+    assert!(
+        rt.block_on(tasks.account_states())
+            .unwrap_err()
+            .contains("updated configuration")
+    );
+    assert!(
+        rt.block_on(tasks.credential_labels())
+            .unwrap_err()
+            .contains("updated configuration")
+    );
+    client.stop().unwrap();
+    let states = rt.block_on(tasks.account_states()).unwrap();
+    assert!(states[0].contains_key("local-account"));
+    assert!(!states[0].contains_key("daemon-account"));
+    let labels = rt.block_on(tasks.credential_labels()).unwrap();
+    assert_eq!(
+        labels
+            .get(&("Codex".into(), "local-account".into()))
+            .map(String::as_str),
+        Some("local-account")
+    );
 }

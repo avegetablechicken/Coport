@@ -26,7 +26,7 @@ pub async fn get_state(app: AppHandle, state: State<'_, AppState>) -> Result<Sna
     }
     if let Some(probe) = core.begin_account_states() {
         tauri::async_runtime::spawn(async move {
-            let states = probe.account_route_states().await;
+            let states = probe.account_states().await;
             let state = app.state::<AppState>();
             state
                 .core
@@ -136,10 +136,14 @@ pub async fn get_traffic(
     minutes: u64,
     scope: Option<crate::traffic::TrafficScope>,
 ) -> Result<crate::traffic::Traffic> {
-    let (path, config) = {
+    let (path, config, tasks) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();
-        (core.logs.path(), core.loaded_config().cloned())
+        (
+            core.logs.path(),
+            core.loaded_config().cloned(),
+            core.account_tasks(),
+        )
     };
     // An unreadable file leaves every changed configuration to be reviewed.
     let assignments =
@@ -149,8 +153,8 @@ pub async fn get_traffic(
         .as_ref()
         .map(|config| crate::traffic_identity::Identities::from_config(config, &assignments))
         .unwrap_or_default();
-    let labels = match config {
-        Some(config) => config.traffic_credential_labels().await,
+    let labels = match tasks {
+        Some(tasks) => tasks.credential_labels().await?,
         None => Default::default(),
     };
     tauri::async_runtime::spawn_blocking(move || {

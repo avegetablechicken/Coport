@@ -774,7 +774,8 @@ function routingBlock() {
     return `<div class="routing-service"><div class="subhead"><span>${name}</span>${badge}</div>${rows}
       ${fallbacks ? `<div class="route-defaults"><div class="route-defaults-title">Defaults &amp; helpers</div>${fallbacks}</div>` : ""}</div>`;
   };
-  return block("Routing", "", section("Codex", d.codex) + section("Claude", d.claude));
+  const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
+  return block("Routing", "", accountError + section("Codex", d.codex) + section("Claude", d.claude));
 }
 
 // ---------------------------------------------------------------- activity

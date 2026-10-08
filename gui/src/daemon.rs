@@ -33,6 +33,8 @@ pub struct Status {
     pub pid: u32,
     #[serde(default)]
     pub proxy_probe_supported: bool,
+    #[serde(default)]
+    pub metadata_supported: bool,
     pub port: u16,
     pub uptime_ms: u64,
     pub config_path: PathBuf,
@@ -45,6 +47,8 @@ enum Action {
     Status,
     Stop,
     Probe { name: String },
+    AccountStates,
+    CredentialLabels,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -58,6 +62,8 @@ enum Response {
     Status(Status),
     Stopped,
     Probe(crate::proxy::Probe),
+    AccountStates([std::collections::BTreeMap<String, String>; 2]),
+    CredentialLabels(Vec<((String, String), String)>),
     Error(String),
 }
 
@@ -94,15 +100,47 @@ impl Client {
         }
     }
 
-    /// Cancellation-safe control I/O for the GUI runtime: quitting the panel
-    /// need not wait for a blocking read while a daemon test is in flight.
     pub async fn probe_async(&self, name: &str) -> io::Result<crate::proxy::Probe> {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        match self
+            .request_async(Action::Probe { name: name.into() }, Duration::from_secs(10))
+            .await?
+        {
+            Response::Probe(probe) => Ok(probe),
+            _ => Err(io::Error::other("Unexpected daemon probe response")),
+        }
+    }
+
+    pub async fn account_states(
+        &self,
+    ) -> io::Result<[std::collections::BTreeMap<String, String>; 2]> {
+        match self
+            .request_async(Action::AccountStates, Duration::from_secs(60))
+            .await?
+        {
+            Response::AccountStates(states) => Ok(states),
+            _ => Err(io::Error::other("Unexpected daemon account response")),
+        }
+    }
+
+    pub async fn credential_labels(
+        &self,
+    ) -> io::Result<std::collections::BTreeMap<(String, String), String>> {
+        match self
+            .request_async(Action::CredentialLabels, Duration::from_secs(60))
+            .await?
+        {
+            Response::CredentialLabels(labels) => Ok(labels.into_iter().collect()),
+            _ => Err(io::Error::other("Unexpected daemon labels response")),
+        }
+    }
+
+    async fn request_async(&self, action: Action, timeout: Duration) -> io::Result<Response> {
+        tokio::time::timeout(timeout, async {
             let mut stream =
                 tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, self.endpoint.port)).await?;
             let bytes = serde_json::to_vec(&Request {
                 token: self.endpoint.token.clone(),
-                action: Action::Probe { name: name.into() },
+                action,
             })?;
             stream.write_u32(bytes.len() as u32).await?;
             stream.write_all(&bytes).await?;
@@ -113,13 +151,12 @@ impl Client {
             let mut bytes = vec![0; length];
             stream.read_exact(&mut bytes).await?;
             match serde_json::from_slice(&bytes)? {
-                Response::Probe(probe) => Ok(probe),
                 Response::Error(error) => Err(io::Error::other(error)),
-                _ => Err(io::Error::other("Unexpected daemon probe response")),
+                response => Ok(response),
             }
         })
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Daemon proxy test timed out"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Daemon request timed out"))?
     }
 
     /// The daemon acknowledges only after the proxy has released its listener.
@@ -351,7 +388,7 @@ async fn handle_control(
     token: Arc<str>,
     status: Arc<Status>,
     started: Instant,
-    proxies: Arc<std::collections::BTreeMap<String, String>>,
+    server: Arc<Server>,
     stops: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
 ) {
     let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
@@ -366,10 +403,12 @@ async fn handle_control(
                 uptime_ms: started.elapsed().as_millis() as u64,
                 ..Status::clone(&status)
             }),
-            Action::Probe { name } => match proxies.get(&name) {
+            Action::Probe { name } => match server.config.proxies.get(&name) {
                 Some(endpoint) => Response::Probe(crate::proxy::run_probe(endpoint).await),
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
             },
+            Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
+            Action::CredentialLabels => Response::CredentialLabels(server.config.traffic_credential_labels().await.into_iter().collect()),
             // The serve loop acknowledges once the listener has been released.
             Action::Stop => {
                 let _ = stops.send(stream);
@@ -426,7 +465,6 @@ async fn serve_until(
         token: uuid::Uuid::new_v4().to_string(),
     };
     let logger = Arc::new(Logger::new(log_path.clone()));
-    let proxies = Arc::new(config.proxies.clone());
     let mut server = Server::new(config, logger.clone());
     // Without TLS, plain-HTTP clients still work; HTTPS base URLs fail to connect.
     match coport::local_tls::acceptor(&coport::local_tls::dir_for(&config_path)) {
@@ -445,8 +483,9 @@ async fn serve_until(
         let server = server.clone();
         async move { server.startup_log().await }
     });
+    let serving_server = server.clone();
     let mut serving = tokio::spawn(async move {
-        server
+        serving_server
             .serve(proxy, async {
                 let _ = stop.await;
             })
@@ -463,6 +502,7 @@ async fn serve_until(
     let status = Arc::new(Status {
         pid: std::process::id(),
         proxy_probe_supported: true,
+        metadata_supported: true,
         port,
         uptime_ms: 0,
         config_path,
@@ -484,7 +524,7 @@ async fn serve_until(
             Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
             accepted = control.accept() => {
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
-                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, proxies.clone(), stops.clone()));
+                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, server.clone(), stops.clone()));
             }
         }
     };
@@ -565,6 +605,7 @@ pub(crate) mod tests {
                 let bytes = serde_json::to_vec(&Response::Status(Status {
                     pid: 1,
                     proxy_probe_supported: false,
+                    metadata_supported: false,
                     port,
                     uptime_ms: 0,
                     config_path: dir.join("config.yaml"),

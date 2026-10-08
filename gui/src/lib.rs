@@ -3,3 +3,5 @@ pub mod daemon;
 pub mod data_migration;
 pub mod proxy;
 pub mod settings;
+
+pub mod tasks;

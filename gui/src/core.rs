@@ -22,9 +22,10 @@ pub struct Core {
     pub settings: Settings,
     pub launch_at_login: bool,
     config: ConfigCache,
-    account_probe: Option<std::sync::Arc<coport::server::Server>>,
+    account_probe: Option<std::sync::Arc<coport_gui::tasks::Tasks>>,
     /// Last account activation; kept across config changes until replaced.
     account_states: Option<AccountStates>,
+    account_states_error: Option<String>,
     account_states_pending: bool,
     notify: Notify,
     /// Config file modification time when the proxy last started.
@@ -116,6 +117,7 @@ impl Core {
             config: ConfigCache::default(),
             account_probe: None,
             account_states: None,
+            account_states_error: None,
             account_states_pending: false,
             notify,
             started_stamp,
@@ -177,11 +179,11 @@ impl Core {
     /// Profile lookups can take seconds, so snapshots never wait for them.
     pub(crate) fn begin_account_states(
         &mut self,
-    ) -> Option<std::sync::Arc<coport::server::Server>> {
+    ) -> Option<std::sync::Arc<coport_gui::tasks::Tasks>> {
         if self.account_states_pending {
             return None;
         }
-        let probe = self.account_probe()?;
+        let probe = self.account_tasks()?;
         self.account_states_pending = true;
         Some(probe)
     }
@@ -190,8 +192,8 @@ impl Core {
     /// Results for a configuration that has since been replaced are dropped.
     pub(crate) fn finish_account_states(
         &mut self,
-        probe: &std::sync::Arc<coport::server::Server>,
-        states: AccountStates,
+        probe: &std::sync::Arc<coport_gui::tasks::Tasks>,
+        states: Result<AccountStates, String>,
     ) {
         if !self
             .account_probe
@@ -201,20 +203,23 @@ impl Core {
             return;
         }
         self.account_states_pending = false;
-        if self.account_states.as_ref() != Some(&states) {
-            self.account_states = Some(states);
+        let (states, error) = match states {
+            Ok(states) => (Some(states), None),
+            Err(error) => (None, Some(error)),
+        };
+        if self.account_states != states || self.account_states_error != error {
+            self.account_states = states;
+            self.account_states_error = error;
             (self.notify)();
         }
     }
 
-    fn account_probe(&mut self) -> Option<std::sync::Arc<coport::server::Server>> {
+    pub(crate) fn account_tasks(&mut self) -> Option<std::sync::Arc<coport_gui::tasks::Tasks>> {
         if self.account_probe.is_none() {
-            let config = self.loaded_config()?.clone();
-            let logger = std::sync::Arc::new(coport::logger::Logger::new(
-                crate::settings::log_path().with_file_name("account-probes.jsonl"),
-            ));
-            self.account_probe = Some(std::sync::Arc::new(coport::server::Server::new(
-                config, logger,
+            self.account_probe = Some(std::sync::Arc::new(coport_gui::tasks::Tasks::new(
+                crate::settings::app_dir(),
+                self.config_path(),
+                self.loaded_config()?.clone(),
             )));
         }
         self.account_probe.clone()
@@ -265,6 +270,9 @@ impl Core {
                 self.logs.set_path(status.log_path);
             }
             self.attached_pid = pid;
+            self.reset_account_probe();
+            self.account_states = None;
+            self.account_states_error = None;
         }
     }
 
@@ -313,6 +321,7 @@ impl Core {
                 .is_some_and(|started| started != file_stamp(&self.config_path()));
         let probes = self.controller.probes();
         Snapshot {
+            account_states_error: self.account_states_error.clone(),
             version: env!("CARGO_PKG_VERSION"),
             phase: match &phase {
                 Phase::Running { port, since } => PhaseDto {
@@ -630,6 +639,7 @@ fn service(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    account_states_error: Option<String>,
     version: &'static str,
     phase: PhaseDto,
     stats: StatsDto,
@@ -639,7 +649,7 @@ pub struct Snapshot {
     settings: SettingsDto,
 }
 
-pub(crate) type AccountStates = [BTreeMap<String, &'static str>; 2];
+pub(crate) type AccountStates = coport_gui::tasks::AccountStates;
 
 impl Snapshot {
     pub fn set_account_route_states(&mut self, states: AccountStates) {
@@ -649,7 +659,7 @@ impl Snapshot {
                 .zip(states)
             {
                 for route in &mut service.account_routes {
-                    route.activation = states.get(&route.selector).copied();
+                    route.activation = states.get(&route.selector).cloned();
                 }
             }
         }
@@ -758,7 +768,7 @@ struct KeyValue {
 
 #[derive(Serialize)]
 struct RouteRow {
-    activation: Option<&'static str>,
+    activation: Option<String>,
     selector: String,
     kind: &'static str,
     proxies: Vec<String>,
