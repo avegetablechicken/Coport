@@ -1,4 +1,4 @@
-//! Controls the independent proxy daemon; GUI-only probes use a Tokio runtime.
+//! Prefer daemon tests; fall back locally only when no daemon is running.
 
 use crate::daemon;
 use coport::config::Config;
@@ -23,7 +23,7 @@ pub enum Phase {
     Failed(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Probe {
     Pending,
     Reachable {
@@ -32,10 +32,12 @@ pub enum Probe {
         exit: Option<Exit>,
     },
     Unreachable(String),
+    /// The test could not be submitted; this is not a proxy connection failure.
+    Unavailable(String),
 }
 
 /// Where traffic through a proxy leaves for the internet.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Exit {
     pub ip: String,
     /// ISO 3166-1 alpha-2 country or region code.
@@ -279,10 +281,13 @@ impl Controller {
     }
 
     fn test(&self, name: &str, endpoint: &str, show_progress: bool) {
-        let Some(addr) = host_port(endpoint) else {
+        let Some(_) = host_port(endpoint) else {
             self.set_probe(name, Probe::Unreachable("Invalid proxy URL".into()));
             return;
         };
+        let directory = self.daemon_dir.clone();
+        let endpoint = endpoint.to_owned();
+        let generation = self.lock().generation;
         let started = (Instant::now(), SystemTime::now());
         {
             let mut shared = self.lock();
@@ -296,13 +301,23 @@ impl Controller {
         let shared = self.shared.clone();
         let notify = self.notify.clone();
         let name = name.to_owned();
-        let endpoint = endpoint.to_owned();
         self.rt.spawn(async move {
-            let probe = if is_local_network(&endpoint) {
-                trace(&endpoint).await
-            } else {
-                connect(addr).await
-            };
+            let result = async {
+                match daemon::task_backend(directory).await? {
+                    Some((client, status)) => {
+                        if !status.proxy_probe_supported {
+                            return Err(std::io::Error::other(
+                                "Restart the proxy daemon to enable proxy tests.",
+                            ));
+                        }
+                        daemon::check_task_config(&status)?;
+                        client.probe_async(&name).await
+                    }
+                    None => Ok(run_probe(&endpoint).await),
+                }
+            }
+            .await;
+            let probe = result.unwrap_or_else(|error| Probe::Unavailable(error.to_string()));
             let mut shared = shared.lock().unwrap();
             if let Some(running) = shared.testing.get_mut(&name) {
                 *running -= 1;
@@ -311,10 +326,11 @@ impl Controller {
                 }
             }
             // A test started later, such as a manual one, has the newer result.
-            if shared
-                .probes
-                .get(&name)
-                .is_none_or(|(_, at, _)| *at <= started.0)
+            if shared.generation == generation
+                && shared
+                    .probes
+                    .get(&name)
+                    .is_none_or(|(_, at, _)| *at <= started.0)
             {
                 shared.probes.insert(name, (probe, started.0, started.1));
             }
@@ -369,6 +385,18 @@ impl Drop for Controller {
     fn drop(&mut self) {
         // A detached daemon was deliberately kept running.
         let _ = self.stop_attached();
+    }
+}
+
+/// The shared test used by the daemon and by the GUI when no daemon exists.
+pub(crate) async fn run_probe(endpoint: &str) -> Probe {
+    let Some(addr) = host_port(endpoint) else {
+        return Probe::Unreachable("Invalid proxy URL".into());
+    };
+    if is_local_network(endpoint) {
+        trace(endpoint).await
+    } else {
+        connect(addr).await
     }
 }
 
@@ -530,15 +558,21 @@ mod tests {
 
     #[test]
     fn background_refreshes_keep_the_last_result_shown() {
+        let _guard = crate::daemon::spawn_guard();
         let dir = tempfile::tempdir().unwrap();
-        let controller = Controller::with_daemon(
-            Arc::new(|| {}),
-            dir.path().to_owned(),
-            dir.path().join("missing-daemon"),
-        );
-        // A local proxy that accepts but never answers keeps a test running.
+        // The daemon, not the controller, contacts this silent local proxy.
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", silent.local_addr().unwrap());
+        let (_signal, daemon) = crate::daemon::tests::serve_with_proxies(
+            dir.path(),
+            &format!("proxies:\n  local: {endpoint}\n"),
+        );
+        crate::daemon::tests::wait_for_daemon(dir.path());
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("unused"),
+        );
         let name = "local".to_owned();
         let earlier = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(2))
@@ -565,6 +599,76 @@ mod tests {
         controller.probe(&name, &endpoint);
         assert!(matches!(controller.probes()[&name].0, Probe::Pending));
         assert_eq!(controller.lock().testing[&name], 2);
+        // A slow test must not block the daemon's status or stop commands.
+        assert!(controller.running.as_ref().unwrap().client.status().is_ok());
+        controller.stop().unwrap();
+        daemon.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn only_an_absent_daemon_permits_gui_networking() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        {
+            let controller = Controller::with_daemon(
+                Arc::new(|| {}),
+                dir.path().into(),
+                dir.path().join("unused"),
+            );
+            controller.probe("test", &endpoint);
+            let mut incoming = None;
+            wait_for(|| {
+                incoming = listener.accept().ok();
+                incoming.is_some()
+            });
+            let (mut socket, _) = incoming.unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            assert!(request.starts_with(b"CONNECT 1.1.1.1:443 "));
+            socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(socket);
+            wait_for(|| matches!(controller.probes()["test"].0, Probe::Unreachable(_)));
+        }
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::daemon::tests::fake_daemon(dir.path(), up.clone());
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("unused"),
+        );
+        controller.probe("test", &endpoint);
+        wait_for(
+            || matches!(&controller.probes()["test"].0, Probe::Unavailable(e) if e.contains("Restart")),
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // A process holding registration must not be treated as absent merely
+        // because it stops answering control requests.
+        let lock = crate::daemon::lock_file(&dir.path().join("daemon.lock")).unwrap();
+        lock.try_lock().unwrap();
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.probe("test", &endpoint);
+        wait_for(
+            || matches!(&controller.probes()["test"].0, Probe::Unavailable(e) if e.contains("control channel")),
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        controller.on_app_exit(true).unwrap();
     }
 
     #[test]

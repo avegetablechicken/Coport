@@ -56,3 +56,25 @@ test("LAN proxy renders the measured exit IP", () => {
   assert.match(html, /10\.156\.232\.107:10810 → 203\.0\.113\.5/);
   assert.match(html, /42 ms/);
 });
+
+test("route failures stay separate from pending and measured proxy tests", () => {
+  const proxy = { local: true, routeFailures: ["https://chatgpt.com/"] };
+  const pending = render({ state: "pending" }, proxy);
+  assert.match(pending, /class="spinner"/);
+  assert.match(pending, /Route unavailable: https:\/\/chatgpt\.com\//);
+  assert.doesNotMatch(pending, /Unreachable|Available/);
+  const measured = render({ state: "ok", ms: 42, exitIp: "203.0.113.5" }, proxy);
+  assert.match(measured, /42 ms/);
+  assert.match(measured, /203\.0\.113\.5/);
+  assert.match(measured, /Route unavailable:/);
+  assert.doesNotMatch(measured, /Unreachable|Available/);
+  assert.match(render({ state: "error", error: "timed out" }, { routeFailures: [] }), /Unreachable/);
+  assert.doesNotMatch(render(null, proxy), /Unreachable|Available/);
+});
+
+test("unavailable daemon is not reported as an unreachable proxy", () => {
+  const html = render({ state: "unavailable", error: "Start the proxy daemon to test proxies." });
+  assert.match(html, /Not tested/);
+  assert.match(html, /Start the proxy daemon/);
+  assert.doesNotMatch(html, /Unreachable|dot failed/);
+});

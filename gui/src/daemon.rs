@@ -31,6 +31,8 @@ struct Endpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
     pub pid: u32,
+    #[serde(default)]
+    pub proxy_probe_supported: bool,
     pub port: u16,
     pub uptime_ms: u64,
     pub config_path: PathBuf,
@@ -42,6 +44,7 @@ pub struct Status {
 enum Action {
     Status,
     Stop,
+    Probe { name: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +57,7 @@ struct Request {
 enum Response {
     Status(Status),
     Stopped,
+    Probe(crate::proxy::Probe),
     Error(String),
 }
 
@@ -79,6 +83,43 @@ impl Client {
             Response::Status(status) => Ok(status),
             _ => Err(io::Error::other("Unexpected daemon status response")),
         }
+    }
+
+    /// Only a configured proxy name crosses the control channel. The daemon
+    /// owns the endpoint, authentication and outbound connection.
+    pub fn probe(&self, name: &str) -> io::Result<crate::proxy::Probe> {
+        match self.request(Action::Probe { name: name.into() }, Duration::from_secs(10))? {
+            Response::Probe(probe) => Ok(probe),
+            _ => Err(io::Error::other("Unexpected daemon probe response")),
+        }
+    }
+
+    /// Cancellation-safe control I/O for the GUI runtime: quitting the panel
+    /// need not wait for a blocking read while a daemon test is in flight.
+    pub async fn probe_async(&self, name: &str) -> io::Result<crate::proxy::Probe> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream =
+                tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, self.endpoint.port)).await?;
+            let bytes = serde_json::to_vec(&Request {
+                token: self.endpoint.token.clone(),
+                action: Action::Probe { name: name.into() },
+            })?;
+            stream.write_u32(bytes.len() as u32).await?;
+            stream.write_all(&bytes).await?;
+            let length = stream.read_u32().await? as usize;
+            if length > MAX_MESSAGE {
+                return Err(io::Error::other("Daemon response too large"));
+            }
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await?;
+            match serde_json::from_slice(&bytes)? {
+                Response::Probe(probe) => Ok(probe),
+                Response::Error(error) => Err(io::Error::other(error)),
+                _ => Err(io::Error::other("Unexpected daemon probe response")),
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Daemon proxy test timed out"))?
     }
 
     /// The daemon acknowledges only after the proxy has released its listener.
@@ -124,6 +165,42 @@ impl Client {
             response => Ok(response),
         }
     }
+}
+
+/// A failed status request is not proof that the daemon is absent. Only an
+/// unlocked registration permits GUI fallback (including stale discovery).
+pub async fn task_backend(dir: PathBuf) -> io::Result<Option<(Client, Status)>> {
+    tokio::task::spawn_blocking(move || {
+        if let Some(found) = Client::discover(&dir) {
+            return Ok(Some(found));
+        }
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let lock = lock_file(&dir.join("daemon.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(None),
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::other(
+                "Proxy daemon is running but its control channel is unavailable.",
+            )),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+pub fn check_task_config(status: &Status) -> io::Result<()> {
+    if std::fs::metadata(&status.config_path)
+        .and_then(|m| m.modified())
+        .ok()
+        != status.config_modified
+    {
+        return Err(io::Error::other(
+            "Restart the proxy daemon to use the updated configuration.",
+        ));
+    }
+    Ok(())
 }
 
 pub fn binary_path() -> io::Result<PathBuf> {
@@ -274,6 +351,7 @@ async fn handle_control(
     token: Arc<str>,
     status: Arc<Status>,
     started: Instant,
+    proxies: Arc<std::collections::BTreeMap<String, String>>,
     stops: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
 ) {
     let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
@@ -288,6 +366,10 @@ async fn handle_control(
                 uptime_ms: started.elapsed().as_millis() as u64,
                 ..Status::clone(&status)
             }),
+            Action::Probe { name } => match proxies.get(&name) {
+                Some(endpoint) => Response::Probe(crate::proxy::run_probe(endpoint).await),
+                None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
+            },
             // The serve loop acknowledges once the listener has been released.
             Action::Stop => {
                 let _ = stops.send(stream);
@@ -344,6 +426,7 @@ async fn serve_until(
         token: uuid::Uuid::new_v4().to_string(),
     };
     let logger = Arc::new(Logger::new(log_path.clone()));
+    let proxies = Arc::new(config.proxies.clone());
     let mut server = Server::new(config, logger.clone());
     // Without TLS, plain-HTTP clients still work; HTTPS base URLs fail to connect.
     match coport::local_tls::acceptor(&coport::local_tls::dir_for(&config_path)) {
@@ -379,6 +462,7 @@ async fn serve_until(
     let token: Arc<str> = endpoint.token.into();
     let status = Arc::new(Status {
         pid: std::process::id(),
+        proxy_probe_supported: true,
         port,
         uptime_ms: 0,
         config_path,
@@ -400,7 +484,7 @@ async fn serve_until(
             Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
             accepted = control.accept() => {
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
-                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, stops.clone()));
+                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, proxies.clone(), stops.clone()));
             }
         }
     };
@@ -480,6 +564,7 @@ pub(crate) mod tests {
                 }
                 let bytes = serde_json::to_vec(&Response::Status(Status {
                     pid: 1,
+                    proxy_probe_supported: false,
                     port,
                     uptime_ms: 0,
                     config_path: dir.join("config.yaml"),
@@ -501,6 +586,16 @@ pub(crate) mod tests {
         tokio::sync::oneshot::Sender<()>,
         std::thread::JoinHandle<io::Result<()>>,
     ) {
+        serve_with_proxies(dir, "")
+    }
+
+    pub(crate) fn serve_with_proxies(
+        dir: &Path,
+        proxies: &str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
         let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .local_addr()
@@ -510,7 +605,7 @@ pub(crate) mod tests {
         std::fs::write(
             &config,
             format!(
-                "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n"
+                "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n{proxies}"
             ),
         )
         .unwrap();

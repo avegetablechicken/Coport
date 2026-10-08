@@ -592,6 +592,7 @@ function proxiesBlock() {
           if (state === "pending") value = `<span class="spinner"></span>`;
           else if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
           else if (state === "error") value = `<span class="bad">Unreachable</span>`;
+          else if (state === "unavailable") value = "Not tested";
           // Plain HTTP is the common case; other schemes stay visible.
           const shown = p.endpoint.replace(/^http:\/\//, "");
           const mark = flag(probe?.country);
@@ -604,6 +605,7 @@ function proxiesBlock() {
             <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
             <span class="row-sub">${esc(shown)}${exit}</span>
+            ${p.routeFailures?.length ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
           </div>`;
         })
         .join("")

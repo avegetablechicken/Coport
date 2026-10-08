@@ -299,25 +299,29 @@ fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
     }
     let endpoint: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let mut control =
-        TcpStream::connect(("127.0.0.1", endpoint["port"].as_u64().unwrap() as u16)).unwrap();
-    control
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let bytes = br#"{"token":"wrong","action":"Stop"}"#;
-    control
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .unwrap();
-    control.write_all(bytes).unwrap();
-    let mut length = [0; 4];
-    control.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    control.read_exact(&mut response).unwrap();
-    assert!(
-        String::from_utf8(response)
-            .unwrap()
-            .contains("Unauthorized")
-    );
+    for bytes in [
+        br#"{"token":"wrong","action":"Stop"}"#.as_slice(),
+        br#"{"token":"wrong","action":{"Probe":{"name":"test"}}}"#.as_slice(),
+    ] {
+        let mut control =
+            TcpStream::connect(("127.0.0.1", endpoint["port"].as_u64().unwrap() as u16)).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        control
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        control.write_all(bytes).unwrap();
+        let mut length = [0; 4];
+        control.read_exact(&mut length).unwrap();
+        let mut response = vec![0; u32::from_be_bytes(length) as usize];
+        control.read_exact(&mut response).unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("Unauthorized")
+        );
+    }
     let duplicate = Command::new(helper())
         .arg(dir.path())
         .arg(dir.path().join("config.yaml"))
@@ -326,5 +330,74 @@ fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
         .unwrap();
     assert!(!duplicate.status.success());
     assert_eq!(client.status().unwrap().pid, status.pid);
+    client.stop().unwrap();
+}
+
+#[test]
+fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
+    use coport_gui::proxy::Probe;
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().into());
+    fixture(dir.path(), None);
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://user:password@{}", proxy.local_addr().unwrap());
+    let config_path = dir.path().join("config.yaml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!("proxies:\n  test: {endpoint}\n"));
+    std::fs::write(&config_path, config).unwrap();
+    let (client, status) = daemon::start(
+        &helper(),
+        dir.path(),
+        &config_path,
+        &dir.path().join("proxy.log"),
+    )
+    .unwrap();
+    assert!(status.proxy_probe_supported);
+    assert!(
+        client
+            .probe("missing")
+            .unwrap_err()
+            .to_string()
+            .contains("running daemon configuration")
+    );
+    let mut gui = controller(dir.path());
+    gui.probe("test", &endpoint);
+    assert!(matches!(gui.probes()["test"].0, Probe::Pending));
+    let mut incoming = None;
+    wait_for(|| {
+        incoming = proxy.accept().ok();
+        incoming.is_some()
+    });
+    let (mut socket, _) = incoming.unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+        assert!(head.len() < 8192);
+    }
+    let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+    assert!(head.starts_with("connect 1.1.1.1:443 "));
+    assert!(head.contains("proxy-authorization: basic dxnlcjpwyxnzd29yza=="));
+    // While the daemon waits for the test endpoint, control stays responsive.
+    assert_eq!(client.status().unwrap().pid, status.pid);
+    socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    drop(socket);
+    wait_for(|| matches!(gui.probes()["test"].0, Probe::Unreachable(_)));
+    // A config edit must not silently test the daemon's old endpoint.
+    std::fs::write(&config_path, "invalid config").unwrap();
+    std::fs::File::open(&config_path)
+        .unwrap()
+        .set_modified(status.config_modified.unwrap() + Duration::from_secs(2))
+        .unwrap();
+    gui.probe("test", &endpoint);
+    wait_for(
+        || matches!(&gui.probes()["test"].0, Probe::Unavailable(e) if e.contains("updated configuration")),
+    );
+    gui.on_app_exit(true).unwrap();
     client.stop().unwrap();
 }

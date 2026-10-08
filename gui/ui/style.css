@@ -1188,6 +1188,19 @@ details.disclosure[open] summary svg {
   font-variant-numeric: tabular-nums;
 }
 
+.row.proxy .proxy-route-warning {
+  color: var(--secondary);
+}
+
+.row.proxy .dot[data-tip]:hover::after {
+  left: 0;
+  right: auto;
+  width: max-content;
+  max-width: 280px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* Per-credential activity history. */
 .traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
 .credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }

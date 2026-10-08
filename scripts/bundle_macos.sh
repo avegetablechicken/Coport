@@ -42,6 +42,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>Coport connects to the local-network proxies and devices you configure to test connections and retrieve their status.</string>
 </dict>
 </plist>
 EOF
