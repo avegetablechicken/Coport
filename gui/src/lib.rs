@@ -14,3 +14,6 @@ pub mod settings;
 pub mod tasks;
 pub mod traffic;
 pub mod traffic_identity;
+
+#[cfg(test)]
+mod test_support;

@@ -753,7 +753,7 @@ async fn merge_fetched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     fn sample(key: &DataKey, proxy: &str, upstream: &str) -> Summary {
         let mut counts = vec![0; 30];
         counts[0] = 1;
@@ -782,10 +782,20 @@ mod tests {
     }
     #[tokio::test]
     async fn all_views_share_alignment_retries_and_omit_unused_groups() {
+        if data_key_in_subprocess(
+            "data_client::tests::all_views_share_alignment_retries_and_omit_unused_groups",
+        ) {
+            return;
+        }
         alignment_fixture(true).await;
     }
     #[tokio::test]
     async fn failed_alignment_stops_after_three_rounds_for_all_views() {
+        if data_key_in_subprocess(
+            "data_client::tests::failed_alignment_stops_after_three_rounds_for_all_views",
+        ) {
+            return;
+        }
         alignment_fixture(false).await;
     }
     async fn alignment_fixture(recover: bool) {
@@ -793,8 +803,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
-        let keyfile = dir.path().join("key");
-        crate::settings::create_private(&keyfile, KEY.as_bytes()).unwrap();
         let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         let aligned = now - 60_000;
         let mut tasks = Vec::new();
@@ -831,8 +839,8 @@ mod tests {
                 transport: Transport::Http,
                 ssh_connection: None,
                 url,
-                token_env: None,
-                token_file: Some(keyfile.to_string_lossy().into()),
+                token_env: Some(DATA_KEY_ENV.into()),
+                token_file: None,
                 ca_certificate: None,
                 ssh_device: None,
             });
@@ -1268,6 +1276,11 @@ mod tests {
     #[tokio::test]
     async fn one_http_snapshot_builds_all_views_and_matches_known_accounts_without_disclosing_identity()
      {
+        if data_key_in_subprocess(
+            "data_client::tests::one_http_snapshot_builds_all_views_and_matches_known_accounts_without_disclosing_identity",
+        ) {
+            return;
+        }
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("codex");
@@ -1314,15 +1327,13 @@ mod tests {
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
             socket.write_all(&body).await.unwrap();
         });
-        let keyfile = dir.path().join("key");
-        crate::settings::create_private(&keyfile, KEY.as_bytes()).unwrap();
         let source = Source {
             name: "Peer".into(),
             transport: Transport::Http,
             ssh_connection: None,
             url: format!("http://127.0.0.1:{port}"),
-            token_env: None,
-            token_file: Some(keyfile.to_string_lossy().into()),
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
             ca_certificate: None,
             device_id: None,
             ssh_device: None,

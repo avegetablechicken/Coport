@@ -557,19 +557,22 @@ async fn reply<S: AsyncWrite + Unpin>(socket: &mut S, status: u16, body: &[u8]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     use serde_json::json;
-    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     #[tokio::test]
     async fn starting_data_listener_does_not_scan_logs_before_returning() {
+        if data_key_in_subprocess(
+            "data_api::tests::starting_data_listener_does_not_scan_logs_before_returning",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
-        let keyfile = dir.path().join("key");
-        crate::settings::create_private(&keyfile, KEY.as_bytes()).unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let reserve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserve.local_addr().unwrap().port();
         drop(reserve);
-        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: {port}\n  token_file: '{}'\n  trusted_lan: [10.42.0.0/24]\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n", keyfile.display())).unwrap();
+        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: {port}\n  token_env: {DATA_KEY_ENV}\n  trusted_lan: [10.42.0.0/24]\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
         let before = crate::traffic::live_scans(&log);
         let running = start(config, dir.path(), log.clone()).await.unwrap();
         // On this current-thread runtime the background publisher has not been
@@ -778,13 +781,16 @@ mod tests {
     }
     #[tokio::test]
     async fn network_endpoint_returns_only_cached_results_and_rejects_mutations() {
+        if data_key_in_subprocess(
+            "data_api::tests::network_endpoint_returns_only_cached_results_and_rejects_mutations",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
-        let keyfile = dir.path().join("key");
-        crate::settings::create_private(&keyfile, KEY.as_bytes()).unwrap();
         let reserve = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = reserve.local_addr().unwrap().port();
         drop(reserve);
-        let config=Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: {port}\n  token_file: '{}'\n  trusted_lan: [10.42.0.0/24]\n",keyfile.display())).unwrap();
+        let config=Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: {port}\n  token_env: {DATA_KEY_ENV}\n  trusted_lan: [10.42.0.0/24]\n")).unwrap();
         let log = dir.path().join("proxy.log");
         let row = serde_json::json!({"timestamp":(chrono::Utc::now()-chrono::Duration::minutes(2)).to_rfc3339(), "event":"model_call_finished", "model_call_id":"private-call", "service":"codex", "method":"POST", "path":"/responses", "proxy_endpoint":"http://10.9.8.7:7891", "upstream_base_url":"https://private.example/v1", "status":"200"});
         std::fs::write(&log, format!("{row}\n")).unwrap();
