@@ -1154,26 +1154,37 @@ details.disclosure[open] summary svg {
   opacity: 0.6;
 }
 
-/* Proxy rows: status dot, then label over endpoint and exit address. */
+/* Proxy rows: name and latency above a full-width endpoint and exit address. */
 .row.proxy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 2px 8px;
   min-height: 38px;
 }
 
-.row.proxy .row-label {
-  gap: 2px;
+.proxy-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
 }
 
-.row.proxy .tag {
-  align-self: flex-start;
+.proxy-heading .tag {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.row.proxy .dot {
-  flex: none;
-  align-self: flex-start;
-  margin-top: 11px;
+.proxy-heading .row-value {
+  flex-shrink: 0;
 }
 
 .row.proxy .row-sub {
+  grid-column: 2 / -1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-variant-numeric: tabular-nums;
 }
 

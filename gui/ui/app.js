@@ -601,9 +601,9 @@ function proxiesBlock() {
               : "";
           return `<div class="row proxy">
             <span class="dot ${dot}" ${probe?.error ? `data-tip="${esc(probe.error)}"` : ""}></span>
-            <span class="row-label">${tag(p.name)}<span class="row-sub">${esc(shown)}${exit}</span></span>
-            <span class="row-value">${value}</span>
+            <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
+            <span class="row-sub">${esc(shown)}${exit}</span>
           </div>`;
         })
         .join("")
