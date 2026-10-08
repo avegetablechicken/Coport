@@ -164,7 +164,7 @@ test('review menu offers current configurations and Unidentified for each change
   assert.doesNotMatch(context.trafficReview({ ...group, sources: [group.sources[1]] }, targets), /traffic-review review/);
   assert.equal(context.trafficReview(credential('main', 3), targets), '');
 });
-test('Models charts of calls without reported usage show no zero token peak', () => {
+test('Models charts omit empty and unreported token bars but retain hover targets', () => {
   const context = setup('model');
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
@@ -172,7 +172,12 @@ test('Models charts of calls without reported usage show no zero token peak', ()
   assert.doesNotMatch(html, /chart-peak/);
   assert.match(html, /No reported tokens/);
   assert.doesNotMatch(html, /calls|requests/);
-  assert.equal((html.match(/class="err"/g) || []).length, 2);
+  assert.doesNotMatch(html, /<rect class="(?!chart-hit)/);
+  assert.equal((html.match(/class="chart-hit"/g) || []).length, 3);
+  const cancelled = context.chart({ ...failed, errorCounts: [0, 0, 0] }, 'model', true);
+  assert.doesNotMatch(cancelled, /<rect class="(?!chart-hit)/);
+  const requests = context.chart(failed, 'all', true);
+  assert.equal((requests.match(/class="err"/g) || []).length, 2);
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
 });
@@ -244,6 +249,8 @@ test('bar tooltips use their own time bucket and only the plotted metric', () =>
     const groups = [...tokens.matchAll(/<g class="chart-bar"[^>]*>(.*?)<\/g>/g)].map(m => m[1]);
     assert.equal(groups.length, 3);
     for (const group of groups) assert.match(group, /<rect class="chart-hit"[^>]* y="0"[^>]* height="32"><\/rect>$/);
+    assert.match(groups[0], /<rect class=""/);
+    for (const group of groups.slice(1)) assert.doesNotMatch(group, /<rect class="(?!chart-hit)/);
   }
 });
 

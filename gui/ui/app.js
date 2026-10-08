@@ -476,7 +476,7 @@ function proxyBlock() {
 
 /// Bars of a stats object's buckets: requests, or with Models reported input
 /// plus output tokens, in the ring's unit. Red marks the share of failed
-/// requests or calls; buckets whose calls reported no usage keep a stub bar.
+/// requests or calls. Token buckets without usage keep only a hover target.
 function chart(stats, scope, showPeak = false, window = stats) {
   const model = scope === "model";
   const values = model ? stats.tokenCounts : stats.counts;
@@ -497,22 +497,24 @@ function chart(stats, scope, showPeak = false, window = stats) {
   let bars = "";
   values.forEach((v, i) => {
     const x = (i * (bar + gap)).toFixed(2);
-    const bh = v ? Math.max(2.5, (v / max) * h) : calls[i] ? 2.5 : 1;
+    const bh = v ? Math.max(2.5, (v / max) * h) : 1;
     const title = model ? (v || !calls[i] ? `${v.toLocaleString("en-US")} tokens` : "No reported tokens") : `${v.toLocaleString("en-US")} requests`;
     const from = start + i * bucketMs;
     const to = Math.min(from + bucketMs, end);
     const range = Number.isFinite(from) && Number.isFinite(to) ? `${date(from)} – ${date(to)}\n` : "";
     bars += `<g class="chart-bar" data-tip="${esc(range + title)}" aria-label="${esc(range + title)}">`;
-    bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"></rect>`;
-    if (errors[i]) {
-      const eh = (bh * errors[i]) / calls[i];
-      bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
+    if (!model || v > 0) {
+      bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"></rect>`;
+      if (errors[i]) {
+        const eh = (bh * errors[i]) / calls[i];
+        bars += `<rect class="err" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${eh.toFixed(2)}" rx="1"></rect>`;
+      }
     }
     bars += `<rect class="chart-hit" x="${x}" y="0" width="${bar.toFixed(2)}" height="${h}"></rect></g>`;
   });
   const plot = `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
   const peak = Math.max(0, ...values);
-  // Failed calls report no usage; without any, there is no token peak to show.
+  // Without reported usage, there is no token peak to show.
   if (!showPeak || (model && !peak)) return plot;
   const index = values.indexOf(peak);
   const position = ((index * (bar + gap) + bar / 2) / w) * 100;
