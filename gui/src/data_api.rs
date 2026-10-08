@@ -835,12 +835,33 @@ mod tests {
             body.groups[0].upstream_ref,
             reader_key.reference("upstream", "https://private.example/v1")
         );
+        // HTTP identities stay stable within the running server on every OS.
+        let repeated = client
+            .get(&url)
+            .bearer_auth(KEY)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let repeated: Summary = serde_json::from_slice(&repeated).unwrap();
+        assert_eq!(body.groups[0].proxy_ref, repeated.groups[0].proxy_ref);
+        assert_eq!(body.groups[0].upstream_ref, repeated.groups[0].upstream_ref);
+        // Unix persists the private key for SSH matching. Other platforms
+        // deliberately keep it in memory and reject attempts to read it back.
+        #[cfg(unix)]
         assert_eq!(
             body.groups[0].proxy_ref,
             identity_key(dir.path(), false)
                 .unwrap()
                 .reference("proxy", "http://10.9.8.7:7891")
         );
+        #[cfg(not(unix))]
+        {
+            assert!(identity_key(dir.path(), false).is_err());
+            assert!(!dir.path().join("data-identity.key").exists());
+        }
         drop(running);
     }
 }
