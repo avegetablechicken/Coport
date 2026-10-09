@@ -577,7 +577,18 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     let _cleanup = Cleanup(dir.path().to_owned());
     let port = fixture(dir.path(), None);
     let ssh = dir.path().join("ssh");
-    std::fs::write(&ssh, "#!/bin/sh\nprintf 'COPORT-FORWARD/1\\n'\nIFS= read -r request || exit 0\nprintf 'HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 6\\r\\n\\r\\nremote'\n").unwrap();
+    let ssh_script = r#"#!/bin/sh
+for argument do command="$argument"; done
+case "$command" in *--capabilities*)
+  printf '%s\n' '{"protocol":1,"version":"test-capabilities","runningVersion":"test-capabilities","running":true,"statistics":true,"forwarding":true,"forwardingAvailable":true}'
+  exit 0 ;;
+esac
+printf 'COPORT-FORWARD/1\n'
+IFS= read -r request || exit 0
+printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
+"#;
+    std::fs::write(&ssh, ssh_script).unwrap();
+    std::fs::write(dir.path().join("gui.json"), r#"{"managed_devices":[{"id":"test-device","name":"Remote","ssh":{"host":"fake-host","binary":"coportd"},"data":null}]}"#).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let wrapper = dir.path().join("start-daemon");
@@ -601,6 +612,18 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     assert!(status.forwarding_supported);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let client = rt.block_on(async {
+        // The daemon checks configured devices without any GUI request to inspect them.
+        let started=Instant::now();
+        loop {
+            let checks=client.device_capabilities().await.unwrap();
+            if let Some(caps)=checks.first().and_then(|check|check.capabilities.as_ref()) {
+                assert!(caps.forwarding && caps.forwarding_available);
+                assert_eq!(caps.version,"test-capabilities");
+                break;
+            }
+            assert!(started.elapsed()<Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let cert =
             reqwest::Certificate::from_pem(&std::fs::read(dir.path().join("tls/ca.pem")).unwrap())
                 .unwrap();

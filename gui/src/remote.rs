@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub name: String,
     pub host: String,

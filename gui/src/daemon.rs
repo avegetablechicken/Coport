@@ -72,6 +72,8 @@ enum Action {
     SetForwardRestore {
         enabled: bool,
     },
+    DeviceCapabilities,
+    RefreshDeviceCapabilities,
     RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
@@ -90,6 +92,7 @@ enum Response {
     CredentialLabels(Vec<((String, String), String)>),
     Recorded,
     ForwardingSet,
+    DeviceCapabilities(Vec<crate::device_capabilities::Status>),
     Error(String),
 }
 
@@ -117,6 +120,29 @@ impl Client {
         }
     }
 
+    pub async fn device_capabilities(&self) -> io::Result<Vec<crate::device_capabilities::Status>> {
+        match self
+            .request_async(Action::DeviceCapabilities, STATUS_TIMEOUT)
+            .await?
+        {
+            Response::DeviceCapabilities(value) => Ok(value),
+            _ => Err(io::Error::other(
+                "Update the local proxy for automatic capability checks.",
+            )),
+        }
+    }
+    pub async fn refresh_device_capabilities(&self) -> io::Result<()> {
+        match self
+            .request_async(Action::RefreshDeviceCapabilities, STATUS_TIMEOUT)
+            .await?
+        {
+            Response::Recorded => Ok(()),
+            Response::Error(error) => Err(io::Error::other(error)),
+            _ => Err(io::Error::other(
+                "Update the local proxy for automatic capability checks.",
+            )),
+        }
+    }
     pub async fn set_forwarding_restore(&self, enabled: bool) -> io::Result<()> {
         match self
             .request_async(
@@ -485,6 +511,8 @@ async fn handle_control(
                 forwarding_restore: routing.restore_enabled(),
                 ..Status::clone(&status)
             })),
+            Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
+            Action::RefreshDeviceCapabilities => match routing.device_checks.refresh() { Ok(())=>Response::Recorded, Err(error)=>Response::Error(error.to_string()) },
             Action::SetForwardRestore { enabled } => match routing.set_restore(enabled).await {
                 Ok(()) => Response::ForwardingSet,
                 Err(error) => Response::Error(error),
@@ -656,6 +684,8 @@ async fn serve_until(
     let (stops, mut stop_requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::pin!(signal);
     let mut controls = tokio::task::JoinSet::new();
+    let checks = routing.device_checks.monitor();
+    tokio::pin!(checks);
     let monitor = routing.monitor();
     tokio::pin!(monitor);
     let mut stop_client = None;
@@ -663,6 +693,7 @@ async fn serve_until(
         tokio::select! {
             _ = &mut signal => break Ok(()),
             Some(_) = controls.join_next(), if !controls.is_empty() => {},
+            _ = &mut checks => break Err(io::Error::other("Device capability checker stopped unexpectedly")),
             _ = &mut monitor => break Err(io::Error::other("Forwarding monitor stopped unexpectedly")),
             result = &mut serving => {
                 // Do not poll the completed JoinHandle again during cleanup.

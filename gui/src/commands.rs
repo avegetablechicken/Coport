@@ -493,21 +493,19 @@ pub async fn set_forwarding_restore(state: State<'_, AppState>, enabled: bool) -
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-pub async fn inspect_ssh_device(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<coport_gui::remote::Capabilities> {
-    let device = state
-        .core
-        .lock()
-        .unwrap()
-        .settings
-        .managed_devices
-        .iter()
-        .find(|d| d.id == id)
-        .and_then(|d| d.ssh_connection())
-        .ok_or("SSH device no longer exists")?;
-    coport_gui::remote::capabilities(&device).await
+pub async fn get_device_capabilities() -> Result<Vec<coport_gui::device_capabilities::Status>> {
+    match local_daemon().await? {
+        Some((client, _)) => client
+            .device_capabilities()
+            .await
+            .map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+async fn refresh_device_capabilities() {
+    if let Ok(Some((client, _))) = local_daemon().await {
+        let _ = client.refresh_device_capabilities().await;
+    }
 }
 #[tauri::command]
 pub async fn set_device_forwarding(
@@ -540,6 +538,25 @@ pub async fn set_device_forwarding(
         .ok_or("Start the local proxy before enabling SSH forwarding.")?;
     if !status.forwarding_supported {
         return Err("Update and restart the local proxy to enable unified SSH forwarding.".into());
+    }
+    client
+        .refresh_device_capabilities()
+        .await
+        .map_err(|e| e.to_string())?;
+    let checks = client
+        .device_capabilities()
+        .await
+        .map_err(|e| e.to_string())?;
+    let supported = checks
+        .iter()
+        .find(|entry| entry.device_id == target.device_id)
+        .and_then(|entry| entry.capabilities.as_ref())
+        .is_some_and(|caps| caps.forwarding && caps.forwarding_available);
+    if !supported {
+        return Err(
+            "Remote forwarding is unavailable or its capabilities have not been verified yet."
+                .into(),
+        );
     }
     client
         .set_forwarding(Some(target))
@@ -585,17 +602,21 @@ pub async fn save_device(
         settings.try_save().map_err(|e| e.to_string())?;
         core.settings = settings;
     }
+    refresh_device_capabilities().await;
     Ok(id)
 }
 #[tauri::command]
 pub async fn remove_device(state: State<'_, AppState>, id: String) -> Result {
     let _guard = state.forwarding_operations.lock().await;
     stop_device_forwarding(&id).await?;
-    let mut core = state.core.lock().unwrap();
-    let mut settings = core.settings.clone();
-    settings.managed_devices.retain(|device| device.id != id);
-    settings.try_save().map_err(|e| e.to_string())?;
-    core.settings = settings;
+    {
+        let mut core = state.core.lock().unwrap();
+        let mut settings = core.settings.clone();
+        settings.managed_devices.retain(|device| device.id != id);
+        settings.try_save().map_err(|e| e.to_string())?;
+        core.settings = settings;
+    }
+    refresh_device_capabilities().await;
     Ok(())
 }
 #[tauri::command]

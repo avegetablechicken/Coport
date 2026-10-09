@@ -258,6 +258,7 @@ pub struct Routing {
     executable: std::path::PathBuf,
     preferences: Mutex<Preferences>,
     store: Option<std::path::PathBuf>,
+    pub device_checks: Arc<crate::device_capabilities::Checks>,
 }
 impl Default for Routing {
     fn default() -> Self {
@@ -267,6 +268,7 @@ impl Default for Routing {
             executable: "ssh".into(),
             preferences: Mutex::new(Preferences::default()),
             store: None,
+            device_checks: Arc::new(Default::default()),
         }
     }
 }
@@ -291,6 +293,7 @@ impl Routing {
         }
         let routing = Self {
             store: Some(path),
+            device_checks: Arc::new(crate::device_capabilities::Checks::new(dir)),
             ..Self::default()
         };
         if preferences.restore {

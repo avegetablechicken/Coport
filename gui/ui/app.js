@@ -1512,7 +1512,6 @@ async function checkConfiguredSsh() {
       try {
         await invoke("check_ssh_device", { id: device.id });
         result.state = "running"; result.label = "SSH reachable at startup";
-        await inspectDeviceCapabilities(device.id);
       } catch (error) {
         result.state = "failed"; result.label = `Startup SSH check failed: ${String(error)}`;
       }
@@ -1528,6 +1527,7 @@ async function loadDevices() {
     // Forwarding status comes only from the local daemon. Remote statistics
     // must not start when Settings is open or the user has left Devices.
     ui.deviceForwarders = await invoke("get_device_forwarders");
+    await loadDeviceCapabilities();
     if (ui.page !== "devices") return;
     if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
@@ -1537,34 +1537,25 @@ async function loadDevices() {
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
 }
 
-async function inspectDeviceCapabilities(id) {
-  const device = ui.devices.find(d => d.id === id);
-  if (!device?.ssh) return;
-  ui.deviceCapabilities ||= Object.create(null);
-  const key = JSON.stringify(device.ssh);
-  const entry = { key, pending: true };
-  ui.deviceCapabilities[id] = entry;
-  if (ui.page === "settings") render();
-  try { entry.value = await invoke("inspect_ssh_device", { id }); }
-  catch (error) { entry.error = String(error); }
-  finally {
-    entry.pending = false;
-    if (ui.page === "settings" && ui.devices.some(d => d.id === id && JSON.stringify(d.ssh) === key)) render();
-  }
+async function loadDeviceCapabilities() {
+  try {
+    const values = await invoke("get_device_capabilities");
+    ui.deviceCapabilities = Object.fromEntries(values.map(value => [value.deviceId, value]));
+    ui.deviceCapabilitiesError = "";
+  } catch (error) { ui.deviceCapabilities = {}; ui.deviceCapabilitiesError = String(error); }
 }
 function deviceCapabilities(device) {
   if (!device.ssh) return "";
-  const cached = ui.deviceCapabilities?.[device.id];
-  const entry = cached?.key === JSON.stringify(device.ssh) ? cached : null;
-  const active = (ui.deviceForwarders || []).find(target => target.deviceId === device.id);
-  const caps = entry?.value || active?.capabilities;
-  let text = entry?.pending ? "Checking…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${esc(caps.runningVersion)}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Forwarding unavailable" : " · Offline"}` : "Version not checked";
-  if (entry?.error || (!caps && active?.capabilitiesError)) text += `<br>${esc(entry?.error || active.capabilitiesError)}`;
-  return `<div class="row"><span class="row-label setting-description">${text}</span><button class="text-link" data-action="device-capabilities" data-id="${esc(device.id)}" ${entry?.pending ? "disabled" : ""}>Check version</button></div>`;
+  const entry = ui.deviceCapabilities?.[device.id];
+  const caps = entry?.capabilities;
+  const error = entry?.error || ui.deviceCapabilitiesError;
+  const text = error ? "Version unavailable" : entry?.pending ? "Checking…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${esc(caps.runningVersion)}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Unavailable" : " · Offline"}` : "Checking…";
+  return `<div class="row"><span class="row-label setting-description"${error ? ` data-tip="${esc(error)}"` : ""}>${text}</span></div>`;
 }
 async function refreshForwardingStatus() {
   try {
     ui.deviceForwarders = await invoke("get_device_forwarders");
+    await loadDeviceCapabilities();
     if (ui.snap) ui.snap.forwarding = ui.deviceForwarders[0] || null;
     if (ui.page === "settings") render();
   } catch (error) { toast(String(error)); }
@@ -1574,7 +1565,9 @@ function forwardingSettings() {
   const rows = devices.map(device => {
     const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
     const busy = ui.deviceForwardingBusy === device.id;
-    return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
+    const caps = ui.deviceCapabilities?.[device.id]?.capabilities;
+    const unavailable = !status && !(caps?.forwarding && caps.forwardingAvailable);
+    return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy || unavailable ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
   }).join("");
   const restore = `<div class="row"><span class="row-label">Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup" data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>`;
   const hint = !devices.length ? "Add an SSH device above." : !ui.snap.forwardingRestoreSupported ? "Update the local proxy to enable startup restore." : "";
@@ -1633,10 +1626,9 @@ function deviceSettings() {
       <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" placeholder="Use either a file or an environment variable"></label>
       <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
     `}
-    <p class="setting-description">SSH also supports request forwarding.</p>
     <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
   </div>` : "";
-  return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + `<div class="placeholder">Up to 32 devices.</div>` + form);
+  return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + form);
 }
 function captureDeviceDraft() {
   if (!$("device-name")) return;
@@ -1842,9 +1834,6 @@ async function act(action, el) {
       $("content").scrollTop = 0;
       if (ui.pinLog) scrollToLog();
       break;
-    case "device-capabilities":
-      await inspectDeviceCapabilities(el.dataset.id);
-      break;
     case "forwarding-restore": {
       if (ui.forwardingRestoreBusy) break;
       const enabled = !ui.snap.forwardingRestore;
@@ -1894,7 +1883,7 @@ async function act(action, el) {
       const device = { id: d.id || null, name: d.name.trim() || (ssh ? d.host.trim() : d.url.trim()),
         ssh: ssh ? { host: d.host.trim(), binary: d.binary.trim() } : null,
         data: { transport: d.transport, url: ssh ? "" : d.url.trim(), tokenFile: ssh ? null : d.key.trim() || null, tokenEnv: ssh ? null : d.env.trim() || null, caCertificate: ssh ? null : d.ca.trim() || null } };
-      try { const savedId = await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); if (device.ssh) inspectDeviceCapabilities(savedId); if (changed || !ui.mergedData) loadMergedData(true); }
+      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || !ui.mergedData) loadMergedData(true); }
       catch (e) { toast(String(e)); }
       break;
     }

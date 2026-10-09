@@ -98,7 +98,7 @@ fn main() {
             commands::get_device_forwarders,
             commands::set_device_forwarding,
             commands::set_forwarding_restore,
-            commands::inspect_ssh_device,
+            commands::get_device_capabilities,
             commands::get_merged_data,
             commands::save_device,
             commands::remove_device,

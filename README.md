@@ -1447,13 +1447,14 @@ Metadata is refreshed 30 seconds after each retrieval completes, independently o
 health checks. Unavailable or stale statistics are marked explicitly and do not
 make a working forwarding connection unhealthy.
 
-Settings shows the helper version, running daemon version and support for statistics
-and forwarding. Checks run after saving an SSH device and after a successful startup
-SSH check; **Check version** refreshes them explicitly. Older peers without
-`--capabilities` are shown as unverified with an update hint; they are not falsely
-reported as supported or denied forwarding if their existing handshake works.
-The active remote's capabilities also refresh in the background. Merely opening
-Settings starts no new remote query; its periodic status reads use the local daemon.
+Settings shows a compact version and capability status. The daemon automatically
+checks configured SSH devices, with at most four checks in flight, and retries
+unavailable peers after 30 seconds. Saving or removing devices refreshes its local
+configuration; opening Settings only reads cached results. No manual version-check
+button is needed. Unverified or unsupported destinations have a disabled forwarding
+switch; an already active destination can always be switched off. Errors are shown
+as a short status with details on hover. Older peers without `--capabilities` must
+be updated before enabling a new forwarding session from the GUI.
 
 This mode uses remote routing. Using the remote device solely as a network exit
 while retaining local service/account routing is not yet supported.

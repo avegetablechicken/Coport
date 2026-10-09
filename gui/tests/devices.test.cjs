@@ -88,7 +88,7 @@ test('refresh loads definitions and statistics without invoking remote lifecycle
   const calls = [];
   const h = harness(async command => { calls.push(command); return [{ id: 'remote', name: 'Remote', ssh: { host: '<remote>', management: true } }]; });
   await h.loadDevices();
-  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders']);
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities']);
   const html = h.devicesPage();
   assert.match(html, /&lt;remote>/); assert.doesNotMatch(html, /Read-only statistics/);
   assert.doesNotMatch(html, /device-control|Remote Port|PID|Uptime/);
@@ -404,7 +404,7 @@ test('entering Settings through navigation reads definitions without remote stat
   await h.action('page', { dataset: { page: 'settings' } });
   await Promise.resolve();
   assert.equal(h.ui.page, 'settings');
-  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders']);
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities']);
 });
 
 test('leaving Devices while definitions load prevents starting remote statistics', async () => {
@@ -448,13 +448,12 @@ test('startup checks only SSH devices once and retains failed checks without ret
   const h = harness(async (command, args) => {
     calls.push([command, args?.id]);
     if (command === 'get_devices') return devices;
-    if (command === 'inspect_ssh_device') return { version: 'test', forwarding: true };
     assert.equal(command, 'check_ssh_device');
     if (args.id === 'down') throw new Error('unavailable');
   });
   await h.checkConfiguredSsh();
   await h.checkConfiguredSsh();
-  assert.deepEqual(calls, [['get_devices', undefined], ['check_ssh_device', 'up'], ['check_ssh_device', 'down'], ['inspect_ssh_device', 'up']]);
+  assert.deepEqual(calls, [['get_devices', undefined], ['check_ssh_device', 'up'], ['check_ssh_device', 'down']]);
   assert.equal(h.deviceConnectionStatus(devices[0]).label, 'SSH reachable at startup');
   assert.equal(h.deviceConnectionStatus(devices[1]).state, 'failed');
   assert.match(h.deviceConnectionStatus(devices[1]).label, /unavailable/);
@@ -469,7 +468,6 @@ test('startup SSH checks have at most four connections in flight', async () => {
   let active = 0, maximum = 0, checked = 0;
   const h = harness(async command => {
     if (command === 'get_devices') return devices;
-    if (command === 'inspect_ssh_device') return {};
     active++; maximum = Math.max(maximum, active); checked++;
     await new Promise(resolve => pending.push(() => { active--; resolve(); }));
   });
@@ -605,18 +603,26 @@ test('restore switch changes only after daemon confirms persistence', async () =
   assert.equal(h.ui.snap.forwardingRestore,true); assert.equal(h.ui.forwardingRestoreBusy,false);
 });
 
-test('version checks report supported features and discard changed device configuration', async () => {
-  const h=harness(async()=>({version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:true,running:true,forwardingAvailable:true}));
+test('cached daemon capabilities disable unsupported switches without a check button', async () => {
+  const results = [{ deviceId:'ms', pending:false, capabilities:{version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:false,running:true,forwardingAvailable:false}, error:null }];
+  const calls=[];
+  const h=harness(async command=>{calls.push(command);return results;});
   const device={id:'ms',name:'MS',ssh:{host:'MS',binary:''}};h.ui.devices=[device];
-  await h.inspectDeviceCapabilities('ms');
+  await h.loadDeviceCapabilities();
+  assert.deepEqual(calls,['get_device_capabilities']);
   assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
-  assert.match(h.deviceCapabilities(device),/Forwarding ✓/);
-  device.ssh.host='different';
-  assert.match(h.deviceCapabilities(device),/Version not checked/);
-  h.invoke=async()=>{throw new Error('old daemon has no capabilities command')};
-  await h.inspectDeviceCapabilities('ms');
-  assert.match(h.deviceCapabilities(device),/old daemon/);
-  assert.doesNotMatch(h.deviceCapabilities(device),/Forwarding ✓/);
+  assert.doesNotMatch(h.deviceSettings(),/Check version|device-capabilities|<br>|Up to 32|SSH also supports/);
+  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  results[0].capabilities.forwarding=true;results[0].capabilities.forwardingAvailable=true;
+  await h.loadDeviceCapabilities();
+  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  results[0].capabilities=null;results[0].error='old daemon has no capabilities command';
+  await h.loadDeviceCapabilities();
+  assert.match(h.deviceCapabilities(device),/data-tip="old daemon/);
+  assert.match(h.deviceCapabilities(device),/>Version unavailable<\/span>/);
+  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  h.ui.deviceForwarders=[{deviceId:'ms',name:'MS'}];
+  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
 });
 
 

@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod data_api;
 pub mod data_client;
 pub mod data_migration;
+pub mod device_capabilities;
 mod device_events;
 pub mod devices;
 pub mod logs;
