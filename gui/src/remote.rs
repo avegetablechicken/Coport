@@ -128,7 +128,10 @@ fn summary_command(binary: &str) -> String {
 }
 
 pub(crate) fn helper_command(binary: &str, operation: &str) -> String {
-    assert!(matches!(operation, "--summary" | "--forward"));
+    assert!(matches!(
+        operation,
+        "--summary" | "--forward" | "--capabilities"
+    ));
     if binary.is_empty() || binary == "coportd" {
         discovery_command(DISCOVERY_SCRIPT, operation)
     } else {
@@ -348,8 +351,64 @@ async fn read_summary_stream(
 }
 
 pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String> {
-    let limit = 1024 * 1024;
-    let mut child = ssh_command(device, &summary_command(&device.binary))?;
+    read_json(device, &summary_command(&device.binary), 1024 * 1024).await
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Capabilities {
+    pub protocol: u8,
+    pub version: String,
+    pub running_version: Option<String>,
+    pub running: bool,
+    pub statistics: bool,
+    pub forwarding: bool,
+    pub forwarding_available: bool,
+}
+pub fn capabilities_in(dir: &Path) -> Capabilities {
+    let status = crate::daemon::Client::discover(dir).map(|(_, status)| status);
+    Capabilities {
+        protocol: 1,
+        version: env!("CARGO_PKG_VERSION").into(),
+        running_version: status
+            .as_ref()
+            .map(|s| s.version.clone())
+            .filter(|v| !v.is_empty()),
+        running: status.is_some(),
+        statistics: true,
+        forwarding: true,
+        forwarding_available: status.is_some_and(|s| s.forwarding.is_none()),
+    }
+}
+pub async fn capabilities(device: &Device) -> Result<Capabilities, String> {
+    let result: Capabilities = read_json(
+        device,
+        &helper_command(&device.binary, "--capabilities"),
+        8192,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Version/capability check failed (older Coport versions may not support it): {error}"
+        )
+    })?;
+    if result.protocol != 1
+        || result.version.len() > 128
+        || result
+            .running_version
+            .as_ref()
+            .is_some_and(|v| v.len() > 128)
+    {
+        return Err("Unsupported capability response; update Coport.".into());
+    }
+    Ok(result)
+}
+async fn read_json<T: serde::de::DeserializeOwned>(
+    device: &Device,
+    command: &str,
+    limit: usize,
+) -> Result<T, String> {
+    let mut child = ssh_command(device, command)?;
     let mut process = child
         .spawn()
         .map_err(|e| format!("Cannot start SSH: {e}"))?;
@@ -369,12 +428,12 @@ pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String
         let status = process.wait().await.map_err(|e| e.to_string())?;
         if !status.success() {
             return Err(format!(
-                "SSH statistics request failed: {}",
+                "SSH helper request failed: {}",
                 String::from_utf8_lossy(&err).trim()
             ));
         }
         serde_json::from_slice(&out)
-            .map_err(|_| "Invalid statistics response; update Coport on the destination.".into())
+            .map_err(|_| "Invalid helper response; update Coport on the destination.".into())
     };
     match tokio::time::timeout(std::time::Duration::from_secs(25), operation).await {
         Ok(result) => {
@@ -483,6 +542,22 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn capabilities_report_protocol_without_creating_state_or_exporting_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = capabilities_in(dir.path());
+        assert_eq!(caps.protocol, 1);
+        assert!(!caps.running);
+        assert!(!caps.forwarding_available);
+        assert!(caps.forwarding && caps.statistics);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(!json.contains("config_path") && !json.contains("token"));
+        assert_eq!(
+            helper_command("/path with spaces/coportd", "--capabilities"),
+            "'/path with spaces/coportd' --capabilities"
+        );
+    }
     #[test]
     fn legacy_fallback_never_retries_denied_or_timed_out_ssh() {
         let usage = b"Usage: coportd ... --summary";

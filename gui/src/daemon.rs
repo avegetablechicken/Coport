@@ -32,6 +32,12 @@ struct Endpoint {
 pub struct Status {
     pub pid: u32,
     #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub forwarding_restore_supported: bool,
+    #[serde(default)]
+    pub forwarding_restore: bool,
+    #[serde(default)]
     pub forwarding_supported: bool,
     #[serde(default)]
     pub forwarding: Option<crate::remote_forward::Status>,
@@ -63,6 +69,9 @@ enum Action {
     SetForwarding {
         target: Option<crate::remote_forward::Target>,
     },
+    SetForwardRestore {
+        enabled: bool,
+    },
     RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
@@ -74,7 +83,7 @@ struct Request {
 
 #[derive(Serialize, Deserialize)]
 enum Response {
-    Status(Status),
+    Status(Box<Status>),
     Stopped,
     Probe(crate::proxy::Probe),
     AccountStates([std::collections::BTreeMap<String, String>; 2]),
@@ -103,8 +112,24 @@ impl Client {
 
     pub fn status(&self) -> io::Result<Status> {
         match self.request(Action::Status, STATUS_TIMEOUT)? {
-            Response::Status(status) => Ok(status),
+            Response::Status(status) => Ok(*status),
             _ => Err(io::Error::other("Unexpected daemon status response")),
+        }
+    }
+
+    pub async fn set_forwarding_restore(&self, enabled: bool) -> io::Result<()> {
+        match self
+            .request_async(
+                Action::SetForwardRestore { enabled },
+                Duration::from_secs(60),
+            )
+            .await?
+        {
+            Response::ForwardingSet => Ok(()),
+            Response::Error(error) => Err(io::Error::other(error)),
+            _ => Err(io::Error::other(
+                "Update the local daemon to configure forwarding restore.",
+            )),
         }
     }
 
@@ -454,11 +479,16 @@ async fn handle_control(
         Response::Error("Unauthorized".into())
     } else {
         match request.action {
-            Action::Status => Response::Status(Status {
+            Action::Status => Response::Status(Box::new(Status {
                 uptime_ms: started.elapsed().as_millis() as u64,
                 forwarding: routing.status(),
+                forwarding_restore: routing.restore_enabled(),
                 ..Status::clone(&status)
-            }),
+            })),
+            Action::SetForwardRestore { enabled } => match routing.set_restore(enabled).await {
+                Ok(()) => Response::ForwardingSet,
+                Err(error) => Response::Error(error),
+            },
             Action::SetForwarding { target } => match routing.set(target).await {
                 Ok(()) => Response::ForwardingSet,
                 Err(error) => Response::Error(error),
@@ -584,7 +614,7 @@ async fn serve_until(
         let server = server.clone();
         async move { server.startup_log().await }
     });
-    let routing = Arc::new(crate::remote_forward::Routing::default());
+    let routing = Arc::new(crate::remote_forward::Routing::with_store(dir)?);
     let handler = routing.handler();
     let serving_server = server.clone();
     let mut serving = tokio::spawn(async move {
@@ -608,6 +638,9 @@ async fn serve_until(
     let token: Arc<str> = endpoint.token.into();
     let status = Arc::new(Status {
         pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        forwarding_restore_supported: true,
+        forwarding_restore: false,
         forwarding_supported: true,
         forwarding: None,
         proxy_probe_supported: true,
@@ -623,11 +656,14 @@ async fn serve_until(
     let (stops, mut stop_requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::pin!(signal);
     let mut controls = tokio::task::JoinSet::new();
+    let monitor = routing.monitor();
+    tokio::pin!(monitor);
     let mut stop_client = None;
     let result = loop {
         tokio::select! {
             _ = &mut signal => break Ok(()),
             Some(_) = controls.join_next(), if !controls.is_empty() => {},
+            _ = &mut monitor => break Err(io::Error::other("Forwarding monitor stopped unexpectedly")),
             result = &mut serving => {
                 // Do not poll the completed JoinHandle again during cleanup.
                 controls.shutdown().await;
@@ -818,8 +854,11 @@ pub(crate) mod tests {
                 if stream.read_exact(&mut request).is_err() {
                     continue;
                 }
-                let bytes = serde_json::to_vec(&Response::Status(Status {
+                let bytes = serde_json::to_vec(&Response::Status(Box::new(Status {
                     pid: 1,
+                    version: String::new(),
+                    forwarding_restore_supported: false,
+                    forwarding_restore: false,
                     forwarding_supported: false,
                     forwarding: None,
                     proxy_probe_supported: false,
@@ -831,7 +870,7 @@ pub(crate) mod tests {
                     config_path: dir.join("config.yaml"),
                     log_path: dir.join("proxy.log"),
                     config_modified: None,
-                }))
+                })))
                 .unwrap();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
                 let _ = stream.write_all(&bytes);

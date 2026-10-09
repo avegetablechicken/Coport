@@ -2,6 +2,19 @@
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--capabilities") {
+        match helper_directory(&args, 1) {
+            Ok(dir) => println!(
+                "{}",
+                serde_json::to_string(&coport_gui::remote::capabilities_in(&dir)).unwrap()
+            ),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--forward") {
         let result = helper_directory(&args, 1).and_then(|dir| {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -77,7 +90,7 @@ fn main() {
     }
     if args.len() != 3 {
         eprintln!(
-            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --summary-stream --window MINUTES model|all [--state-dir PATH] | --forward [--state-dir PATH]"
+            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --summary-stream --window MINUTES model|all [--state-dir PATH] | --forward [--state-dir PATH] | --capabilities [--state-dir PATH]"
         );
         std::process::exit(2);
     }

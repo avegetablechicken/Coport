@@ -600,7 +600,7 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     .unwrap();
     assert!(status.forwarding_supported);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
+    let client = rt.block_on(async {
         let cert =
             reqwest::Certificate::from_pem(&std::fs::read(dir.path().join("tls/ca.pem")).unwrap())
                 .unwrap();
@@ -645,13 +645,31 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
                 "Remote SSH proxy unavailable.\n"
             );
         }
-        assert!(client.status().unwrap().forwarding.unwrap().error.is_some());
+        let failed = client.status().unwrap().forwarding.unwrap();
+        assert!(failed.error.is_some());
+        assert_eq!(failed.health.state, "disconnected");
+        assert!(failed.traffic.upload_bytes > 0 && failed.traffic.download_bytes > 0);
+        assert_eq!(failed.traffic.connections, 4); // health probes are excluded
+        client.set_forwarding_restore(true).await.unwrap();
+        client.stop().unwrap();
+        let (client, restored) = daemon::start(&wrapper, dir.path(), &dir.path().join("config.yaml"), &dir.path().join("proxy.log")).unwrap();
+        assert!(client.status().unwrap().forwarding_restore);
+        assert!(restored.forwarding.is_some());
+        // Restore selects remote mode before accepting the first request, even offline.
+        for url in &urls { assert_eq!(http.get(url).send().await.unwrap().status(), 502); }
+        std::fs::write(&ssh, "#!/bin/sh\nprintf 'COPORT-FORWARD/1\\n'\nIFS= read -r request || exit 0\nprintf 'HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 6\\r\\n\\r\\nremote'\n").unwrap();
+        assert_eq!(http.get(&urls[0]).send().await.unwrap().text().await.unwrap(), "remote");
+        let recovered = client.status().unwrap().forwarding.unwrap();
+        assert_eq!(recovered.health.state, "connected");
+        assert!(recovered.health.recovered_at.is_some());
+        assert!(recovered.error.is_none());
         client.set_forwarding(None).await.unwrap();
         assert!(client.status().unwrap().forwarding.is_none());
         for url in &urls {
             assert_eq!(http.get(url).send().await.unwrap().status(), before);
         }
         assert_eq!(client.status().unwrap().port, port);
+        client
     });
     client.stop().unwrap();
 }
