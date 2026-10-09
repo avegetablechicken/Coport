@@ -766,6 +766,9 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     );
     std::fs::write(dir.path().join("config.yaml"), &config_text).unwrap();
     let log = dir.path().join("proxy.log");
+    let timestamp = (chrono::Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
+    let rows: String = (0..100).map(|index| format!("{}\n", serde_json::json!({"event":"model_call_finished","timestamp":timestamp,"model_call_id":format!("fixture-{index}"),"service":"claude","status":"200","input_tokens":"10","output_tokens":"5"}))).collect();
+    std::fs::write(&log, rows).unwrap();
     let (client, _) =
         daemon::start(&helper(), dir.path(), &dir.path().join("config.yaml"), &log).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -784,18 +787,20 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
                 .unwrap();
         }
         // Explicit statistics refresh also uses local/cached identity evidence.
-        let config_labels = config.local_traffic_credential_labels().await;
-        cache
-            .refresh_progressive(
-                Vec::new(),
-                config,
-                log,
-                config_labels,
-                (30, coport_gui::traffic::TrafficScope::Model),
-                |_| Ok(()),
-            )
-            .await
-            .unwrap();
+        for minutes in [30, 360, 1440] {
+            let config_labels = config.local_traffic_credential_labels().await;
+            cache
+                .refresh_progressive(
+                    Vec::new(),
+                    config.clone(),
+                    log.clone(),
+                    config_labels,
+                    (minutes, coport_gui::traffic::TrafficScope::Model),
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap();
+        }
     });
     let output = Command::new(helper())
         .args(["--summary-stream", "--window", "30", "model", "--state-dir"])
