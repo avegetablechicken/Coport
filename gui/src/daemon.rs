@@ -513,9 +513,33 @@ async fn serve_until(
     let log_path = std::path::absolute(log)?;
     let config_modified = std::fs::metadata(&config_path)?.modified().ok();
     let config = Config::read(&config_path).map_err(|e| io::Error::other(e.message))?;
-    crate::data_api::prepare_identity(dir)?;
-    crate::remote::register_summary_executable(dir, &std::env::current_exe()?)?;
+    let logger = Arc::new(Logger::new(log_path.clone()));
     let allow_external_access = config.allow_external_access;
+    // SSH summaries are optional when external sharing is disabled. Preserve
+    // damaged files for diagnosis instead of blocking the local proxy or
+    // silently generating a new identity for a previously known device.
+    if let Err(error) = crate::data_api::prepare_identity(dir) {
+        if allow_external_access {
+            return Err(error);
+        }
+        logger.write(
+            "statistics_unavailable",
+            [("reason".to_owned(), error.to_string().into())]
+                .into_iter()
+                .collect(),
+        );
+    }
+    // Publishing the SSH discovery hint is independent of proxy/HTTP startup.
+    if let Err(error) = std::env::current_exe()
+        .and_then(|binary| crate::remote::register_summary_executable(dir, &binary))
+    {
+        logger.write(
+            "statistics_discovery_unavailable",
+            [("reason".to_owned(), error.to_string().into())]
+                .into_iter()
+                .collect(),
+        );
+    }
     let _data_api = if allow_external_access {
         Some(crate::data_api::start(config.clone(), dir, log_path.clone()).await?)
     } else {
@@ -529,7 +553,6 @@ async fn serve_until(
         port: control.local_addr()?.port(),
         token: uuid::Uuid::new_v4().to_string(),
     };
-    let logger = Arc::new(Logger::new(log_path.clone()));
     let mut server = Server::new(config, logger.clone());
     // Without TLS, plain-HTTP clients still work; HTTPS base URLs fail to connect.
     match coport::local_tls::acceptor(&coport::local_tls::dir_for(&config_path)) {
@@ -651,6 +674,58 @@ pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disabled_statistics_errors_do_not_prevent_proxy_start() {
+        for broken in ["data-node-id", "data-identity.key", "summary-executable"] {
+            // Only Unix stores persistent private identity keys and SSH hints.
+            if !cfg!(unix) && broken != "data-node-id" {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.yaml");
+            let log = dir.path().join("proxy.log");
+            let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            std::fs::write(&config, format!("listen_port: {port}\nrequest_timeout_seconds: 3\nallow_external_access: false\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+            let path = dir.path().join(broken);
+            if broken == "summary-executable" {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                crate::settings::create_private(&path, b"broken-statistics-file").unwrap();
+            }
+            let result = serve_until(dir.path(), &config, &log, async {}).await;
+            assert!(
+                result.is_ok(),
+                "{broken} prevented local proxy startup: {result:?}"
+            );
+            let logged = std::fs::read_to_string(&log).unwrap();
+            assert!(logged.contains(if broken == "summary-executable" {
+                "statistics_discovery_unavailable"
+            } else {
+                "statistics_unavailable"
+            }));
+            if broken != "summary-executable" {
+                assert_eq!(std::fs::read(&path).unwrap(), b"broken-statistics-file");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicitly_enabled_statistics_reject_invalid_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "listen_port: 8787\nrequest_timeout_seconds: 3\nallow_external_access: true\nexternal_data:\n  port: 8788\n  token_env: UNUSED_TEST_DATA_KEY\n  trusted_lan: [10.0.0.0/8]\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        crate::settings::create_private(&dir.path().join("data-node-id"), b"broken-statistics-id")
+            .unwrap();
+        let result =
+            serve_until(dir.path(), &config, &dir.path().join("proxy.log"), async {}).await;
+        assert_eq!(result.unwrap_err().to_string(), "Invalid node identity");
+        assert!(!dir.path().join(ENDPOINT).exists());
+    }
 
     /// A control endpoint registered in `dir` that answers status requests
     /// while `up` is set and otherwise drops them, like a daemon that stalls.
