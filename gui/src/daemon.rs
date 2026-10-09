@@ -683,18 +683,18 @@ async fn serve_until(
     });
     let (stops, mut stop_requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::pin!(signal);
-    let mut controls = tokio::task::JoinSet::new();
     let checks = routing.device_checks.monitor();
     tokio::pin!(checks);
     let monitor = routing.monitor();
     tokio::pin!(monitor);
+    let mut controls = tokio::task::JoinSet::new();
     let mut stop_client = None;
     let result = loop {
         tokio::select! {
             _ = &mut signal => break Ok(()),
-            Some(_) = controls.join_next(), if !controls.is_empty() => {},
             _ = &mut checks => break Err(io::Error::other("Device capability checker stopped unexpectedly")),
             _ = &mut monitor => break Err(io::Error::other("Forwarding monitor stopped unexpectedly")),
+            Some(_) = controls.join_next(), if !controls.is_empty() => {},
             result = &mut serving => {
                 // Do not poll the completed JoinHandle again during cleanup.
                 controls.shutdown().await;

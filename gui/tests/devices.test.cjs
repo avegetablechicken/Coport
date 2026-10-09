@@ -482,6 +482,67 @@ test('startup SSH checks have at most four connections in flight', async () => {
   assert.equal(maximum, 4);
 });
 
+test('remote home distinguishes health, recovery and whole-device statistics', () => {
+  const start = source.indexOf('function main()');
+  const end = source.indexOf('function message(', start);
+  const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
+  vm.createContext(context); vm.runInContext(source.slice(start,end),context);
+  let html = context.remoteForwardingBlock();
+  assert.match(html,/Connected/); assert.match(html,/52 ms/); assert.match(html,/Connection restored/);
+  assert.match(html,/3 \/ 1 \/ 1/); assert.match(html,/8 B\/s/);
+  assert.match(html,/10 \/ 20.0%/); assert.match(html,/Includes other clients on MS/);
+  context.ui.snap.forwarding.health.state='disconnected'; context.ui.snap.forwarding.error='offline';
+  context.ui.snap.forwarding.remoteTrafficError='statistics offline';
+  html=context.remoteForwardingBlock();
+  assert.match(html,/Disconnected · retrying/); assert.match(html,/never fall back/); assert.match(html,/stale/);
+  assert.doesNotMatch(html,/Connection restored/);
+});
+
+test('restore switch changes only after daemon confirms persistence', async () => {
+  const calls=[];
+  const h=harness(async (command,args)=>{calls.push([command,args]);});
+  h.ui.snap.forwardingRestoreSupported=true;
+  assert.match(h.forwardingSettings(),/data-action="forwarding-restore"/);
+  await h.action('forwarding-restore');
+  assert.equal(calls[0][0],'set_forwarding_restore'); assert.equal(calls[0][1].enabled,true);
+  assert.equal(h.ui.snap.forwardingRestore,true);
+  h.invoke=async()=>{throw new Error('cannot save')};
+  await h.action('forwarding-restore');
+  assert.equal(h.ui.snap.forwardingRestore,true); assert.equal(h.ui.forwardingRestoreBusy,false);
+});
+
+test('cached daemon capabilities disable unsupported switches without a check button', async () => {
+  const results = [{ deviceId:'ms', pending:false, capabilities:{version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:false,running:true,forwardingAvailable:false}, error:null }];
+  const calls=[];
+  const h=harness(async command=>{calls.push(command);return results;});
+  const device={id:'ms',name:'MS',ssh:{host:'MS',binary:''}};h.ui.devices=[device];
+  await h.loadDeviceCapabilities();
+  assert.deepEqual(calls,['get_device_capabilities']);
+  assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
+  assert.doesNotMatch(h.deviceSettings(),/Check version|device-capabilities|<br>|Up to 32|SSH also supports/);
+  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  results[0].capabilities.forwarding=true;results[0].capabilities.forwardingAvailable=true;
+  await h.loadDeviceCapabilities();
+  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  results[0].capabilities=null;results[0].error='old daemon has no capabilities command';
+  await h.loadDeviceCapabilities();
+  assert.match(h.deviceCapabilities(device),/data-tip="old daemon/);
+  assert.match(h.deviceCapabilities(device),/>Version unavailable<\/span>/);
+  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  h.ui.deviceForwarders=[{deviceId:'ms',name:'MS'}];
+  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+});
+
+
+test('forwarding settings keep mechanisms in documentation instead of repeated help text', () => {
+  const h = harness(async () => []);
+  h.ui.snap.forwardingRestoreSupported = true;
+  h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
+  const html = h.forwardingSettings();
+  assert.match(html, /Restore on startup/);
+  assert.doesNotMatch(html, /placeholder|Clients keep|Switching disconnects|Only one remote|If the remote is offline|daemon runs/);
+});
+
 test('selected device traffic renders before completion and ignores superseded channel updates', async () => {
   const pending = [];
   let renders = 0;
@@ -572,65 +633,4 @@ test('saving a device merges only its list after asynchronous forwarding work', 
   assert.match(before,/managed_devices\.clone\(\)/);
   assert.match(after,/core\.settings\.clone\(\)/);
   assert.match(after,/settings\.managed_devices = devices/);
-});
-
-test('remote home distinguishes health, recovery and whole-device statistics', () => {
-  const start = source.indexOf('function main()');
-  const end = source.indexOf('function message(', start);
-  const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
-  vm.createContext(context); vm.runInContext(source.slice(start,end),context);
-  let html = context.remoteForwardingBlock();
-  assert.match(html,/Connected/); assert.match(html,/52 ms/); assert.match(html,/Connection restored/);
-  assert.match(html,/3 \/ 1 \/ 1/); assert.match(html,/8 B\/s/);
-  assert.match(html,/10 \/ 20.0%/); assert.match(html,/Includes other clients on MS/);
-  context.ui.snap.forwarding.health.state='disconnected'; context.ui.snap.forwarding.error='offline';
-  context.ui.snap.forwarding.remoteTrafficError='statistics offline';
-  html=context.remoteForwardingBlock();
-  assert.match(html,/Disconnected · retrying/); assert.match(html,/never fall back/); assert.match(html,/stale/);
-  assert.doesNotMatch(html,/Connection restored/);
-});
-
-test('restore switch changes only after daemon confirms persistence', async () => {
-  const calls=[];
-  const h=harness(async (command,args)=>{calls.push([command,args]);});
-  h.ui.snap.forwardingRestoreSupported=true;
-  assert.match(h.forwardingSettings(),/data-action="forwarding-restore"/);
-  await h.action('forwarding-restore');
-  assert.equal(calls[0][0],'set_forwarding_restore'); assert.equal(calls[0][1].enabled,true);
-  assert.equal(h.ui.snap.forwardingRestore,true);
-  h.invoke=async()=>{throw new Error('cannot save')};
-  await h.action('forwarding-restore');
-  assert.equal(h.ui.snap.forwardingRestore,true); assert.equal(h.ui.forwardingRestoreBusy,false);
-});
-
-test('cached daemon capabilities disable unsupported switches without a check button', async () => {
-  const results = [{ deviceId:'ms', pending:false, capabilities:{version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:false,running:true,forwardingAvailable:false}, error:null }];
-  const calls=[];
-  const h=harness(async command=>{calls.push(command);return results;});
-  const device={id:'ms',name:'MS',ssh:{host:'MS',binary:''}};h.ui.devices=[device];
-  await h.loadDeviceCapabilities();
-  assert.deepEqual(calls,['get_device_capabilities']);
-  assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
-  assert.doesNotMatch(h.deviceSettings(),/Check version|device-capabilities|<br>|Up to 32|SSH also supports/);
-  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
-  results[0].capabilities.forwarding=true;results[0].capabilities.forwardingAvailable=true;
-  await h.loadDeviceCapabilities();
-  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
-  results[0].capabilities=null;results[0].error='old daemon has no capabilities command';
-  await h.loadDeviceCapabilities();
-  assert.match(h.deviceCapabilities(device),/data-tip="old daemon/);
-  assert.match(h.deviceCapabilities(device),/>Version unavailable<\/span>/);
-  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
-  h.ui.deviceForwarders=[{deviceId:'ms',name:'MS'}];
-  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
-});
-
-
-test('forwarding settings keep mechanisms in documentation instead of repeated help text', () => {
-  const h = harness(async () => []);
-  h.ui.snap.forwardingRestoreSupported = true;
-  h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
-  const html = h.forwardingSettings();
-  assert.match(html, /Restore on startup/);
-  assert.doesNotMatch(html, /placeholder|Clients keep|Switching disconnects|Only one remote|If the remote is offline|daemon runs/);
 });

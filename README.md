@@ -1448,9 +1448,11 @@ health checks. Unavailable or stale statistics are marked explicitly and do not
 make a working forwarding connection unhealthy.
 
 Settings shows a compact version and capability status. The daemon automatically
-checks configured SSH devices, with at most four checks in flight, and retries
-unavailable peers after 30 seconds. Saving or removing devices refreshes its local
-configuration; opening Settings only reads cached results. No manual version-check
+checks each configured SSH connection once per configuration, with at most four
+checks in flight. Successes and failures are retained; neither page visits nor
+timers retry a denied or unavailable device. A changed connection or daemon restart
+allows another check. Saving or removing devices reloads local configuration;
+opening Settings only reads cached results. No manual version-check
 button is needed. Unverified or unsupported destinations have a disabled forwarding
 switch; an already active destination can always be switched off. Errors are shown
 as a short status with details on hover. Older peers without `--capabilities` must

@@ -30,8 +30,8 @@ struct ExitState {
 
 pub struct AppState {
     pub core: Mutex<core::Core>,
-    pub merged_cache: tokio::sync::Mutex<coport_gui::data_client::MergeCache>,
     pub forwarding_operations: tokio::sync::Mutex<()>,
+    pub merged_cache: tokio::sync::Mutex<coport_gui::data_client::MergeCache>,
     pub traffic_request: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -149,8 +149,8 @@ fn main() {
             app.manage(AppState {
                 traffic_request: Mutex::new(None),
                 core: Mutex::new(core),
-                merged_cache: Default::default(),
                 forwarding_operations: Default::default(),
+                merged_cache: Default::default(),
             });
             apply_appearance(app.handle(), appearance);
             tray::create(app.handle())?;

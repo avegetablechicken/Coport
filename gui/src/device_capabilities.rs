@@ -6,7 +6,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct Status {
 struct Entry {
     device: Device,
     result: Status,
-    checked: Option<Instant>,
+    checked: bool,
 }
 #[derive(Default)]
 pub struct Checks {
@@ -89,7 +89,7 @@ impl Checks {
                         error: None,
                     },
                     device,
-                    checked: None,
+                    checked: false,
                 },
             );
         }
@@ -115,7 +115,7 @@ impl Checks {
             .filter(|entry| entry.device == device)
         {
             entry.result.pending = false;
-            entry.checked = Some(Instant::now());
+            entry.checked = true;
             match result {
                 Ok(caps) => {
                     entry.result.capabilities = Some(caps);
@@ -128,50 +128,81 @@ impl Checks {
             }
         }
     }
+    fn take_pending(&self) -> Vec<Device> {
+        self.entries
+            .lock()
+            .unwrap()
+            .values_mut()
+            .filter_map(|entry| {
+                if entry.checked {
+                    return None;
+                }
+                entry.checked = true;
+                Some(entry.device.clone())
+            })
+            .collect()
+    }
     pub async fn monitor(self: &Arc<Self>) {
         loop {
             let _ = self.reload();
-            let pending: Vec<_> = self
-                .entries
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|entry| {
-                    entry
-                        .checked
-                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
-                })
-                .map(|entry| entry.device.clone())
-                .collect();
-            let inspect = async {
-                let mut pending = pending.into_iter();
-                let mut tasks = tokio::task::JoinSet::new();
-                loop {
-                    while tasks.len() < 4 {
-                        let Some(device) = pending.next() else {
-                            break;
-                        };
-                        tasks.spawn(async move {
-                            let result = crate::remote::capabilities(&device).await;
-                            (device, result)
-                        });
-                    }
-                    if tasks.is_empty() {
+            let mut pending = self.take_pending().into_iter();
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                while tasks.len() < 4 {
+                    let Some(device) = pending.next() else {
                         break;
+                    };
+                    // A removed or changed configuration must not be contacted later
+                    // just because it was waiting behind another device's check.
+                    if !self
+                        .entries
+                        .lock()
+                        .unwrap()
+                        .get(&device.name)
+                        .is_some_and(|entry| entry.device == device)
+                    {
+                        continue;
                     }
-                    if let Some(Ok((device, result))) = tasks.join_next().await {
-                        self.finish(device, result);
-                    }
+                    tasks.spawn(async move {
+                        let result = crate::remote::capabilities(&device).await;
+                        (device, result)
+                    });
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            };
-            tokio::select! { _=self.changed.notified()=>{}, _=inspect=>{} }
+                if tasks.is_empty() {
+                    break;
+                }
+                if let Some(Ok((device, result))) = tasks.join_next().await {
+                    self.finish(device, result);
+                }
+            }
+            // This only watches local configuration. Completed/failed checks are
+            // never retried because a timer fires or a GUI reads their results.
+            tokio::select! { _=self.changed.notified()=>{}, _=tokio::time::sleep(Duration::from_secs(30))=>{} }
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn successful_and_denied_checks_are_not_requeued_by_refresh_or_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |host: &str| {
+            std::fs::write(dir.path().join("gui.json"),format!(r#"{{"managed_devices":[{{"id":"device","name":"Device","ssh":{{"host":"{host}","binary":"coportd"}},"data":null}}]}}"#)).unwrap()
+        };
+        write("old-host");
+        let checks = Checks::new(dir.path());
+        let device = checks.take_pending().pop().unwrap();
+        assert!(checks.take_pending().is_empty());
+        checks.finish(device, Err("Access denied".into()));
+        for _ in 0..10 {
+            checks.refresh().unwrap();
+            assert!(checks.take_pending().is_empty());
+        }
+        write("new-host");
+        checks.refresh().unwrap();
+        assert_eq!(checks.take_pending().len(), 1);
+    }
     #[test]
     fn configuration_changes_discard_old_capabilities_and_late_results() {
         let dir = tempfile::tempdir().unwrap();
