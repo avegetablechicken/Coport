@@ -159,6 +159,8 @@ impl Strings {
 /// window and the current configuration apply.
 #[derive(Default)]
 struct FileTraffic {
+    scan_end: i64,
+    latest_event: Option<i64>,
     /// Logged account labels by service and ID, each at its first sighting.
     evidence: Vec<(String, String, String)>,
     requests: BTreeMap<String, Record>,
@@ -170,7 +172,10 @@ struct FileTraffic {
 
 impl FileTraffic {
     fn scan(file: File, scope: TrafficScope, end: i64) -> Result<Self, String> {
-        let mut traffic = Self::default();
+        let mut traffic = Self {
+            scan_end: end,
+            ..Self::default()
+        };
         let mut sighted = HashSet::new();
         let mut strings = Strings::default();
         for_each_line(file, |entry| {
@@ -189,10 +194,15 @@ impl FileTraffic {
                     traffic.evidence.push(evidence);
                 }
             }
-            if !included_in_scope(&entry, scope)
-                || lifecycle_rank(&entry) == 0
-                || entry.time.is_none_or(|t| t.timestamp_millis() >= end)
-            {
+            if !included_in_scope(&entry, scope) || lifecycle_rank(&entry) == 0 {
+                return;
+            }
+            let Some(at) = entry.time.map(|t| t.timestamp_millis()) else {
+                return;
+            };
+            // Even excluded events constrain reuse at another snapshot boundary.
+            traffic.latest_event = Some(traffic.latest_event.map_or(at, |last| last.max(at)));
+            if at >= end {
                 return;
             }
             let call = entry.event.starts_with("model_call_");
@@ -314,9 +324,9 @@ impl ReadSource<'_> {
     }
 }
 
-/// Each file's contribution, in file order; see `for_each_file`. A cached
-/// summary keeps the window end of the read that made it, which a rotated
-/// file, written before then, does not reach.
+/// Each file's contribution, in file order; see `for_each_file`. A summary
+/// is reusable across boundaries only when both include every relevant event.
+/// Keep one summary per file/scope so historical snapshots cannot grow the cache.
 fn file_summaries(
     path: &Path,
     start: i64,
@@ -373,9 +383,15 @@ fn file_summaries(
             let mut cache = SUMMARIES.lock().unwrap();
             let cache = cache.get_or_insert_with(HashMap::new);
             cache.retain(|_, (used, _)| used.elapsed() < SUMMARY_TTL);
-            cache.get_mut(&key).map(|(used, summary)| {
+            cache.get_mut(&key).and_then(|(used, summary)| {
+                let complete = summary
+                    .latest_event
+                    .is_none_or(|last| last < summary.scan_end && last < end);
+                if summary.scan_end != end && !complete {
+                    return None;
+                }
                 *used = Instant::now();
-                summary.clone()
+                Some(summary.clone())
             })
         };
         let summary = match cached {
@@ -1098,6 +1114,91 @@ fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotated_cache_preserves_requests_after_earlier_snapshot_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        std::fs::write(&path, "").unwrap();
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000 - 60_000;
+        let row = |id: &str, at: i64| {
+            serde_json::json!({
+                "timestamp": chrono::DateTime::from_timestamp_millis(at).unwrap().to_rfc3339(),
+                "event": "model_call_finished", "model_call_id": id, "request_id": id,
+                "service": "claude", "path": "/v1/messages", "method": "POST", "status": "200"
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(
+            path.with_file_name("proxy.log.1"),
+            row("before", end - 1000) + &row("after", end + 1000),
+        )
+        .unwrap();
+        let labels = BTreeMap::new();
+        let identities = Identities::default();
+        let first = Snapshot::load(&path, end).unwrap();
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&first),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            1
+        );
+        let next_end = end + 60_000;
+        let next = Snapshot::load(&path, next_end).unwrap();
+        let count = read_at(
+            ReadSource::Snapshot(&next),
+            30,
+            &labels,
+            TrafficScope::Model,
+            &identities,
+            next_end,
+        )
+        .unwrap()
+        .summary
+        .requests;
+        assert_eq!(
+            count, 2,
+            "advancing the snapshot lost a request from the unchanged rotated log"
+        );
+        let older = Snapshot::load(&path, end).unwrap();
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&older),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            1
+        );
+        // A previously returned snapshot stays immutable after cache replacements.
+        assert_eq!(
+            read_at(
+                ReadSource::Snapshot(&first),
+                30,
+                &labels,
+                TrafficScope::Model,
+                &identities,
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            1
+        );
+    }
 
     #[test]
     fn shared_snapshot_matches_every_range_and_remains_immutable_across_log_changes() {
