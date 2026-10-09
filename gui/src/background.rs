@@ -231,6 +231,27 @@ impl BackgroundController {
             })
             .unwrap_or_default()
     }
+    /// Only expose results measured for the currently configured endpoint.
+    pub fn probes_for(
+        &self,
+        endpoints: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, (Probe, SystemTime)> {
+        self.shared
+            .lock()
+            .map(|s| {
+                s.probes
+                    .iter()
+                    .filter(|(name, _)| {
+                        endpoints
+                            .get(*name)
+                            .is_some_and(|endpoint| s.probe_endpoints.get(*name) == Some(endpoint))
+                    })
+                    .map(|(name, (probe, _, at))| (name.clone(), (probe.clone(), *at)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn diagnostic(&self, run: Operation) {
         if !self.busy() && !self.closing.load(Ordering::Acquire) && !self.shared.is_poisoned() {
             let _ = self.jobs.try_send(Job {
@@ -267,6 +288,38 @@ impl BackgroundController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_do_not_relabel_old_probe_results_with_new_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = BackgroundController::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        {
+            let mut shared = controller.shared.lock().unwrap();
+            shared
+                .probe_endpoints
+                .insert("same".into(), "http://127.0.0.1:12345".into());
+            shared.probes.insert(
+                "same".into(),
+                (
+                    Probe::Reachable {
+                        latency: Duration::from_millis(3),
+                        exit: None,
+                    },
+                    std::time::Instant::now(),
+                    SystemTime::now(),
+                ),
+            );
+        }
+        let mut endpoints = BTreeMap::from([("same".into(), "http://127.0.0.1:12345".into())]);
+        assert_eq!(controller.probes_for(&endpoints).len(), 1);
+        endpoints.insert("same".into(), "http://127.0.0.1:23456".into());
+        assert!(controller.probes_for(&endpoints).is_empty());
+        assert!(controller.probes_for(&BTreeMap::new()).is_empty());
+    }
 
     #[test]
     fn slow_control_operations_leave_status_readable_and_quit_is_serialized() {

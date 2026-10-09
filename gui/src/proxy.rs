@@ -56,9 +56,11 @@ struct Shared {
     /// Each result with when its test started: monotonic time for its age,
     /// wall-clock time to order it against logged observations.
     probes: BTreeMap<String, (Probe, Instant, SystemTime)>,
-    /// Tests still running, by proxy. A background refresh keeps the last
+    /// Endpoints associated with the current name-keyed results.
+    probe_endpoints: BTreeMap<String, String>,
+    /// Tests still running, by name and endpoint. A background refresh keeps the last
     /// result shown meanwhile instead of a pending state.
-    testing: BTreeMap<String, usize>,
+    testing: BTreeMap<(String, String), usize>,
 }
 
 struct Running {
@@ -284,7 +286,11 @@ impl Controller {
 
     fn test(&self, name: &str, endpoint: &str, show_progress: bool) {
         let Some(_) = host_port(endpoint) else {
-            self.set_probe(name, Probe::Unreachable("Invalid proxy URL".into()));
+            self.set_probe(
+                name,
+                endpoint,
+                Probe::Unreachable("Invalid proxy URL".into()),
+            );
             return;
         };
         let directory = self.daemon_dir.clone();
@@ -293,8 +299,15 @@ impl Controller {
         let started = (Instant::now(), SystemTime::now());
         {
             let mut shared = self.lock();
-            *shared.testing.entry(name.to_owned()).or_default() += 1;
-            if show_progress {
+            let changed = shared.probe_endpoints.get(name) != Some(&endpoint);
+            shared
+                .probe_endpoints
+                .insert(name.to_owned(), endpoint.clone());
+            *shared
+                .testing
+                .entry((name.to_owned(), endpoint.clone()))
+                .or_default() += 1;
+            if show_progress || changed {
                 shared
                     .probes
                     .insert(name.to_owned(), (Probe::Pending, started.0, started.1));
@@ -321,14 +334,16 @@ impl Controller {
             .await;
             let probe = result.unwrap_or_else(|error| Probe::Unavailable(error.to_string()));
             let mut shared = shared.lock().unwrap();
-            if let Some(running) = shared.testing.get_mut(&name) {
+            let testing_key = (name.clone(), endpoint.clone());
+            if let Some(running) = shared.testing.get_mut(&testing_key) {
                 *running -= 1;
                 if *running == 0 {
-                    shared.testing.remove(&name);
+                    shared.testing.remove(&testing_key);
                 }
             }
             // A test started later, such as a manual one, has the newer result.
             if shared.generation == generation
+                && shared.probe_endpoints.get(&name) == Some(&endpoint)
                 && shared
                     .probes
                     .get(&name)
@@ -352,11 +367,14 @@ impl Controller {
             let stale = {
                 let shared = self.lock();
                 // A wall clock set back would make every result look new.
-                !shared.testing.contains_key(name)
-                    && shared
-                        .probes
-                        .get(name)
-                        .is_none_or(|(_, started, _)| started.elapsed() > max_age)
+                !shared
+                    .testing
+                    .contains_key(&(name.clone(), endpoint.clone()))
+                    && (shared.probe_endpoints.get(name) != Some(endpoint)
+                        || shared
+                            .probes
+                            .get(name)
+                            .is_none_or(|(_, started, _)| started.elapsed() > max_age))
             };
             if stale {
                 self.test(name, endpoint, false);
@@ -364,8 +382,12 @@ impl Controller {
         }
     }
 
-    fn set_probe(&self, name: &str, probe: Probe) {
-        self.lock()
+    fn set_probe(&self, name: &str, endpoint: &str, probe: Probe) {
+        let mut shared = self.lock();
+        shared
+            .probe_endpoints
+            .insert(name.to_owned(), endpoint.to_owned());
+        shared
             .probes
             .insert(name.to_owned(), (probe, Instant::now(), SystemTime::now()));
     }
@@ -569,6 +591,74 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_changes_bypass_fresh_results_and_old_inflight_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let name = "same-name".to_owned();
+        let old = "http://127.0.0.1:12345".to_owned();
+        controller.set_probe(
+            &name,
+            &old,
+            Probe::Reachable {
+                latency: std::time::Duration::from_millis(5),
+                exit: None,
+            },
+        );
+        controller.lock().testing.insert((name.clone(), old), 1);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let changed = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        controller.probe_stale([(&name, &changed)], std::time::Duration::from_secs(60));
+        assert!(!matches!(
+            controller.probes()[&name].0,
+            Probe::Reachable { .. }
+        ));
+        wait_for(|| matches!(controller.probes()[&name].0, Probe::Unreachable(_)));
+        assert_eq!(controller.lock().probe_endpoints[&name], changed);
+    }
+
+    #[test]
+    fn old_endpoint_completion_cannot_overwrite_its_replacement() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let old = format!("http://{}", listener.local_addr().unwrap());
+        controller.probe("same", &old);
+        let mut incoming = None;
+        wait_for(|| {
+            incoming = listener.accept().ok();
+            incoming.is_some()
+        });
+        let (mut socket, _) = incoming.unwrap();
+        controller.probe("same", "invalid replacement");
+        socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        drop(socket);
+        wait_for(|| {
+            !controller
+                .lock()
+                .testing
+                .contains_key(&("same".into(), old.clone()))
+        });
+        assert!(
+            matches!(&controller.probes()["same"].0, Probe::Unreachable(error) if error == "Invalid proxy URL")
+        );
+        assert_eq!(
+            controller.lock().probe_endpoints["same"],
+            "invalid replacement"
+        );
+    }
+
+    #[test]
     fn a_stalled_daemon_is_lost_only_after_repeated_failures_and_recovers() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
@@ -625,6 +715,10 @@ mod tests {
             (Probe::Unreachable("timed out".into()), started, recorded),
         );
         let (name, endpoint) = ("proxy".to_owned(), "not a proxy URL".to_owned());
+        controller
+            .lock()
+            .probe_endpoints
+            .insert(name.clone(), endpoint.clone());
         controller.probe_stale([(&name, &endpoint)], std::time::Duration::from_secs(1));
         assert!(matches!(
             &controller.probes()["proxy"].0,
@@ -661,6 +755,10 @@ mod tests {
             name.clone(),
             (reachable, earlier, std::time::SystemTime::now()),
         );
+        controller
+            .lock()
+            .probe_endpoints
+            .insert(name.clone(), endpoint.clone());
         let refresh =
             || controller.probe_stale([(&name, &endpoint)], std::time::Duration::from_secs(1));
         refresh();
@@ -670,11 +768,17 @@ mod tests {
         ));
         // A refresh already running is not started again.
         refresh();
-        assert_eq!(controller.lock().testing[&name], 1);
+        assert_eq!(
+            controller.lock().testing[&(name.clone(), endpoint.clone())],
+            1
+        );
         // A manual test still shows its progress.
         controller.probe(&name, &endpoint);
         assert!(matches!(controller.probes()[&name].0, Probe::Pending));
-        assert_eq!(controller.lock().testing[&name], 2);
+        assert_eq!(
+            controller.lock().testing[&(name.clone(), endpoint.clone())],
+            2
+        );
         // A slow test must not block the daemon's status or stop commands.
         assert!(controller.running.as_ref().unwrap().client.status().is_ok());
         controller.stop().unwrap();

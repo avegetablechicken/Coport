@@ -319,7 +319,6 @@ impl Core {
             && self
                 .started_stamp
                 .is_some_and(|started| started != file_stamp(&self.config_path()));
-        let probes = self.controller.probes();
         Snapshot {
             account_states_error: self.account_states_error.clone(),
             version: env!("CARGO_PKG_VERSION"),
@@ -388,7 +387,7 @@ impl Core {
                 },
                 changed_since_start,
                 details: self.loaded_config().map(|c| {
-                    let mut result = details(c, &probes);
+                    let mut result = details(c, &self.controller.probes_for(&c.proxies));
                     if matches!(phase, Phase::Running { .. }) && !changed_since_start {
                         sync_route_health(&mut result, &stats.route_health, SystemTime::now());
                     }
