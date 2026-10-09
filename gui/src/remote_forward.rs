@@ -59,9 +59,12 @@ where
     C: AsyncRead + Unpin,
     D: AsyncWrite + Unpin,
 {
-    let upload = async {
+    let upload = async move {
         tokio::io::copy(&mut a, &mut d).await?;
-        d.shutdown().await
+        d.shutdown().await?;
+        // A child's stdin pipe ignores shutdown and only closes when dropped.
+        drop(d);
+        io::Result::Ok(())
     };
     let download = async {
         tokio::io::copy(&mut c, &mut b).await?;
@@ -170,20 +173,27 @@ impl Channel {
         })
     }
     async fn transfer(
-        mut self,
+        self,
         socket: coport::server::Connection,
         counters: &Counters,
     ) -> io::Result<()> {
+        let Self {
+            mut child,
+            input,
+            mut output,
+            _diagnostics,
+        } = self;
         let (reader, writer) = tokio::io::split(socket);
+        // The relay owns stdin so a client half-close reaches the remote helper.
         let result = relay(
             reader,
             CountWriter(writer, counters.download.clone()),
-            &mut self.output,
-            CountWriter(&mut self.input, counters.upload.clone()),
+            &mut output,
+            CountWriter(input, counters.upload.clone()),
         )
         .await;
         // A remote helper must not outlive its local request, even on failure.
-        let _ = self.child.kill().await;
+        let _ = child.kill().await;
         result
     }
 }
@@ -498,7 +508,7 @@ impl Routing {
                                     // Drain a bounded amount of the rejected request so an unread
                                     // body cannot turn the 502 into a TCP reset on macOS/Windows.
                                     let _ = tokio::time::timeout(Duration::from_millis(250),
-                                        tokio::io::copy(&mut socket.take(65536), &mut tokio::io::sink())).await;
+                                        tokio::io::copy(&mut socket.take(32 * 1024 * 1024 + 65536), &mut tokio::io::sink())).await;
                                 }
                             }
                         } else {
@@ -575,6 +585,32 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"data: first\n\ndata: second\n\n");
+        task.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_closes_child_stdin_after_client_half_close() {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (mut client, local) = tokio::io::duplex(64);
+        let (a, b) = tokio::io::split(local);
+        let task = tokio::spawn(relay(a, b, output, input));
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        // `cat` only exits, ending the download, once its stdin reaches EOF.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("the remote helper never saw the client's EOF")
+            .unwrap();
+        assert_eq!(response, b"request");
         task.await.unwrap().unwrap();
     }
 
