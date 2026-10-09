@@ -216,14 +216,8 @@ impl Server {
             {
                 continue;
             }
-            if let Ok(mut profiles) = self.claude_profiles.lock() {
-                if profiles
-                    .get(&token)
-                    .is_some_and(|(at, _)| at.elapsed() >= Duration::from_secs(300))
-                {
-                    profiles.remove(&token);
-                }
-            }
+            // Statistics reuse the request router's bounded identity cache.
+            // Its timestamps are for LRU eviction, not background revalidation.
             let cached =
                 self.claude_profiles.lock().ok().and_then(|profiles| {
                     profiles.get(&token).map(|(_, identity)| identity.clone())

@@ -2729,3 +2729,55 @@ async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_reject
     }
     assert!(fixture.requests.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn statistics_preserve_aged_claude_identity() {
+    let Some(stale) = Instant::now().checked_sub(Duration::from_secs(301)) else {
+        return; // Some platforms count Instant from a recent system boot.
+    };
+    let mut lookup = fixture("http", "profile_unauthorized").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &lookup, &endpoint);
+    let identity = crate::claude::ClaudeIdentity::profile(
+        &json!({"account":{"uuid":"remote-account", "email":"remote@example.invalid"}}),
+    )
+    .unwrap();
+    running
+        .server
+        .cache_claude_profile("saved-secret".into(), identity)
+        .unwrap();
+    running
+        .server
+        .claude_profiles
+        .lock()
+        .unwrap()
+        .get_mut("saved-secret")
+        .unwrap()
+        .0 = stale;
+    let labels = running.server.traffic_credential_labels().await;
+    assert_eq!(
+        labels
+            .get(&("Claude".into(), "remote-account".into()))
+            .map(String::as_str),
+        Some("remote@example.invalid")
+    );
+    let retained = running
+        .server
+        .claude_profiles
+        .lock()
+        .unwrap()
+        .contains_key("saved-secret");
+    let sent_lookup = lookup.requests.try_recv().is_ok();
+    assert!(
+        retained && !sent_lookup,
+        "statistics invalidated request cache: retained={retained}, sent_lookup={sent_lookup}, has_label={}",
+        labels.contains_key(&("Claude".into(), "remote-account".into()))
+    );
+}
