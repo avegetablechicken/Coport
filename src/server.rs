@@ -473,6 +473,7 @@ impl Server {
             log.field("model_call_id", uuid::Uuid::new_v4());
             log.field("model_transport", "http");
         }
+        crate::request_ids::headers(incoming.headers(), &mut log.fields);
         log.event("request_received");
         if incoming.method() == "CONNECT" {
             log.field("service", "connect");

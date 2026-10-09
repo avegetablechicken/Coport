@@ -199,6 +199,7 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
 }
 
 pub(crate) fn observe_request(bytes: &[u8], log: &mut RequestLog) {
+    crate::request_ids::body(bytes, &mut log.fields, false);
     // Compressed bodies are forwarded as they are and not decoded; the response
     // reports the model as well.
     if let Ok(event) = serde_json::from_slice::<Envelope>(bytes) {
@@ -594,6 +595,13 @@ impl WsCalls {
             fields.remove(key);
         }
         field(&mut fields, "model_transport", "websocket");
+        // A handshake request ID identifies the connection, not every turn.
+        for key in ["client_request_id", "client_request_id_source"] {
+            if let Some(value) = fields.remove(key) {
+                fields.insert(format!("connection_{key}"), value);
+            }
+        }
+        fields.insert("client_request_id".into(), Value::Null);
         Self {
             logger: log.logger.clone(),
             fields,
@@ -673,6 +681,7 @@ impl WsCalls {
             }
             let mut fields = self.fields.clone();
             field(&mut fields, "model_call_id", uuid::Uuid::new_v4());
+            crate::request_ids::body(bytes, &mut fields, true);
             field(&mut fields, "wrote_downstream", false);
             event.apply(&mut fields);
             self.logger.write("model_call_started", fields.clone());
@@ -1141,6 +1150,80 @@ mod tests {
         ] {
             assert_eq!(is_model_endpoint(method, path), expected, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn websocket_call_ids_do_not_leak_between_turns_or_from_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let mut log = log_at(&path);
+        log.field("session_id", "connection-session");
+        log.field("client_request_id", "handshake");
+        let mut calls = WsCalls::new(&log, "");
+        for (id, request) in [
+            (
+                "one",
+                json!({"type":"response.create", "session_id":"turn-session", "event_id":"client-one"}),
+            ),
+            ("two", json!({"type":"response.create"})),
+        ] {
+            send(&mut calls, true, request);
+            send(
+                &mut calls,
+                false,
+                json!({"type":"response.completed", "session_id":"wrong", "request_id":"wrong", "response":{"id":id}}),
+            );
+        }
+        log.logger.flush().unwrap();
+        let rows = records(&path);
+        let done: Vec<_> = rows
+            .iter()
+            .filter(|r| r["event"] == "model_call_finished")
+            .collect();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["session_id"], "turn-session");
+        assert_eq!(done[0]["client_request_id"], "client-one");
+        assert_eq!(done[0]["client_request_id_source"], "body:event_id");
+        assert_eq!(done[1]["session_id"], "connection-session");
+        assert_eq!(done[1]["client_request_id"], Value::Null);
+        assert!(done[1].get("client_request_id_source").is_none());
+        assert_eq!(done[1]["connection_client_request_id"], "handshake");
+    }
+
+    #[test]
+    fn http_body_ids_survive_finished_and_failed_lifecycle_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        for outcome in ["request_finished", "request_failed"] {
+            let mut log = log_at(&path);
+            log.field("model_call_id", outcome);
+            crate::request_ids::headers(&hyper::HeaderMap::new(), &mut log.fields);
+            log.event("request_received");
+            observe_request(br#"{"metadata":{"user_id":"user_PRIVATE_account_PRIVATE_session_550e8400-e29b-41d4-a716-446655440000"},"request_id":"client-http","model":"test","input":"PRIVATE"}"#, &mut log);
+            log.outcome = outcome;
+            log.status = if outcome == "request_failed" {
+                502
+            } else {
+                200
+            };
+        }
+        let rows = records(&path);
+        let done: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r["event"].as_str(),
+                    Some("model_call_finished" | "model_call_failed")
+                )
+            })
+            .collect();
+        assert_eq!(done.len(), 2);
+        for row in done {
+            assert_eq!(row["session_id"], "550e8400-e29b-41d4-a716-446655440000");
+            assert_eq!(row["client_request_id"], "client-http");
+            assert_eq!(row["request_id"], "connection");
+        }
+        assert!(!std::fs::read_to_string(path).unwrap().contains("PRIVATE"));
     }
 
     #[test]

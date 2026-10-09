@@ -2484,6 +2484,8 @@ async fn http_model_calls_observe_compressed_and_untyped_streams_without_changin
         let response = http()
             .post(format!("{}/responses", running.url))
             .bearer_auth("model-secret")
+            .header("session_id", "http-session")
+            .header("x-client-request-id", "http-client-request")
             .header("content-encoding", "zstd")
             .header("accept-encoding", "zstd, gzip")
             .body(request.clone())
@@ -2522,6 +2524,9 @@ async fn http_model_calls_observe_compressed_and_untyped_streams_without_changin
         })
         .await
         .unwrap();
+        assert_eq!(call["session_id"], "http-session");
+        assert_eq!(call["client_request_id"], "http-client-request");
+        assert_ne!(call["request_id"], call["client_request_id"]);
         assert_eq!(call["model_outcome"], "finished", "{mode}");
         assert_eq!(call["input_tokens"], "12", "{mode}");
         assert_eq!(call["output_tokens"], "3", "{mode}");
@@ -2545,7 +2550,7 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
     let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
         .await
         .unwrap();
-    socket.write_all(b"GET /codex/https://upstream.invalid/v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    socket.write_all(b"GET /codex/https://upstream.invalid/v1/responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nsession_id: ws-session\r\nx-client-request-id: handshake-request\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
     assert!(
         read_response_head(&mut socket)
             .await
@@ -2554,7 +2559,7 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
     for id in ["turn-one", "turn-two"] {
         socket
             .write_all(&test_ws_message(
-                br#"{"type":"response.create","model":"test-model","input":"PRIVATE PROMPT"}"#,
+                serde_json::json!({"type":"response.create","model":"test-model","input":"PRIVATE PROMPT", "request_id":id}).to_string().as_bytes(),
                 true,
             ))
             .await
@@ -2576,6 +2581,11 @@ async fn responses_websocket_records_two_model_calls_while_connection_stays_open
     assert_eq!(calls.len(), 2);
     assert_ne!(calls[0]["model_call_id"], calls[1]["model_call_id"]);
     assert_eq!(calls[0]["request_id"], calls[1]["request_id"]);
+    for (call, id) in calls.iter().zip(["turn-one", "turn-two"]) {
+        assert_eq!(call["session_id"], "ws-session");
+        assert_eq!(call["client_request_id"], id);
+        assert_eq!(call["connection_client_request_id"], "handshake-request");
+    }
     assert_eq!(calls[1]["output_tokens"], "4");
     assert!(!raw.contains("PRIVATE PROMPT"));
     assert!(!rows.iter().any(|r| r["event"] == "request_finished"));

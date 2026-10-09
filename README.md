@@ -1097,6 +1097,28 @@ reconciliation is read-only and never rewrites retained logs.
 | `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |
 | `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
 
+Request logs keep the proxy-generated `request_id` separate from the client's
+`client_request_id` and `session_id`. Session headers are checked in this order:
+`session_id`, `x-session-id`, `x-codex-session-id`, `x-claude-code-session-id`.
+Client request headers are checked in this order: `x-client-request-id`,
+`x-request-id`, `request-id`, `request_id`. The corresponding `*_source` fields
+identify the selected header or body field. IDs must be nonempty printable ASCII,
+without spaces, and at most 256 bytes; ambiguous duplicate headers are skipped.
+Missing or invalid IDs are recorded as `null`, never generated as client IDs.
+
+For uncompressed JSON model requests, absent header IDs can be filled from
+`session_id` or `metadata.session_id`, and `client_request_id` or `request_id`.
+Claude's `metadata.user_id` JSON-string session field and legacy
+`user_<hash>_account_<id>_session_<uuid>` form are also recognized; the user/account
+portion is never logged. Body IDs appear in subsequent lifecycle records, since
+`request_received` and HTTP `model_call_started` precede body parsing. Compressed
+request bodies are not decoded, so their IDs must be supplied in headers.
+WebSocket calls inherit the handshake session ID unless the individual
+`response.create` supplies one. Each call reads its own request ID from
+`client_request_id`, `request_id`, or `event_id`, in that order; the handshake ID
+is retained separately as `connection_client_request_id` and is never reused as
+a per-call client request ID. Upstream response IDs remain `response_id`.
+
 The GUI's **Model Calls** scope counts each HTTP generation/compaction request and
 each WebSocket generation, including active calls. **All** counts network requests
 and connections instead. Model calls are deduplicated by call ID across log rotation.
