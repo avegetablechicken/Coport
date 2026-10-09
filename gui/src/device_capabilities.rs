@@ -63,13 +63,9 @@ impl Checks {
             .collect())
     }
     pub fn reload(&self) -> io::Result<()> {
-        let devices = match self.devices() {
-            Ok(devices) => devices,
-            Err(error) => {
-                self.entries.lock().unwrap().clear();
-                return Err(error);
-            }
-        };
+        // An unreadable file is not a configuration change: keep earlier results so
+        // a transient read error cannot requeue SSH checks that were denied.
+        let devices = self.devices()?;
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|id, _| devices.iter().any(|device| &device.name == id));
         for device in devices {
@@ -199,6 +195,12 @@ mod tests {
             checks.refresh().unwrap();
             assert!(checks.take_pending().is_empty());
         }
+        std::fs::write(dir.path().join("gui.json"), "{not json").unwrap();
+        assert!(checks.refresh().is_err());
+        assert_eq!(checks.statuses()[0].error.as_deref(), Some("Access denied"));
+        write("old-host");
+        checks.refresh().unwrap();
+        assert!(checks.take_pending().is_empty());
         write("new-host");
         checks.refresh().unwrap();
         assert_eq!(checks.take_pending().len(), 1);
