@@ -421,6 +421,23 @@ test('leaving Devices while definitions load prevents starting remote statistics
   assert.deepEqual(calls, []);
 });
 
+test('Devices statistics start without waiting for forwarding or capability reads', async () => {
+  const pending = [];
+  const calls = [];
+  const h = harness(command => {
+    calls.push(command);
+    if (command === 'get_devices') return Promise.resolve([]);
+    return new Promise(resolve => pending.push(resolve));
+  });
+  h.loadMergedData = (force, refreshRemote) => { calls.push(['statistics', refreshRemote]); };
+  const loading = h.loadDevices();
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities', ['statistics', false]]);
+  for (const resolve of pending) resolve([]);
+  await loading;
+  assert.deepEqual(h.ui.deviceForwarders, []);
+});
+
 test('Settings timer never polls remote devices', () => {
   const calls = [];
   let tick;

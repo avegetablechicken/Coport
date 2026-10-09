@@ -1524,14 +1524,17 @@ async function loadDevices(refreshRemote = false) {
   ui.deviceRefresh = true;
   try {
     await loadDeviceDefinitions();
-    // Forwarding status comes only from the local daemon. Remote statistics
-    // must not start when Settings is open or the user has left Devices.
-    ui.deviceForwarders = await invoke("get_device_forwarders");
-    await loadDeviceCapabilities();
-    if (ui.page !== "devices") return;
-    if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
+    // Forwarding status comes only from the local daemon; read it alongside
+    // statistics instead of delaying the first traffic frame behind it.
+    const local = Promise.all([
+      invoke("get_device_forwarders").then(forwarders => { ui.deviceForwarders = forwarders; }),
+      loadDeviceCapabilities(),
+    ]);
+    // Remote statistics must not start when Settings is open or the user has left Devices.
+    if (ui.page !== "devices") { await local; return; }
+    if (!(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
-    await loadMergedData(false, refreshRemote);
+    await Promise.all([local, loadMergedData(false, refreshRemote)]);
 
   } catch (error) { toast(String(error)); }
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
