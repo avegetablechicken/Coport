@@ -36,7 +36,7 @@ pub async fn get_state(
     if let Some(states) = core.account_states() {
         snapshot.set_account_route_states(states);
     }
-    if refresh_accounts != Some(false)
+    if refresh_accounts == Some(true)
         && let Some(probe) = core.begin_account_states()
     {
         tauri::async_runtime::spawn(async move {
@@ -168,7 +168,7 @@ pub async fn get_traffic(
         .map(|config| crate::traffic_identity::Identities::from_config(config, &assignments))
         .unwrap_or_default();
     let labels = match tasks {
-        Some(tasks) => tasks.credential_labels().await?,
+        Some(tasks) => tasks.cached_credential_labels().await,
         None => Default::default(),
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -496,14 +496,21 @@ pub async fn save_device(
     device: coport_gui::devices::Draft,
 ) -> Result<String> {
     let _guard = state.forwarding_operations.lock().await;
-    let (id, settings) = {
-        let mut settings = state.core.lock().unwrap().settings.clone();
-        let id = coport_gui::devices::save(&mut settings.managed_devices, device)?;
-        (id, settings)
+    let (id, devices) = {
+        let mut devices = state.core.lock().unwrap().settings.managed_devices.clone();
+        let id = coport_gui::devices::save(&mut devices, device)?;
+        (id, devices)
     };
     stop_device_forwarding(&id).await?;
-    settings.try_save().map_err(|e| e.to_string())?;
-    state.core.lock().unwrap().settings = settings;
+    {
+        // General preferences can change while the daemon operation is pending.
+        // Commit only the device list against the latest settings snapshot.
+        let mut core = state.core.lock().unwrap();
+        let mut settings = core.settings.clone();
+        settings.managed_devices = devices;
+        settings.try_save().map_err(|e| e.to_string())?;
+        core.settings = settings;
+    }
     Ok(id)
 }
 #[tauri::command]
@@ -523,45 +530,55 @@ pub async fn get_merged_data(
     minutes: u64,
     scope: crate::traffic::TrafficScope,
     on_update: tauri::ipc::Channel<Vec<coport_gui::data_client::Merged>>,
+    refresh_remote: Option<bool>,
 ) -> Result<Vec<coport_gui::data_client::Merged>> {
+    coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    let (sources, config, log, probe) = {
+        let mut core = state.core.lock().unwrap();
+        core.refresh_config();
+        (
+            core.settings.data_sources(),
+            core.loaded_config()
+                .cloned()
+                .ok_or("Cannot read local configuration")?,
+            core.logs.path(),
+            core.account_tasks(),
+        )
+    };
+    let labels = match probe {
+        Some(tasks) => tasks.cached_credential_labels().await,
+        None => config.local_traffic_credential_labels().await,
+    };
+    if refresh_remote != Some(true) {
+        return state
+            .merged_cache
+            .lock()
+            .await
+            .views(sources, config, log, labels, false)
+            .await;
+    }
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {
         let _ = previous.send(());
     }
     let operation = async {
-        let (sources, config, log, probe) = {
-            let mut core = state.core.lock().unwrap();
-            core.refresh_config();
-            (
-                core.settings.data_sources(),
-                core.loaded_config()
-                    .cloned()
-                    .ok_or("Cannot read local configuration")?,
-                core.logs.path(),
-                core.account_tasks(),
+        state
+            .merged_cache
+            .lock()
+            .await
+            .refresh_progressive(
+                sources,
+                config,
+                log,
+                labels,
+                (minutes, scope),
+                move |views| {
+                    on_update
+                        .send(views)
+                        .map_err(|_| "Traffic view closed".into())
+                },
             )
-        };
-        let labels = match probe {
-            Some(tasks) => tasks.credential_labels().await?,
-            None => config.traffic_credential_labels().await,
-        };
-        coport_gui::data_client::merge_progressive_with_labels(
-            sources,
-            config,
-            log,
-            labels,
-            minutes,
-            scope,
-            move |views| {
-                on_update
-                    .send(views)
-                    .map_err(|_| "Traffic view closed".into())
-            },
-        )
-        .await
+            .await
     };
-    tokio::select! {
-        result = operation => result,
-        _ = cancelled => Err("Traffic request superseded".into()),
-    }
+    tokio::select! {result=operation=>result,_=cancelled=>Err("Traffic request superseded".into())}
 }

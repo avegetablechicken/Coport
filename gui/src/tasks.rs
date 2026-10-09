@@ -73,6 +73,14 @@ impl Tasks {
         }
     }
 
+    pub async fn cached_credential_labels(&self) -> CredentialLabels {
+        if let Ok(Some(client)) = self.backend().await
+            && let Ok(labels) = client.cached_credential_labels().await
+        {
+            return labels;
+        }
+        self.config.local_traffic_credential_labels().await
+    }
     pub async fn credential_labels(&self) -> Result<CredentialLabels, String> {
         if let Some(client) = self.backend().await? {
             return client.credential_labels().await.map_err(|e| e.to_string());

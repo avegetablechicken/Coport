@@ -130,13 +130,18 @@ fn summary_command(binary: &str) -> String {
 pub(crate) fn helper_command(binary: &str, operation: &str) -> String {
     assert!(matches!(operation, "--summary" | "--forward"));
     if binary.is_empty() || binary == "coportd" {
-        format!(
-            "/bin/sh -c {}",
-            quote(&DISCOVERY_SCRIPT.replace("--summary", operation))
-        )
+        discovery_command(DISCOVERY_SCRIPT, operation)
     } else {
         format!("{} {operation}", quote(binary))
     }
+}
+
+fn discovery_command(script: &str, operation: &str) -> String {
+    // include_str! preserves checkout line endings; POSIX sh requires LF.
+    format!(
+        "/bin/sh -c {}",
+        quote(&script.replace("\r\n", "\n").replace("--summary", operation))
+    )
 }
 
 /// Published privately at daemon startup, never by a summary request.
@@ -244,10 +249,7 @@ pub async fn summary_progressive(
     // three positional arguments would otherwise be interpreted as daemon startup.
     let operation = format!("--summary-stream --window {minutes} {scope}");
     let command = if device.binary.is_empty() || device.binary == "coportd" {
-        format!(
-            "/bin/sh -c {}",
-            quote(&DISCOVERY_SCRIPT.replace("--summary", &operation))
-        )
+        discovery_command(DISCOVERY_SCRIPT, &operation)
     } else {
         format!("{} {operation}", quote(&device.binary))
     };
@@ -258,19 +260,21 @@ pub async fn summary_progressive(
     let stdout = process.stdout.take().unwrap();
     let mut stderr = process.stderr.take().unwrap().take(8193);
     let mut received = false;
+    let mut errors = Vec::new();
+    let mut exit_code = None;
     let operation = async {
         let read = read_summary_stream(stdout, |summary| {
             received = true;
             on_summary(summary)
         });
-        let mut errors = Vec::new();
         let (result, error_result) = tokio::join!(read, stderr.read_to_end(&mut errors));
-        result?;
         error_result.map_err(|e| e.to_string())?;
         if errors.len() > 8192 {
             return Err("SSH response exceeded the size limit.".into());
         }
         let status = process.wait().await.map_err(|e| e.to_string())?;
+        exit_code = status.code();
+        result?;
         if !status.success() {
             return Err("SSH statistics request failed.".into());
         }
@@ -283,13 +287,23 @@ pub async fn summary_progressive(
     if result.is_err() {
         let _ = process.kill().await;
         // Older helpers reject the new option without changing any state.
-        if !received {
+        if legacy_summary_retry(received, exit_code, &errors) {
             let legacy = summary(device).await?;
             legacy.validate()?;
             return on_summary(legacy);
         }
     }
     result
+}
+
+fn legacy_summary_retry(received: bool, exit_code: Option<i32>, errors: &[u8]) -> bool {
+    // Only a known old helper's usage error proves lack of protocol support.
+    // Denied SSH access, timeouts and malformed output must not reconnect.
+    !received
+        && exit_code == Some(2)
+        && errors
+            .windows(b"Usage: coportd".len())
+            .any(|part| part == b"Usage: coportd")
 }
 
 async fn read_summary_stream(
@@ -469,6 +483,47 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn legacy_fallback_never_retries_denied_or_timed_out_ssh() {
+        let usage = b"Usage: coportd ... --summary";
+        assert!(legacy_summary_retry(false, Some(2), usage));
+        for code in [None, Some(0), Some(1), Some(255)] {
+            assert!(!legacy_summary_retry(false, code, usage));
+        }
+        assert!(!legacy_summary_retry(false, Some(2), b"Permission denied"));
+        assert!(!legacy_summary_retry(true, Some(2), usage));
+    }
+    #[test]
+    fn discovery_command_is_independent_of_checkout_line_endings() {
+        let lf = DISCOVERY_SCRIPT.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        for operation in ["--summary", "--forward"] {
+            let command = discovery_command(&crlf, operation);
+            assert_eq!(command, discovery_command(&lf, operation));
+            assert!(!command.contains('\r'));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn lf_and_crlf_discovery_scripts_execute_the_registered_helper() {
+        let (home, _, _) = discovery_fixture();
+        let lf = DISCOVERY_SCRIPT.replace("\r\n", "\n");
+        for script in [lf.clone(), lf.replace('\n', "\r\n")] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &discovery_command(&script, "--summary")])
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+        }
+    }
     #[test]
     fn ssh_availability_uses_noninteractive_login_without_remote_services() {
         let device = Device {

@@ -887,7 +887,7 @@ impl ExportIdentities {
                 .map(|rt| {
                     rt.block_on(async {
                         (
-                            config.traffic_credential_labels().await,
+                            config.local_traffic_credential_labels().await,
                             config.traffic_provider_references().await,
                         )
                     })
@@ -2148,7 +2148,7 @@ mod tests {
             "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{0}]\n  routing:\n    account: {{default: none}}\n    api_key: {{MY_API_KEY: none}}\nclaude:\n  config_dirs: [{0}]\n  routing:\n    account: {{'user@example.test': none, default: none}}\n",
             serde_json::to_string(dir.path()).unwrap()
         )).unwrap();
-        let labels = config.traffic_credential_labels().await;
+        let labels = config.local_traffic_credential_labels().await;
         assert_eq!(labels[&("Codex".into(), "opaque-id".into())], "default");
         assert_eq!(
             labels[&("Claude".into(), "claude-id".into())],

@@ -205,6 +205,7 @@ pub struct MergedGroup {
 #[serde(rename_all = "snake_case")]
 enum SourceExclusion {
     Duplicate,
+    NotRefreshed,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -518,7 +519,7 @@ pub async fn merge(
     minutes: u64,
     scope: crate::traffic::TrafficScope,
 ) -> Result<Merged, String> {
-    let labels = config.traffic_credential_labels().await;
+    let labels = config.local_traffic_credential_labels().await;
     merge_with_labels(sources, config, log, minutes, scope, labels).await
 }
 pub async fn merge_with_labels(
@@ -545,38 +546,161 @@ pub async fn merge_views_with_labels(
     log: PathBuf,
     credential_labels: BTreeMap<(String, String), String>,
 ) -> Result<Vec<Merged>, String> {
-    if sources.len() > crate::devices::LIMIT {
-        return Err("At most 32 data sources are supported.".into());
+    MergeCache::default()
+        .views(sources, config, log, credential_labels, true)
+        .await
+}
+
+fn cache_source_key(source: &Source) -> Result<Vec<u8>, String> {
+    let mut connection = source.clone();
+    connection.name.clear();
+    serde_json::to_vec(&(
+        source.device_id.as_deref().unwrap_or(&source.name),
+        connection,
+    ))
+    .map_err(|e| e.to_string())
+}
+#[derive(Default)]
+pub struct MergeCache {
+    key: Vec<u8>,
+    fetched: Option<(Fetched, i64)>,
+    errors: BTreeMap<Vec<u8>, String>,
+}
+impl MergeCache {
+    pub async fn refresh_progressive(
+        &mut self,
+        sources: Vec<Source>,
+        config: Config,
+        log: PathBuf,
+        labels: BTreeMap<(String, String), String>,
+        selection: (u64, crate::traffic::TrafficScope),
+        on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
+    ) -> Result<Vec<Merged>, String> {
+        let mut keys = sources
+            .iter()
+            .map(cache_source_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        let key = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
+        if key != self.key {
+            self.key = key;
+            self.fetched = None;
+            self.errors.clear();
+        }
+        let result = merge_progressive_snapshot(
+            sources,
+            config,
+            log,
+            labels,
+            selection.0,
+            selection.1,
+            on_update,
+        )
+        .await?;
+        self.errors.clear();
+        for (source, _) in &result.fetched {
+            if let Some(error) = result.errors.get(&source.name) {
+                self.errors.insert(cache_source_key(source)?, error.clone());
+            }
+        }
+        self.fetched = Some((result.fetched, result.end));
+        Ok(result.views)
     }
-    let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
-    let selections: Vec<_> = crate::data_api::RANGES
-        .into_iter()
-        .flat_map(|minutes| {
-            [
-                crate::traffic::TrafficScope::Model,
-                crate::traffic::TrafficScope::All,
-            ]
+
+    /// Only an explicit remote refresh may open a connection. Cached snapshots
+    /// are re-merged with current local assignments without refetching peers.
+    pub async fn views(
+        &mut self,
+        sources: Vec<Source>,
+        config: Config,
+        log: PathBuf,
+        credential_labels: BTreeMap<(String, String), String>,
+        refresh_remote: bool,
+    ) -> Result<Vec<Merged>, String> {
+        if sources.len() > crate::devices::LIMIT {
+            return Err("At most 32 data sources are supported.".into());
+        }
+        let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
+        let selections: Vec<_> = crate::data_api::RANGES
             .into_iter()
-            .map(move |scope| (minutes, scope))
-        })
-        .collect();
-    let (fetched, end) = align_sources(&context, sources, &selections).await?;
-    let snapshot = load_snapshot(&context.log, end).await?;
-    let mut views = Vec::new();
-    for (minutes, scope) in selections {
-        views.push(
-            merge_fetched(
+            .flat_map(|minutes| {
+                [
+                    crate::traffic::TrafficScope::Model,
+                    crate::traffic::TrafficScope::All,
+                ]
+                .into_iter()
+                .map(move |scope| (minutes, scope))
+            })
+            .collect();
+        let keyed: Vec<_> = sources
+            .iter()
+            .map(|source| Ok((source, cache_source_key(source)?)))
+            .collect::<Result<_, String>>()?;
+        let mut keys: Vec<_> = keyed.iter().map(|(_, key)| key.clone()).collect();
+        keys.sort();
+        let key = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
+        if key != self.key {
+            self.fetched = None;
+            self.errors.clear();
+            self.key = key;
+        }
+        if refresh_remote {
+            self.fetched = Some(align_sources(&context, sources.clone(), &selections).await?);
+            self.errors.clear();
+        }
+        let pending = self.fetched.is_none();
+        let empty: Fetched = Vec::new();
+        let (fetched, end) = match &mut self.fetched {
+            Some((fetched, end)) => {
+                for (source, _) in fetched.iter_mut() {
+                    let key = cache_source_key(source)?;
+                    let current = keyed
+                        .iter()
+                        .find(|(_, candidate)| candidate == &key)
+                        .ok_or("Cached source is no longer configured")?
+                        .0;
+                    *source = current.clone();
+                }
+                (&*fetched, *end)
+            }
+            None => (&empty, context.at),
+        };
+        let snapshot = load_snapshot(&context.log, end).await?;
+        let mut views = Vec::new();
+        for (minutes, scope) in selections {
+            let mut view = merge_fetched(
                 context.clone(),
-                &fetched,
+                fetched,
                 minutes,
                 scope,
                 end,
                 snapshot.clone(),
             )
-            .await?,
-        );
+            .await?;
+            if pending {
+                view.sources = sources
+                    .iter()
+                    .map(|source| SourceState {
+                        name: source.name.clone(),
+                        included: false,
+                        exclusion: Some(SourceExclusion::NotRefreshed),
+                        error: None,
+                        traffic: None,
+                    })
+                    .collect();
+                view.sources.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            for state in &mut view.sources {
+                if let Some((_, key)) = keyed.iter().find(|(source, _)| source.name == state.name)
+                    && let Some(error) = self.errors.get(key)
+                {
+                    state.error = Some(error.clone());
+                }
+            }
+            views.push(view);
+        }
+        Ok(views)
     }
-    Ok(views)
 }
 /// Publish the selected view as peers respond, then fill the other cached views.
 pub async fn merge_progressive_with_labels(
@@ -588,6 +712,33 @@ pub async fn merge_progressive_with_labels(
     scope: crate::traffic::TrafficScope,
     on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
 ) -> Result<Vec<Merged>, String> {
+    Ok(merge_progressive_snapshot(
+        sources,
+        config,
+        log,
+        credential_labels,
+        minutes,
+        scope,
+        on_update,
+    )
+    .await?
+    .views)
+}
+struct ProgressiveResult {
+    views: Vec<Merged>,
+    fetched: Fetched,
+    end: i64,
+    errors: BTreeMap<String, String>,
+}
+async fn merge_progressive_snapshot(
+    sources: Vec<Source>,
+    config: Config,
+    log: PathBuf,
+    credential_labels: BTreeMap<(String, String), String>,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
+) -> Result<ProgressiveResult, String> {
     crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
     if sources.len() > crate::devices::LIMIT {
         return Err("At most 32 data sources are supported.".into());
@@ -726,7 +877,12 @@ pub async fn merge_progressive_with_labels(
             }
         }
     }
-    Ok(views)
+    Ok(ProgressiveResult {
+        views,
+        fetched,
+        end,
+        errors: background_errors,
+    })
 }
 
 async fn load_selected_snapshot(
@@ -1046,15 +1202,15 @@ mod tests {
             }));
         }
         let updates = std::sync::Mutex::new(Vec::new());
+        let mut cache = MergeCache::default();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            merge_progressive_with_labels(
-                sources,
-                config,
-                log,
+            cache.refresh_progressive(
+                sources.clone(),
+                config.clone(),
+                log.clone(),
                 BTreeMap::new(),
-                1440,
-                crate::traffic::TrafficScope::All,
+                (1440, crate::traffic::TrafficScope::All),
                 |views| {
                     assert_eq!(views.len(), 1);
                     assert_eq!(views[0].minutes, 1440);
@@ -1093,8 +1249,86 @@ mod tests {
         for server in servers {
             server.await.unwrap();
         }
+        // Listeners are gone: cached page reads must retain successful snapshots.
+        let cached = cache
+            .views(sources, config, log, BTreeMap::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(cached.len(), 12);
+        assert!(cached.iter().all(|view| {
+            view.sources
+                .iter()
+                .all(|source| source.included && source.error.is_none())
+        }));
     }
 
+    #[tokio::test]
+    async fn cached_views_never_connect_and_keep_sources_matched_after_renaming() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("data.key");
+        crate::settings::write_private(&key, KEY.as_bytes()).unwrap();
+        let config=Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let source = |id: &str, name: &str| Source {
+            name: name.into(),
+            device_id: Some(id.into()),
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token_env: None,
+            token_file: Some(key.to_string_lossy().into()),
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let mut sources = vec![source("z", "Z"), source("a", "A")];
+        for source in &sources {
+            source.validate().unwrap();
+        }
+        let log = dir.path().join("traffic.log");
+        std::fs::write(&log, "").unwrap();
+        let mut cache = MergeCache::default();
+        for _ in 0..3 {
+            let views = tokio::time::timeout(
+                Duration::from_secs(2),
+                cache.views(
+                    sources.clone(),
+                    config.clone(),
+                    log.clone(),
+                    BTreeMap::new(),
+                    false,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(views[0].sources.iter().all(|source| source.error.is_none()
+                && source.exclusion == Some(SourceExclusion::NotRefreshed)));
+        }
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        cache.fetched = Some((
+            vec![
+                (sources[1].clone(), Err("error A".into())),
+                (sources[0].clone(), Err("error Z".into())),
+            ],
+            end,
+        ));
+        sources[0].name = "First".into();
+        sources[1].name = "Second".into();
+        let views = cache
+            .views(sources, config, log, BTreeMap::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(views[0].sources[0].name, "First");
+        assert_eq!(views[0].sources[0].error.as_deref(), Some("error Z"));
+        assert_eq!(views[0].sources[1].name, "Second");
+        assert_eq!(views[0].sources[1].error.as_deref(), Some("error A"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "Reading cached views opened a network connection"
+        );
+    }
     fn sample(key: &DataKey, proxy: &str, upstream: &str) -> Summary {
         let mut counts = vec![0; 30];
         counts[0] = 1;
@@ -1476,7 +1710,7 @@ mod tests {
         }
         let summary: Summary = serde_json::from_slice(&body).unwrap();
         assert_eq!(summary.groups.len(), 2);
-        let labels = config.traffic_credential_labels().await;
+        let labels = config.local_traffic_credential_labels().await;
         let context = prepare_merge(config.clone(), log.clone(), labels.clone())
             .await
             .unwrap();
@@ -1679,7 +1913,7 @@ mod tests {
             device_id: None,
             ssh_device: None,
         };
-        let labels = config.traffic_credential_labels().await;
+        let labels = config.local_traffic_credential_labels().await;
         let views = merge_views_with_labels(vec![source], config, log.clone(), labels)
             .await
             .unwrap();

@@ -9,7 +9,7 @@ use std::{
 };
 
 pub(crate) fn is_url(name: &str) -> bool {
-    !(name.ends_with(".json") && !name.contains(['/', ':', '\\']))
+    (!name.ends_with(".json") || name.contains(['/', ':', '\\']))
         && crate::url_routing::is_url_selector(name)
 }
 

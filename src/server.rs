@@ -186,6 +186,28 @@ impl Server {
         }
         states
     }
+    /// Read-only display metadata: local configuration plus identities already
+    /// observed by real requests. Never probe a profile endpoint or run a shell.
+    pub async fn cached_traffic_credential_labels(
+        &self,
+    ) -> std::collections::BTreeMap<(String, String), String> {
+        let mut labels = self.config.local_traffic_credential_labels().await;
+        if let Ok(profiles) = self.claude_profiles.lock() {
+            for (_, identity) in profiles.values() {
+                if let Some(label) = crate::identity::routing_account_label(
+                    &self.config.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    "",
+                ) {
+                    labels
+                        .entry(("Claude".into(), identity.account_id.clone()))
+                        .or_insert(label);
+                }
+            }
+        }
+        labels
+    }
     pub async fn traffic_credential_labels(
         &self,
     ) -> std::collections::BTreeMap<(String, String), String> {

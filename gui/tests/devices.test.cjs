@@ -536,3 +536,40 @@ test('a background failure retains the selected traffic already rendered', async
   assert.equal(context.ui.mergedDataLoading, false);
   assert.equal(context.ui.mergedDataError, 'Background statistics failed');
 });
+
+test('reentering Devices and periodic refreshes never authorize a remote refresh', async () => {
+  const calls=[];
+  const h=harness(async(command,args)=>{calls.push([command,args]);return command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : [];});
+  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
+  vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
+  for(let i=0;i<4;i++) {h.ui.page='devices';await h.loadDevices();h.ui.page='settings';await h.loadDevices();}
+  const reads=calls.filter(([command])=>command==='get_merged_data');
+  assert.equal(reads.length,4);assert.ok(reads.every(([,args])=>args.refreshRemote===false));
+  assert.equal(h.ui.mergedDataError,'');
+  await h.action('merged-refresh');
+  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,1);
+  h.ui.page='devices';await h.loadDevices();
+  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,1);
+});
+
+
+test('an old startup success never overrides a later failure or expired statistics', () => {
+  const h=harness(async()=>[]);const device={id:'peer',name:'Peer',ssh:{host:'test'}};
+  h.ui.deviceStates={peer:{host:'test',state:'running',label:'SSH reachable at startup'}};
+  h.ui.deviceTrafficFetchedAt=Date.now()-60000;
+  h.ui.mergedData={sources:[{name:'Peer',error:'connection refused'}]};
+  assert.equal(h.deviceConnectionStatus(device).state,'failed');
+  h.ui.mergedData.sources[0]={name:'Peer',included:true,error:null};
+  assert.notEqual(h.deviceConnectionStatus(device).state,'running');
+});
+
+test('saving a device merges only its list after asynchronous forwarding work', () => {
+  const commands=fs.readFileSync(require('node:path').join(__dirname,'../src/commands.rs'),'utf8');
+  const save=commands.slice(commands.indexOf('pub async fn save_device('),commands.indexOf('pub async fn remove_device('));
+  const before=save.slice(0,save.indexOf('stop_device_forwarding(&id).await?'));
+  const after=save.slice(save.indexOf('stop_device_forwarding(&id).await?'));
+  assert.doesNotMatch(before,/settings\.clone\(\)/);
+  assert.match(before,/managed_devices\.clone\(\)/);
+  assert.match(after,/core\.settings\.clone\(\)/);
+  assert.match(after,/settings\.managed_devices = devices/);
+});

@@ -774,8 +774,9 @@ Opening the panel again does not repeat the startup check.
 
 Configured proxies are also tested automatically at app startup. Reopening the
 panel does not repeat these checks; use **Test** or **Test All** to run them again. Entering Settings reads local device definitions,
-uses cached account status, and does not poll remote device statistics. Remote
-statistics refresh on the Devices page. These UI controls do not stop health checks
+uses cached account status, and does not poll remote device statistics. Entering
+or revisiting Devices and its periodic refresh also read local caches only.
+Use the Devices **Refresh** action to explicitly retrieve remote statistics. These UI controls do not stop health checks
 for routes already in use by the running proxy.
 
 Enable **Settings → General → Keep proxy running after quit** to leave the
@@ -1322,12 +1323,10 @@ and uses its own display name. Emails, names, URLs and other guessable identifie
 never produce a shared reference. Unknown accounts stay anonymous. This allows the
 same known account on multiple devices to merge without exporting IDs or labels.
 
-If saved Claude OAuth metadata does not identify a configured account, the
-receiver uses its configured account-probe transport and locally available
-credential to read the authenticated profile. Only a profile matching local
-routing restores a name. Positive identities and failed checks are cached to
-avoid repeated probes; credentials and profile data stay on the receiving device.
-A statistics request to another device never triggers this probe or exports a profile.
+Statistics use local metadata and identities already observed by real requests.
+Reading traffic or account status never initiates a profile request, runs a login
+shell, or probes an upstream provider. Accounts without local/cached evidence remain
+anonymous until normal request routing establishes their identity.
 
 Named API providers such as ShareCoder additionally use a domain-separated
 HMAC-SHA256 proof keyed by their high-entropy API credential and bound to the

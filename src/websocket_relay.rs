@@ -475,14 +475,14 @@ pub(super) async fn run<A, B>(
     // still receive a valid close; a blocked/broken socket is dropped promptly.
     let close_timeout = timeout.min(Duration::from_secs(5));
     let client_close = async {
-        if !trace.client_write_partial && !(exit.peer_close && !exit.client) {
+        if !(trace.client_write_partial || exit.peer_close && !exit.client) {
             send_close(&mut cw, exit.code, exit.stage, false, close_timeout).await
         } else {
             false
         }
     };
     let upstream_close = async {
-        if !trace.upstream_write_partial && !(exit.peer_close && exit.client) {
+        if !(trace.upstream_write_partial || exit.peer_close && exit.client) {
             send_close(&mut uw, exit.code, exit.stage, true, close_timeout).await
         } else {
             false

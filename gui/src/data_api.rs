@@ -828,16 +828,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
-        let reserve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = reserve.local_addr().unwrap().port();
-        drop(reserve);
-        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: {port}\n  token_env: {DATA_KEY_ENV}\n  trusted_lan: [10.42.0.0/24]\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+        let mut config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nallow_external_access: true\nexternal_data:\n  port: 8788\n  token_env: {DATA_KEY_ENV}\n  trusted_lan: [10.42.0.0/24]\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+        // Let the OS allocate the test port atomically. Reserving and releasing
+        // an ephemeral port races concurrent client connections in other tests.
+        config.external_data.as_mut().unwrap().port = 0;
         let before = crate::traffic::live_scans(&log);
         let running = start(config, dir.path(), log.clone()).await.unwrap();
         // On this current-thread runtime the background publisher has not been
         // polled yet. Startup must already have returned a bound listener.
-        assert_eq!(running.port, port);
+        assert_ne!(running.port, 0);
         assert_eq!(crate::traffic::live_scans(&log), before);
+        let socket = std::net::TcpStream::connect_timeout(
+            &(Ipv4Addr::LOCALHOST, running.port).into(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        drop(socket);
         drop(running);
     }
 

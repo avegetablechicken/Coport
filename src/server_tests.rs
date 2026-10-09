@@ -686,6 +686,16 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
         std::fs::write(&credentials, saved).unwrap();
         let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n",serde_json::to_string(dir.path()).unwrap())).await;
         trust(&running, &lookup, &endpoint);
+        for _ in 0..3 {
+            let cached = running.server.cached_traffic_credential_labels().await;
+            assert!(!cached.contains_key(&("Claude".into(), "remote-account".into())));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lookup.requests.recv())
+                .await
+                .is_err(),
+            "Reading cached display labels must not contact the upstream"
+        );
         let (first, second) = tokio::join!(
             running.server.traffic_credential_labels(),
             running.server.traffic_credential_labels()
@@ -722,6 +732,10 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
         let checks = running.server.account_checks.lock().await;
         let before = checks.values().next().unwrap().0;
         drop(checks);
+        assert_eq!(
+            running.server.cached_traffic_credential_labels().await,
+            first
+        );
         assert_eq!(running.server.traffic_credential_labels().await, first);
         assert_eq!(
             running

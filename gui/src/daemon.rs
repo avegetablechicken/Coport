@@ -59,6 +59,7 @@ enum Action {
     },
     AccountStates,
     CredentialLabels,
+    CachedCredentialLabels,
     SetForwarding {
         target: Option<crate::remote_forward::Target>,
     },
@@ -154,6 +155,17 @@ impl Client {
         }
     }
 
+    pub async fn cached_credential_labels(
+        &self,
+    ) -> io::Result<std::collections::BTreeMap<(String, String), String>> {
+        match self
+            .request_async(Action::CachedCredentialLabels, Duration::from_secs(5))
+            .await?
+        {
+            Response::CredentialLabels(labels) => Ok(labels.into_iter().collect()),
+            _ => Err(io::Error::other("Cached metadata unavailable")),
+        }
+    }
     pub async fn credential_labels(
         &self,
     ) -> io::Result<std::collections::BTreeMap<(String, String), String>> {
@@ -456,6 +468,7 @@ async fn handle_control(
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
             },
             Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
+            Action::CachedCredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
             Action::CredentialLabels => Response::CredentialLabels(server.traffic_credential_labels().await.into_iter().collect()),
             Action::RecordDeviceQuery(event) => {
                 if event.validate() {
@@ -609,12 +622,15 @@ async fn serve_until(
     });
     let (stops, mut stop_requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::pin!(signal);
+    let mut controls = tokio::task::JoinSet::new();
     let mut stop_client = None;
     let result = loop {
         tokio::select! {
             _ = &mut signal => break Ok(()),
+            Some(_) = controls.join_next(), if !controls.is_empty() => {},
             result = &mut serving => {
                 // Do not poll the completed JoinHandle again during cleanup.
+                controls.shutdown().await;
                 startup.abort();
                 logger.write("server_stopped", Default::default());
                 return result.map_err(io::Error::other)?;
@@ -622,10 +638,11 @@ async fn serve_until(
             Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
             accepted = control.accept() => {
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
-                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, server.clone(), stops.clone(), routing.clone()));
+                controls.spawn(handle_control(stream, token.clone(), status.clone(), started, server.clone(), stops.clone(), routing.clone()));
             }
         }
     };
+    controls.shutdown().await;
     let _ = shutdown.send(());
     let stopped = match tokio::time::timeout(Duration::from_secs(5), &mut serving).await {
         Ok(result) => result.map_err(io::Error::other).and_then(|result| result),
@@ -674,6 +691,55 @@ pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_pending_control_connections_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let log = dir.path().join("proxy.log");
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(&config,format!("listen_port: {port}\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let directory = dir.path().to_owned();
+        let server = tokio::spawn(async move {
+            serve_until(&directory, &config, &log, async {
+                let _ = stopped.await;
+            })
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join(ENDPOINT).exists() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let endpoint: Endpoint =
+            serde_json::from_slice(&std::fs::read(dir.path().join(ENDPOINT)).unwrap()).unwrap();
+        let mut idle = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port))
+            .await
+            .unwrap();
+        let client = Client {
+            endpoint,
+            directory: dir.path().to_owned(),
+        };
+        client
+            .request_async(Action::Status, Duration::from_secs(2))
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), idle.read(&mut byte))
+                .await
+                .expect("A control task survived server shutdown")
+                .unwrap(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn disabled_statistics_errors_do_not_prevent_proxy_start() {

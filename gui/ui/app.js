@@ -206,7 +206,7 @@ const ui = {
 async function refresh() {
   const request = ++ui.refreshRequest;
   const [snap, recent] = await Promise.all([
-    invoke("get_state", { refreshAccounts: ui.page !== "settings" }),
+    invoke("get_state", { refreshAccounts: false }),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
   if (request !== ui.refreshRequest) return;
@@ -1375,7 +1375,7 @@ function selectDeviceTraffic() {
   ui.mergedData = cached;
   return true;
 }
-async function loadMergedData(force = false) {
+async function loadMergedData(force = false, refreshRemote = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
   ui.mergedDataLoading = true;
@@ -1389,12 +1389,12 @@ async function loadMergedData(force = false) {
       ui.deviceTrafficViews ||= Object.create(null);
       for (const view of data) ui.deviceTrafficViews[`${view.minutes}:${view.scope}`] = view;
       selectDeviceTraffic();
-      ui.deviceTrafficFetchedAt = Date.now();
+      if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
       ui.mergedDataError = ""; ui.mergedDataUpdating = false;
       if (ui.page === "devices" || ui.page === "settings") render();
     };
     const data = await invoke("get_merged_data", {
-      minutes: ui.deviceTrafficMinutes || 30, scope: ui.trafficScope || "model", onUpdate,
+      minutes: ui.deviceTrafficMinutes || 30, scope: ui.trafficScope || "model", onUpdate, refreshRemote,
     });
     if (request !== ui.mergedDataRequest) return;
     if (Array.isArray(data)) {
@@ -1402,7 +1402,7 @@ async function loadMergedData(force = false) {
       ui.deviceTrafficViews = Object.fromEntries(data.map(view => [`${view.minutes}:${view.scope}`, view]));
       selectDeviceTraffic();
     } else { ui.mergedData = data; }
-    ui.deviceTrafficFetchedAt = Date.now();
+    if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
     ui.mergedDataError = ""; ui.mergedDataUpdating = false;
   } catch (e) {
     if (request === ui.mergedDataRequest) {
@@ -1514,7 +1514,7 @@ async function loadDevices() {
     if (ui.page !== "devices") return;
     if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
-    loadMergedData();
+    await loadMergedData();
 
   } catch (error) { toast(String(error)); }
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
@@ -1547,20 +1547,20 @@ function devicesPage() {
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : "Loading traffic…"}</div>`));
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading ? "Loading traffic…" : "Not refreshed"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
 function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
   const source = (ui.mergedData || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
-  if (!source || age < 0 || age > 45000 || ui.mergedDataError) {
+  if (source?.error && source.error !== "TRAFFIC_UPDATING") return { state: "failed", label: String(source.error) };
+  if (!source || source.exclusion === "not_refreshed" || age < 0 || age > 45000 || ui.mergedDataError) {
     const startup = ui.deviceStates?.[device.id];
-    if (startup && startup.host === device.ssh?.host && !ui.mergedDataLoading) return startup;
+    if ((!source || source.exclusion === "not_refreshed") && startup && startup.host === device.ssh?.host && !ui.mergedDataLoading) return startup;
     return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently" };
   }
   if (source.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
-  if (source.error) return { state: "failed", label: String(source.error) };
   if (source.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
   return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
 }
@@ -1819,10 +1819,11 @@ async function act(action, el) {
       break;
     }
     case "merged-refresh":
-      await loadMergedData();
+      await loadMergedData(false, true);
       break;
     case "devices-refresh":
       await loadDevices();
+      await loadMergedData(false, true);
       break;
     case "device-save": {
       captureDeviceDraft(); const d = ui.deviceDraft;

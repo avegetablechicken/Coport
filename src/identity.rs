@@ -449,6 +449,13 @@ pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Resul
 }
 impl Codex {
     pub(crate) async fn account_identity(&self, source: &AccountSource) -> Result<Identity> {
+        self.account_identity_with_shell(source, true).await
+    }
+    async fn account_identity_with_shell(
+        &self,
+        source: &AccountSource,
+        allow_shell: bool,
+    ) -> Result<Identity> {
         let name = match source {
             AccountSource::Directory(home) => return Identity::parse(&saved_auth(home).await?),
             AccountSource::Env(name) => name,
@@ -469,7 +476,7 @@ impl Codex {
         }
         let token = match found {
             Some(token) => token,
-            None => environment_key(name).await?,
+            None => environment_key_with_shell(name, allow_shell).await?,
         };
         Identity::from_token(&token).ok_or(Error::config(
             "Codex account token requires ChatGPT account claims.",
@@ -722,9 +729,23 @@ impl Config {
 
     /// Safe display names for recorded account IDs, using routing's selector precedence.
     pub async fn traffic_credential_labels(&self) -> BTreeMap<(String, String), String> {
+        self.traffic_labels_with_shell(true).await
+    }
+    /// Display-only metadata must never run login-shell startup scripts.
+    pub async fn local_traffic_credential_labels(&self) -> BTreeMap<(String, String), String> {
+        self.traffic_labels_with_shell(false).await
+    }
+    async fn traffic_labels_with_shell(
+        &self,
+        allow_shell: bool,
+    ) -> BTreeMap<(String, String), String> {
         let mut labels = BTreeMap::new();
         for (source, account) in self.codex.account_sources() {
-            if let Ok(identity) = self.codex.account_identity(&account).await {
+            if let Ok(identity) = self
+                .codex
+                .account_identity_with_shell(&account, allow_shell)
+                .await
+            {
                 if let Some(selector) = routing_account_label(
                     &self.codex.routing,
                     &identity.account_id,
