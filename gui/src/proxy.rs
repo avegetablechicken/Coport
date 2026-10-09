@@ -456,8 +456,8 @@ async fn trace_at(endpoint: &str, trace_url: &str) -> Probe {
     let response = match client.get(trace_url).send().await {
         Ok(response) => response,
         Err(error) => {
-            // A failed lookup may be a destination/TLS failure. Only report
-            // the proxy unreachable if its own socket also cannot be reached.
+            // No response means the proxy path could not carry the lookup.
+            // A listening TCP socket alone does not establish a working proxy.
             let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
             while let Some(current) = cause {
                 if current
@@ -468,17 +468,12 @@ async fn trace_at(endpoint: &str, trace_url: &str) -> Probe {
                 }
                 cause = current.source();
             }
-            // The lookup and fallback must fit inside the daemon's 10s reply deadline.
-            if let Some(addr) = host_port(endpoint)
-                && let Ok(unreachable @ Probe::Unreachable(_)) =
-                    tokio::time::timeout(Duration::from_secs(1), connect(addr)).await
-            {
-                return unreachable;
-            }
-            return Probe::Unavailable(if error.is_timeout() {
-                "Exit IP lookup timed out; proxy reachability is unverified.".into()
+            return Probe::Unreachable(if error.is_timeout() {
+                "timed out".into()
+            } else if error.is_connect() {
+                "cannot connect".into()
             } else {
-                "Exit IP lookup failed; proxy reachability is unverified.".into()
+                "request failed".into()
             });
         }
     };
@@ -588,6 +583,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_proxy_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(matches!(
+            super::trace_at(&endpoint, "http://trace.invalid/cdn-cgi/trace").await,
+            Probe::Unreachable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_listening_proxy_that_never_responds_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // Keep the socket open, like a stalled listener, without forwarding.
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = super::trace_at(&endpoint, "http://trace.invalid/cdn-cgi/trace").await;
+        server.abort();
+        assert!(
+            matches!(result, Probe::Unreachable(ref error) if error == "timed out"),
+            "{result:?}"
+        );
     }
 
     #[test]
