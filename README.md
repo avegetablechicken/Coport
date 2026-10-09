@@ -1410,7 +1410,7 @@ local routes, and the selected remote mode stays active for subsequent retries.
 **Stop forwarding** restores local handling on the same port. Editing/removing the
 selected device also restores local handling. The daemon owns forwarding, so closing
 the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
-Startup is local by default. Enable **Restore last remote on daemon startup** to
+Startup is local by default. Enable **Restore on startup** to
 restore the selected remote before accepting any requests. An offline destination
 stays selected and returns 502 until it recovers; it never falls back to local.
 The option and destination are stored privately in `forwarding.json`. Turning
