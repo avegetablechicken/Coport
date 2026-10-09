@@ -651,24 +651,19 @@ pub async fn get_merged_data(
     if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {
         let _ = previous.send(());
     }
-    let operation = async {
-        state
-            .merged_cache
-            .lock()
-            .await
-            .refresh_progressive(
-                sources,
-                config,
-                log,
-                labels,
-                (minutes, scope),
-                move |views| {
-                    on_update
-                        .send(views)
-                        .map_err(|_| "Traffic view closed".into())
-                },
-            )
-            .await
-    };
+    // Cached views remain readable while peers respond to this refresh.
+    let operation = coport_gui::data_client::MergeCache::refresh_shared(
+        &state.merged_cache,
+        sources,
+        config,
+        log,
+        labels,
+        (minutes, scope),
+        move |views| {
+            on_update
+                .send(views)
+                .map_err(|_| "Traffic view closed".into())
+        },
+    );
     tokio::select! {result=operation=>result,_=cancelled=>Err("Traffic request superseded".into())}
 }

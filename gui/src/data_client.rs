@@ -576,17 +576,7 @@ impl MergeCache {
         selection: (u64, crate::traffic::TrafficScope),
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
-        let mut keys = sources
-            .iter()
-            .map(cache_source_key)
-            .collect::<Result<Vec<_>, _>>()?;
-        keys.sort();
-        let key = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
-        if key != self.key {
-            self.key = key;
-            self.fetched = None;
-            self.errors.clear();
-        }
+        let key = self.begin_refresh(&sources)?;
         let result = merge_progressive_snapshot(
             sources,
             config,
@@ -597,6 +587,58 @@ impl MergeCache {
             on_update,
         )
         .await?;
+        self.commit_refresh(&key, result)
+    }
+
+    /// Like `refresh_progressive`, but the lock is held only to read and commit
+    /// state, never across peer I/O, so cached views stay readable meanwhile.
+    pub async fn refresh_shared(
+        cache: &tokio::sync::Mutex<Self>,
+        sources: Vec<Source>,
+        config: Config,
+        log: PathBuf,
+        labels: BTreeMap<(String, String), String>,
+        selection: (u64, crate::traffic::TrafficScope),
+        on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
+    ) -> Result<Vec<Merged>, String> {
+        let key = cache.lock().await.begin_refresh(&sources)?;
+        let result = merge_progressive_snapshot(
+            sources,
+            config,
+            log,
+            labels,
+            selection.0,
+            selection.1,
+            on_update,
+        )
+        .await?;
+        cache.lock().await.commit_refresh(&key, result)
+    }
+
+    fn begin_refresh(&mut self, sources: &[Source]) -> Result<Vec<u8>, String> {
+        let mut keys = sources
+            .iter()
+            .map(cache_source_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        let key = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
+        if key != self.key {
+            self.key = key.clone();
+            self.fetched = None;
+            self.errors.clear();
+        }
+        Ok(key)
+    }
+
+    fn commit_refresh(
+        &mut self,
+        key: &[u8],
+        result: ProgressiveResult,
+    ) -> Result<Vec<Merged>, String> {
+        // Devices changed while peers were read: never cache the old set's results.
+        if self.key != key {
+            return Ok(result.views);
+        }
         self.errors.clear();
         for (source, _) in &result.fetched {
             if let Some(error) = result.errors.get(&source.name) {
@@ -1406,6 +1448,132 @@ mod tests {
             2,
             "One explicit refresh must contact each peer only once when boundaries disagree"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_views_stay_readable_while_a_refresh_waits_for_peers() {
+        if data_key_in_subprocess(
+            "data_client::tests::cached_views_stay_readable_while_a_refresh_waits_for_peers",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bytes = crate::data_api::publish(
+            &config,
+            &log,
+            &DataKey::new(KEY).unwrap(),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let source = Source {
+            name: "peer".into(),
+            device_id: None,
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = {
+            let (accepted, waiting, release) = (accepted.clone(), waiting.clone(), release.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(socket.read_u8().await.unwrap());
+                    }
+                    if accepted.fetch_add(1, SeqCst) == 0 {
+                        waiting.notify_one();
+                        release.notified().await;
+                    }
+                    let mut summary: Summary = serde_json::from_slice(&bytes).unwrap();
+                    let header = String::from_utf8(header).unwrap().to_lowercase();
+                    if header.contains("x-coport-window: 30:model") {
+                        summary.schema_version = 4;
+                        summary.groups.clear();
+                        summary.windows.retain(|w| {
+                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
+                        });
+                        summary.previous_windows.retain(|w| {
+                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
+                        });
+                    }
+                    let body = serde_json::to_vec(&summary).unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            })
+        };
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(MergeCache::default()));
+        let refresh = {
+            let (cache, config, log, source) =
+                (cache.clone(), config.clone(), log.clone(), source.clone());
+            tokio::spawn(async move {
+                MergeCache::refresh_shared(
+                    &cache,
+                    vec![source],
+                    config,
+                    log,
+                    BTreeMap::new(),
+                    (30, crate::traffic::TrafficScope::Model),
+                    |_| Ok(()),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+            .await
+            .unwrap();
+        // The peer is still holding its response: a passive read must not wait.
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            cache
+                .lock()
+                .await
+                .views(
+                    vec![source.clone()],
+                    config.clone(),
+                    log.clone(),
+                    BTreeMap::new(),
+                    false,
+                )
+                .await
+        })
+        .await
+        .expect("A passive read waited for an explicit refresh")
+        .unwrap();
+        assert!(cached.iter().all(|view| !view.sources[0].included));
+        assert_eq!(
+            accepted.load(SeqCst),
+            1,
+            "The passive read opened a connection"
+        );
+        release.notify_one();
+        let refreshed = tokio::time::timeout(Duration::from_secs(10), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.iter().all(|view| view.sources[0].included));
+        let cached = cache
+            .lock()
+            .await
+            .views(vec![source], config, log, BTreeMap::new(), false)
+            .await
+            .unwrap();
+        assert!(cached.iter().all(|view| view.sources[0].included));
         server.abort();
     }
 
