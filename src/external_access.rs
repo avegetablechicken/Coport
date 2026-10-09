@@ -124,7 +124,7 @@ pub fn read_limited(path: &Path, private: bool, limit: u64) -> Result<Vec<u8>> {
     #[cfg(not(unix))]
     if private {
         return Err(Error::config(
-            "Private-file ownership checks are unavailable on this platform; use an environment data key.",
+            "Data key files and TLS private keys are unsupported on this platform; use token_env with trusted_lan.",
         ));
     }
     let mut data = Vec::new();

@@ -6,9 +6,10 @@ allow_external_access: false
 # external_data:
 #   port: 8788
 #   token_file: "~/.coport-data.key" # 64 hex characters; owner-only file.
-#   # Alternatively: token_env: COPORT_DATA_KEY (not both).
+#   # Alternatively: token_env: COPORT_DATA_KEY (not both; required on Windows).
 #   trusted_lan: [10.42.0.0/24] # HTTP allowed only from these RFC1918 CIDRs.
-#   # Public peers require HTTPS with a certificate valid for your hostname/IP.
+#   # Public peers require HTTPS with a certificate valid for your hostname/IP
+#   # (Unix only; Windows serves trusted_lan over HTTP).
 #   # tls:
 #   #   certificate: "/absolute/path/to/fullchain.pem"
 #   #   private_key: "/absolute/path/to/private.key"
