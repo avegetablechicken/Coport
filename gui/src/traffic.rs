@@ -413,7 +413,7 @@ pub struct Traffic {
 }
 
 /// Logged configuration identity counted in a group without an exact match.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceTraffic {
     name: String,
@@ -769,6 +769,16 @@ pub(crate) fn observed_identity_labels(
 }
 /// This device uses exactly Activity Traffic's own identity resolution. It must
 /// not be passed through the remote privacy projection and then re-identified.
+pub(crate) struct LocalTraffic {
+    pub groups: Vec<(
+        coport_gui::data_api::Service,
+        String,
+        coport_gui::data_api::Stats,
+    )>,
+    pub reviews: BTreeMap<(String, String), Vec<SourceTraffic>>,
+    pub targets: Vec<Target>,
+}
+
 pub(crate) fn local_named_groups(
     source: ReadSource<'_>,
     config: &coport::config::Config,
@@ -776,21 +786,20 @@ pub(crate) fn local_named_groups(
     end: i64,
     minutes: u64,
     scope: TrafficScope,
-) -> Result<
-    Vec<(
-        coport_gui::data_api::Service,
-        String,
-        coport_gui::data_api::Stats,
-    )>,
-    String,
-> {
+) -> Result<LocalTraffic, String> {
     let assignments = crate::traffic_identity::Compatibility::load(
         &crate::settings::traffic_compatibility_path(),
     )
     .unwrap_or_default();
     let identities = Identities::from_config(config, &assignments.assignments);
     let traffic = read_at(source, minutes, labels, scope, &identities, end)?;
-    Ok(traffic
+    let reviews = traffic
+        .credentials
+        .iter()
+        .filter(|g| !g.sources.is_empty())
+        .map(|g| ((g.service.clone(), g.credential.clone()), g.sources.clone()))
+        .collect();
+    let groups = traffic
         .credentials
         .into_iter()
         .map(|g| {
@@ -820,7 +829,12 @@ pub(crate) fn local_named_groups(
                 },
             )
         })
-        .collect())
+        .collect();
+    Ok(LocalTraffic {
+        groups,
+        reviews,
+        targets: traffic.targets,
+    })
 }
 
 /// Only numeric results and keyed opaque references leave the device.

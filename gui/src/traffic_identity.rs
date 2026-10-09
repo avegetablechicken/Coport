@@ -103,7 +103,7 @@ pub struct Resolution {
 }
 
 /// A current configuration that historical traffic can be assigned to.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
     service: String,

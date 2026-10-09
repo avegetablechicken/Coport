@@ -301,3 +301,40 @@ test('hovering across bars updates the tooltip and leaving hides it', () => {
   flush();
   assert.equal(tip.hidden, true);
 });
+
+test('device traffic exposes renamed local sources with assignment choices', () => {
+  const context = setup();
+  Object.assign(context, {
+    ICON: { warning: '<warning>', more: '<more>', chevron: '' },
+    esc: v => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;'),
+    trafficShare: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
+    fmtBytes: () => '', modelTokenStats: () => '',
+  });
+  vm.runInContext(source.slice(source.indexOf('function deviceTrafficContent('), source.indexOf('document.addEventListener("toggle"')), context);
+  const traffic = { requests: 2, errors: 0, credentials: [{ service: 'Claude', credential: 'myServer', requests: 2,
+    sources: [{ name: 'api', base: 'https://example.invalid', reason: 'renamed', requests: 2 }] }],
+    targets: [{ service: 'Claude', name: 'myServer', label: 'myServer', base: 'https://example.invalid' }] };
+  const html = context.deviceTrafficContent(traffic, 'all');
+  assert.match(html, /configurations need review/);
+  assert.match(html, /traffic-review review/);
+  const items = JSON.parse(html.match(/data-menu="([^"]*)"/)[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+  assert.equal(items[0].detail, 'Same base URL, different name · 2 requests');
+  assert.equal(JSON.parse(items[1].target).name, 'api');
+  assert.equal(JSON.parse(items[1].target).target.name, 'myServer');
+  traffic.credentials[0].sources[0].reason = null;
+  assert.doesNotMatch(context.deviceTrafficContent(traffic, 'model'), /traffic-review review|configurations need review/);
+});
+
+test('assigning traffic refreshes device views and removes stale cached mappings', async () => {
+  const context = setup();
+  const calls = [];
+  Object.assign(context, { invoke: async () => calls.push('assign'),
+    loadTraffic: async () => calls.push('activity'), loadMergedData: async force => calls.push(force),
+    refresh: async () => calls.push('refresh') });
+  context.ui.localTrafficViews = { old: {} };
+  context.ui.deviceTrafficViews = { old: {} };
+  await context.assignTraffic({});
+  assert.deepEqual(calls, ['assign', 'activity', true, 'refresh']);
+  assert.equal(Object.keys(context.ui.localTrafficViews).length, 0);
+  assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 0);
+});

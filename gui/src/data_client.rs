@@ -222,12 +222,14 @@ pub struct TrafficView {
     avg_ms: Option<u64>,
     cache_hit_rate: Option<f64>,
     credentials: Vec<CredentialView>,
+    targets: Vec<crate::traffic_identity::Target>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CredentialView {
     #[serde(skip)]
     anonymous: bool,
+    sources: Vec<crate::traffic::SourceTraffic>,
     service: Service,
     credential: String,
     #[serde(flatten)]
@@ -269,6 +271,7 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
         .map(
             |((service, _), (credential, anonymous, stats))| CredentialView {
                 anonymous,
+                sources: Vec::new(),
                 service,
                 credential,
                 avg_ms: (stats.latency_samples > 0)
@@ -288,6 +291,22 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
             .then(|| total.cache_read as f64 / total.cache_prompt as f64),
         stats: total,
         credentials,
+        targets: Vec::new(),
+    }
+}
+fn attach_local_reviews(view: &mut TrafficView, local: &crate::traffic::LocalTraffic) {
+    view.targets = local.targets.clone();
+    for credential in &mut view.credentials {
+        let service = match credential.service {
+            Service::Codex => "Codex",
+            Service::Claude => "Claude",
+            Service::Other => "Unknown",
+        };
+        credential.sources = local
+            .reviews
+            .get(&(service.into(), credential.credential.clone()))
+            .cloned()
+            .unwrap_or_default();
     }
 }
 fn selected_groups(
@@ -670,21 +689,21 @@ async fn merge_fetched(
     .await
     .map_err(|_| "Cannot read local processed statistics")??;
     let mut groups = BTreeMap::new();
-    for (service, credential, stats) in local {
+    for (service, credential, stats) in &local.groups {
         let anonymous = credential == crate::traffic_identity::UNIDENTIFIED;
         groups.insert(
-            (service, "local".into(), credential.clone()),
+            (*service, "local".into(), credential.clone()),
             MergedGroup {
-                service,
+                service: *service,
                 proxy: "Unidentified proxy".into(),
-                upstream: credential,
+                upstream: credential.clone(),
                 anonymous_proxy: true,
                 anonymous_upstream: anonymous,
-                stats,
+                stats: stats.clone(),
             },
         );
     }
-    let local_view = traffic_view(
+    let mut local_view = traffic_view(
         &groups
             .values()
             .map(|g| MergedGroup {
@@ -698,6 +717,7 @@ async fn merge_fetched(
             .collect::<Vec<_>>(),
         buckets,
     );
+    attach_local_reviews(&mut local_view, &local);
     let mut seen = BTreeSet::from([context.local_id.clone()]);
     let mut states = Vec::new();
     for (source, result) in fetched {
@@ -746,7 +766,8 @@ async fn merge_fetched(
     }
     states.sort_by(|a, b| a.name.cmp(&b.name));
     let groups: Vec<_> = groups.into_values().collect();
-    let traffic = traffic_view(&groups, buckets);
+    let mut traffic = traffic_view(&groups, buckets);
+    attach_local_reviews(&mut traffic, &local);
     Ok(Merged {
         window_start: end - minutes as i64 * 60_000,
         window_end: end,
@@ -1157,7 +1178,7 @@ mod tests {
             crate::traffic::TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(local.len(), 2);
+        assert_eq!(local.groups.len(), 2);
         let mut groups = BTreeMap::new();
         add_groups(
             &mut groups,
@@ -1168,7 +1189,7 @@ mod tests {
         );
         let remote = traffic_view(&groups.into_values().collect::<Vec<_>>(), 30);
         assert_eq!(remote.credentials.len(), 2);
-        for (_, label, stats) in local {
+        for (_, label, stats) in local.groups {
             assert!(label.starts_with("Shared (https://"));
             let matched = remote
                 .credentials
@@ -1394,6 +1415,58 @@ mod tests {
         assert_eq!(result.traffic.credentials.len(), 1);
         assert_eq!(result.traffic.stats.input_tokens, Some(200));
     }
+    #[tokio::test]
+    async fn renamed_claude_review_survives_local_and_merged_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "https://renamed-review.invalid";
+        std::fs::write(
+            dir.path().join("myServer.json"),
+            serde_json::json!({
+                "env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": "test-key"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  routing:\n    api_key: {{myServer: none}}\n",
+            serde_json::to_string(dir.path()).unwrap()
+        )).unwrap();
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let log = dir.path().join("traffic.log");
+        std::fs::write(&log, serde_json::json!({
+            "timestamp": chrono::DateTime::from_timestamp_millis(end - 1000).unwrap().to_rfc3339(),
+            "event": "model_call_finished", "model_call_id": "renamed-call",
+            "request_id": "renamed-request", "service": "claude", "provider": "api",
+            "upstream_base_url": base, "path": "/v1/messages", "method": "POST", "status": "200"
+        }).to_string() + "\n").unwrap();
+        let context = std::sync::Arc::new(MergeContext {
+            config,
+            log: log.clone(),
+            accounts: BTreeMap::new(),
+            credential_labels: BTreeMap::new(),
+            local_id: "local-test".into(),
+            at: end,
+        });
+        let merged = merge_fetched(
+            context,
+            &vec![],
+            30,
+            crate::traffic::TrafficScope::Model,
+            end,
+            load_snapshot(&log, end).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        for view in [&merged.local, &merged.traffic] {
+            let value = serde_json::to_value(view).unwrap();
+            assert_eq!(value["requests"], 1);
+            assert_eq!(value["credentials"][0]["credential"], "myServer");
+            assert_eq!(value["credentials"][0]["sources"][0]["name"], "api");
+            assert_eq!(value["credentials"][0]["sources"][0]["reason"], "renamed");
+            assert_eq!(value["targets"][0]["name"], "myServer");
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_sources_are_excluded_without_connection_errors() {
         let dir = tempfile::tempdir().unwrap();

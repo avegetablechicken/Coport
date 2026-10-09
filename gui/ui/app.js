@@ -538,7 +538,7 @@ function chart(stats, scope, showPeak = false, window = stats) {
 
 function rememberLocalTraffic(traffic, minutes, scope) {
   (ui.localTrafficViews ||= Object.create(null))[`${minutes}:${scope}`] = {
-    ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, scope,
+    ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, targets: traffic.targets, scope,
   };
 }
 
@@ -1119,10 +1119,10 @@ const MATCH_REASONS = {
 
 /// Logged configurations counted here without an exact match. Each can be
 /// assigned to a current configuration or to Unidentified; the logs stay as they are.
-function trafficReview(c, targets) {
+function trafficReview(c, targets = [], scope = ui.traffic?.scope) {
   if (!c.sources?.length) return "";
   const review = c.sources.some((s) => s.reason);
-  const unit = ui.traffic?.scope === "model" ? "call" : "request";
+  const unit = scope === "model" ? "call" : "request";
   const items = c.sources.flatMap((s, i) => {
     const choose = (target, automatic = false) => JSON.stringify({ service: c.service, name: s.name, base: s.base ?? null, target, automatic });
     const where = [s.name || "No name", s.base?.replace(/^https?:\/\//, "") ?? "No base URL"].join(" · ");
@@ -1148,10 +1148,14 @@ async function assignTraffic(choice) {
     await invoke("set_traffic_assignment", choice);
   } catch (error) {
     ui.trafficError = String(error);
-    renderActivityTraffic();
+    ui.mergedDataError = String(error);
+    if (ui.page === "devices") render();
+    else renderActivityTraffic();
     return;
   }
-  await Promise.all([loadTraffic(), refresh()]);
+  ui.localTrafficViews = Object.create(null);
+  ui.deviceTrafficViews = Object.create(null);
+  await Promise.all([loadTraffic(), loadMergedData(true), refresh()]);
 }
 
 function renderActivityTraffic() {
@@ -1399,8 +1403,10 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
     ${trafficShare(traffic.credentials, scope)}${chart(traffic, scope, false, window)}
     <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", traffic.requests)}${stat("Error Rate", rate, traffic.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(traffic.avgMs))}${stat("Received", fmtBytes(traffic.bytes))}</div>
     ${modelTokenStats(traffic, scope)}</div>`;
+  const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
+  if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
-    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong></div>
+    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong>${trafficReview(c, traffic.targets, scope)}</div>
     ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
   return body;
 }
