@@ -1599,14 +1599,16 @@ function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
   const source = (ui.mergedData || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
   if (source?.error && source.error !== "TRAFFIC_UPDATING") return { state: "failed", label: String(source.error) };
-  if (!source || source.exclusion === "not_refreshed" || age < 0 || age > 45000 || ui.mergedDataError) {
+  if (source?.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
+  if (source?.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
+  if (source?.included) return { state: "running", label: age < 0 || age > 45000 || ui.mergedDataError ? "Last statistics refresh succeeded (cached)" : "Read-only statistics available" };
+  if (!source || source.exclusion === "not_refreshed") {
     const startup = ui.deviceStates?.[device.id];
-    if ((!source || source.exclusion === "not_refreshed") && startup && startup.host === device.ssh?.host && !ui.mergedDataLoading) return startup;
-    return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently" };
+    if (startup && startup.host === device.ssh?.host && startup.state !== "warn") return startup;
+    if (ui.deviceCapabilities?.[device.id]?.capabilities) return { state: "running", label: "SSH capability check succeeded (cached)" };
+    return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Loading cached statistics…" : "Not checked" };
   }
-  if (source.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
-  if (source.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
-  return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
+  return { state: "warn", label: "Statistics not included" };
 }
 function deviceSettings() {
   const d = ui.deviceDraft || { transport: "ssh" };

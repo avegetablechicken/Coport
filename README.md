@@ -1456,7 +1456,9 @@ checks each configured SSH connection once per configuration, with at most four
 checks in flight. Successes and failures are retained; neither page visits nor
 timers retry a denied or unavailable device. A changed connection or daemon restart
 allows another check. Saving or removing devices reloads local configuration;
-opening Settings only reads cached results. No manual version-check
+opening Settings only reads cached results. Status lights retain the last verified
+result with a cached tooltip instead of expiring to gray or starting a new check.
+No manual version-check
 button is needed. Unverified or unsupported destinations have a disabled forwarding
 switch; an already active destination can always be switched off. Errors are shown
 as a short status with details on hover. Older peers without `--capabilities` must

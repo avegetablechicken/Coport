@@ -216,7 +216,7 @@ test('Models and All switch immediately from one snapshot without new IPC reques
   assert.equal(calls,1);
 });
 
-test('Settings devices use add/remove icons and show green only for recent verified data', () => {
+test('Settings devices retain verified results and label older results as cached', () => {
   const h = harness(async () => []);
   h.ui.devices = [{ id: 'ok', name: 'Working', ssh: { host: 'ok' }, data: { transport: 'ssh' } }, { id: 'bad', name: 'Failed', ssh: { host: 'bad' }, data: { transport: 'ssh' } }];
   h.ui.deviceTrafficFetchedAt = Date.now();
@@ -227,7 +227,7 @@ test('Settings devices use add/remove icons and show green only for recent verif
   assert.match(html, /dot running/); assert.match(html, /dot failed/);
   assert.doesNotMatch(html, />Remove<|>Add Device</);
   h.ui.deviceTrafficFetchedAt = Date.now() - 46000;
-  html = h.deviceSettings(); assert.doesNotMatch(html, /dot running/);
+  html = h.deviceSettings(); assert.match(html, /dot running/); assert.match(html, /succeeded \(cached\)/); assert.match(html, /dot failed/);
 });
 
 test('device cards show transport beside the same verified status light as Settings', () => {
@@ -251,7 +251,9 @@ test('device cards show transport beside the same verified status light as Setti
   assert.match(html, /dot failed"[^>]*><\/span>SSH/);
   h.ui.deviceTrafficFetchedAt = Date.now() - 46000;
   html = h.devicesPage();
-  assert.doesNotMatch(html, /dot running"[^>]*><\/span>(SSH|HTTP|HTTPS)/);
+  assert.match(html, /dot running"[^>]*><\/span>(HTTP|HTTPS)/);
+  assert.match(html, /succeeded \(cached\)/);
+  assert.match(html, /dot failed"[^>]*><\/span>SSH/);
 });
 
 test('renaming only a device alias preserves all cached traffic and does not refetch it', async () => {
@@ -459,7 +461,7 @@ test('startup checks only SSH devices once and retains failed checks without ret
   assert.match(h.deviceConnectionStatus(devices[1]).label, /unavailable/);
   assert.equal(h.ui.deviceStates.http, undefined);
   devices[0].ssh.host = 'changed';
-  assert.equal(h.deviceConnectionStatus(devices[0]).label, 'Not checked recently');
+  assert.equal(h.deviceConnectionStatus(devices[0]).label, 'Not checked');
 });
 
 test('startup SSH checks have at most four connections in flight', async () => {
@@ -614,14 +616,17 @@ test('reentering Devices and periodic refreshes never authorize a remote refresh
 });
 
 
-test('an old startup success never overrides a later failure or expired statistics', () => {
+test('cached statistics retain success without hiding a later failure', () => {
   const h=harness(async()=>[]);const device={id:'peer',name:'Peer',ssh:{host:'test'}};
   h.ui.deviceStates={peer:{host:'test',state:'running',label:'SSH reachable at startup'}};
   h.ui.deviceTrafficFetchedAt=Date.now()-60000;
   h.ui.mergedData={sources:[{name:'Peer',error:'connection refused'}]};
   assert.equal(h.deviceConnectionStatus(device).state,'failed');
   h.ui.mergedData.sources[0]={name:'Peer',included:true,error:null};
-  assert.notEqual(h.deviceConnectionStatus(device).state,'running');
+  assert.equal(h.deviceConnectionStatus(device).state,'running');
+  assert.match(h.deviceConnectionStatus(device).label,/cached/);
+  h.ui.mergedData.sources[0]={name:'Peer',error:'new failure'};
+  assert.equal(h.deviceConnectionStatus(device).label,'new failure');
 });
 
 test('saving a device merges only its list after asynchronous forwarding work', () => {
@@ -634,6 +639,7 @@ test('saving a device merges only its list after asynchronous forwarding work', 
   assert.match(after,/core\.settings\.clone\(\)/);
   assert.match(after,/settings\.managed_devices = devices/);
 });
+
 
 test('Devices Refresh performs only one explicitly authorized statistics read', async () => {
   const calls = [];
@@ -656,4 +662,16 @@ test('Devices Refresh performs only one explicitly authorized statistics read', 
   calls.length = 0;
   for (let i = 0; i < 3; i++) await h.loadDevices();
   assert.ok(calls.filter(([command]) => command === 'get_merged_data').every(([,args]) => args.refreshRemote === false));
+});
+
+
+test('Settings status uses successful cached SSH capabilities without connecting', () => {
+  const h = harness(() => { throw new Error('Status rendering must not invoke IPC'); });
+  const device = { id: 'peer', name: 'Peer', ssh: { host: 'test' } };
+  h.ui.mergedData = { sources: [{ name: 'Peer', exclusion: 'not_refreshed' }] };
+  h.ui.deviceCapabilities = { peer: { pending: false, capabilities: { running: true, forwarding: true } } };
+  assert.equal(h.deviceConnectionStatus(device).state, 'running');
+  assert.match(h.deviceConnectionStatus(device).label, /cached/);
+  h.ui.deviceCapabilities = {};
+  assert.equal(h.deviceConnectionStatus(device).state, '');
 });
