@@ -28,3 +28,19 @@ test('a failed asynchronous restart does not display success', async () => {
   assert.deepEqual(messages, ['Error: stop failed']);
   assert.equal(refreshed, true);
 });
+
+test('tray updates dispatch before taking locks or calling native setters', () => {
+  const tray = fs.readFileSync(path.join(__dirname, '../src/tray.rs'), 'utf8');
+  const sync = tray.match(/pub fn sync\(app: &AppHandle\) \{[\s\S]*?\r?\n\}/)[0];
+  // Stop/restart completion and state notifications can arrive simultaneously
+  // on worker and UI threads. Neither may hold the view lock while dispatching.
+  assert.match(sync, /run_on_main_thread\(move \|\| sync_on_main_thread\(&handle\)\)/);
+  assert.doesNotMatch(sync, /\.lock\(|\.state::<|\.try_state::<|\.set_(?:icon|text|tooltip|enabled)\(/);
+  const update = tray.match(/fn sync_on_main_thread\(app: &AppHandle\) \{[\s\S]*?\r?\n\}/)[0];
+  assert.match(update, /tray\.view\.lock\(/);
+  assert.match(update, /tray\.icon\.set_icon\(/);
+  // The main-thread implementation must remain private, with its only call
+  // originating inside the dispatcher above.
+  assert.doesNotMatch(tray, /pub(?:\([^)]*\))? fn sync_on_main_thread/);
+  assert.equal((tray.match(/sync_on_main_thread\(/g) || []).length, 2);
+});

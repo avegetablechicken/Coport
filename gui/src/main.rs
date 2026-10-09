@@ -249,8 +249,7 @@ fn tray_notifier(app: tauri::AppHandle) -> proxy::Notify {
             while rx.recv().is_ok() {
                 std::thread::sleep(Duration::from_millis(50));
                 while rx.try_recv().is_ok() {}
-                let h = worker.clone();
-                let _ = worker.run_on_main_thread(move || tray::sync(&h));
+                tray::sync(&worker);
             }
         })
         .expect("tray sync thread");

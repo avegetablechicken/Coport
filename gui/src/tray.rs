@@ -147,8 +147,16 @@ impl Tray {
     }
 }
 
-/// Pushes proxy state to the icon, tooltip and menu.
+/// Schedule the entire update before taking any state/view locks. Native tray
+/// setters wait for the main thread, so calling them from a worker while holding
+/// the view lock can deadlock against an update already running on that thread.
 pub fn sync(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || sync_on_main_thread(&handle));
+}
+
+/// Pushes proxy state to the icon, tooltip and menu on the main thread only.
+fn sync_on_main_thread(app: &AppHandle) {
     let Some(tray) = app.try_state::<Tray>() else {
         return;
     };
