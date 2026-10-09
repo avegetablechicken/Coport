@@ -484,8 +484,14 @@ impl Routing {
                                 Err(error) => {
                                     mode.counters.failures.fetch_add(1,Ordering::Relaxed);
                                     mode.observe(sequence, Err(error));
-                                    // The local TLS handshake already completed. Return an HTTP
-                                    // gateway error instead of silently routing through local accounts.
+                                    // A completed TLS handshake does not mean the HTTP client has
+                                    // sent a request yet. An unsolicited response can be rejected
+                                    // by its HTTP state machine (hyper UnexpectedMessage).
+                                    if !matches!(tokio::time::timeout(Duration::from_secs(30),
+                                        read_rejected_request_head(&mut socket)).await, Ok(Ok(()))) {
+                                        return;
+                                    }
+                                    // Reject after headers, without waiting for a body or routing locally.
                                     let response = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 30\r\n\r\nRemote SSH proxy unavailable.\n";
                                     let _ = socket.write_all(response).await;
                                     let _ = socket.shutdown().await;
@@ -503,6 +509,33 @@ impl Routing {
             })
         })
     }
+}
+
+async fn read_rejected_request_head(socket: &mut (impl AsyncRead + Unpin)) -> io::Result<()> {
+    let mut head = Vec::new();
+    while head.len() < 65536 {
+        let mut chunk = [0; 4096];
+        let remaining = (65536 - head.len()).min(chunk.len());
+        let count = socket.read(&mut chunk[..remaining]).await?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Incomplete request headers",
+            ));
+        }
+        let boundary = head.len().saturating_sub(3);
+        head.extend_from_slice(&chunk[..count]);
+        if head[boundary..]
+            .windows(4)
+            .any(|bytes| bytes == b"\r\n\r\n")
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Request headers exceed 64 KiB",
+    ))
 }
 
 fn validate_target(target: &Target) -> Result<(), String> {
@@ -560,6 +593,62 @@ mod tests {
             host: "test-host".into(),
             binary: "coportd".into(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_ssh_waits_for_request_headers_before_replying() {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = Arc::new(Routing {
+            executable: fake_ssh(dir.path(), "exit 1"),
+            ..Default::default()
+        });
+        routing.mode.send_replace(Arc::new(Mode::new(Some(Target {
+            device_id: "offline".into(),
+            name: "Offline".into(),
+            connection: device(),
+        }))));
+        let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let server = Arc::new(coport::server::Server::new(
+            config,
+            Arc::new(coport::logger::Logger::new(dir.path().join("test.log"))),
+        ));
+        let (mut client, socket) = tokio::io::duplex(1024);
+        let task = tokio::spawn(routing.handler()(server, Box::new(socket)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while routing.status().unwrap().traffic.failures == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                .await
+                .is_err(),
+            "Server replied before the client sent its request"
+        );
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), client.read(&mut byte))
+                .await
+                .is_err(),
+            "Server replied before request headers completed"
+        );
+        client.write_all(b"\r\n").await.unwrap();
+        // An early rejection must not wait for the request body (e.g. Expect: 100-continue).
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 30\r\n\r\nRemote SSH proxy unavailable.\n");
+        drop(client);
+        task.await.unwrap();
     }
 
     #[cfg(unix)]
