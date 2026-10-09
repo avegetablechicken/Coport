@@ -443,8 +443,24 @@ function main() {
 
 function remoteForwardingBlock() {
   const target = ui.snap.forwarding;
-  return block("SSH forwarding", "", `<div class="row"><span class="row-label">${esc(target.name)}</span><span class="state">${target.error ? "Connection error" : "Enabled"}</span></div><div class="row"><span class="row-label selectable">127.0.0.1:${ui.snap.phase.port}</span><span class="state">Client address unchanged</span></div>` +
-    message(target.error ? "warn" : "info", target.error ? esc(target.error) : "Requests use the remote device’s routes. Local proxy routing is inactive. Change forwarding in Settings."));
+  const health = target.health || {};
+  const state = health.state || "checking";
+  const label = { connected: "Connected", disconnected: "Disconnected · retrying", checking: "Checking connection…" }[state] || "Status unavailable";
+  const stamp = value => value ? new Date(value).toLocaleTimeString() : "Not yet";
+  let body = `<div class="row"><span class="row-label">${esc(target.name)}</span><span class="state">${label}</span></div><div class="row"><span class="row-label selectable">127.0.0.1:${ui.snap.phase.port}</span><span class="state">Client address unchanged</span></div><div class="row"><span class="row-label" data-tip="Includes SSH authentication and remote helper startup; not network ping">SSH connection time</span><span class="row-value">${health.latencyMs == null ? "—" : `${health.latencyMs} ms`}</span></div><div class="row"><span class="row-label">Last verified connection</span><span class="row-value">${esc(stamp(health.lastConnectedAt))}</span></div>`;
+  if (target.error) body += message("warn", `${esc(target.error)} Automatic retries keep remote routing selected; requests never fall back to local routes.`);
+  else if (state === "checking") body += message("info", "Checking the saved remote destination. Requests stay in remote mode.");
+  else if (health.recoveredAt && Date.now() - health.recoveredAt < 120000) body += message("info", `Connection restored at ${esc(stamp(health.recoveredAt))}.`);
+  const traffic = target.traffic || {};
+  body += `<div class="block-head"><span class="block-title">This forwarding session</span></div><div class="row"><span class="row-label">Connections / active / failed</span><span class="row-value">${traffic.connections || 0} / ${traffic.active || 0} / ${traffic.failures || 0}</span></div><div class="row"><span class="row-label">Upload / download</span><span class="row-value">${fmtBytes(traffic.uploadBytes || 0)} / ${fmtBytes(traffic.downloadBytes || 0)}</span></div><div class="row"><span class="row-label">Upload / download speed</span><span class="row-value">${fmtBytes(traffic.uploadBytesPerSecond || 0)}/s / ${fmtBytes(traffic.downloadBytesPerSecond || 0)}/s</span></div>`;
+  const remote = target.remoteTraffic;
+  body += `<div class="block-head"><span class="block-title">Remote device · all requests · 30 min</span></div>`;
+  if (remote) {
+    const stale = Date.now() - remote.fetchedAt > 90000 || target.remoteTrafficError;
+    body += `<div class="row"><span class="row-label">Requests / error rate</span><span class="row-value">${remote.requests} / ${remote.requests ? (remote.errors / remote.requests * 100).toFixed(1) : "0.0"}%</span></div><div class="placeholder">Includes other clients on ${esc(target.name)}. Updated ${esc(stamp(remote.fetchedAt))}${stale ? " · stale" : ""}.</div>`;
+  } else body += `<div class="placeholder">${target.remoteTrafficError ? "Remote statistics unavailable" : "Loading remote statistics…"}</div>`;
+  if (target.remoteTrafficError) body += message("warn", esc(target.remoteTrafficError));
+  return block("SSH forwarding", "", body);
 }
 
 function message(kind, text, actions = "") {
@@ -1496,6 +1512,7 @@ async function checkConfiguredSsh() {
       try {
         await invoke("check_ssh_device", { id: device.id });
         result.state = "running"; result.label = "SSH reachable at startup";
+        await inspectDeviceCapabilities(device.id);
       } catch (error) {
         result.state = "failed"; result.label = `Startup SSH check failed: ${String(error)}`;
       }
@@ -1520,6 +1537,38 @@ async function loadDevices() {
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
 }
 
+async function inspectDeviceCapabilities(id) {
+  const device = ui.devices.find(d => d.id === id);
+  if (!device?.ssh) return;
+  ui.deviceCapabilities ||= Object.create(null);
+  const key = JSON.stringify(device.ssh);
+  const entry = { key, pending: true };
+  ui.deviceCapabilities[id] = entry;
+  if (ui.page === "settings") render();
+  try { entry.value = await invoke("inspect_ssh_device", { id }); }
+  catch (error) { entry.error = String(error); }
+  finally {
+    entry.pending = false;
+    if (ui.page === "settings" && ui.devices.some(d => d.id === id && JSON.stringify(d.ssh) === key)) render();
+  }
+}
+function deviceCapabilities(device) {
+  if (!device.ssh) return "";
+  const cached = ui.deviceCapabilities?.[device.id];
+  const entry = cached?.key === JSON.stringify(device.ssh) ? cached : null;
+  const active = (ui.deviceForwarders || []).find(target => target.deviceId === device.id);
+  const caps = entry?.value || active?.capabilities;
+  let text = entry?.pending ? "Checking version…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion ? ` · daemon ${esc(caps.runningVersion)}` : ""} · Statistics: ${caps.statistics ? "supported" : "unsupported"} · Forwarding: ${caps.forwarding ? "supported" : "unsupported"}${caps.running ? caps.forwardingAvailable ? "" : " · currently unavailable" : " · daemon stopped"}` : "Version and capabilities not verified";
+  if (entry?.error || (!caps && active?.capabilitiesError)) text += `<br>${esc(entry?.error || active.capabilitiesError)}`;
+  return `<div class="row"><span class="row-label setting-description">${text}</span><button class="text-link" data-action="device-capabilities" data-id="${esc(device.id)}" ${entry?.pending ? "disabled" : ""}>Check version</button></div>`;
+}
+async function refreshForwardingStatus() {
+  try {
+    ui.deviceForwarders = await invoke("get_device_forwarders");
+    if (ui.snap) ui.snap.forwarding = ui.deviceForwarders[0] || null;
+    if (ui.page === "settings") render();
+  } catch (error) { toast(String(error)); }
+}
 function forwardingSettings() {
   const devices = ui.devices.filter(device => device.ssh);
   const rows = devices.map(device => {
@@ -1527,7 +1576,8 @@ function forwardingSettings() {
     const busy = ui.deviceForwardingBusy === device.id;
     return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
   }).join("");
-  return block("Request forwarding", "", rows + `<div class="placeholder">${devices.length ? "Clients keep using the same local Coport address. Only one remote device can be active. Switching disconnects existing requests; remote failures never fall back to local routes. Forwarding stays active while the daemon runs." : "Add an SSH device above to forward requests through its remote Coport service."}</div>`);
+  const restore = `<div class="row"><span class="row-label">Restore last remote on daemon startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore last remote on daemon startup" data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div><div class="placeholder">If the remote is offline at startup, requests fail until it recovers; local routing is never used automatically.${ui.snap.forwardingRestoreSupported ? "" : " Start or update the local proxy to configure this option."}</div>`;
+  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "") + `<div class="placeholder">${devices.length ? "Clients keep using the same local Coport address. Only one remote device can be active. Switching disconnects existing requests; remote failures never fall back to local routes. Forwarding stays active while the daemon runs." : "Add an SSH device above to forward requests through its remote Coport service."}</div>`);
 }
 function devicesPage() {
   const local = ui.snap.phase;
@@ -1568,7 +1618,7 @@ function deviceSettings() {
   const d = ui.deviceDraft || { transport: "ssh" };
   const rows = ui.devices.map(device => {
     const status = deviceConnectionStatus(device);
-    return `<div class="row device-setting-row"><span class="device-setting-name row-label"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>`;
+    return `<div class="row device-setting-row"><span class="device-setting-name row-label"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>` + deviceCapabilities(device);
   }).join("");
   const form = ui.deviceFormOpen ? `<div class="device-form">
     <label>Connection<select class="field" id="device-transport"><option value="ssh" ${d.transport === "ssh" ? "selected" : ""}>SSH</option><option value="http" ${d.transport !== "ssh" ? "selected" : ""}>HTTP / HTTPS</option></select></label>
@@ -1791,6 +1841,18 @@ async function act(action, el) {
       $("content").scrollTop = 0;
       if (ui.pinLog) scrollToLog();
       break;
+    case "device-capabilities":
+      await inspectDeviceCapabilities(el.dataset.id);
+      break;
+    case "forwarding-restore": {
+      if (ui.forwardingRestoreBusy) break;
+      const enabled = !ui.snap.forwardingRestore;
+      ui.forwardingRestoreBusy = true; render();
+      try { await invoke("set_forwarding_restore", { enabled }); ui.snap.forwardingRestore = enabled; }
+      catch (error) { toast(String(error)); }
+      finally { ui.forwardingRestoreBusy = false; render(); }
+      break;
+    }
     case "device-forward": {
       if (ui.deviceForwardingBusy) break;
       ui.deviceForwardingBusy = el.dataset.id; render();
@@ -1831,7 +1893,7 @@ async function act(action, el) {
       const device = { id: d.id || null, name: d.name.trim() || (ssh ? d.host.trim() : d.url.trim()),
         ssh: ssh ? { host: d.host.trim(), binary: d.binary.trim() } : null,
         data: { transport: d.transport, url: ssh ? "" : d.url.trim(), tokenFile: ssh ? null : d.key.trim() || null, tokenEnv: ssh ? null : d.env.trim() || null, caCertificate: ssh ? null : d.ca.trim() || null } };
-      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); if (changed || !ui.mergedData) loadMergedData(true); }
+      try { const savedId = await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); if (device.ssh) inspectDeviceCapabilities(savedId); if (changed || !ui.mergedData) loadMergedData(true); }
       catch (e) { toast(String(e)); }
       break;
     }
@@ -2162,4 +2224,5 @@ setInterval(() => {
     scheduleActivityLog();
   } else if (ui.page === "devices") { refresh(); loadDevices(); }
   else if (ui.page === "main") refresh();
+  else if (ui.page === "settings") refreshForwardingStatus();
 }, 15000);

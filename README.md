@@ -1410,7 +1410,12 @@ local routes, and the selected remote mode stays active for subsequent retries.
 **Stop forwarding** restores local handling on the same port. Editing/removing the
 selected device also restores local handling. The daemon owns forwarding, so closing
 the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
-A daemon restart starts in local mode; forwarding is not saved as a startup preference.
+Startup is local by default. Enable **Restore last remote on daemon startup** to
+restore the selected remote before accepting any requests. An offline destination
+stays selected and returns 502 until it recovers; it never falls back to local.
+The option and destination are stored privately in `forwarding.json`. Turning
+forwarding off or deleting the selected device clears the saved destination.
+Malformed saved preferences prevent daemon startup rather than silently choosing local routes.
 
 The local daemon must support unified forwarding; update and restart older local
 daemons before enabling it. The destination must support `coportd --forward` and
@@ -1418,6 +1423,37 @@ already be running. A summary-only restricted SSH key cannot forward requests.
 The helper only connects to the running daemon's loopback proxy. A destination
 already forwarding to another device rejects this helper to prevent forwarding
 chains and loops. No remote network listener needs to be exposed.
+
+#### Connection health, traffic and remote versions
+
+Home distinguishes a selected remote from a verified connection: **Checking**,
+**Connected**, or **Disconnected · retrying**. Connection time includes SSH
+negotiation, authentication and remote helper startup; it is not ICMP latency.
+The last verified connection and recent recovery are shown separately. The daemon
+checks the active destination again 15 seconds after each health check completes,
+including while the GUI is closed. Request failures keep the same destination,
+and a successful background check clears the connection error without needing
+another client request. Errors include bounded SSH/helper diagnostics.
+
+**This forwarding session** counts actual client connections, active connections,
+failed connections, uploaded/downloaded bytes and sampled transfer rates. These are
+transport counters, not model request counts; health and metadata checks are excluded.
+Counters reset on destination changes or daemon restart. Local client disconnects
+can increase failed connections without marking the remote server offline.
+
+**Remote device · all requests · 30 min** uses the existing read-only summary to
+show the remote device's request total and error rate, including its other clients.
+Metadata is refreshed 30 seconds after each retrieval completes, independently of
+health checks. Unavailable or stale statistics are marked explicitly and do not
+make a working forwarding connection unhealthy.
+
+Settings shows the helper version, running daemon version and support for statistics
+and forwarding. Checks run after saving an SSH device and after a successful startup
+SSH check; **Check version** refreshes them explicitly. Older peers without
+`--capabilities` are shown as unverified with an update hint; they are not falsely
+reported as supported or denied forwarding if their existing handshake works.
+The active remote's capabilities also refresh in the background. Merely opening
+Settings starts no new remote query; its periodic status reads use the local daemon.
 
 This mode uses remote routing. Using the remote device solely as a network exit
 while retaining local service/account routing is not yet supported.

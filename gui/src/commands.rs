@@ -24,12 +24,32 @@ pub async fn get_state(
     state: State<'_, AppState>,
     refresh_accounts: Option<bool>,
 ) -> Result<Snapshot> {
-    let forwarding = local_daemon()
-        .await?
-        .and_then(|(_, status)| status.forwarding);
+    let daemon = local_daemon().await?.map(|(_, status)| status);
+    let stopped_restore = if daemon.is_none() {
+        let result = tauri::async_runtime::spawn_blocking(|| {
+            coport_gui::remote_forward::Routing::stored_restore(&coport_gui::settings::app_dir())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        Some(result)
+    } else {
+        None
+    };
     let mut core = state.core.lock().unwrap();
     let mut snapshot = core.snapshot();
-    snapshot.forwarding = forwarding;
+    if let Some(daemon) = daemon {
+        snapshot.forwarding = daemon.forwarding;
+        snapshot.forwarding_restore = daemon.forwarding_restore;
+        snapshot.forwarding_restore_supported = daemon.forwarding_restore_supported;
+    } else if let Some(restore) = stopped_restore {
+        match restore {
+            Ok(restore) => {
+                snapshot.forwarding_restore = restore;
+                snapshot.forwarding_restore_supported = true;
+            }
+            Err(error) => snapshot.forwarding_restore_error = Some(error),
+        }
+    }
     if snapshot.forwarding.is_some() {
         return Ok(snapshot);
     }
@@ -414,16 +434,31 @@ async fn local_daemon() -> Result<Option<(coport_gui::daemon::Client, coport_gui
     .map_err(|error| error.to_string())
 }
 async fn stop_device_forwarding(id: &str) -> Result {
-    if let Some((client, status)) = local_daemon().await?
-        && status
-            .forwarding
-            .as_ref()
-            .is_some_and(|target| target.device_id == id)
-    {
-        client
-            .set_forwarding(None)
+    match local_daemon().await? {
+        Some((client, status))
+            if status
+                .forwarding
+                .as_ref()
+                .is_some_and(|target| target.device_id == id) =>
+        {
+            client
+                .set_forwarding(None)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        None => {
+            let id = id.to_owned();
+            tauri::async_runtime::spawn_blocking(move || {
+                coport_gui::remote_forward::Routing::configure_stopped(
+                    &coport_gui::settings::app_dir(),
+                    None,
+                    Some(&id),
+                )
+            })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())??;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -434,6 +469,45 @@ pub async fn get_device_forwarders() -> Result<Vec<coport_gui::remote_forward::S
         .and_then(|(_, status)| status.forwarding)
         .into_iter()
         .collect())
+}
+#[tauri::command]
+pub async fn set_forwarding_restore(state: State<'_, AppState>, enabled: bool) -> Result {
+    let _guard = state.forwarding_operations.lock().await;
+    let Some((client, status)) = local_daemon().await? else {
+        return tauri::async_runtime::spawn_blocking(move || {
+            coport_gui::remote_forward::Routing::configure_stopped(
+                &coport_gui::settings::app_dir(),
+                Some(enabled),
+                None,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    };
+    if !status.forwarding_restore_supported {
+        return Err("Update and restart the local daemon to configure startup restore.".into());
+    }
+    client
+        .set_forwarding_restore(enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub async fn inspect_ssh_device(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<coport_gui::remote::Capabilities> {
+    let device = state
+        .core
+        .lock()
+        .unwrap()
+        .settings
+        .managed_devices
+        .iter()
+        .find(|d| d.id == id)
+        .and_then(|d| d.ssh_connection())
+        .ok_or("SSH device no longer exists")?;
+    coport_gui::remote::capabilities(&device).await
 }
 #[tauri::command]
 pub async fn set_device_forwarding(

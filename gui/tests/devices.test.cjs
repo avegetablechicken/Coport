@@ -380,7 +380,7 @@ test('home highlights remote mode and collapses inactive local configuration', (
   const start = source.indexOf('function main()');
   const end = source.indexOf('function message(', start);
   const context = { ui: { snap: { forwarding: { name: 'MS', error: null }, phase: { port: 8787 } } },
-    ICON: { chevron: '' }, esc: v => v, block: (title, aside, body) => title + body,
+    ICON: { chevron: '' }, fmtBytes: v => `${v} B`, esc: v => v, block: (title, aside, body) => title + body,
     message: (_, text) => text, connectBlock: () => '[Connect]', proxyBlock: () => '[Proxy]',
     trafficBlock: () => '[Traffic]', recentBlock: () => '[Recent]', proxiesBlock: () => '[Proxies]', routingBlock: () => '[Routing]' };
   vm.createContext(context); vm.runInContext(source.slice(start,end), context);
@@ -426,10 +426,10 @@ test('Settings timer never polls remote devices', () => {
     ui: { page: 'settings', devices: [{ id: 'remote' }] }, document: { hidden: false },
     setInterval: callback => { tick = callback; },
     refresh: () => calls.push('refresh'), loadDevices: () => calls.push('devices'),
-    loadMergedData: () => calls.push('remote-statistics'),
+    loadMergedData: () => calls.push('remote-statistics'), refreshForwardingStatus: () => calls.push('local-forwarding-status'),
   });
   for (let i = 0; i < 5; i++) tick();
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls, Array(5).fill('local-forwarding-status'));
 });
 
 test('explicit proxy Test and Test All still invoke the requested probe', async () => {
@@ -448,12 +448,13 @@ test('startup checks only SSH devices once and retains failed checks without ret
   const h = harness(async (command, args) => {
     calls.push([command, args?.id]);
     if (command === 'get_devices') return devices;
+    if (command === 'inspect_ssh_device') return { version: 'test', forwarding: true };
     assert.equal(command, 'check_ssh_device');
     if (args.id === 'down') throw new Error('unavailable');
   });
   await h.checkConfiguredSsh();
   await h.checkConfiguredSsh();
-  assert.deepEqual(calls, [['get_devices', undefined], ['check_ssh_device', 'up'], ['check_ssh_device', 'down']]);
+  assert.deepEqual(calls, [['get_devices', undefined], ['check_ssh_device', 'up'], ['check_ssh_device', 'down'], ['inspect_ssh_device', 'up']]);
   assert.equal(h.deviceConnectionStatus(devices[0]).label, 'SSH reachable at startup');
   assert.equal(h.deviceConnectionStatus(devices[1]).state, 'failed');
   assert.match(h.deviceConnectionStatus(devices[1]).label, /unavailable/);
@@ -468,6 +469,7 @@ test('startup SSH checks have at most four connections in flight', async () => {
   let active = 0, maximum = 0, checked = 0;
   const h = harness(async command => {
     if (command === 'get_devices') return devices;
+    if (command === 'inspect_ssh_device') return {};
     active++; maximum = Math.max(maximum, active); checked++;
     await new Promise(resolve => pending.push(() => { active--; resolve(); }));
   });
@@ -572,4 +574,47 @@ test('saving a device merges only its list after asynchronous forwarding work', 
   assert.match(before,/managed_devices\.clone\(\)/);
   assert.match(after,/core\.settings\.clone\(\)/);
   assert.match(after,/settings\.managed_devices = devices/);
+});
+
+test('remote home distinguishes health, recovery and whole-device statistics', () => {
+  const start = source.indexOf('function main()');
+  const end = source.indexOf('function message(', start);
+  const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
+  vm.createContext(context); vm.runInContext(source.slice(start,end),context);
+  let html = context.remoteForwardingBlock();
+  assert.match(html,/Connected/); assert.match(html,/52 ms/); assert.match(html,/Connection restored/);
+  assert.match(html,/3 \/ 1 \/ 1/); assert.match(html,/8 B\/s/);
+  assert.match(html,/10 \/ 20.0%/); assert.match(html,/Includes other clients on MS/);
+  context.ui.snap.forwarding.health.state='disconnected'; context.ui.snap.forwarding.error='offline';
+  context.ui.snap.forwarding.remoteTrafficError='statistics offline';
+  html=context.remoteForwardingBlock();
+  assert.match(html,/Disconnected · retrying/); assert.match(html,/never fall back/); assert.match(html,/stale/);
+  assert.doesNotMatch(html,/Connection restored/);
+});
+
+test('restore switch changes only after daemon confirms persistence', async () => {
+  const calls=[];
+  const h=harness(async (command,args)=>{calls.push([command,args]);});
+  h.ui.snap.forwardingRestoreSupported=true;
+  assert.match(h.forwardingSettings(),/data-action="forwarding-restore"/);
+  await h.action('forwarding-restore');
+  assert.equal(calls[0][0],'set_forwarding_restore'); assert.equal(calls[0][1].enabled,true);
+  assert.equal(h.ui.snap.forwardingRestore,true);
+  h.invoke=async()=>{throw new Error('cannot save')};
+  await h.action('forwarding-restore');
+  assert.equal(h.ui.snap.forwardingRestore,true); assert.equal(h.ui.forwardingRestoreBusy,false);
+});
+
+test('version checks report supported features and discard changed device configuration', async () => {
+  const h=harness(async()=>({version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:true,running:true,forwardingAvailable:true}));
+  const device={id:'ms',name:'MS',ssh:{host:'MS',binary:''}};h.ui.devices=[device];
+  await h.inspectDeviceCapabilities('ms');
+  assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
+  assert.match(h.deviceCapabilities(device),/Forwarding: supported/);
+  device.ssh.host='different';
+  assert.match(h.deviceCapabilities(device),/not verified/);
+  h.invoke=async()=>{throw new Error('old daemon has no capabilities command')};
+  await h.inspectDeviceCapabilities('ms');
+  assert.match(h.deviceCapabilities(device),/old daemon/);
+  assert.doesNotMatch(h.deviceCapabilities(device),/Forwarding: supported/);
 });

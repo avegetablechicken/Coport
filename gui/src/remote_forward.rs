@@ -650,6 +650,7 @@ mod tests {
     }
     #[test]
     fn stopped_preferences_preserve_selection_and_clear_removed_devices_under_lock() {
+        let _guard = crate::daemon::spawn_guard();
         let dir = tempfile::tempdir().unwrap();
         let preferences = Preferences {
             restore: true,

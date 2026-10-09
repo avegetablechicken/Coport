@@ -321,6 +321,9 @@ impl Core {
                 .is_some_and(|started| started != file_stamp(&self.config_path()));
         Snapshot {
             forwarding: None,
+            forwarding_restore: false,
+            forwarding_restore_supported: false,
+            forwarding_restore_error: None,
             account_states_error: self.account_states_error.clone(),
             version: env!("CARGO_PKG_VERSION"),
             phase: match &phase {
@@ -641,6 +644,9 @@ fn service(
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub forwarding: Option<coport_gui::remote_forward::Status>,
+    pub forwarding_restore: bool,
+    pub forwarding_restore_supported: bool,
+    pub forwarding_restore_error: Option<String>,
     account_states_error: Option<String>,
     version: &'static str,
     phase: PhaseDto,
