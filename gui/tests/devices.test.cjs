@@ -304,3 +304,18 @@ test('first Devices render reuses local Traffic before remote statistics arrive'
   h.ui.mergedData = { scope: 'model', local: { requests: 18, credentials: [] }, sources: [] };
   assert.match(h.devicesPage(), /local:model:18:0/);
 });
+
+test('This Device distinguishes failures and pending operations from stopped', () => {
+  const h = harness(async () => []);
+  h.message = (_, text) => `<warning>${text}</warning>`;
+  h.ui.snap.phase = { state: 'failed', port: 8787, error: 'Cannot stop proxy daemon: unavailable' };
+  let html = h.devicesPage();
+  assert.match(html, /Status unavailable/);
+  assert.match(html, /Cannot stop proxy daemon/);
+  assert.doesNotMatch(html, />Stopped</);
+  h.ui.snap.phase = { state: 'running', port: 8787, busy: true };
+  html = h.devicesPage();
+  assert.match(html, /Updating…/);
+  h.ui.snap.phase = { state: 'stopped', port: 8787 };
+  assert.match(h.devicesPage(), />Stopped</);
+});

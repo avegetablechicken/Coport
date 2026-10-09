@@ -1462,7 +1462,8 @@ function devicesPage() {
   const localTraffic = data?.local || ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`];
   const localScope = data?.scope || ui.trafficScope || "model";
   let cards = block("This Device", "",
-    `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.state === "running" ? "Running" : "Stopped"}</span></div>` +
+    `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
+    (local.error ? message("warn", esc(local.error)) : "") +
     (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local", data || localTraffic)}` : `<div class="placeholder">Loading traffic…</div>`));
   for (const device of ui.devices) {
     const source = data?.sources.find(source => source.name === device.name);
