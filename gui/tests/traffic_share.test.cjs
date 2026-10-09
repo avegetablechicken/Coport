@@ -164,7 +164,7 @@ test('review menu offers current configurations and Unidentified for each change
   assert.doesNotMatch(context.trafficReview({ ...group, sources: [group.sources[1]] }, targets), /traffic-review review/);
   assert.equal(context.trafficReview(credential('main', 3), targets), '');
 });
-test('Models charts omit empty and unreported token bars but retain hover targets', () => {
+test('Models charts retain idle baselines and omit calls without reported tokens', () => {
   const context = setup('model');
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
@@ -172,10 +172,13 @@ test('Models charts omit empty and unreported token bars but retain hover target
   assert.doesNotMatch(html, /chart-peak/);
   assert.match(html, /No reported tokens/);
   assert.doesNotMatch(html, /calls|requests/);
-  assert.doesNotMatch(html, /<rect class="(?!chart-hit)/);
+  const groups = [...html.matchAll(/<g class="chart-bar"[^>]*>(.*?)<\/g>/g)].map(m => m[1]);
+  assert.match(groups[1], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
+  for (const i of [0, 2]) assert.doesNotMatch(groups[i], /<rect class="(?!chart-hit)/);
   assert.equal((html.match(/class="chart-hit"/g) || []).length, 3);
   const cancelled = context.chart({ ...failed, errorCounts: [0, 0, 0] }, 'model', true);
-  assert.doesNotMatch(cancelled, /<rect class="(?!chart-hit)/);
+  assert.equal((cancelled.match(/class="idle"/g) || []).length, 1);
+  assert.doesNotMatch(cancelled, /<rect class="(?:err|)"/);
   const requests = context.chart(failed, 'all', true);
   assert.equal((requests.match(/class="err"/g) || []).length, 2);
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
@@ -250,7 +253,8 @@ test('bar tooltips use their own time bucket and only the plotted metric', () =>
     assert.equal(groups.length, 3);
     for (const group of groups) assert.match(group, /<rect class="chart-hit"[^>]* y="0"[^>]* height="32"><\/rect>$/);
     assert.match(groups[0], /<rect class=""/);
-    for (const group of groups.slice(1)) assert.doesNotMatch(group, /<rect class="(?!chart-hit)/);
+    assert.doesNotMatch(groups[1], /<rect class="(?!chart-hit)/);
+    assert.match(groups[2], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
   }
 });
 
@@ -337,4 +341,16 @@ test('assigning traffic refreshes device views and removes stale cached mappings
   assert.deepEqual(calls, ['assign', 'activity', true, 'refresh']);
   assert.equal(Object.keys(context.ui.localTrafficViews).length, 0);
   assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 0);
+});
+
+test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
+  const context = setup();
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  const stats = { counts: [0, 0, 0], tokenCounts: [0, 0, 0], errorCounts: [0, 0, 0] };
+  for (const scope of ['model', 'all']) {
+    const html = context.chart(stats, scope, true);
+    assert.equal((html.match(/<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/g) || []).length, 3);
+    assert.equal((html.match(/class="chart-hit"/g) || []).length, 3);
+    assert.doesNotMatch(html, /class="err"/);
+  }
 });

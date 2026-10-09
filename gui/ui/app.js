@@ -485,7 +485,8 @@ function proxyBlock() {
 
 /// Bars of a stats object's buckets: requests, or with Models reported input
 /// plus output tokens, in the ring's unit. Red marks the share of failed
-/// requests or calls. Token buckets without usage keep only a hover target.
+/// requests or calls. Idle buckets keep a baseline; calls without reported
+/// tokens keep only a hover target.
 function chart(stats, scope, showPeak = false, window = stats) {
   const model = scope === "model";
   const values = model ? stats.tokenCounts : stats.counts;
@@ -512,7 +513,7 @@ function chart(stats, scope, showPeak = false, window = stats) {
     const to = Math.min(from + bucketMs, end);
     const range = Number.isFinite(from) && Number.isFinite(to) ? `${date(from)} – ${date(to)}\n` : "";
     bars += `<g class="chart-bar" data-tip="${esc(range + title)}" aria-label="${esc(range + title)}">`;
-    if (!model || v > 0) {
+    if (!model || v > 0 || !calls[i]) {
       bars += `<rect class="${calls[i] ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"></rect>`;
       if (errors[i]) {
         const eh = (bh * errors[i]) / calls[i];
