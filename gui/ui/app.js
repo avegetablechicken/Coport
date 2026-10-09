@@ -1558,7 +1558,7 @@ function deviceCapabilities(device) {
   const entry = cached?.key === JSON.stringify(device.ssh) ? cached : null;
   const active = (ui.deviceForwarders || []).find(target => target.deviceId === device.id);
   const caps = entry?.value || active?.capabilities;
-  let text = entry?.pending ? "Checking version…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion ? ` · daemon ${esc(caps.runningVersion)}` : ""} · Statistics: ${caps.statistics ? "supported" : "unsupported"} · Forwarding: ${caps.forwarding ? "supported" : "unsupported"}${caps.running ? caps.forwardingAvailable ? "" : " · currently unavailable" : " · daemon stopped"}` : "Version and capabilities not verified";
+  let text = entry?.pending ? "Checking…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${esc(caps.runningVersion)}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Forwarding unavailable" : " · Offline"}` : "Version not checked";
   if (entry?.error || (!caps && active?.capabilitiesError)) text += `<br>${esc(entry?.error || active.capabilitiesError)}`;
   return `<div class="row"><span class="row-label setting-description">${text}</span><button class="text-link" data-action="device-capabilities" data-id="${esc(device.id)}" ${entry?.pending ? "disabled" : ""}>Check version</button></div>`;
 }
@@ -1576,8 +1576,9 @@ function forwardingSettings() {
     const busy = ui.deviceForwardingBusy === device.id;
     return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
   }).join("");
-  const restore = `<div class="row"><span class="row-label">Restore last remote on daemon startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore last remote on daemon startup" data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div><div class="placeholder">If the remote is offline at startup, requests fail until it recovers; local routing is never used automatically.${ui.snap.forwardingRestoreSupported ? "" : " Start or update the local proxy to configure this option."}</div>`;
-  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "") + `<div class="placeholder">${devices.length ? "Clients keep using the same local Coport address. Only one remote device can be active. Switching disconnects existing requests; remote failures never fall back to local routes. Forwarding stays active while the daemon runs." : "Add an SSH device above to forward requests through its remote Coport service."}</div>`);
+  const restore = `<div class="row"><span class="row-label">Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup" data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>`;
+  const hint = !devices.length ? "Add an SSH device above." : !ui.snap.forwardingRestoreSupported ? "Update the local proxy to enable startup restore." : "";
+  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "") + (hint ? `<div class="placeholder">${hint}</div>` : ""));
 }
 function devicesPage() {
   const local = ui.snap.phase;
@@ -1632,10 +1633,10 @@ function deviceSettings() {
       <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" placeholder="Use either a file or an environment variable"></label>
       <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
     `}
-    <p class="setting-description">Both connections return read-only statistics. SSH also supports optional request forwarding from the Request forwarding settings block. SSH needs no HTTP URL or data key. Unknown configurations stay anonymous.</p>
+    <p class="setting-description">SSH also supports request forwarding.</p>
     <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
   </div>` : "";
-  return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + `<div class="placeholder">Maximum 32 devices · Choose HTTP/HTTPS or SSH for read-only statistics.</div>` + form);
+  return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + `<div class="placeholder">Up to 32 devices.</div>` + form);
 }
 function captureDeviceDraft() {
   if (!$("device-name")) return;

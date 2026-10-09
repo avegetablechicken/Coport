@@ -610,11 +610,21 @@ test('version checks report supported features and discard changed device config
   const device={id:'ms',name:'MS',ssh:{host:'MS',binary:''}};h.ui.devices=[device];
   await h.inspectDeviceCapabilities('ms');
   assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
-  assert.match(h.deviceCapabilities(device),/Forwarding: supported/);
+  assert.match(h.deviceCapabilities(device),/Forwarding ✓/);
   device.ssh.host='different';
-  assert.match(h.deviceCapabilities(device),/not verified/);
+  assert.match(h.deviceCapabilities(device),/Version not checked/);
   h.invoke=async()=>{throw new Error('old daemon has no capabilities command')};
   await h.inspectDeviceCapabilities('ms');
   assert.match(h.deviceCapabilities(device),/old daemon/);
-  assert.doesNotMatch(h.deviceCapabilities(device),/Forwarding: supported/);
+  assert.doesNotMatch(h.deviceCapabilities(device),/Forwarding ✓/);
+});
+
+
+test('forwarding settings keep mechanisms in documentation instead of repeated help text', () => {
+  const h = harness(async () => []);
+  h.ui.snap.forwardingRestoreSupported = true;
+  h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
+  const html = h.forwardingSettings();
+  assert.match(html, /Restore on startup/);
+  assert.doesNotMatch(html, /placeholder|Clients keep|Switching disconnects|Only one remote|If the remote is offline|daemon runs/);
 });
