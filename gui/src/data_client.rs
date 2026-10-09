@@ -188,11 +188,17 @@ pub struct MergedGroup {
     anonymous_upstream: bool,
     stats: Stats,
 }
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceExclusion {
+    Duplicate,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceState {
     name: String,
     included: bool,
+    exclusion: Option<SourceExclusion>,
     error: Option<String>,
     traffic: Option<TrafficView>,
 }
@@ -697,9 +703,11 @@ async fn merge_fetched(
     for (source, result) in fetched {
         let name = source.name.clone();
         let mut source_traffic = None;
+        let mut exclusion = None;
         let (included, error) = match result {
             Ok(summary) if !seen.insert(summary.node_id.clone()) => {
-                (false, Some("Duplicate device; already counted.".into()))
+                exclusion = Some(SourceExclusion::Duplicate);
+                (false, None)
             }
             Ok(summary) => match selected_groups(summary, minutes, scope, end) {
                 Ok(selected) => {
@@ -731,6 +739,7 @@ async fn merge_fetched(
         states.push(SourceState {
             name,
             included,
+            exclusion,
             error,
             traffic: source_traffic,
         });
@@ -1385,6 +1394,66 @@ mod tests {
         assert_eq!(result.traffic.credentials.len(), 1);
         assert_eq!(result.traffic.stats.input_tokens, Some(200));
     }
+    #[tokio::test]
+    async fn duplicate_sources_are_excluded_without_connection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("empty.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let summary = sample(
+            &DataKey::new(KEY).unwrap(),
+            "none",
+            "https://example.invalid",
+        );
+        let end = summary.window_end;
+        let context = std::sync::Arc::new(MergeContext {
+            config,
+            log: log.clone(),
+            accounts: BTreeMap::new(),
+            credential_labels: BTreeMap::new(),
+            local_id: "local-test".into(),
+            at: end,
+        });
+        let source = |name: &str| Source {
+            name: name.into(),
+            transport: Transport::Http,
+            url: "http://127.0.0.1:1".into(),
+            token_env: None,
+            token_file: None,
+            ca_certificate: None,
+            device_id: None,
+            ssh_connection: None,
+            ssh_device: None,
+        };
+        let fetched = vec![
+            (source("first"), Ok(summary.clone())),
+            (source("second"), Ok(summary)),
+            (source("failed"), Err("connection refused".into())),
+        ];
+        let merged = merge_fetched(
+            context,
+            &fetched,
+            30,
+            crate::traffic::TrafficScope::Model,
+            end,
+            load_snapshot(&log, end).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.traffic.stats.requests, 1);
+        let first = merged.sources.iter().find(|s| s.name == "first").unwrap();
+        assert!(first.included && first.error.is_none() && first.exclusion.is_none());
+        let duplicate = merged.sources.iter().find(|s| s.name == "second").unwrap();
+        assert!(!duplicate.included && duplicate.error.is_none());
+        assert_eq!(duplicate.exclusion, Some(SourceExclusion::Duplicate));
+        assert_eq!(
+            serde_json::to_value(duplicate).unwrap()["exclusion"],
+            "duplicate"
+        );
+        let failed = merged.sources.iter().find(|s| s.name == "failed").unwrap();
+        assert!(failed.error.is_some() && failed.exclusion.is_none());
+    }
+
     #[test]
     fn unknown_proxy_and_upstream_remain_anonymous_and_do_not_change_config() {
         let config=Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\nproxies:\n  known: http://10.1.1.1:7891\n").unwrap();

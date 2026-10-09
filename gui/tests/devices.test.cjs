@@ -319,3 +319,18 @@ test('This Device distinguishes failures and pending operations from stopped', (
   h.ui.snap.phase = { state: 'stopped', port: 8787 };
   assert.match(h.devicesPage(), />Stopped</);
 });
+
+test('duplicate devices show an exclusion notice instead of a connection failure', () => {
+  const h = harness(async () => []);
+  h.ui.devices = [{ id: 'duplicate', name: 'Duplicate', ssh: { host: 'peer' } }];
+  h.ui.deviceTrafficFetchedAt = Date.now();
+  h.ui.mergedData = { sources: [{ name: 'Duplicate', included: false, error: null, exclusion: 'duplicate' }] };
+  h.message = (_, text) => text;
+  let html = h.devicesPage();
+  assert.match(html, /Already counted via another entry/);
+  assert.match(html, /Statistics available/);
+  assert.doesNotMatch(html.slice(html.indexOf('Duplicate<div')), /dot failed|Traffic unavailable|Loading traffic/);
+  html = h.deviceSettings();
+  assert.match(html, /Statistics available; already counted/);
+  assert.doesNotMatch(html, /dot failed/);
+});

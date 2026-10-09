@@ -1408,7 +1408,10 @@ function mergedDataBlock() {
   if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
   if (data) {
     body += deviceTrafficContent(data.traffic, data.scope, "merged", data);
-    for (const source of data.sources) if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
+    for (const source of data.sources) {
+      if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
+      else if (source.exclusion === "duplicate") body += `<div class="placeholder">${esc(source.name)}: Already counted via another entry.</div>`;
+    }
   }
   return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading ? "disabled" : ""}>Refresh</button>`, body);
 }
@@ -1474,7 +1477,7 @@ function devicesPage() {
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : "Loading traffic…"}</div>`));
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : "Loading traffic…"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
@@ -1485,6 +1488,7 @@ function deviceConnectionStatus(device) {
     state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently",
   };
   if (source.error) return { state: "failed", label: String(source.error) };
+  if (source.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
   return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
 }
 function deviceSettings() {
