@@ -287,7 +287,10 @@ pub(crate) struct Snapshot {
 }
 impl Snapshot {
     pub(crate) fn load(path: &Path, end: i64) -> Result<Self, String> {
-        let start = end - 43200 * 60_000;
+        Self::load_range(path, end, 43200)
+    }
+    pub(crate) fn load_range(path: &Path, end: i64, minutes: u64) -> Result<Self, String> {
+        let start = end - minutes as i64 * 60_000;
         Ok(Self {
             end,
             all: file_summaries(path, start, TrafficScope::All, end)?,
@@ -774,12 +777,13 @@ fn entries_from_files(
 
 /// Already observed identities belong to this device; matching them to a peer
 /// does not import any peer configuration or expose names in a shared snapshot.
-pub(crate) fn observed_identity_labels(
+pub(crate) fn observed_identity_labels_range(
     path: &Path,
     mut labels: BTreeMap<(String, String), String>,
+    minutes: u64,
 ) -> Result<BTreeMap<(String, String), String>, String> {
     let end = chrono::Utc::now().timestamp_millis();
-    let start = end - 43200 * 60_000;
+    let start = end - minutes as i64 * 60_000;
     let _ = processed_entries(path, start, end, TrafficScope::Model, &mut labels)?;
     Ok(labels)
 }

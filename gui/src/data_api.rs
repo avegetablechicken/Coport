@@ -109,7 +109,7 @@ pub fn account_reference(service: &str, account: &str) -> Option<String> {
 impl Summary {
     pub fn validate(&self) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        if !matches!(self.schema_version, 1..=3)
+        if !matches!(self.schema_version, 1..=4)
             || uuid::Uuid::parse_str(&self.node_id).is_err()
             || self.bucket_minutes != 1
             || self.window_end % 60_000 != 0
@@ -124,8 +124,15 @@ impl Summary {
         if self.schema_version == 1 && !self.windows.is_empty() {
             return Err("Unexpected version-one windows.".into());
         }
-        if self.schema_version >= 2 && self.windows.len() != 12 {
+        if matches!(self.schema_version, 2 | 3) && self.windows.len() != 12 {
             return Err("Missing traffic windows.".into());
+        }
+        if self.schema_version == 4
+            && (self.windows.is_empty()
+                || self.windows.len() > 12
+                || self.previous_windows.len() != self.windows.len() * 2)
+        {
+            return Err("Invalid partial traffic windows.".into());
         }
         let mut seen = std::collections::BTreeSet::new();
         if (self.schema_version < 3 && !self.previous_windows.is_empty())
@@ -160,7 +167,33 @@ impl Summary {
             }
             validate_groups(&window.groups, (window.minutes / bucket) as usize)?;
         }
+        if self.schema_version == 4 {
+            for window in &self.windows {
+                for offset in [60_000, 120_000] {
+                    if !seen.contains(&(
+                        self.window_end - offset,
+                        window.minutes,
+                        window.scope == crate::traffic::TrafficScope::Model,
+                    )) {
+                        return Err("Missing partial alignment window.".into());
+                    }
+                }
+            }
+            if !self
+                .windows
+                .iter()
+                .any(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model)
+                && !self.groups.is_empty()
+            {
+                return Err("Unexpected default traffic groups.".into());
+            }
+        }
         if self.schema_version >= 2
+            && (self.schema_version != 4
+                || self
+                    .windows
+                    .iter()
+                    .any(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model))
             && self
                 .windows
                 .iter()
@@ -303,6 +336,91 @@ pub fn read_summary(dir: &Path) -> io::Result<Summary> {
     let node = read_node_id(dir)?;
     let bytes = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+/// Flush the requested range before computing the remaining history.
+pub fn stream_summary(
+    dir: &Path,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    mut output: impl io::Write,
+) -> io::Result<()> {
+    bucket_minutes(minutes).ok_or_else(|| io::Error::other("Unsupported traffic range"))?;
+    let (config_path, log) = crate::daemon::Client::discover(dir)
+        .map(|(_, status)| (status.config_path, status.log_path))
+        .unwrap_or_else(|| (dir.join("config.yaml"), dir.join("logs/proxy.log")));
+    let config = Config::read(&config_path).map_err(io::Error::other)?;
+    let key = identity_key(dir, false)?;
+    let node = read_node_id(dir)?;
+    let first =
+        publish_selected(&config, &log, &key, &node, minutes, scope).map_err(io::Error::other)?;
+    output.write_all(&first)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    let rest = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
+    output.write_all(&rest)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn publish_selected(
+    config: &Config,
+    log: &Path,
+    key: &DataKey,
+    node: &str,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+) -> Result<Vec<u8>, String> {
+    let bucket = bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+    let identities = crate::traffic::ExportIdentities::from_config(config);
+    for limit in [24, 8] {
+        let mut windows = Vec::new();
+        for offset in [0, 60_000, 120_000] {
+            let at = end - offset;
+            windows.push(Window {
+                minutes,
+                scope,
+                window_start: at - minutes as i64 * 60_000,
+                window_end: at,
+                bucket_minutes: bucket,
+                groups: crate::traffic::export_window_limit(
+                    crate::traffic::ReadSource::Path(log),
+                    config,
+                    key,
+                    crate::traffic::ExportOptions {
+                        end: at,
+                        minutes,
+                        scope,
+                        limit,
+                    },
+                    &identities,
+                )?,
+            });
+        }
+        let first = windows.remove(0);
+        let groups = if minutes == 30 && scope == crate::traffic::TrafficScope::Model {
+            first.groups.clone()
+        } else {
+            Vec::new()
+        };
+        let summary = Summary {
+            schema_version: 4,
+            node_id: node.into(),
+            window_start: end - 30 * 60_000,
+            window_end: end,
+            bucket_minutes: 1,
+            groups,
+            windows: vec![first],
+            previous_windows: windows,
+        };
+        summary.validate()?;
+        let bytes = serde_json::to_vec(&summary).map_err(|_| "Cannot encode processed summary")?;
+        if bytes.len() <= 1024 * 1024 {
+            return Ok(bytes);
+        }
+    }
+    Err("Processed summary exceeds size limit".into())
 }
 
 #[cfg(test)]
@@ -501,7 +619,29 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         reply(&mut socket, 503, b"{}").await;
         return;
     }
-    reply(&mut socket, 200, &bytes).await;
+    if let Ok(Some((minutes, scope))) = requested_window(&head) {
+        let selected = (|| {
+            let mut summary: Summary = serde_json::from_slice(&bytes).ok()?;
+            summary
+                .windows
+                .retain(|w| w.minutes == minutes && w.scope == scope);
+            summary
+                .previous_windows
+                .retain(|w| w.minutes == minutes && w.scope == scope);
+            if minutes != 30 || scope != crate::traffic::TrafficScope::Model {
+                summary.groups.clear();
+            }
+            summary.schema_version = 4;
+            summary.validate().ok()?;
+            serde_json::to_vec(&summary).ok()
+        })();
+        match selected {
+            Some(bytes) => reply(&mut socket, 200, &bytes).await,
+            None => reply(&mut socket, 503, b"{}").await,
+        }
+    } else {
+        reply(&mut socket, 200, &bytes).await;
+    }
 }
 fn validate_request(head: &[u8], key: &DataKey) -> Result<(), u16> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
@@ -542,7 +682,30 @@ fn validate_request(head: &[u8], key: &DataKey) -> Result<(), u16> {
     if !names.contains("host") {
         return Err(400);
     }
+    requested_window(head)?;
     Ok(())
+}
+fn requested_window(head: &[u8]) -> Result<Option<(u64, crate::traffic::TrafficScope)>, u16> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut headers);
+    request.parse(head).map_err(|_| 400u16)?;
+    let Some(header) = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("x-coport-window"))
+    else {
+        return Ok(None);
+    };
+    let value = std::str::from_utf8(header.value).map_err(|_| 400u16)?;
+    let (minutes, scope) = value.split_once(':').ok_or(400u16)?;
+    let minutes = minutes.parse().map_err(|_| 400u16)?;
+    bucket_minutes(minutes).ok_or(400u16)?;
+    let scope = match scope {
+        "model" => crate::traffic::TrafficScope::Model,
+        "all" => crate::traffic::TrafficScope::All,
+        _ => return Err(400),
+    };
+    Ok(Some((minutes, scope)))
 }
 async fn reply<S: AsyncWrite + Unpin>(socket: &mut S, status: u16, body: &[u8]) {
     let head = format!(
@@ -559,6 +722,102 @@ mod tests {
     use super::*;
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     use serde_json::json;
+
+    #[test]
+    fn selected_summary_contains_only_requested_range_with_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let key = DataKey::new(KEY).unwrap();
+        for minutes in RANGES {
+            for scope in [
+                crate::traffic::TrafficScope::Model,
+                crate::traffic::TrafficScope::All,
+            ] {
+                let bytes = publish_selected(
+                    &config,
+                    &log,
+                    &key,
+                    &uuid::Uuid::new_v4().to_string(),
+                    minutes,
+                    scope,
+                )
+                .unwrap();
+                let summary: Summary = serde_json::from_slice(&bytes).unwrap();
+                summary.validate().unwrap();
+                assert_eq!(summary.schema_version, 4);
+                assert_eq!(summary.windows.len(), 1);
+                assert_eq!(summary.previous_windows.len(), 2);
+                assert!(
+                    summary
+                        .windows
+                        .iter()
+                        .chain(&summary.previous_windows)
+                        .all(|w| w.minutes == minutes && w.scope == scope)
+                );
+                let mut invalid = summary.clone();
+                invalid.previous_windows[0].scope = if scope == crate::traffic::TrafficScope::All {
+                    crate::traffic::TrafficScope::Model
+                } else {
+                    crate::traffic::TrafficScope::All
+                };
+                assert!(invalid.validate().is_err());
+                let mut invalid = summary;
+                invalid.windows.clear();
+                assert!(invalid.validate().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_selected_window_is_bounded_and_does_not_change_cached_snapshot() {
+        let request = |method: &str, path: &str, extra: &str| {
+            format!(
+            "{method} {path} HTTP/1.1\r\nHost: data\r\nAuthorization: Bearer {KEY}\r\n{extra}\r\n"
+        ).into_bytes()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let key = DataKey::new(KEY).unwrap();
+        let bytes = publish(&config, &log, &key, &uuid::Uuid::new_v4().to_string()).unwrap();
+        let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes.clone())))));
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        let cache = shared.clone();
+        let task = tokio::spawn(async move {
+            handle(server, &key, cache).await;
+        });
+        client
+            .write_all(request("GET", "/v1/summary", "X-Coport-Window: 1440:all\r\n").as_slice())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let summary: Summary = serde_json::from_slice(&response[split..]).unwrap();
+        summary.validate().unwrap();
+        assert_eq!(summary.schema_version, 4);
+        assert_eq!(summary.windows.len(), 1);
+        assert_eq!(summary.windows[0].minutes, 1440);
+        assert_eq!(summary.windows[0].scope, crate::traffic::TrafficScope::All);
+        assert_eq!(shared.read().await.as_ref().unwrap().1.as_ref(), &bytes);
+        for invalid in ["31:all", "1440:other", "1440:all:extra"] {
+            assert_eq!(
+                validate_request(
+                    &request(
+                        "GET",
+                        "/v1/summary",
+                        &format!("X-Coport-Window: {invalid}\r\n")
+                    ),
+                    &DataKey::new(KEY).unwrap()
+                ),
+                Err(400)
+            );
+        }
+    }
     #[tokio::test]
     async fn starting_data_listener_does_not_scan_logs_before_returning() {
         if data_key_in_subprocess(

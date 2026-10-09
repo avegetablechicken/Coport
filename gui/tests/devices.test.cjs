@@ -129,7 +129,7 @@ test('each device renders full Traffic metrics and an offline peer leaves other 
 
 test('traffic range changes reject late responses from the previous selection', async () => {
   const pending = [];
-  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: (command, args) => new Promise(resolve => pending.push({ command, args, resolve })), render() {} };
+  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: (command, args) => new Promise(resolve => pending.push({ command, args, resolve })), render() {} };
   vm.createContext(context);
   const start = source.indexOf('async function loadMergedData(');
   vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
@@ -157,7 +157,7 @@ test('Devices button is visible only with configured peers and the redundant Dev
 });
 
 test('automatic alignment retains previous traffic while refreshing without an error message', async () => {
-  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0, mergedData: { selected: 'last-good' } }, invoke: async () => { throw 'TRAFFIC_UPDATING'; }, render() {} };
+  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0, mergedData: { selected: 'last-good' } }, invoke: async () => { throw 'TRAFFIC_UPDATING'; }, render() {} };
   vm.createContext(context);
   const start = source.indexOf('async function loadMergedData(');
   vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
@@ -197,7 +197,7 @@ test('Devices title contains only a settings icon and no redundant update/config
 test('Models and All switch immediately from one snapshot without new IPC requests', async () => {
   let calls = 0;
   const views = [{ minutes: 30, scope: 'model', traffic: { requests: 3 } }, { minutes: 30, scope: 'all', traffic: { requests: 5 } }, { minutes: 360, scope: 'all', traffic: { requests: 8 } }];
-  const context = { ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: async () => { calls++; return views; }, render() {} };
+  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: async () => { calls++; return views; }, render() {} };
   vm.createContext(context);
   const a = source.indexOf('function relabelDeviceViews(');
   vm.runInContext(source.slice(a,source.indexOf('async function loadDeviceDefinitions',a)),context);
@@ -480,4 +480,59 @@ test('startup SSH checks have at most four connections in flight', async () => {
   await started;
   assert.equal(checked, 7);
   assert.equal(maximum, 4);
+});
+
+test('selected device traffic renders before completion and ignores superseded channel updates', async () => {
+  const pending = [];
+  let renders = 0;
+  const context = { Channel: class {}, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 1440, trafficScope: 'all', mergedDataRequest: 0 },
+    invoke: (command, args) => new Promise((resolve, reject) => pending.push({ command, args, resolve, reject })),
+    render() { renders++; } };
+  vm.createContext(context);
+  const a = source.indexOf('function relabelDeviceViews(');
+  vm.runInContext(source.slice(a, source.indexOf('async function loadDeviceDefinitions', a)), context);
+  const b = source.indexOf('function selectDeviceTraffic(');
+  vm.runInContext(source.slice(b, source.indexOf('function deviceTrafficContent(', b)), context);
+  const first = context.loadMergedData();
+  assert.equal(pending[0].args.minutes, 1440);
+  assert.equal(pending[0].args.scope, 'all');
+  const initial = { minutes: 1440, scope: 'all', traffic: { requests: 7 }, sources: [] };
+  pending[0].args.onUpdate.onmessage([initial]);
+  assert.equal(context.ui.mergedData, initial);
+  assert.equal(context.ui.mergedDataLoading, true);
+  assert.equal(renders, 1);
+
+  context.ui.deviceTrafficMinutes = 360;
+  const second = context.loadMergedData(true);
+  const next = { minutes: 360, scope: 'all', traffic: { requests: 9 }, sources: [] };
+  pending[1].args.onUpdate.onmessage([next]);
+  pending[0].args.onUpdate.onmessage([{ ...next, traffic: { requests: 99 } }]);
+  assert.equal(context.ui.mergedData, next);
+  pending[0].resolve([initial]); await first;
+  assert.equal(context.ui.mergedDataLoading, true);
+  pending[1].resolve([initial, next]); await second;
+  assert.equal(context.ui.mergedDataLoading, false);
+  assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 2);
+  pending[1].args.onUpdate.onmessage([{ ...next, traffic: { requests: 100 } }]);
+  assert.equal(context.ui.mergedData, next);
+});
+
+test('a background failure retains the selected traffic already rendered', async () => {
+  let update, reject;
+  const context = { Channel: class {}, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 },
+    invoke: (_, args) => { update = args.onUpdate; return new Promise((_, fail) => { reject = fail; }); },
+    render() {} };
+  vm.createContext(context);
+  const a = source.indexOf('function relabelDeviceViews(');
+  vm.runInContext(source.slice(a, source.indexOf('async function loadDeviceDefinitions', a)), context);
+  const b = source.indexOf('function selectDeviceTraffic(');
+  vm.runInContext(source.slice(b, source.indexOf('function deviceTrafficContent(', b)), context);
+  const loading = context.loadMergedData();
+  const view = { minutes: 30, scope: 'model', traffic: { requests: 5 }, sources: [] };
+  update.onmessage([view]);
+  reject('Background statistics failed');
+  await loading;
+  assert.equal(context.ui.mergedData, view);
+  assert.equal(context.ui.mergedDataLoading, false);
+  assert.equal(context.ui.mergedDataError, 'Background statistics failed');
 });

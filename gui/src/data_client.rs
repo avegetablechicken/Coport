@@ -87,6 +87,12 @@ impl Source {
     }
 }
 async fn fetch(source: &Source) -> Result<Summary, String> {
+    fetch_selected(source, None).await
+}
+async fn fetch_selected(
+    source: &Source,
+    selection: Option<(u64, crate::traffic::TrafficScope)>,
+) -> Result<Summary, String> {
     source.validate()?;
     if source.transport == Transport::Ssh {
         let summary = crate::remote::summary(
@@ -139,9 +145,16 @@ async fn fetch(source: &Source) -> Result<Summary, String> {
     }
     url.set_path("/v1/summary");
     let client = builder.build().map_err(|_| "Cannot create data client")?;
-    let mut response = client
-        .get(url)
-        .bearer_auth(token)
+    let mut request = client.get(url).bearer_auth(token);
+    if let Some((minutes, scope)) = selection {
+        let scope = if scope == crate::traffic::TrafficScope::Model {
+            "model"
+        } else {
+            "all"
+        };
+        request = request.header("x-coport-window", format!("{minutes}:{scope}"));
+    }
+    let mut response = request
         .send()
         .await
         .map_err(|_| "Data connection failed; check connectivity and HTTPS certificate")?;
@@ -565,6 +578,170 @@ pub async fn merge_views_with_labels(
     }
     Ok(views)
 }
+/// Publish the selected view as peers respond, then fill the other cached views.
+pub async fn merge_progressive_with_labels(
+    sources: Vec<Source>,
+    config: Config,
+    log: PathBuf,
+    credential_labels: BTreeMap<(String, String), String>,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
+) -> Result<Vec<Merged>, String> {
+    crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    if sources.len() > crate::devices::LIMIT {
+        return Err("At most 32 data sources are supported.".into());
+    }
+    let context =
+        std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut fetched: Fetched = sources
+        .iter()
+        .cloned()
+        .map(|s| (s, Err("TRAFFIC_UPDATING".into())))
+        .collect();
+    for (index, source) in sources.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let log = context.log.clone();
+        tasks.spawn(async move {
+            let started = std::time::Instant::now();
+            let result = async {
+                source.validate()?;
+                if source.transport == Transport::Ssh {
+                    crate::remote::summary_progressive(
+                        source
+                            .ssh_connection
+                            .as_ref()
+                            .ok_or("Missing SSH data connection")?,
+                        minutes,
+                        scope,
+                        |summary| {
+                            tx.send((index, Ok(summary)))
+                                .map_err(|_| "Data reader closed".into())
+                        },
+                    )
+                    .await
+                } else {
+                    let first = fetch_selected(&source, Some((minutes, scope))).await?;
+                    let partial = first.schema_version == 4;
+                    tx.send((index, Ok(first)))
+                        .map_err(|_| "Data reader closed")?;
+                    if partial {
+                        let rest = fetch(&source).await?;
+                        tx.send((index, Ok(rest)))
+                            .map_err(|_| "Data reader closed")?;
+                    }
+                    Ok(())
+                }
+            }
+            .await;
+            crate::device_events::record(log, &source, result.is_ok(), started.elapsed()).await;
+            if let Err(error) = result {
+                let _ = tx.send((index, Err(error)));
+            }
+        });
+    }
+    drop(tx);
+    let mut snapshots = BTreeMap::new();
+    let mut background_errors = BTreeMap::new();
+    while let Some((index, result)) = rx.recv().await {
+        if let Err(error) = &result {
+            background_errors.insert(fetched[index].0.name.clone(), error.clone());
+        }
+        // A late background failure must not erase an already rendered window.
+        if result.is_ok() || fetched[index].1.is_err() {
+            fetched[index].1 = result;
+        }
+        let mut seen = BTreeSet::from([context.local_id.clone()]);
+        let summaries: Vec<_> = fetched
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .filter(|s| seen.insert(s.node_id.clone()))
+            .filter(|s| selected_groups(s, minutes, scope, s.window_end).is_ok())
+            .collect();
+        let Some(end) = common_end(&summaries, context.at, minutes, scope) else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = snapshots.entry(end) {
+            entry.insert(load_selected_snapshot(&context.log, end, minutes).await?);
+        }
+        let mut view = merge_fetched(
+            context.clone(),
+            &fetched,
+            minutes,
+            scope,
+            end,
+            snapshots[&end].clone(),
+        )
+        .await?;
+        for source in &mut view.sources {
+            if let Some(error) = background_errors.get(&source.name) {
+                source.error = Some(error.clone());
+            }
+        }
+        on_update(vec![view])?;
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.map_err(|_| "Data reader stopped")?;
+    }
+    // Reuse the received snapshots. Only clock-boundary mismatches require retries.
+    let selections: Vec<_> = crate::data_api::RANGES
+        .into_iter()
+        .flat_map(|m| {
+            [
+                (m, crate::traffic::TrafficScope::Model),
+                (m, crate::traffic::TrafficScope::All),
+            ]
+        })
+        .collect();
+    let mut complete_context = prepare_merge(
+        context.config.clone(),
+        context.log.clone(),
+        context.credential_labels.clone(),
+    )
+    .await?;
+    complete_context.at = context.at;
+    let context = std::sync::Arc::new(complete_context);
+    let (fetched, end) = align_fetched(&context, fetched, &selections).await?;
+    let snapshot = load_snapshot(&context.log, end).await?;
+    let mut views = Vec::new();
+    for (minutes, scope) in selections {
+        views.push(
+            merge_fetched(
+                context.clone(),
+                &fetched,
+                minutes,
+                scope,
+                end,
+                snapshot.clone(),
+            )
+            .await?,
+        );
+    }
+    for view in &mut views {
+        for source in &mut view.sources {
+            if let Some(error) = background_errors.get(&source.name) {
+                source.error = Some(error.clone());
+            }
+        }
+    }
+    Ok(views)
+}
+
+async fn load_selected_snapshot(
+    log: &std::path::Path,
+    end: i64,
+    minutes: u64,
+) -> Result<std::sync::Arc<crate::traffic::Snapshot>, String> {
+    let log = log.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::traffic::Snapshot::load_range(&log, end, minutes).map(std::sync::Arc::new)
+    })
+    .await
+    .map_err(|_| "Cannot read local traffic snapshot")?
+}
+
 struct MergeContext {
     config: Config,
     log: PathBuf,
@@ -578,9 +755,17 @@ async fn prepare_merge(
     log: PathBuf,
     credential_labels: BTreeMap<(String, String), String>,
 ) -> Result<MergeContext, String> {
+    prepare_merge_range(config, log, credential_labels, 43200).await
+}
+async fn prepare_merge_range(
+    config: Config,
+    log: PathBuf,
+    credential_labels: BTreeMap<(String, String), String>,
+    minutes: u64,
+) -> Result<MergeContext, String> {
     let evidence_path = log.clone();
     let credential_labels = tokio::task::spawn_blocking(move || {
-        crate::traffic::observed_identity_labels(&evidence_path, credential_labels)
+        crate::traffic::observed_identity_labels_range(&evidence_path, credential_labels, minutes)
     })
     .await
     .map_err(|_| "Cannot read local identity evidence")??;
@@ -625,7 +810,14 @@ async fn align_sources(
     sources: Vec<Source>,
     selections: &[(u64, crate::traffic::TrafficScope)],
 ) -> Result<(Fetched, i64), String> {
-    let mut fetched = fetch_sources(sources, &context.log).await?;
+    let fetched = fetch_sources(sources, &context.log).await?;
+    align_fetched(context, fetched, selections).await
+}
+async fn align_fetched(
+    context: &MergeContext,
+    mut fetched: Fetched,
+    selections: &[(u64, crate::traffic::TrafficScope)],
+) -> Result<(Fetched, i64), String> {
     for attempt in 0..3 {
         let mut seen = BTreeSet::from([context.local_id.clone()]);
         let valid: Vec<_> = fetched
@@ -784,6 +976,125 @@ async fn merge_fetched(
 mod tests {
     use super::*;
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
+    #[tokio::test]
+    async fn selected_views_render_before_slow_peers_and_background_responses() {
+        if data_key_in_subprocess(
+            "data_client::tests::selected_views_render_before_slow_peers_and_background_responses",
+        ) {
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let release_slow = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_background = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut servers = Vec::new();
+        let mut sources = Vec::new();
+        for peer in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bytes = crate::data_api::publish(
+                &config,
+                &log,
+                &DataKey::new(KEY).unwrap(),
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap();
+            let mut selected: Summary = serde_json::from_slice(&bytes).unwrap();
+            selected.schema_version = 4;
+            selected.groups.clear();
+            selected
+                .windows
+                .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+            selected
+                .previous_windows
+                .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+            selected.validate().unwrap();
+            let selected = serde_json::to_vec(&selected).unwrap();
+            sources.push(Source {
+                name: format!("peer-{peer}"),
+                device_id: None,
+                transport: Transport::Http,
+                ssh_connection: None,
+                url: format!("http://{}", listener.local_addr().unwrap()),
+                token_env: Some(DATA_KEY_ENV.into()),
+                token_file: None,
+                ca_certificate: None,
+                ssh_device: None,
+            });
+            let slow = release_slow.clone();
+            let background = release_background.clone();
+            servers.push(tokio::spawn(async move {
+                for phase in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.unwrap()); }
+                    let header = String::from_utf8(header).unwrap().to_lowercase();
+                    let body = if phase == 0 {
+                        assert!(header.contains("x-coport-window: 1440:all"));
+                        if peer == 1 { slow.notified().await; }
+                        &selected
+                    } else {
+                        assert!(!header.contains("x-coport-window"));
+                        background.acquire().await.unwrap().forget();
+                        &bytes
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                }
+            }));
+        }
+        let updates = std::sync::Mutex::new(Vec::new());
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            merge_progressive_with_labels(
+                sources,
+                config,
+                log,
+                BTreeMap::new(),
+                1440,
+                crate::traffic::TrafficScope::All,
+                |views| {
+                    assert_eq!(views.len(), 1);
+                    assert_eq!(views[0].minutes, 1440);
+                    assert_eq!(views[0].scope, crate::traffic::TrafficScope::All);
+                    let included = views[0].sources.iter().filter(|s| s.included).count();
+                    let mut updates = updates.lock().unwrap();
+                    if updates.is_empty() {
+                        assert_eq!(
+                            included, 1,
+                            "Fast peer must render while slow peer is blocked"
+                        );
+                        assert_eq!(
+                            views[0].sources[1].error.as_deref(),
+                            Some("TRAFFIC_UPDATING")
+                        );
+                        release_slow.notify_one();
+                    }
+                    if included == 2 && !updates.contains(&2) {
+                        release_background.add_permits(2);
+                    }
+                    updates.push(included);
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.len(), 12);
+        assert!(
+            result
+                .iter()
+                .all(|view| view.sources.iter().all(|s| s.included))
+        );
+        assert_eq!(updates.lock().unwrap()[0], 1);
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
     fn sample(key: &DataKey, proxy: &str, upstream: &str) -> Summary {
         let mut counts = vec![0; 30];
         counts[0] = 1;

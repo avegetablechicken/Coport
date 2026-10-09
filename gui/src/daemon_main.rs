@@ -19,6 +19,34 @@ fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--summary-stream") {
+        let result = (|| {
+            if args.get(1).is_none_or(|arg| arg != "--window") {
+                return Err(std::io::Error::other("Expected --window MINUTES model|all"));
+            }
+            let minutes = args
+                .get(2)
+                .and_then(|v| v.to_str())
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| std::io::Error::other("Expected traffic range"))?;
+            let scope = match args.get(3).and_then(|v| v.to_str()) {
+                Some("model") => coport_gui::traffic::TrafficScope::Model,
+                Some("all") => coport_gui::traffic::TrafficScope::All,
+                _ => return Err(std::io::Error::other("Expected model or all")),
+            };
+            coport_gui::data_api::stream_summary(
+                &helper_directory(&args, 4)?,
+                minutes,
+                scope,
+                std::io::stdout().lock(),
+            )
+        })();
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--summary") {
         let result =
             helper_directory(&args, 1).and_then(|dir| coport_gui::data_api::read_summary(&dir));
@@ -49,7 +77,7 @@ fn main() {
     }
     if args.len() != 3 {
         eprintln!(
-            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --forward [--state-dir PATH]"
+            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --summary-stream --window MINUTES model|all [--state-dir PATH] | --forward [--state-dir PATH]"
         );
         std::process::exit(2);
     }

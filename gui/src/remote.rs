@@ -228,6 +228,111 @@ async fn check_command(
     }
 }
 
+/// One SSH process sends the selected window, then the complete snapshot.
+pub async fn summary_progressive(
+    device: &Device,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    mut on_summary: impl FnMut(crate::data_api::Summary) -> Result<(), String>,
+) -> Result<(), String> {
+    crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    let scope = match scope {
+        crate::traffic::TrafficScope::Model => "model",
+        crate::traffic::TrafficScope::All => "all",
+    };
+    // Four arguments also make old helpers reject this as an unknown command:
+    // three positional arguments would otherwise be interpreted as daemon startup.
+    let operation = format!("--summary-stream --window {minutes} {scope}");
+    let command = if device.binary.is_empty() || device.binary == "coportd" {
+        format!(
+            "/bin/sh -c {}",
+            quote(&DISCOVERY_SCRIPT.replace("--summary", &operation))
+        )
+    } else {
+        format!("{} {operation}", quote(&device.binary))
+    };
+    let mut process = ssh_command(device, &command)?
+        .spawn()
+        .map_err(|e| format!("Cannot start SSH: {e}"))?;
+    use tokio::io::AsyncReadExt;
+    let stdout = process.stdout.take().unwrap();
+    let mut stderr = process.stderr.take().unwrap().take(8193);
+    let mut received = false;
+    let operation = async {
+        let read = read_summary_stream(stdout, |summary| {
+            received = true;
+            on_summary(summary)
+        });
+        let mut errors = Vec::new();
+        let (result, error_result) = tokio::join!(read, stderr.read_to_end(&mut errors));
+        result?;
+        error_result.map_err(|e| e.to_string())?;
+        if errors.len() > 8192 {
+            return Err("SSH response exceeded the size limit.".into());
+        }
+        let status = process.wait().await.map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("SSH statistics request failed.".into());
+        }
+        Ok(())
+    };
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(60), operation).await {
+        Ok(result) => result,
+        Err(_) => Err("SSH statistics request timed out.".into()),
+    };
+    if result.is_err() {
+        let _ = process.kill().await;
+        // Older helpers reject the new option without changing any state.
+        if !received {
+            let legacy = summary(device).await?;
+            legacy.validate()?;
+            return on_summary(legacy);
+        }
+    }
+    result
+}
+
+async fn read_summary_stream(
+    input: impl tokio::io::AsyncRead + Unpin,
+    mut on_summary: impl FnMut(crate::data_api::Summary) -> Result<(), String>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut input = tokio::io::BufReader::new(input);
+    for index in 0..2 {
+        let mut bytes = Vec::new();
+        (&mut input)
+            .take(1024 * 1024 + 2)
+            .read_until(b'\n', &mut bytes)
+            .await
+            .map_err(|_| "Cannot read SSH statistics stream")?;
+        if bytes.len() > 1024 * 1024 + 1 || !bytes.ends_with(b"\n") {
+            return Err("Invalid or oversized SSH statistics frame.".into());
+        }
+        let summary: crate::data_api::Summary =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid SSH statistics frame")?;
+        summary.validate()?;
+        // Forced-command SSH keys may always return the original single DTO.
+        let legacy = index == 0 && summary.schema_version < 4;
+        if index == 1 && summary.schema_version != 3 {
+            return Err("Unexpected SSH statistics frame.".into());
+        }
+        on_summary(summary)?;
+        if legacy {
+            break;
+        }
+    }
+    let mut extra = [0];
+    if input
+        .read(&mut extra)
+        .await
+        .map_err(|_| "Cannot finish SSH statistics stream")?
+        != 0
+    {
+        return Err("Unexpected extra SSH statistics frame.".into());
+    }
+    Ok(())
+}
+
 pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String> {
     let limit = 1024 * 1024;
     let mut child = ssh_command(device, &summary_command(&device.binary))?;
@@ -273,6 +378,96 @@ pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn selected_ssh_frame_arrives_before_the_remaining_statistics() {
+        use tokio::io::AsyncWriteExt;
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let window = |minutes, scope, at| crate::data_api::Window {
+            minutes,
+            scope,
+            window_start: at - minutes as i64 * 60_000,
+            window_end: at,
+            bucket_minutes: crate::data_api::bucket_minutes(minutes).unwrap(),
+            groups: Vec::new(),
+        };
+        let mut first = crate::data_api::Summary {
+            schema_version: 4,
+            node_id: uuid::Uuid::new_v4().to_string(),
+            window_start: end - 30 * 60_000,
+            window_end: end,
+            bucket_minutes: 1,
+            groups: Vec::new(),
+            windows: vec![window(1440, crate::traffic::TrafficScope::All, end)],
+            previous_windows: [60_000, 120_000]
+                .into_iter()
+                .map(|offset| window(1440, crate::traffic::TrafficScope::All, end - offset))
+                .collect(),
+        };
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+        first.schema_version = 3;
+        first.windows.clear();
+        first.previous_windows.clear();
+        for offset in [0, 60_000, 120_000] {
+            for minutes in crate::data_api::RANGES {
+                for scope in [
+                    crate::traffic::TrafficScope::Model,
+                    crate::traffic::TrafficScope::All,
+                ] {
+                    let w = window(minutes, scope, end - offset);
+                    if offset == 0 {
+                        first.windows.push(w);
+                    } else {
+                        first.previous_windows.push(w);
+                    }
+                }
+            }
+        }
+        let rest_bytes = serde_json::to_vec(&first).unwrap();
+        let mut legacy = rest_bytes.clone();
+        legacy.push(b'\n');
+        let mut legacy_versions = Vec::new();
+        super::read_summary_stream(legacy.as_slice(), |s| {
+            legacy_versions.push(s.schema_version);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(legacy_versions, [3]);
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            writer.write_all(&first_bytes).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            ready.await.unwrap(); // Cannot finish until the caller renders the first frame.
+            writer.write_all(&rest_bytes).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        let mut release = Some(release);
+        let mut versions = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::read_summary_stream(reader, |summary| {
+                versions.push(summary.schema_version);
+                if let Some(release) = release.take() {
+                    release.send(()).unwrap();
+                }
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(versions, [4, 3]);
+        for bytes in [b"{}\n".to_vec(), vec![b'x'; 1024 * 1024 + 2]] {
+            assert!(
+                super::read_summary_stream(bytes.as_slice(), |_| Ok(()))
+                    .await
+                    .is_err()
+            );
+        }
+    }
     use super::*;
     #[test]
     fn ssh_availability_uses_noninteractive_login_without_remote_services() {

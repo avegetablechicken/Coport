@@ -1,6 +1,6 @@
 "use strict";
 
-const { invoke } = window.__TAURI__.core;
+const { invoke, Channel } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const IS_MAC = navigator.userAgent.includes("Mac");
@@ -1379,9 +1379,23 @@ async function loadMergedData(force = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
   ui.mergedDataLoading = true;
+  let completed = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
   try {
-    const data = await invoke("get_merged_data");
+    const onUpdate = new Channel();
+    onUpdate.onmessage = data => {
+      if (completed || request !== ui.mergedDataRequest) return;
+      relabelDeviceViews(data, requestedDevices, ui.devices || []);
+      ui.deviceTrafficViews ||= Object.create(null);
+      for (const view of data) ui.deviceTrafficViews[`${view.minutes}:${view.scope}`] = view;
+      selectDeviceTraffic();
+      ui.deviceTrafficFetchedAt = Date.now();
+      ui.mergedDataError = ""; ui.mergedDataUpdating = false;
+      if (ui.page === "devices" || ui.page === "settings") render();
+    };
+    const data = await invoke("get_merged_data", {
+      minutes: ui.deviceTrafficMinutes || 30, scope: ui.trafficScope || "model", onUpdate,
+    });
     if (request !== ui.mergedDataRequest) return;
     if (Array.isArray(data)) {
       relabelDeviceViews(data, requestedDevices, ui.devices || []);
@@ -1396,7 +1410,7 @@ async function loadMergedData(force = false) {
       ui.mergedDataError = ui.mergedDataUpdating ? "" : String(e);
     }
   }
-  finally { if (request === ui.mergedDataRequest) { ui.mergedDataLoading = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
+  finally { completed = true; if (request === ui.mergedDataRequest) { ui.mergedDataLoading = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
 }
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
   const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
@@ -1425,7 +1439,8 @@ function mergedDataBlock() {
   if (data) {
     body += deviceTrafficContent(data.traffic, data.scope, "merged", data);
     for (const source of data.sources) {
-      if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
+      if (source.error === "TRAFFIC_UPDATING") body += `<div class="placeholder">${esc(source.name)}: Loading traffic…</div>`;
+      else if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
       else if (source.exclusion === "duplicate") body += `<div class="placeholder">${esc(source.name)}: Already counted via another entry.</div>`;
     }
   }
@@ -1531,19 +1546,20 @@ function devicesPage() {
     const status = deviceConnectionStatus(device);
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
-      (source?.error ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : "Loading traffic…"}</div>`));
+      (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : "Loading traffic…"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
 function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
-  const source = (ui.deviceTrafficViews?.["30:model"] || ui.mergedData)?.sources?.find(s => s.name === device.name);
+  const source = (ui.mergedData || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
   if (!source || age < 0 || age > 45000 || ui.mergedDataError) {
     const startup = ui.deviceStates?.[device.id];
     if (startup && startup.host === device.ssh?.host && !ui.mergedDataLoading) return startup;
     return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently" };
   }
+  if (source.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
   if (source.error) return { state: "failed", label: String(source.error) };
   if (source.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
   return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
@@ -1985,7 +2001,7 @@ document.addEventListener("change", async (event) => {
       ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
     } else { ui.deviceTrafficMinutes = Number(event.target.value); }
     if (selectDeviceTraffic()) { render(); return; }
-    const loading = loadMergedData(); render(); await loading;
+    const loading = loadMergedData(true); render(); await loading;
     return;
   }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {

@@ -655,3 +655,50 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     });
     client.stop().unwrap();
 }
+
+#[test]
+fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path(), None);
+    std::fs::create_dir(dir.path().join("logs")).unwrap();
+    std::fs::write(dir.path().join("logs/proxy.log"), "").unwrap();
+    coport_gui::data_api::prepare_identity(dir.path()).unwrap();
+    let output = Command::new(helper())
+        .args(["--summary-stream", "--window", "1440", "all", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    #[cfg(unix)]
+    {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frames: Vec<coport_gui::data_api::Summary> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        for frame in &frames {
+            frame.validate().unwrap();
+        }
+        assert_eq!(frames[0].schema_version, 4);
+        assert_eq!(frames[0].windows.len(), 1);
+        assert_eq!(frames[0].windows[0].minutes, 1440);
+        assert_eq!(
+            frames[0].windows[0].scope,
+            coport_gui::traffic::TrafficScope::All
+        );
+        assert_eq!(frames[1].schema_version, 3);
+        assert_eq!(frames[1].windows.len(), 12);
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unavailable on this platform"));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(daemon::Client::discover(dir.path()).is_none());
+}

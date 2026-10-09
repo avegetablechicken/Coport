@@ -1291,16 +1291,25 @@ proxies/endpoints do not manufacture additional apparent accounts. All unknown
 labels in the application are English. Settings Devices uses icon add/remove
 actions and shows green only after a recent successful statistics retrieval.
 
-A single refresh fetches each device once and prepares all twelve display views.
-Models/All and time-range switches select in-memory views immediately, without
-repeating SSH connections or account probes. Periodic refresh updates the cache
-in the background. Expanded upstream accounts use the same order as Activity
+A refresh prioritizes the GUI's selected time range and Models/All category.
+Each device's selected statistics render as soon as they arrive; slower devices
+do not hold up the others. SSH uses one connection to send the selected window
+first, then computes and sends the complete snapshot. HTTP requests the selected
+cached window with an optional `X-Coport-Window: MINUTES:model|all` header, then
+fetches the full cache. Partial responses use schema version four and retain
+the same two alignment boundaries and privacy/size limits.
+Once all twelve views are cached, range/category switches are immediate.
+Selecting an uncached range cancels the previous refresh and prioritizes the new
+selection. Background failures retain statistics already displayed. Periodic
+refresh updates the cache in the background. Expanded upstream accounts use the same order as Activity
 Traffic: known accounts by received bytes descending, unidentified accounts last.
 
 Each device selects one read-only transport: **HTTP/HTTPS** or **SSH**.
 HTTP/HTTPS requests the authenticated service described above. SSH invokes
-`coportd --summary`, returning exactly the same versioned DTO without requiring
-an HTTP listener or sharing key. New devices default to SSH; entering only the SSH
+`coportd --summary-stream --window MINUTES model|all`, flushing two newline-delimited
+DTOs (selected, then complete) without requiring an HTTP listener or sharing key.
+Older helpers automatically fall back to `coportd --summary`; keys restricted to
+that command still return the complete snapshot, without progressive delivery. New devices default to SSH; entering only the SSH
 config alias uses it as the display name and automatically discovers the executable.
 SSH statistics calls do not invoke lifecycle operations,
 read raw credentials, request configuration matching, or modify files.
@@ -1358,15 +1367,14 @@ Both machines need this version of Coport. The destination must have existing
 GUI configuration and identity files created by starting its desktop daemon.
 At startup the daemon atomically records its executable in the owner-only
 `summary-executable` file in its application data directory. SSH reads that record
-locally, checks ownership, permissions and file type, and executes `--summary`
-for statistics or `--forward` when request forwarding is explicitly enabled.
+locally, checks ownership, permissions and file type, and executes `--summary-stream`
+(or `--summary` for older helpers) for statistics or `--forward` when request forwarding is explicitly enabled.
 The path stays on the destination. A stale or unsafe record fails closed with an
 instruction to restart the destination app. When no record exists, discovery checks
 `PATH`, standard user/system binary locations and macOS Applications bundles.
 No directory scanning, configuration export, service restart or registration write
 occurs during a statistics request.
-Statistics connections run `coportd --summary`, which returns processed statistics without
-an HTTP listener. Raw logs and remote configurations are not returned.
+Statistics connections return processed statistics without an HTTP listener. Raw logs and remote configurations are not returned.
 
 Set up key authentication (or an SSH agent) and connect once from a terminal to
 verify and trust the destination's host key. SSH ports, keys and jump hosts come

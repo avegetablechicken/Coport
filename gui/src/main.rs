@@ -31,6 +31,7 @@ struct ExitState {
 pub struct AppState {
     pub core: Mutex<core::Core>,
     pub forwarding_operations: tokio::sync::Mutex<()>,
+    pub traffic_request: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 const USAGE: &str = "\
@@ -143,6 +144,7 @@ fn main() {
                 let _ = core.start_if_stopped();
             }
             app.manage(AppState {
+                traffic_request: Mutex::new(None),
                 core: Mutex::new(core),
                 forwarding_operations: Default::default(),
             });

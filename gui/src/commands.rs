@@ -520,22 +520,48 @@ pub async fn remove_device(state: State<'_, AppState>, id: String) -> Result {
 #[tauri::command]
 pub async fn get_merged_data(
     state: State<'_, AppState>,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    on_update: tauri::ipc::Channel<Vec<coport_gui::data_client::Merged>>,
 ) -> Result<Vec<coport_gui::data_client::Merged>> {
-    let (sources, config, log, probe) = {
-        let mut core = state.core.lock().unwrap();
-        core.refresh_config();
-        (
-            core.settings.data_sources(),
-            core.loaded_config()
-                .cloned()
-                .ok_or("Cannot read local configuration")?,
-            core.logs.path(),
-            core.account_tasks(),
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {
+        let _ = previous.send(());
+    }
+    let operation = async {
+        let (sources, config, log, probe) = {
+            let mut core = state.core.lock().unwrap();
+            core.refresh_config();
+            (
+                core.settings.data_sources(),
+                core.loaded_config()
+                    .cloned()
+                    .ok_or("Cannot read local configuration")?,
+                core.logs.path(),
+                core.account_tasks(),
+            )
+        };
+        let labels = match probe {
+            Some(tasks) => tasks.credential_labels().await?,
+            None => config.traffic_credential_labels().await,
+        };
+        coport_gui::data_client::merge_progressive_with_labels(
+            sources,
+            config,
+            log,
+            labels,
+            minutes,
+            scope,
+            move |views| {
+                on_update
+                    .send(views)
+                    .map_err(|_| "Traffic view closed".into())
+            },
         )
+        .await
     };
-    let labels = match probe {
-        Some(tasks) => tasks.credential_labels().await?,
-        None => config.traffic_credential_labels().await,
-    };
-    coport_gui::data_client::merge_views_with_labels(sources, config, log, labels).await
+    tokio::select! {
+        result = operation => result,
+        _ = cancelled => Err("Traffic request superseded".into()),
+    }
 }
