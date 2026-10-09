@@ -1519,7 +1519,7 @@ async function checkConfiguredSsh() {
     }
   }));
 }
-async function loadDevices() {
+async function loadDevices(refreshRemote = false) {
   if (ui.deviceRefresh) return;
   ui.deviceRefresh = true;
   try {
@@ -1531,7 +1531,7 @@ async function loadDevices() {
     if (ui.page !== "devices") return;
     if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
-    await loadMergedData();
+    await loadMergedData(false, refreshRemote);
 
   } catch (error) { toast(String(error)); }
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
@@ -1874,8 +1874,7 @@ async function act(action, el) {
       await loadMergedData(false, true);
       break;
     case "devices-refresh":
-      await loadDevices();
-      await loadMergedData(false, true);
+      await loadDevices(true);
       break;
     case "device-save": {
       captureDeviceDraft(); const d = ui.deviceDraft;

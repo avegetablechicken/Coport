@@ -171,77 +171,90 @@ struct FileTraffic {
 }
 
 impl FileTraffic {
-    fn scan(file: File, scope: TrafficScope, end: i64) -> Result<Self, String> {
-        let mut traffic = Self {
-            scan_end: end,
-            ..Self::default()
-        };
-        let mut sighted = HashSet::new();
+    fn scan_many(file: File, selections: &[(TrafficScope, i64)]) -> Result<Vec<Self>, String> {
+        let mut traffic: Vec<_> = selections
+            .iter()
+            .map(|(_, end)| Self {
+                scan_end: *end,
+                ..Self::default()
+            })
+            .collect();
+        let mut sighted: Vec<HashSet<_>> = selections.iter().map(|_| HashSet::new()).collect();
         let mut strings = Strings::default();
         for_each_line(file, |entry| {
-            // Retain safe identity evidence even when the corresponding request is
-            // outside the selected window. Current configuration mappings win.
-            if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
-                && !id.is_empty()
-                && !label.is_empty()
+            for ((traffic, sighted), (scope, _)) in
+                traffic.iter_mut().zip(&mut sighted).zip(selections)
             {
-                let service = entry
-                    .service()
-                    .or_else(|| entry.get("service"))
-                    .unwrap_or("Unknown");
-                let evidence = (service.to_owned(), id.to_owned(), label.to_owned());
-                if sighted.insert(evidence.clone()) {
-                    traffic.evidence.push(evidence);
-                }
-            }
-            if !included_in_scope(&entry, scope) || lifecycle_rank(&entry) == 0 {
-                return;
-            }
-            let Some(at) = entry.time.map(|t| t.timestamp_millis()) else {
-                return;
-            };
-            // Even excluded events constrain reuse at another snapshot boundary.
-            traffic.latest_event = Some(traffic.latest_event.map_or(at, |last| last.max(at)));
-            if at >= end {
-                return;
-            }
-            let call = entry.event.starts_with("model_call_");
-            if let Some(id) = entry
-                .get(if call { "model_call_id" } else { "request_id" })
-                .filter(|id| !id.is_empty())
-            {
-                if call
-                    && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty())
-                {
-                    traffic.explicit_call_requests.insert(request_id.to_owned());
-                }
-                let id = format!("{}:{id}", if call { "call" } else { "request" });
-                let record = Record::new(&entry, &mut strings);
-                match traffic.requests.get_mut(&id) {
-                    Some(current) => current.merge(&record),
-                    None => {
-                        traffic.requests.insert(id, record);
-                    }
-                }
-            } else if entry.is_request_end()
-                && (scope == TrafficScope::All || is_historical_http_call(&entry))
-            {
-                // Uncorrelated connection events can only be counted separately.
-                // New model-call events always require their explicit call ID.
-                use std::hash::{Hash, Hasher};
-                let mut hash = std::hash::DefaultHasher::new();
-                (
-                    &entry.event,
-                    entry.time,
-                    serde_json::to_string(&entry.fields).unwrap_or_default(),
-                )
-                    .hash(&mut hash);
-                traffic
-                    .uncorrelated
-                    .push((hash.finish(), Record::new(&entry, &mut strings)));
+                traffic.observe(&entry, *scope, sighted, &mut strings);
             }
         })?;
         Ok(traffic)
+    }
+    fn observe(
+        &mut self,
+        entry: &Entry,
+        scope: TrafficScope,
+        sighted: &mut HashSet<(String, String, String)>,
+        strings: &mut Strings,
+    ) {
+        // Retain safe identity evidence even when the corresponding request is
+        // outside the selected window. Current configuration mappings win.
+        if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
+            && !id.is_empty()
+            && !label.is_empty()
+        {
+            let service = entry
+                .service()
+                .or_else(|| entry.get("service"))
+                .unwrap_or("Unknown");
+            let evidence = (service.to_owned(), id.to_owned(), label.to_owned());
+            if sighted.insert(evidence.clone()) {
+                self.evidence.push(evidence);
+            }
+        }
+        if !included_in_scope(entry, scope) || lifecycle_rank(entry) == 0 {
+            return;
+        }
+        let Some(at) = entry.time.map(|t| t.timestamp_millis()) else {
+            return;
+        };
+        // Even excluded events constrain reuse at another snapshot boundary.
+        self.latest_event = Some(self.latest_event.map_or(at, |last| last.max(at)));
+        if at >= self.scan_end {
+            return;
+        }
+        let call = entry.event.starts_with("model_call_");
+        if let Some(id) = entry
+            .get(if call { "model_call_id" } else { "request_id" })
+            .filter(|id| !id.is_empty())
+        {
+            if call && let Some(request_id) = entry.get("request_id").filter(|id| !id.is_empty()) {
+                self.explicit_call_requests.insert(request_id.to_owned());
+            }
+            let id = format!("{}:{id}", if call { "call" } else { "request" });
+            let record = Record::new(entry, strings);
+            match self.requests.get_mut(&id) {
+                Some(current) => current.merge(&record),
+                None => {
+                    self.requests.insert(id, record);
+                }
+            }
+        } else if entry.is_request_end()
+            && (scope == TrafficScope::All || is_historical_http_call(entry))
+        {
+            // Uncorrelated connection events can only be counted separately.
+            // New model-call events always require their explicit call ID.
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::hash::DefaultHasher::new();
+            (
+                &entry.event,
+                entry.time,
+                serde_json::to_string(&entry.fields).unwrap_or_default(),
+            )
+                .hash(&mut hash);
+            self.uncorrelated
+                .push((hash.finish(), Record::new(entry, strings)));
+        }
     }
 }
 
@@ -290,12 +303,49 @@ impl Snapshot {
         Self::load_range(path, end, 43200)
     }
     pub(crate) fn load_range(path: &Path, end: i64, minutes: u64) -> Result<Self, String> {
-        let start = end - minutes as i64 * 60_000;
-        Ok(Self {
-            end,
-            all: file_summaries(path, start, TrafficScope::All, end)?,
-            model: file_summaries(path, start, TrafficScope::Model, end)?,
-        })
+        Ok(Self::load_many(
+            path,
+            &[end],
+            minutes,
+            &[TrafficScope::All, TrafficScope::Model],
+        )?
+        .remove(0))
+    }
+    /// Read and parse each file once while retaining separate lifecycle state
+    /// for every scope/boundary. Later events must not leak into older windows.
+    pub(crate) fn load_many(
+        path: &Path,
+        ends: &[i64],
+        minutes: u64,
+        scopes: &[TrafficScope],
+    ) -> Result<Vec<Self>, String> {
+        let Some(first) = ends.iter().min() else {
+            return Ok(Vec::new());
+        };
+        let selections: Vec<_> = ends
+            .iter()
+            .flat_map(|end| scopes.iter().map(move |scope| (*scope, *end)))
+            .collect();
+        let mut files =
+            file_summaries_many(path, first - minutes as i64 * 60_000, &selections)?.into_iter();
+        Ok(ends
+            .iter()
+            .map(|end| {
+                let mut snapshot = Self {
+                    end: *end,
+                    all: Vec::new(),
+                    model: Vec::new(),
+                };
+                for scope in scopes {
+                    let selected = files.next().unwrap();
+                    match scope {
+                        TrafficScope::All => snapshot.all = selected,
+                        TrafficScope::Model => snapshot.model = selected,
+                    }
+                }
+                snapshot
+            })
+            .collect())
     }
 }
 #[derive(Clone, Copy)]
@@ -336,9 +386,15 @@ fn file_summaries(
     scope: TrafficScope,
     end: i64,
 ) -> Result<Vec<SnapshotFile>, String> {
-    let model = scope == TrafficScope::Model;
-    let mut summaries = Vec::new();
-    for_each_file(path, start, |file, live, _path| {
+    Ok(file_summaries_many(path, start, &[(scope, end)])?.remove(0))
+}
+fn file_summaries_many(
+    path: &Path,
+    start: i64,
+    selections: &[(TrafficScope, i64)],
+) -> Result<Vec<Vec<SnapshotFile>>, String> {
+    let mut summaries: Vec<Vec<SnapshotFile>> = selections.iter().map(|_| Vec::new()).collect();
+    for_each_file(path, start, |file, live, file_path| {
         let meta = file
             .metadata()
             .map_err(|_| "Cannot read traffic history".to_owned())?;
@@ -346,7 +402,7 @@ fn file_summaries(
             "{}.1",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
-        let archived_modified = if live || _path == backup {
+        let archived_modified = if live || file_path == backup {
             None
         } else {
             meta.modified()
@@ -354,22 +410,6 @@ fn file_summaries(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|t| t.as_millis() as i64)
         };
-        if live {
-            #[cfg(test)]
-            {
-                *LIVE_SCANS
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(HashMap::new)
-                    .entry(path.to_owned())
-                    .or_default() += 1;
-            }
-            summaries.push(SnapshotFile {
-                summary: Arc::new(FileTraffic::scan(file, scope, end)?),
-                archived_modified,
-            });
-            return Ok(());
-        }
         let stamp = FileStamp {
             #[cfg(unix)]
             node: {
@@ -377,42 +417,67 @@ fn file_summaries(
                 (meta.dev(), meta.ino())
             },
             #[cfg(not(unix))]
-            path: _path.to_owned(),
+            path: file_path.to_owned(),
             len: meta.len(),
             modified: meta.modified().ok(),
         };
-        let key = (stamp, model);
-        let cached = {
+        let mut results: Vec<Option<Arc<FileTraffic>>> = selections.iter().map(|_| None).collect();
+        if !live {
             let mut cache = SUMMARIES.lock().unwrap();
             let cache = cache.get_or_insert_with(HashMap::new);
             cache.retain(|_, (used, _)| used.elapsed() < SUMMARY_TTL);
-            cache.get_mut(&key).and_then(|(used, summary)| {
-                let complete = summary
-                    .latest_event
-                    .is_none_or(|last| last < summary.scan_end && last < end);
-                if summary.scan_end != end && !complete {
-                    return None;
+            for (result, (scope, end)) in results.iter_mut().zip(selections) {
+                if let Some((used, summary)) =
+                    cache.get_mut(&(stamp.clone(), *scope == TrafficScope::Model))
+                {
+                    let complete = summary
+                        .latest_event
+                        .is_none_or(|last| last < summary.scan_end && last < *end);
+                    if summary.scan_end == *end || complete {
+                        *used = Instant::now();
+                        *result = Some(summary.clone());
+                    }
                 }
-                *used = Instant::now();
-                Some(summary.clone())
-            })
-        };
-        let summary = match cached {
-            Some(summary) => summary,
-            None => {
-                let summary = Arc::new(FileTraffic::scan(file, scope, end)?);
-                SUMMARIES
+            }
+        }
+        let missing: Vec<_> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, value)| value.is_none().then_some(i))
+            .collect();
+        if !missing.is_empty() {
+            #[cfg(test)]
+            if live {
+                *LIVE_SCANS
                     .lock()
                     .unwrap()
                     .get_or_insert_with(HashMap::new)
-                    .insert(key, (Instant::now(), summary.clone()));
-                summary
+                    .entry(path.to_owned())
+                    .or_default() += 1;
             }
-        };
-        summaries.push(SnapshotFile {
-            summary,
-            archived_modified,
-        });
+            let pending: Vec<_> = missing.iter().map(|i| selections[*i]).collect();
+            let scanned = FileTraffic::scan_many(file, &pending)?;
+            for (i, summary) in missing.into_iter().zip(scanned) {
+                let summary = Arc::new(summary);
+                if !live {
+                    SUMMARIES
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(HashMap::new)
+                        .insert(
+                            (stamp.clone(), selections[i].0 == TrafficScope::Model),
+                            (Instant::now(), summary.clone()),
+                        );
+                }
+                results[i] = Some(summary);
+            }
+        }
+        for (summaries, summary) in summaries.iter_mut().zip(results) {
+            summaries.push(SnapshotFile {
+                summary: summary.unwrap(),
+                archived_modified,
+            });
+        }
         Ok(())
     })?;
     Ok(summaries)
@@ -1119,6 +1184,80 @@ fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String>
 mod tests {
     use super::*;
     #[test]
+    fn batched_boundaries_match_independent_scans_without_future_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut rows = String::new();
+        for index in 0..3000 {
+            for (event, offset) in [
+                ("model_call_started", 180_000),
+                ("model_call_finished", (index % 3) * 60_000 + 1000),
+            ] {
+                let mut row = serde_json::json!({"timestamp":chrono::DateTime::from_timestamp_millis(end-offset).unwrap().to_rfc3339(),"event":event,"request_id":format!("req-{index}"),"model_call_id":format!("call-{index}"),"service":"codex","method":"POST","path":"/v1/responses"});
+                if event == "model_call_finished" {
+                    row["input_tokens"] = "10".into();
+                    row["output_tokens"] = "5".into();
+                    row["status"] = "200".into();
+                }
+                rows.push_str(&row.to_string());
+                rows.push('\n');
+            }
+        }
+        std::fs::write(&path, rows).unwrap();
+        let ends = [end, end - 60_000, end - 120_000];
+        let scopes = [TrafficScope::Model, TrafficScope::All];
+        let labels = BTreeMap::new();
+        let identities = Identities::default();
+        let before = live_scans(&path);
+        let started = Instant::now();
+        let mut expected = Vec::new();
+        for at in ends {
+            for scope in scopes {
+                expected.push(
+                    serde_json::to_value(
+                        read_at(ReadSource::Path(&path), 30, &labels, scope, &identities, at)
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let separate_time = started.elapsed();
+        assert_eq!(live_scans(&path) - before, 6);
+        let before = live_scans(&path);
+        let started = Instant::now();
+        let snapshots = Snapshot::load_many(&path, &ends, 30, &scopes).unwrap();
+        let mut actual = Vec::new();
+        for snapshot in &snapshots {
+            for scope in scopes {
+                actual.push(
+                    serde_json::to_value(
+                        read_at(
+                            ReadSource::Snapshot(snapshot),
+                            30,
+                            &labels,
+                            scope,
+                            &identities,
+                            snapshot.end,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let batch_time = started.elapsed();
+        assert_eq!(live_scans(&path) - before, 1);
+        assert_eq!(actual, expected);
+        eprintln!("6000 lifecycle rows: separate={separate_time:?}, batched={batch_time:?}");
+        // Finished lifecycle information after a boundary must stay excluded.
+        assert_eq!(actual[0]["summary"]["inputTokens"], 30000);
+        assert_eq!(actual[2]["summary"]["inputTokens"], 20000);
+        assert_eq!(actual[4]["summary"]["inputTokens"], 10000);
+    }
+
+    #[test]
     fn rotated_cache_preserves_requests_after_earlier_snapshot_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
@@ -1215,7 +1354,7 @@ mod tests {
         std::fs::write(&path, row("first")).unwrap();
         let before = live_scans(&path);
         let snapshot = Snapshot::load(&path, end).unwrap();
-        assert_eq!(live_scans(&path) - before, 2);
+        assert_eq!(live_scans(&path) - before, 1);
         let labels = BTreeMap::new();
         let identities = Identities::default();
         for minutes in crate::data_api::RANGES {

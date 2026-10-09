@@ -1298,7 +1298,11 @@ do not hold up the others. SSH uses one connection to send the selected window
 first, then computes and sends the complete snapshot. HTTP requests the selected
 cached window with an optional `X-Coport-Window: MINUTES:model|all` header, then
 fetches the full cache. Partial responses use schema version four and retain
-the same two alignment boundaries and privacy/size limits.
+the same two alignment boundaries and privacy/size limits. Both SSH frames use
+one fixed snapshot boundary, even if computing the complete snapshot crosses a
+minute. The selected and full snapshots each parse every log file once for their
+scopes and boundaries. A progressive refresh does not reconnect automatically
+when peers cannot align; another remote fetch requires an explicit refresh.
 Once all twelve views are cached, range/category switches are immediate.
 Background failures retain statistics already displayed. Page entry, periodic
 refresh and range/category switches read cached snapshots only; the explicit

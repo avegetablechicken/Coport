@@ -634,3 +634,26 @@ test('saving a device merges only its list after asynchronous forwarding work', 
   assert.match(after,/core\.settings\.clone\(\)/);
   assert.match(after,/settings\.managed_devices = devices/);
 });
+
+test('Devices Refresh performs only one explicitly authorized statistics read', async () => {
+  const calls = [];
+  const h = harness(async (command, args) => {
+    calls.push([command, args]);
+    assert.ok(['get_devices', 'get_device_forwarders', 'get_device_capabilities', 'get_merged_data'].includes(command), `Unexpected networking command: ${command}`);
+    return [];
+  });
+  h.Channel = class {};
+  h.ui.mergedDataRequest = 0;
+  h.ui.deviceTrafficMinutes = 30;
+  h.ui.trafficScope = 'model';
+  h.selectDeviceTraffic = () => false;
+  vm.runInContext(source.slice(source.indexOf('async function loadMergedData('), source.indexOf('function deviceTrafficContent(')), h);
+  await h.action('devices-refresh');
+  const reads = calls.filter(([command]) => command === 'get_merged_data');
+  assert.equal(reads.length, 1, 'Refresh must not wait for a redundant local full-history merge');
+  assert.equal(reads[0][1].refreshRemote, true);
+  assert.equal(h.ui.mergedDataError, '');
+  calls.length = 0;
+  for (let i = 0; i < 3; i++) await h.loadDevices();
+  assert.ok(calls.filter(([command]) => command === 'get_merged_data').every(([,args]) => args.refreshRemote === false));
+});

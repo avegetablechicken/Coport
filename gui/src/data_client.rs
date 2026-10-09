@@ -743,8 +743,6 @@ async fn merge_progressive_snapshot(
     if sources.len() > crate::devices::LIMIT {
         return Err("At most 32 data sources are supported.".into());
     }
-    let context =
-        std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut tasks = tokio::task::JoinSet::new();
     let mut fetched: Fetched = sources
@@ -754,7 +752,7 @@ async fn merge_progressive_snapshot(
         .collect();
     for (index, source) in sources.iter().cloned().enumerate() {
         let tx = tx.clone();
-        let log = context.log.clone();
+        let log = log.clone();
         tasks.spawn(async move {
             let started = std::time::Instant::now();
             let result = async {
@@ -794,6 +792,10 @@ async fn merge_progressive_snapshot(
         });
     }
     drop(tx);
+    // Remote I/O runs while local identity evidence is prepared.
+    let context =
+        std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
+
     let mut snapshots = BTreeMap::new();
     let mut background_errors = BTreeMap::new();
     while let Some((index, result)) = rx.recv().await {
@@ -854,7 +856,7 @@ async fn merge_progressive_snapshot(
     .await?;
     complete_context.at = context.at;
     let context = std::sync::Arc::new(complete_context);
-    let (fetched, end) = align_fetched(&context, fetched, &selections).await?;
+    let (fetched, end) = align_fetched(&context, fetched, &selections, false).await?;
     let snapshot = load_snapshot(&context.log, end).await?;
     let mut views = Vec::new();
     for (minutes, scope) in selections {
@@ -967,12 +969,13 @@ async fn align_sources(
     selections: &[(u64, crate::traffic::TrafficScope)],
 ) -> Result<(Fetched, i64), String> {
     let fetched = fetch_sources(sources, &context.log).await?;
-    align_fetched(context, fetched, selections).await
+    align_fetched(context, fetched, selections, true).await
 }
 async fn align_fetched(
     context: &MergeContext,
     mut fetched: Fetched,
     selections: &[(u64, crate::traffic::TrafficScope)],
+    allow_refetch: bool,
 ) -> Result<(Fetched, i64), String> {
     for attempt in 0..3 {
         let mut seen = BTreeSet::from([context.local_id.clone()]);
@@ -1005,10 +1008,21 @@ async fn align_fetched(
         if let Some(end) = end {
             return Ok((fetched, end));
         }
+        // Progressive refresh already has all frames from the authorized connection.
+        // A boundary mismatch must not launch another SSH connection behind the UI.
+        if !allow_refetch {
+            break;
+        }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
-            let sources = fetched.into_iter().map(|(s, _)| s).collect();
-            fetched = fetch_sources(sources, &context.log).await?;
+            // Only boundary skew is retried; failed sources (e.g. SSH denial or
+            // timeout) keep their result and are never reconnected.
+            let (ok, mut failed): (Fetched, Fetched) =
+                fetched.into_iter().partition(|(_, result)| result.is_ok());
+            let sources = ok.into_iter().map(|(s, _)| s).collect();
+            failed.extend(fetch_sources(sources, &context.log).await?);
+            failed.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+            fetched = failed;
         }
     }
     Err("TRAFFIC_UPDATING".into())
@@ -1329,6 +1343,154 @@ mod tests {
             "Reading cached views opened a network connection"
         );
     }
+    #[tokio::test]
+    async fn progressive_alignment_mismatch_never_opens_another_connection() {
+        if data_key_in_subprocess(
+            "data_client::tests::progressive_alignment_mismatch_never_opens_another_connection",
+        ) {
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = count.clone();
+        let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let end = now - (index % 2) as i64 * 60_000;
+                let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+                summary.window_end = end;
+                summary.window_start = end - 30 * 60_000;
+                let body = serde_json::to_vec(&summary).unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        let sources = (0..2)
+            .map(|i| Source {
+                name: format!("peer-{i}"),
+                device_id: None,
+                transport: Transport::Http,
+                ssh_connection: None,
+                url: url.clone(),
+                token_env: Some(DATA_KEY_ENV.into()),
+                token_file: None,
+                ca_certificate: None,
+                ssh_device: None,
+            })
+            .collect();
+        let result = MergeCache::default()
+            .refresh_progressive(
+                sources,
+                config,
+                log,
+                BTreeMap::new(),
+                (30, crate::traffic::TrafficScope::Model),
+                |_| Ok(()),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "One explicit refresh must contact each peer only once when boundaries disagree"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn alignment_retries_never_reconnect_failed_sources() {
+        if data_key_in_subprocess(
+            "data_client::tests::alignment_retries_never_reconnect_failed_sources",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let serve = |fail: bool| {
+            let count = std::sync::Arc::new(AtomicUsize::new(0));
+            let calls = count.clone();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(socket.read_u8().await.unwrap());
+                    }
+                    let index = calls.fetch_add(1, SeqCst);
+                    if fail {
+                        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        continue;
+                    }
+                    let end = now - (index % 2) as i64 * 60_000;
+                    let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+                    summary.window_end = end;
+                    summary.window_start = end - 30 * 60_000;
+                    let body = serde_json::to_vec(&summary).unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            });
+            (url, count, server)
+        };
+        let (skewed, skewed_count, skewed_server) = serve(false);
+        let (denied, denied_count, denied_server) = serve(true);
+        let source = |name: &str, url: &str| Source {
+            name: name.into(),
+            device_id: None,
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: url.into(),
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let sources = vec![
+            source("peer-0", &skewed),
+            source("peer-1", &skewed),
+            source("denied", &denied),
+        ];
+        let result = merge_with_labels(
+            sources,
+            config,
+            log,
+            30,
+            crate::traffic::TrafficScope::Model,
+            BTreeMap::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
+        assert_eq!(skewed_count.load(SeqCst), 6, "Skewed peers are retried");
+        assert_eq!(
+            denied_count.load(SeqCst),
+            1,
+            "A failed source must not be reconnected by alignment retries"
+        );
+        skewed_server.abort();
+        denied_server.abort();
+    }
+
     fn sample(key: &DataKey, proxy: &str, upstream: &str) -> Summary {
         let mut counts = vec![0; 30];
         counts[0] = 1;
@@ -1435,8 +1597,8 @@ mod tests {
                 assert!(json.get("local").is_some());
                 assert!(json.get("sources").is_some());
             }
-            // One identity-evidence scan plus two shared local scope scans.
-            assert_eq!(crate::traffic::live_scans(&log) - before, 3);
+            // One identity-evidence scan plus one scan shared by both scopes.
+            assert_eq!(crate::traffic::live_scans(&log) - before, 2);
         } else {
             assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
             assert_eq!(crate::traffic::live_scans(&log) - before, 1);

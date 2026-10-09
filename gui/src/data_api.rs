@@ -343,6 +343,16 @@ pub fn stream_summary(
     dir: &Path,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
+    output: impl io::Write,
+) -> io::Result<()> {
+    let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+    stream_summary_at(dir, minutes, scope, end, output)
+}
+fn stream_summary_at(
+    dir: &Path,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+    end: i64,
     mut output: impl io::Write,
 ) -> io::Result<()> {
     bucket_minutes(minutes).ok_or_else(|| io::Error::other("Unsupported traffic range"))?;
@@ -352,12 +362,12 @@ pub fn stream_summary(
     let config = Config::read(&config_path).map_err(io::Error::other)?;
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
-    let first =
-        publish_selected(&config, &log, &key, &node, minutes, scope).map_err(io::Error::other)?;
+    let first = publish_selected(&config, &log, &key, &node, minutes, scope, end)
+        .map_err(io::Error::other)?;
     output.write_all(&first)?;
     output.write_all(b"\n")?;
     output.flush()?;
-    let rest = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
+    let rest = publish_at(&config, &log, &key, &node, end).map_err(io::Error::other)?;
     output.write_all(&rest)?;
     output.write_all(b"\n")?;
     output.flush()
@@ -370,13 +380,19 @@ fn publish_selected(
     node: &str,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
+    end: i64,
 ) -> Result<Vec<u8>, String> {
     let bucket = bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
     let identities = crate::traffic::ExportIdentities::from_config(config);
+    let snapshots = crate::traffic::Snapshot::load_many(
+        log,
+        &[end, end - 60_000, end - 120_000],
+        minutes,
+        &[scope],
+    )?;
     for limit in [24, 8] {
         let mut windows = Vec::new();
-        for offset in [0, 60_000, 120_000] {
+        for (index, offset) in [0, 60_000, 120_000].into_iter().enumerate() {
             let at = end - offset;
             windows.push(Window {
                 minutes,
@@ -385,7 +401,7 @@ fn publish_selected(
                 window_end: at,
                 bucket_minutes: bucket,
                 groups: crate::traffic::export_window_limit(
-                    crate::traffic::ReadSource::Path(log),
+                    crate::traffic::ReadSource::Snapshot(&snapshots[index]),
                     config,
                     key,
                     crate::traffic::ExportOptions {
@@ -518,13 +534,27 @@ pub(crate) fn publish(
     node: &str,
 ) -> Result<Vec<u8>, String> {
     let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+    publish_at(config, log, key, node, end)
+}
+fn publish_at(
+    config: &Config,
+    log: &Path,
+    key: &DataKey,
+    node: &str,
+    end: i64,
+) -> Result<Vec<u8>, String> {
     // Keep two previous boundaries so clock offsets and cached HTTP responses
     // can align without asking a user to refresh or changing a machine's clock.
     let identities = crate::traffic::ExportIdentities::from_config(config);
-    let snapshots = [end, end - 60_000, end - 120_000]
-        .into_iter()
-        .map(|at| crate::traffic::Snapshot::load(log, at))
-        .collect::<Result<Vec<_>, _>>()?;
+    let snapshots = crate::traffic::Snapshot::load_many(
+        log,
+        &[end, end - 60_000, end - 120_000],
+        43200,
+        &[
+            crate::traffic::TrafficScope::All,
+            crate::traffic::TrafficScope::Model,
+        ],
+    )?;
     for limit in [24, 8] {
         let mut windows = Vec::new();
         let mut previous_windows = Vec::new();
@@ -723,6 +753,38 @@ mod tests {
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     use serde_json::json;
 
+    #[cfg(unix)]
+    #[test]
+    fn both_stream_frames_use_the_original_boundary_even_when_the_clock_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/proxy.log"), "").unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        prepare_identity(dir.path()).unwrap();
+        let original_end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000 - 60_000;
+        let mut output = Vec::new();
+        stream_summary_at(
+            dir.path(),
+            1440,
+            crate::traffic::TrafficScope::All,
+            original_end,
+            &mut output,
+        )
+        .unwrap();
+        let frames: Vec<Summary> = output
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].schema_version, 4);
+        assert_eq!(frames[1].schema_version, 3);
+        for frame in frames {
+            frame.validate().unwrap();
+            assert_eq!(frame.window_end, original_end);
+        }
+    }
+
     #[test]
     fn selected_summary_contains_only_requested_range_with_alignment() {
         let dir = tempfile::tempdir().unwrap();
@@ -735,6 +797,7 @@ mod tests {
                 crate::traffic::TrafficScope::Model,
                 crate::traffic::TrafficScope::All,
             ] {
+                let before = crate::traffic::live_scans(&log);
                 let bytes = publish_selected(
                     &config,
                     &log,
@@ -742,8 +805,10 @@ mod tests {
                     &uuid::Uuid::new_v4().to_string(),
                     minutes,
                     scope,
+                    chrono::Utc::now().timestamp_millis() / 60_000 * 60_000,
                 )
                 .unwrap();
+                assert_eq!(crate::traffic::live_scans(&log) - before, 1);
                 let summary: Summary = serde_json::from_slice(&bytes).unwrap();
                 summary.validate().unwrap();
                 assert_eq!(summary.schema_version, 4);
@@ -875,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_all_windows_scans_live_log_only_once_per_end_and_scope() {
+    fn publishing_all_windows_reads_live_log_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         std::fs::write(&path, "").unwrap();
@@ -891,7 +956,7 @@ mod tests {
         let summary: Summary = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summary.windows.len(), 12);
         assert_eq!(summary.previous_windows.len(), 24);
-        assert_eq!(crate::traffic::live_scans(&path) - before, 6);
+        assert_eq!(crate::traffic::live_scans(&path) - before, 1);
     }
 
     #[test]
