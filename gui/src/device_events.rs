@@ -170,16 +170,18 @@ pub(crate) async fn record(log: PathBuf, source: &Source, success: bool, elapsed
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record(&log, source, success, elapsed, Instant::now());
     if let Some(event) = event {
-        let result = tokio::task::spawn_blocking(move || persist(&log, event)).await;
+        let result =
+            tokio::task::spawn_blocking(move || persist(&crate::settings::app_dir(), &log, event))
+                .await;
         if !matches!(result, Ok(Ok(()))) {
             eprintln!("Cannot record device statistics query");
         }
     }
 }
-fn persist(log: &Path, event: QueryEvent) -> io::Result<()> {
+fn persist(app_dir: &Path, log: &Path, event: QueryEvent) -> io::Result<()> {
     // The live daemon owns log rotation: enqueue through its authenticated local
     // control channel instead of opening a second rotating writer.
-    if let Some((client, status)) = crate::daemon::Client::discover(&crate::settings::app_dir())
+    if let Some((client, status)) = crate::daemon::Client::discover(app_dir)
         && status.log_path == log
     {
         return client.record_device_query(event);
@@ -299,7 +301,7 @@ mod tests {
             )
             .unwrap();
         assert!(event.validate());
-        persist(&path, event.clone()).unwrap();
+        persist(dir.path(), &path, event.clone()).unwrap();
         let bytes = std::fs::read_to_string(&path).unwrap();
         for secret in [
             "private-device-name",
