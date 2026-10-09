@@ -151,10 +151,8 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
     Ok(())
 }
 
-pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String> {
+fn ssh_command(device: &Device, command: &str) -> Result<tokio::process::Command, String> {
     device.validate()?;
-    let command = summary_command(&device.binary);
-    let limit = 1024 * 1024;
     let mut child = tokio::process::Command::new("ssh");
     child
         .args([
@@ -174,17 +172,57 @@ pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String
             "-o",
             "ConnectTimeout=5",
             "-o",
+            "ConnectionAttempts=1",
+            "-o",
             "ServerAliveInterval=5",
             "-o",
             "ServerAliveCountMax=1",
             "--",
             &device.host,
-            &command,
+            command,
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    Ok(child)
+}
+
+/// A login check only: no summary query, forwarding channel, or daemon lifecycle action.
+pub async fn check_connection(device: &Device) -> Result<(), String> {
+    check_command(
+        ssh_command(device, "exit 0")?,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn check_command(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Cannot start SSH: {e}"))?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_)) => {
+            Err("SSH connection failed; check the host, authentication and known host key.".into())
+        }
+        Ok(Err(error)) => Err(format!("Cannot check SSH: {error}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err("SSH connection check timed out.".into())
+        }
+    }
+}
+
+pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String> {
+    let limit = 1024 * 1024;
+    let mut child = ssh_command(device, &summary_command(&device.binary))?;
     let mut process = child
         .spawn()
         .map_err(|e| format!("Cannot start SSH: {e}"))?;
@@ -228,6 +266,70 @@ pub async fn summary(device: &Device) -> Result<crate::data_api::Summary, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ssh_availability_uses_noninteractive_login_without_remote_services() {
+        let device = Device {
+            name: "test".into(),
+            host: "user@host".into(),
+            binary: "/unused/coportd".into(),
+        };
+        let command = ssh_command(&device, "exit 0").unwrap();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect();
+        for option in [
+            "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
+            "ClearAllForwardings=yes",
+            "PermitLocalCommand=no",
+            "RemoteCommand=none",
+            "ConnectionAttempts=1",
+        ] {
+            assert!(args.contains(&option));
+        }
+        assert_eq!(&args[args.len() - 3..], &["--", "user@host", "exit 0"]);
+        assert!(!args.iter().any(|arg| arg.contains("coportd")
+            || arg.contains("--summary")
+            || arg.contains("--forward")));
+    }
+
+    #[test]
+    fn ssh_check_fixture() {
+        match std::env::var("COPORT_SSH_CHECK_FIXTURE").as_deref() {
+            Ok("success") => std::process::exit(0),
+            Ok("failure") => std::process::exit(7),
+            Ok("timeout") => std::thread::sleep(std::time::Duration::from_secs(60)),
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_check_reports_failure_and_times_out_without_network_access() {
+        for (mode, expected) in [
+            ("success", None),
+            ("failure", Some("SSH connection failed")),
+            ("timeout", Some("timed out")),
+        ] {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "remote::tests::ssh_check_fixture"])
+                .env("COPORT_SSH_CHECK_FIXTURE", mode);
+            let timeout = if mode == "timeout" {
+                std::time::Duration::from_millis(100)
+            } else {
+                std::time::Duration::from_secs(10)
+            };
+            let result = check_command(command, timeout).await;
+            if let Some(expected) = expected {
+                assert!(result.unwrap_err().contains(expected));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn rejects_ssh_options_and_shell_syntax_in_host() {
         for host in [

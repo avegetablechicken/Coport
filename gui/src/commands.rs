@@ -403,6 +403,20 @@ pub fn get_devices(state: State<AppState>) -> Vec<coport_gui::devices::Device> {
     state.core.lock().unwrap().settings.managed_devices.clone()
 }
 #[tauri::command]
+pub async fn check_ssh_device(state: State<'_, AppState>, id: String) -> Result {
+    let device = state
+        .core
+        .lock()
+        .unwrap()
+        .settings
+        .managed_devices
+        .iter()
+        .find(|device| device.id == id)
+        .and_then(|device| device.ssh_connection())
+        .ok_or("SSH device no longer exists; reload Settings.")?;
+    coport_gui::remote::check_connection(&device).await
+}
+#[tauri::command]
 pub fn save_device(state: State<AppState>, device: coport_gui::devices::Draft) -> Result<String> {
     let mut core = state.core.lock().unwrap();
     let mut settings = core.settings.clone();

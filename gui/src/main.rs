@@ -91,6 +91,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::get_devices,
+            commands::check_ssh_device,
             commands::get_merged_data,
             commands::save_device,
             commands::remove_device,

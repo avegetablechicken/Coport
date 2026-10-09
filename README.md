@@ -766,8 +766,14 @@ routed the request: an account route such as an email or `default`, an API Key
 variable or Codex provider ID, a Claude settings/profile name, or a URL route). Searches ignore case and surrounding whitespace; an
 empty search shows all entries in the selected tab and time range.
 
-Opening the panel does not automatically test proxies; use **Test** or **Test All**
-for reachability and exit-IP checks. Entering Settings reads local device definitions,
+At app startup, configured SSH devices receive one noninteractive login check,
+with at most four checks running concurrently and a ten-second timeout per check.
+This check does not retrieve statistics, start forwarding, or manage the remote daemon.
+Device indicators show its result until a fresh statistics result is available.
+Opening the panel again does not repeat the startup check.
+
+Configured proxies are also tested automatically at app startup. Reopening the
+panel does not repeat these checks; use **Test** or **Test All** to run them again. Entering Settings reads local device definitions,
 uses cached account status, and does not poll remote device statistics. Remote
 statistics refresh on the Devices page. These UI controls do not stop health checks
 for routes already in use by the running proxy.

@@ -1446,6 +1446,32 @@ async function loadDeviceDefinitions() {
   if (ui.page === "settings") render();
   return changed;
 }
+async function checkConfiguredSsh() {
+  if (ui.sshStartupCheckStarted) return;
+  ui.sshStartupCheckStarted = true;
+  await loadDeviceDefinitions();
+  const pending = ui.devices.filter(device => device.ssh);
+  ui.deviceStates ||= Object.create(null);
+  const update = () => { if (ui.snap && (ui.page === "settings" || ui.page === "devices")) render(); };
+  for (const device of pending) {
+    ui.deviceStates[device.id] = { host: device.ssh.host, state: "warn", label: "Checking SSH…" };
+  }
+  update();
+  // Bound startup connections and check each configured device only once.
+  await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
+    while (pending.length) {
+      const device = pending.shift();
+      const result = ui.deviceStates[device.id];
+      try {
+        await invoke("check_ssh_device", { id: device.id });
+        result.state = "running"; result.label = "SSH reachable at startup";
+      } catch (error) {
+        result.state = "failed"; result.label = `Startup SSH check failed: ${String(error)}`;
+      }
+      update();
+    }
+  }));
+}
 async function loadDevices() {
   if (ui.deviceRefresh) return;
   ui.deviceRefresh = true;
@@ -1485,9 +1511,11 @@ function devicesPage() {
 function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
   const source = (ui.deviceTrafficViews?.["30:model"] || ui.mergedData)?.sources?.find(s => s.name === device.name);
-  if (!source || age < 0 || age > 45000 || ui.mergedDataError) return {
-    state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently",
-  };
+  if (!source || age < 0 || age > 45000 || ui.mergedDataError) {
+    const startup = ui.deviceStates?.[device.id];
+    if (startup && startup.host === device.ssh?.host && !ui.mergedDataLoading) return startup;
+    return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Checking connection…" : "Not checked recently" };
+  }
   if (source.error) return { state: "failed", label: String(source.error) };
   if (source.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
   return source.included ? { state: "running", label: "Read-only statistics available" } : { state: "warn", label: "Statistics not included" };
@@ -2044,7 +2072,8 @@ setInterval(() => {
   if (el && ui.snap?.phase.state === "running") el.textContent = fmtUptime(uptime());
 }, 1000);
 
-// Proxy tests are explicit actions, not a side effect of opening the panel.
+// Check configured proxies once at startup; reopening the panel does not repeat it.
+const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 
 listen("state-changed", scheduleRefresh);
 const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;
@@ -2065,7 +2094,8 @@ listen("panel-hidden", () => {
   panelHiddenAt ??= Date.now();
   closeSelect();
 });
-refresh();
+refresh().then(probeStale);
+checkConfiguredSsh();
 
 // Refresh even when no new requests arrive, so the rolling window advances.
 setInterval(() => {

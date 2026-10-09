@@ -382,3 +382,44 @@ test('explicit proxy Test and Test All still invoke the requested probe', async 
   await h.action('probe');
   assert.deepEqual(calls, [['probe_proxy', 'selected'], ['probe_proxy', null]]);
 });
+
+
+test('startup checks only SSH devices once and retains failed checks without retries', async () => {
+  const devices = [{ id: 'up', ssh: { host: 'one' } }, { id: 'down', ssh: { host: 'two' } }, { id: 'http', data: { url: 'https://example.invalid' } }];
+  const calls = [];
+  const h = harness(async (command, args) => {
+    calls.push([command, args?.id]);
+    if (command === 'get_devices') return devices;
+    assert.equal(command, 'check_ssh_device');
+    if (args.id === 'down') throw new Error('unavailable');
+  });
+  await h.checkConfiguredSsh();
+  await h.checkConfiguredSsh();
+  assert.deepEqual(calls, [['get_devices', undefined], ['check_ssh_device', 'up'], ['check_ssh_device', 'down']]);
+  assert.equal(h.deviceConnectionStatus(devices[0]).label, 'SSH reachable at startup');
+  assert.equal(h.deviceConnectionStatus(devices[1]).state, 'failed');
+  assert.match(h.deviceConnectionStatus(devices[1]).label, /unavailable/);
+  assert.equal(h.ui.deviceStates.http, undefined);
+  devices[0].ssh.host = 'changed';
+  assert.equal(h.deviceConnectionStatus(devices[0]).label, 'Not checked recently');
+});
+
+test('startup SSH checks have at most four connections in flight', async () => {
+  const devices = Array.from({ length: 7 }, (_, i) => ({ id: String(i), ssh: { host: `host-${i}` } }));
+  const pending = [];
+  let active = 0, maximum = 0, checked = 0;
+  const h = harness(async command => {
+    if (command === 'get_devices') return devices;
+    active++; maximum = Math.max(maximum, active); checked++;
+    await new Promise(resolve => pending.push(() => { active--; resolve(); }));
+  });
+  const started = h.checkConfiguredSsh();
+  for (let i = 0; i < 20 && checked < devices.length; i++) {
+    await Promise.resolve(); await Promise.resolve();
+    const batch = pending.splice(0); batch.forEach(resolve => resolve());
+  }
+  pending.splice(0).forEach(resolve => resolve());
+  await started;
+  assert.equal(checked, 7);
+  assert.equal(maximum, 4);
+});

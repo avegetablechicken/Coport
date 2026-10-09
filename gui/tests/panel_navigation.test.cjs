@@ -15,6 +15,7 @@ function panel(page = "settings") {
   const ui = { page };
   const rendered = [];
   const probes = [];
+  const sshChecks = [];
   vm.runInNewContext(handlers, {
     ui,
     Date: { now: () => now },
@@ -25,10 +26,11 @@ function panel(page = "settings") {
     $: () => content,
     refresh: async () => {},
     probeStale: () => probes.push("stale"),
+    checkConfiguredSsh: () => sshChecks.push("startup"),
     invoke: command => probes.push(command),
     setInterval() {},
   });
-  return { ui, content, rendered, events, probes, advance: (ms) => { now += ms; } };
+  return { ui, content, rendered, events, probes, sshChecks, advance: (ms) => { now += ms; } };
 }
 
 test("first show and short reopening preserve the current page", async () => {
@@ -76,7 +78,7 @@ test("each reopen clears the old hidden timestamp", async () => {
 });
 
 
-test("startup and repeated panel reopening do not automatically test proxies", async () => {
+test("startup tests proxies once and repeated panel reopening does not repeat them", async () => {
   const p = panel();
   await Promise.resolve();
   for (let i = 0; i < 5; i++) {
@@ -84,5 +86,16 @@ test("startup and repeated panel reopening do not automatically test proxies", a
     p.advance(timeout * 3);
     await p.events['panel-shown']();
   }
-  assert.deepEqual(p.probes, []);
+  assert.deepEqual(p.probes, ["stale"]);
+});
+
+
+test("SSH availability is checked once at app startup, not on every panel reopen", async () => {
+  const p = panel();
+  assert.deepEqual(p.sshChecks, ['startup']);
+  for (let i = 0; i < 3; i++) {
+    p.events['panel-hidden']();
+    await p.events['panel-shown']();
+  }
+  assert.deepEqual(p.sshChecks, ['startup']);
 });
