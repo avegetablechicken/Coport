@@ -773,6 +773,29 @@ fn processed_entries(
     let files = file_summaries(path, start, scope, end)?;
     Ok(entries_from_files(&files, start, end, scope, labels))
 }
+/// Evidence only adds ids to label values already present for a service, so
+/// the result does not depend on file order or on the window's entries.
+fn apply_identity_evidence(
+    files: &[SnapshotFile],
+    start: i64,
+    labels: &mut BTreeMap<(String, String), String>,
+) {
+    for file in files
+        .iter()
+        .filter(|f| f.archived_modified.is_none_or(|modified| modified >= start))
+    {
+        for (service, id, label) in &file.summary.evidence {
+            if labels
+                .iter()
+                .any(|((s, _), current)| s == service && current == label)
+            {
+                labels
+                    .entry((service.clone(), id.clone()))
+                    .or_insert_with(|| label.clone());
+            }
+        }
+    }
+}
 fn entries_from_files(
     files: &[SnapshotFile],
     start: i64,
@@ -785,21 +808,12 @@ fn entries_from_files(
     // Most requests lie within one file; only those in several are copied.
     let mut requests = BTreeMap::<&str, std::borrow::Cow<Record>>::new();
     let mut explicit_call_requests = HashSet::new();
+    apply_identity_evidence(files, start, labels);
     for file in files
         .iter()
         .filter(|f| f.archived_modified.is_none_or(|modified| modified >= start))
     {
         let file = &file.summary;
-        for (service, id, label) in &file.evidence {
-            if labels
-                .iter()
-                .any(|((s, _), current)| s == service && current == label)
-            {
-                labels
-                    .entry((service.clone(), id.clone()))
-                    .or_insert_with(|| label.clone());
-            }
-        }
         for (id, record) in &file.requests {
             match requests.get_mut(id.as_str()) {
                 Some(current) => current.to_mut().merge(record),
@@ -849,7 +863,9 @@ pub(crate) fn observed_identity_labels_range(
 ) -> Result<BTreeMap<(String, String), String>, String> {
     let end = chrono::Utc::now().timestamp_millis();
     let start = end - minutes as i64 * 60_000;
-    let _ = processed_entries(path, start, end, TrafficScope::Model, &mut labels)?;
+    // Only identity evidence is needed; do not materialize the window's entries.
+    let files = file_summaries(path, start, TrafficScope::Model, end)?;
+    apply_identity_evidence(&files, start, &mut labels);
     Ok(labels)
 }
 /// This device uses exactly Activity Traffic's own identity resolution. It must
