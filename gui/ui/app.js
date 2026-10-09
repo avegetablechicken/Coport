@@ -642,7 +642,7 @@ function proxiesBlock() {
             <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
             <span class="row-sub">${esc(shown)}${exit}</span>
-            ${p.routeFailures?.length ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
+            ${state === "ok" && p.routeFailures?.length ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
           </div>`;
         })
         .join("")

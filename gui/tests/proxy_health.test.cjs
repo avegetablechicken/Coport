@@ -57,19 +57,26 @@ test("LAN proxy renders the measured exit IP", () => {
   assert.match(html, /42 ms/);
 });
 
-test("route failures stay separate from pending and measured proxy tests", () => {
+test("route failures appear only after the proxy itself is reachable", () => {
   const proxy = { local: true, routeFailures: ["https://chatgpt.com/"] };
   const pending = render({ state: "pending" }, proxy);
   assert.match(pending, /class="spinner"/);
-  assert.match(pending, /Route unavailable: https:\/\/chatgpt\.com\//);
+  assert.doesNotMatch(pending, /Route unavailable:/);
   assert.doesNotMatch(pending, /Unreachable|Available/);
   const measured = render({ state: "ok", ms: 42, exitIp: "203.0.113.5" }, proxy);
   assert.match(measured, /42 ms/);
   assert.match(measured, /203\.0\.113\.5/);
   assert.match(measured, /Route unavailable:/);
   assert.doesNotMatch(measured, /Unreachable|Available/);
-  assert.match(render({ state: "error", error: "timed out" }, { routeFailures: [] }), /Unreachable/);
-  assert.doesNotMatch(render(null, proxy), /Unreachable|Available/);
+  const unreachable = render({ state: "error", error: "timed out" }, proxy);
+  assert.match(unreachable, /Unreachable/);
+  assert.match(unreachable, /timed out/);
+  assert.doesNotMatch(unreachable, /Route unavailable:/);
+  for (const probe of [null, { state: "idle" }, { state: "unavailable" }]) {
+    assert.doesNotMatch(render(probe, proxy), /Route unavailable:|Unreachable|Available/);
+  }
+  // Retain the destination failure so it returns after connectivity recovers.
+  assert.match(render({ state: "ok", ms: 50 }, proxy), /Route unavailable:/);
 });
 
 test("unavailable daemon is not reported as an unreachable proxy", () => {
