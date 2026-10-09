@@ -435,7 +435,16 @@ function stat(label, value, cls = "") {
 // ---------------------------------------------------------------- main
 
 function main() {
+  if (ui.snap.forwarding) {
+    return remoteForwardingBlock() + connectBlock() + `<details class="disclosure"><summary>${ICON.chevron}Local proxy configuration and history (inactive)</summary>${[proxiesBlock(), routingBlock(), trafficBlock(), recentBlock()].join("")}</details>`;
+  }
   return [proxyBlock(), trafficBlock(), connectBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("");
+}
+
+function remoteForwardingBlock() {
+  const target = ui.snap.forwarding;
+  return block("SSH forwarding", "", `<div class="row"><span class="row-label">${esc(target.name)}</span><span class="state">${target.error ? "Connection error" : "Enabled"}</span></div><div class="row"><span class="row-label selectable">127.0.0.1:${ui.snap.phase.port}</span><span class="state">Client address unchanged</span></div>` +
+    message(target.error ? "warn" : "info", target.error ? esc(target.error) : "Requests use the remote device’s routes. Local proxy routing is inactive. Change forwarding in Settings."));
 }
 
 function message(kind, text, actions = "") {
@@ -1477,6 +1486,9 @@ async function loadDevices() {
   ui.deviceRefresh = true;
   try {
     await loadDeviceDefinitions();
+    // Forwarding status comes only from the local daemon. Remote statistics
+    // must not start when Settings is open or the user has left Devices.
+    ui.deviceForwarders = await invoke("get_device_forwarders");
     if (ui.page !== "devices") return;
     if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
@@ -1486,6 +1498,15 @@ async function loadDevices() {
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
 }
 
+function forwardingSettings() {
+  const devices = ui.devices.filter(device => device.ssh);
+  const rows = devices.map(device => {
+    const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
+    const busy = ui.deviceForwardingBusy === device.id;
+    return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
+  }).join("");
+  return block("Request forwarding", "", rows + `<div class="placeholder">${devices.length ? "Clients keep using the same local Coport address. Only one remote device can be active. Switching disconnects existing requests; remote failures never fall back to local routes. Forwarding stays active while the daemon runs." : "Add an SSH device above to forward requests through its remote Coport service."}</div>`);
+}
 function devicesPage() {
   const local = ui.snap.phase;
   const data = ui.mergedData;
@@ -1538,7 +1559,7 @@ function deviceSettings() {
       <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" placeholder="Use either a file or an environment variable"></label>
       <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
     `}
-    <p class="setting-description">Both connections return read-only statistics. SSH needs no HTTP URL or data key. Unknown configurations stay anonymous.</p>
+    <p class="setting-description">Both connections return read-only statistics. SSH also supports optional request forwarding from the Request forwarding settings block. SSH needs no HTTP URL or data key. Unknown configurations stay anonymous.</p>
     <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
   </div>` : "";
   return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + `<div class="placeholder">Maximum 32 devices · Choose HTTP/HTTPS or SSH for read-only statistics.</div>` + form);
@@ -1578,7 +1599,8 @@ function settings() {
     )}
     ${configSettings()}
     ${filesBlock()}
-    ${deviceSettings()}`;
+    ${deviceSettings()}
+    ${forwardingSettings()}`;
 }
 
 /// The fixed configuration and log files: a status per file, actions in a ⋯ menu.
@@ -1740,12 +1762,23 @@ async function act(action, el) {
       }
       if (ui.page === "main") loadHomeTraffic();
       if (ui.page === "devices") loadDevices();
-      if (ui.page === "settings") loadDeviceDefinitions();
+      if (ui.page === "settings") await loadDevices();
       ui.pinLog = ui.page === "activity" && el.dataset.target === "log";
       render();
       $("content").scrollTop = 0;
       if (ui.pinLog) scrollToLog();
       break;
+    case "device-forward": {
+      if (ui.deviceForwardingBusy) break;
+      ui.deviceForwardingBusy = el.dataset.id; render();
+      try {
+        await invoke("set_device_forwarding", { id: el.dataset.id, enabled: el.dataset.enabled === "true" });
+        ui.deviceForwarders = await invoke("get_device_forwarders");
+        ui.snap.forwarding = ui.deviceForwarders[0] || null;
+      } catch (error) { toast(String(error)); }
+      finally { ui.deviceForwardingBusy = null; render(); }
+      break;
+    }
     case "device-new":
       ui.deviceDraft = { id: null, transport: "ssh" };
       ui.deviceFormOpen = true; render(); $("device-name")?.focus();

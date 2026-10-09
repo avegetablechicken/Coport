@@ -2,6 +2,23 @@
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--forward") {
+        let result = helper_directory(&args, 1).and_then(|dir| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(coport_gui::remote_forward::serve_stdio(&dir));
+            // Tokio stdin uses a blocking read. Remote EOF must not wait for the
+            // SSH client to close stdin before the helper process can exit.
+            runtime.shutdown_background();
+            result
+        });
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--summary") {
         let result =
             helper_directory(&args, 1).and_then(|dir| coport_gui::data_api::read_summary(&dir));
@@ -32,7 +49,7 @@ fn main() {
     }
     if args.len() != 3 {
         eprintln!(
-            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH]"
+            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --forward [--state-dir PATH]"
         );
         std::process::exit(2);
     }

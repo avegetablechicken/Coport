@@ -9,6 +9,7 @@ pub mod devices;
 pub mod logs;
 pub mod proxy;
 pub mod remote;
+pub mod remote_forward;
 pub mod settings;
 
 pub mod tasks;

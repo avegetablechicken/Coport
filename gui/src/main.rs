@@ -30,6 +30,7 @@ struct ExitState {
 
 pub struct AppState {
     pub core: Mutex<core::Core>,
+    pub forwarding_operations: tokio::sync::Mutex<()>,
 }
 
 const USAGE: &str = "\
@@ -92,6 +93,8 @@ fn main() {
             commands::get_state,
             commands::get_devices,
             commands::check_ssh_device,
+            commands::get_device_forwarders,
+            commands::set_device_forwarding,
             commands::get_merged_data,
             commands::save_device,
             commands::remove_device,
@@ -141,6 +144,7 @@ fn main() {
             }
             app.manage(AppState {
                 core: Mutex::new(core),
+                forwarding_operations: Default::default(),
             });
             apply_appearance(app.handle(), appearance);
             tray::create(app.handle())?;

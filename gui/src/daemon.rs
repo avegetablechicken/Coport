@@ -32,6 +32,10 @@ struct Endpoint {
 pub struct Status {
     pub pid: u32,
     #[serde(default)]
+    pub forwarding_supported: bool,
+    #[serde(default)]
+    pub forwarding: Option<crate::remote_forward::Status>,
+    #[serde(default)]
     pub proxy_probe_supported: bool,
     #[serde(default)]
     pub metadata_supported: bool,
@@ -50,9 +54,14 @@ pub struct Status {
 enum Action {
     Status,
     Stop,
-    Probe { name: String },
+    Probe {
+        name: String,
+    },
     AccountStates,
     CredentialLabels,
+    SetForwarding {
+        target: Option<crate::remote_forward::Target>,
+    },
     RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
@@ -70,6 +79,7 @@ enum Response {
     AccountStates([std::collections::BTreeMap<String, String>; 2]),
     CredentialLabels(Vec<((String, String), String)>),
     Recorded,
+    ForwardingSet,
     Error(String),
 }
 
@@ -94,6 +104,22 @@ impl Client {
         match self.request(Action::Status, STATUS_TIMEOUT)? {
             Response::Status(status) => Ok(status),
             _ => Err(io::Error::other("Unexpected daemon status response")),
+        }
+    }
+
+    pub async fn set_forwarding(
+        &self,
+        target: Option<crate::remote_forward::Target>,
+    ) -> io::Result<()> {
+        match self
+            .request_async(Action::SetForwarding { target }, Duration::from_secs(60))
+            .await?
+        {
+            Response::ForwardingSet => Ok(()),
+            Response::Error(error) => Err(io::Error::other(error)),
+            _ => Err(io::Error::other(
+                "Update and restart the local daemon to enable unified SSH forwarding.",
+            )),
         }
     }
 
@@ -406,6 +432,7 @@ async fn handle_control(
     started: Instant,
     server: Arc<Server>,
     stops: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
+    routing: Arc<crate::remote_forward::Routing>,
 ) {
     let request = tokio::time::timeout(Duration::from_millis(500), read_request(&mut stream)).await;
     let Ok(Ok(request)) = request else {
@@ -417,8 +444,13 @@ async fn handle_control(
         match request.action {
             Action::Status => Response::Status(Status {
                 uptime_ms: started.elapsed().as_millis() as u64,
+                forwarding: routing.status(),
                 ..Status::clone(&status)
             }),
+            Action::SetForwarding { target } => match routing.set(target).await {
+                Ok(()) => Response::ForwardingSet,
+                Err(error) => Response::Error(error),
+            },
             Action::Probe { name } => match server.config.proxies.get(&name) {
                 Some(endpoint) => Response::Probe(crate::proxy::run_probe(endpoint).await),
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
@@ -516,12 +548,18 @@ async fn serve_until(
         let server = server.clone();
         async move { server.startup_log().await }
     });
+    let routing = Arc::new(crate::remote_forward::Routing::default());
+    let handler = routing.handler();
     let serving_server = server.clone();
     let mut serving = tokio::spawn(async move {
         serving_server
-            .serve(proxy, async {
-                let _ = stop.await;
-            })
+            .serve_routed(
+                proxy,
+                async {
+                    let _ = stop.await;
+                },
+                Some(handler),
+            )
             .await
     });
     logger.write("server_started", Default::default());
@@ -534,6 +572,8 @@ async fn serve_until(
     let token: Arc<str> = endpoint.token.into();
     let status = Arc::new(Status {
         pid: std::process::id(),
+        forwarding_supported: true,
+        forwarding: None,
         proxy_probe_supported: true,
         metadata_supported: true,
         port,
@@ -559,7 +599,7 @@ async fn serve_until(
             Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
             accepted = control.accept() => {
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(e) => break Err(e) };
-                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, server.clone(), stops.clone()));
+                tokio::spawn(handle_control(stream, token.clone(), status.clone(), started, server.clone(), stops.clone(), routing.clone()));
             }
         }
     };
@@ -639,6 +679,8 @@ pub(crate) mod tests {
                 }
                 let bytes = serde_json::to_vec(&Response::Status(Status {
                     pid: 1,
+                    forwarding_supported: false,
+                    forwarding: None,
                     proxy_probe_supported: false,
                     metadata_supported: false,
                     port,

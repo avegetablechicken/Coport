@@ -124,10 +124,18 @@ fn quote(value: &str) -> String {
 const DISCOVERY_SCRIPT: &str = include_str!("ssh_summary.sh");
 
 fn summary_command(binary: &str) -> String {
+    helper_command(binary, "--summary")
+}
+
+pub(crate) fn helper_command(binary: &str, operation: &str) -> String {
+    assert!(matches!(operation, "--summary" | "--forward"));
     if binary.is_empty() || binary == "coportd" {
-        format!("/bin/sh -c {}", quote(DISCOVERY_SCRIPT))
+        format!(
+            "/bin/sh -c {}",
+            quote(&DISCOVERY_SCRIPT.replace("--summary", operation))
+        )
     } else {
-        format!("{} --summary", quote(binary))
+        format!("{} {operation}", quote(binary))
     }
 }
 

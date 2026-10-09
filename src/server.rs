@@ -29,6 +29,19 @@ use url::Url;
 
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
+/// A decrypted client connection; routing happens after local TLS termination.
+pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientStream for T {}
+pub type Connection = Box<dyn ClientStream>;
+pub type ConnectionHandler = Arc<
+    dyn Fn(
+            Arc<Server>,
+            Connection,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 #[path = "relay.rs"]
 mod relay;
@@ -1020,6 +1033,16 @@ impl Server {
         listener: TcpListener,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> std::io::Result<()> {
+        self.serve_routed(listener, shutdown, None).await
+    }
+
+    /// Optional routing retains the same listener and local TLS identity.
+    pub async fn serve_routed(
+        self: Arc<Self>,
+        listener: TcpListener,
+        shutdown: impl std::future::Future<Output = ()>,
+        handler: Option<ConnectionHandler>,
+    ) -> std::io::Result<()> {
         let limit = Arc::new(Semaphore::new(128));
         let mut tasks = tokio::task::JoinSet::new();
         let monitor = self.monitor_probes();
@@ -1041,6 +1064,7 @@ impl Server {
                     // Fails on macOS for a peer that reset before it was accepted.
                     let _=socket.set_nodelay(true);
                     let server=self.clone();
+                    let handler=handler.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
                     // A TLS ClientHello starts with the handshake record type 0x16;
@@ -1053,9 +1077,9 @@ impl Server {
                     };
                     match tls {
                         Some(tls)=>if let Ok(Ok(socket))=tokio::time::timeout(Duration::from_secs(30), tls.accept(socket)).await {
-                            server.connection(socket).await;
+                            server.dispatch_connection(Box::new(socket), handler).await;
                         },
-                        None=>server.connection(socket).await,
+                        None=>server.dispatch_connection(Box::new(socket), handler).await,
                     }
                     });
                 }
@@ -1065,7 +1089,18 @@ impl Server {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
-    async fn connection<S>(self: Arc<Self>, mut socket: S)
+    async fn dispatch_connection(
+        self: Arc<Self>,
+        socket: Connection,
+        handler: Option<ConnectionHandler>,
+    ) {
+        match handler {
+            Some(handler) => handler(self, socket).await,
+            None => self.connection(socket).await,
+        }
+    }
+
+    pub async fn connection<S>(self: Arc<Self>, mut socket: S)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {

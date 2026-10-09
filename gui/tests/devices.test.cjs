@@ -9,7 +9,7 @@ function harness(invoke) {
   const ui = { page: 'devices', devices: [], snap: { phase: { state: 'running', port: 8787 } } };
   const fields = {}, listeners = {};
   const context = { ui, invoke, Promise, ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', loadMergedData() {}, toast() {},
-    esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
+    message: (_, text) => text, esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
     $: id => fields[id], document: { addEventListener: (event, callback) => { listeners[event] = callback; } } };
   context.render = () => {
     for (const key of Object.keys(fields)) delete fields[key];
@@ -24,7 +24,7 @@ function harness(invoke) {
   vm.runInContext(source.slice(relabelStart,relabelEnd),context);
   vm.runInContext(code, context);
   context.fields = fields; context.listeners = listeners;
-  context.action = async (name, el = { dataset: {} }) => {
+  context.action = async (name, el = context.el || { dataset: {} }) => {
     context.el = el;
     const start = source.indexOf(`    case "${name}":`);
     const end = source.indexOf('    case ', start + 10);
@@ -88,7 +88,7 @@ test('refresh loads definitions and statistics without invoking remote lifecycle
   const calls = [];
   const h = harness(async command => { calls.push(command); return [{ id: 'remote', name: 'Remote', ssh: { host: '<remote>', management: true } }]; });
   await h.loadDevices();
-  assert.deepEqual(calls, ['get_devices']);
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders']);
   const html = h.devicesPage();
   assert.match(html, /&lt;remote>/); assert.doesNotMatch(html, /Read-only statistics/);
   assert.doesNotMatch(html, /device-control|Remote Port|PID|Uptime/);
@@ -103,13 +103,14 @@ test('configuration lives in Settings and Settings loading makes no remote reque
   const html = h.devicesPage(); assert.doesNotMatch(html, /device-save|Configure in Settings|Updates automatically/);
 });
 
-test('one Devices configuration block is the last block in Settings', () => {
+test('Settings places forwarding immediately after SSH device configuration', () => {
   const code = source.slice(source.indexOf('function settings()'), source.indexOf('/// The fixed configuration'));
   const rendered = vm.runInNewContext(code + '\nsettings()', {
     ui: { snap: { settings: {} } }, ICON: {}, panelSelect: () => '',
-    block: title => `[${title}]`, configSettings: () => '[Network]', filesBlock: () => '[Files]', deviceSettings: () => '[Devices]',
+    block: title => `[${title}]`, configSettings: () => '[Network]', filesBlock: () => '[Files]', forwardingSettings: () => '[Request forwarding]', deviceSettings: () => '[Devices]',
   });
-  assert.ok(rendered.trim().endsWith('[Devices]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
+  assert.ok(rendered.includes('[Files]\n    [Devices]\n    [Request forwarding]'));
+  assert.ok(rendered.trim().endsWith('[Request forwarding]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
 });
 
 test('each device renders full Traffic metrics and an offline peer leaves other devices visible', () => {
@@ -336,6 +337,63 @@ test('duplicate devices show an exclusion notice instead of a connection failure
   assert.doesNotMatch(html, /dot failed/);
 });
 
+test('Forwarding controls and status appear only in Settings', () => {
+  const h = harness(async () => []);
+  const device = { id: 'ssh', name: 'Remote', ssh: { host: 'host' } };
+  h.ui.devices = [device, { id: 'http', name: 'HTTP peer', data: { transport: 'http', url: 'http://host' } }];
+  let html = h.forwardingSettings();
+  assert.match(html, /^Request forwarding/);
+  assert.match(html, /class="switch" role="switch" aria-checked="false"[^>]*data-action="device-forward"[^>]*><\/button>/);
+  assert.doesNotMatch(html, /Start forwarding|Stop forwarding|Updating…/);
+  assert.doesNotMatch(html, /HTTP peer/);
+  assert.doesNotMatch(h.devicesPage(), /data-action="device-forward"|Start forwarding|Stop forwarding/);
+  assert.doesNotMatch(h.devicesPage(), /Request forwarding|>Off</);
+  assert.doesNotMatch(html, /class="state"|>Off<|>Enabled<|<span class="row-label">Request forwarding/);
+  h.ui.deviceForwarders = [{ deviceId: 'ssh', port: 23456, error: '<connection lost>' }];
+  html = h.forwardingSettings();
+  assert.match(html, /class="switch" role="switch" aria-checked="true"[^>]*><\/button>/);
+  assert.doesNotMatch(html, /23456|Local endpoint/);
+  assert.match(html, /&lt;connection lost>/);
+  assert.doesNotMatch(html, /class="state"|>Off<|>Enabled<|Connection error/);
+  assert.doesNotMatch(h.devicesPage(), /Request forwarding|data-action="device-forward"|23456|connection lost|Connection error|>Enabled</);
+  h.ui.deviceForwardingBusy = 'ssh';
+  assert.match(h.forwardingSettings(), /aria-checked="true" aria-busy="true"[^>]*disabled><\/button>/);
+  h.ui.devices = [];
+  assert.match(h.forwardingSettings(), /Add an SSH device above/);
+});
+
+test('forwarding toggles only the selected device and refreshes confirmed state', async () => {
+  const calls = [];
+  const h = harness(async (command, args) => { calls.push([command, args]); return command === 'get_device_forwarders' ? [{ deviceId: 'remote', port: 23456 }] : null; });
+  h.el = { dataset: { id: 'remote', enabled: 'true' } };
+  await h.action('device-forward');
+  assert.equal(calls[0][0], 'set_device_forwarding');
+  assert.equal(calls[0][1].id, 'remote');
+  assert.equal(calls[0][1].enabled, true);
+  assert.equal(calls[1][0], 'get_device_forwarders');
+  assert.equal(h.ui.deviceForwarders[0].port, 23456);
+  assert.equal(h.ui.deviceForwardingBusy, null);
+});
+
+
+test('home highlights remote mode and collapses inactive local configuration', () => {
+  const start = source.indexOf('function main()');
+  const end = source.indexOf('function message(', start);
+  const context = { ui: { snap: { forwarding: { name: 'MS', error: null }, phase: { port: 8787 } } },
+    ICON: { chevron: '' }, esc: v => v, block: (title, aside, body) => title + body,
+    message: (_, text) => text, connectBlock: () => '[Connect]', proxyBlock: () => '[Proxy]',
+    trafficBlock: () => '[Traffic]', recentBlock: () => '[Recent]', proxiesBlock: () => '[Proxies]', routingBlock: () => '[Routing]' };
+  vm.createContext(context); vm.runInContext(source.slice(start,end), context);
+  const html = context.main();
+  assert.match(html, /SSH forwarding/);
+  assert.match(html, /MS/);
+  assert.match(html, /127\.0\.0\.1:8787/);
+  assert.match(html, /Client address unchanged/);
+  assert.match(html, /<details[^>]*><summary>Local proxy configuration and history \(inactive\)<\/summary>\[Proxies\]/);
+  assert.doesNotMatch(html, /<details[^>]*open/);
+  context.ui.snap.forwarding = null;
+  assert.equal(context.main(), '[Proxy][Traffic][Connect][Recent][Proxies][Routing]');
+});
 
 test('entering Settings through navigation reads definitions without remote statistics', async () => {
   const calls = [];
@@ -346,13 +404,13 @@ test('entering Settings through navigation reads definitions without remote stat
   await h.action('page', { dataset: { page: 'settings' } });
   await Promise.resolve();
   assert.equal(h.ui.page, 'settings');
-  assert.deepEqual(calls, ['get_devices']);
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders']);
 });
 
 test('leaving Devices while definitions load prevents starting remote statistics', async () => {
   let resolve;
   const calls = [];
-  const h = harness(() => new Promise(r => { resolve = r; }));
+  const h = harness(command => command === 'get_devices' ? new Promise(r => { resolve = r; }) : Promise.resolve([]));
   h.loadMergedData = () => calls.push('remote-statistics');
   const loading = h.loadDevices();
   h.ui.page = 'settings';
@@ -379,7 +437,7 @@ test('explicit proxy Test and Test All still invoke the requested probe', async 
   const h = harness(async (command, args) => { calls.push([command, args.name]); return []; });
   h.refresh = async () => {};
   await h.action('probe', { dataset: { name: 'selected' } });
-  await h.action('probe');
+  await h.action('probe', { dataset: {} });
   assert.deepEqual(calls, [['probe_proxy', 'selected'], ['probe_proxy', null]]);
 });
 

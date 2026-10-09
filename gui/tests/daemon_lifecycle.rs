@@ -486,3 +486,172 @@ fn metadata_uses_daemon_then_local_only_after_daemon_stops() {
         Some("local-account")
     );
 }
+
+#[test]
+fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    fixture(dir.path(), Some(upstream_port));
+    let upstream_task = std::thread::spawn(move || {
+        let (mut socket, _) = upstream.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0; 6];
+        socket.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"hello\0");
+        socket.write_all(b"remote-response\0\xff").unwrap();
+    });
+    let mut gui = controller(dir.path());
+    gui.start(
+        &dir.path().join("config.yaml"),
+        dir.path().join("proxy.log"),
+    );
+    assert!(gui.is_running());
+    let original = gui.daemon_status().unwrap().pid;
+    let mut child = Command::new(helper())
+        .arg("--forward")
+        .arg("--state-dir")
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Move all pipe I/O to a worker so a broken helper cannot hang CI.
+    let input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let io = std::thread::spawn(move || {
+        let mut input = input;
+        let mut output = output;
+        let mut ready = [0; b"COPORT-FORWARD/1\n".len()];
+        // Read the protocol marker separately from HTTP bytes.
+        let marker = b"COPORT-FORWARD/1\n";
+        output.read_exact(&mut ready[..marker.len()]).unwrap();
+        assert_eq!(&ready[..marker.len()], marker);
+        write!(
+            input,
+            "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            output.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+            assert!(head.len() < 4096);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        input.write_all(b"hello\0").unwrap();
+        let mut response = Vec::new();
+        // Keep stdin open: a closed remote socket must still terminate the helper.
+        output.read_to_end(&mut response).unwrap();
+        sender.send(response).unwrap();
+    });
+    let response = receiver.recv_timeout(Duration::from_secs(10));
+    if response.is_err() {
+        let _ = child.kill();
+    }
+    let response = response.unwrap();
+    io.join().unwrap();
+    assert_eq!(response, b"remote-response\0\xff");
+    upstream_task.join().unwrap();
+    assert!(!response.windows(7).any(|bytes| bytes == b"COPORT-"));
+    wait_for(|| child.try_wait().unwrap().is_some());
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        daemon::Client::discover(dir.path()).unwrap().1.pid,
+        original
+    );
+    gui.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    let port = fixture(dir.path(), None);
+    let ssh = dir.path().join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nprintf 'COPORT-FORWARD/1\\n'\nIFS= read -r request || exit 0\nprintf 'HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 6\\r\\n\\r\\nremote'\n").unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let wrapper = dir.path().join("start-daemon");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport PATH={}:$PATH\nexec {} \"$@\"\n",
+            quote(dir.path()),
+            quote(&helper())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (client, status) = daemon::start(
+        &wrapper,
+        dir.path(),
+        &dir.path().join("config.yaml"),
+        &dir.path().join("proxy.log"),
+    )
+    .unwrap();
+    assert!(status.forwarding_supported);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cert =
+            reqwest::Certificate::from_pem(&std::fs::read(dir.path().join("tls/ca.pem")).unwrap())
+                .unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(cert)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let urls = [
+            format!("http://127.0.0.1:{port}/unified-test"),
+            format!("https://127.0.0.1:{port}/unified-test"),
+        ];
+        let before = http.get(&urls[0]).send().await.unwrap().status();
+        assert_ne!(before.as_u16(), 200);
+        let target = coport_gui::remote_forward::Target {
+            device_id: "test-device".into(),
+            name: "Remote".into(),
+            connection: coport_gui::remote::Device {
+                name: "test".into(),
+                host: "fake-host".into(),
+                binary: "coportd".into(),
+            },
+        };
+        client.set_forwarding(Some(target)).await.unwrap();
+        for url in &urls {
+            let response = http.get(url).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.text().await.unwrap(), "remote");
+        }
+        let during = client.status().unwrap();
+        assert_eq!(during.port, port);
+        assert_eq!(during.pid, status.pid);
+        assert_eq!(during.forwarding.unwrap().device_id, "test-device");
+        // A failed SSH connection must produce 502, even though local routing works.
+        std::fs::write(&ssh, "#!/bin/sh\nexit 1\n").unwrap();
+        for url in &urls {
+            let response = http.get(url).send().await.unwrap();
+            assert_eq!(response.status(), 502);
+            assert_eq!(
+                response.text().await.unwrap(),
+                "Remote SSH proxy unavailable.\n"
+            );
+        }
+        assert!(client.status().unwrap().forwarding.unwrap().error.is_some());
+        client.set_forwarding(None).await.unwrap();
+        assert!(client.status().unwrap().forwarding.is_none());
+        for url in &urls {
+            assert_eq!(http.get(url).send().await.unwrap().status(), before);
+        }
+        assert_eq!(client.status().unwrap().port, port);
+    });
+    client.stop().unwrap();
+}

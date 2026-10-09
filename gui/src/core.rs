@@ -320,6 +320,7 @@ impl Core {
                 .started_stamp
                 .is_some_and(|started| started != file_stamp(&self.config_path()));
         Snapshot {
+            forwarding: None,
             account_states_error: self.account_states_error.clone(),
             version: env!("CARGO_PKG_VERSION"),
             phase: match &phase {
@@ -639,6 +640,7 @@ fn service(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    pub forwarding: Option<coport_gui::remote_forward::Status>,
     account_states_error: Option<String>,
     version: &'static str,
     phase: PhaseDto,

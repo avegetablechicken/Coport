@@ -1341,7 +1341,7 @@ but starting it with sharing enabled reports that the data API requires `coportd
 
 ## Read statistics from existing devices over SSH
 
-Configure up to 32 devices in the last **Settings → Devices** block. Choose one
+Configure up to 32 devices in **Settings → Devices**; **Request forwarding** follows it. Choose one
 connection: SSH or HTTP/HTTPS. New devices default to SSH. Enter the SSH config
 alias (for example `mbp16`) and select **Add Device**; no URL or sharing key is
 required. The display name defaults to the alias. Leave the executable blank for
@@ -1350,20 +1350,22 @@ An explicit executable path overrides discovery.
 
 **Edit** updates the device's stable ID, so renaming never overwrites another
 device. Duplicate display names are rejected. Older separate SSH/data settings
-are preserved. Removing a device deletes only its saved connection. The Devices
+are preserved. Removing a device deletes its saved connection and stops any local
+forwarding session for it. The Devices
 page merges processed statistics and never starts, stops or restarts remote services.
 
 Both machines need this version of Coport. The destination must have existing
 GUI configuration and identity files created by starting its desktop daemon.
 At startup the daemon atomically records its executable in the owner-only
 `summary-executable` file in its application data directory. SSH reads that record
-locally, checks ownership, permissions and file type, and executes only `--summary`.
+locally, checks ownership, permissions and file type, and executes `--summary`
+for statistics or `--forward` when request forwarding is explicitly enabled.
 The path stays on the destination. A stale or unsafe record fails closed with an
 instruction to restart the destination app. When no record exists, discovery checks
 `PATH`, standard user/system binary locations and macOS Applications bundles.
 No directory scanning, configuration export, service restart or registration write
 occurs during a statistics request.
-SSH runs only `coportd --summary`, which returns processed statistics without
+Statistics connections run `coportd --summary`, which returns processed statistics without
 an HTTP listener. Raw logs and remote configurations are not returned.
 
 Set up key authentication (or an SSH agent) and connect once from a terminal to
@@ -1377,6 +1379,39 @@ supported; `~` is not expanded in executable paths. Batch authentication and str
 host-key checking reject missing keys and untrusted hosts without prompting.
 Connection attempts have a five-second connection timeout and a 25-second overall
 limit. A failed source does not prevent other devices' statistics from merging.
+
+### Forward requests through a remote device
+
+Configure an SSH device in **Settings → Devices**, then enable its switch
+in the following **Request forwarding** block. The local proxy must be running.
+Coport checks SSH access and the destination daemon before switching the existing
+local listener to remote forwarding. Client URLs, service paths, port and local
+TLS trust stay unchanged. Both HTTP and HTTPS continue to work; local TLS is
+terminated before request bytes travel over the encrypted SSH connection.
+
+Only one remote device can be active. The remote daemon applies its own routing
+and credential-selection rules; incoming authorization headers retain their normal
+meaning. No remote credentials or configuration files are exported. Home highlights
+the selected remote device and collapses inactive local routing and historical
+statistics. Devices remains a statistics-only page.
+
+Switching devices or returning to local mode disconnects existing connections.
+A remote connection failure returns **502 Bad Gateway** without falling back to
+local routes, and the selected remote mode stays active for subsequent retries.
+**Stop forwarding** restores local handling on the same port. Editing/removing the
+selected device also restores local handling. The daemon owns forwarding, so closing
+the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
+A daemon restart starts in local mode; forwarding is not saved as a startup preference.
+
+The local daemon must support unified forwarding; update and restart older local
+daemons before enabling it. The destination must support `coportd --forward` and
+already be running. A summary-only restricted SSH key cannot forward requests.
+The helper only connects to the running daemon's loopback proxy. A destination
+already forwarding to another device rejects this helper to prevent forwarding
+chains and loops. No remote network listener needs to be exposed.
+
+This mode uses remote routing. Using the remote device solely as a network exit
+while retaining local service/account routing is not yet supported.
 
 ## Development
 
