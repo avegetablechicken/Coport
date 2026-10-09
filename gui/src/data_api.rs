@@ -560,38 +560,46 @@ fn publish_at(
         let mut previous_windows = Vec::new();
         for (index, offset) in [0, 60_000, 120_000].into_iter().enumerate() {
             let at = end - offset;
-            for minutes in RANGES {
-                for scope in [
-                    crate::traffic::TrafficScope::All,
-                    crate::traffic::TrafficScope::Model,
-                ] {
-                    let window = Window {
+            let options: Vec<_> = RANGES
+                .into_iter()
+                .flat_map(|minutes| {
+                    [
+                        crate::traffic::TrafficScope::All,
+                        crate::traffic::TrafficScope::Model,
+                    ]
+                    .into_iter()
+                    .map(move |scope| crate::traffic::ExportOptions {
+                        end: at,
                         minutes,
                         scope,
-                        window_start: at - minutes as i64 * 60_000,
-                        window_end: at,
-                        bucket_minutes: bucket_minutes(minutes).unwrap(),
-                        groups: crate::traffic::export_window_limit(
-                            crate::traffic::ReadSource::Snapshot(&snapshots[index]),
-                            config,
-                            key,
-                            crate::traffic::ExportOptions {
-                                end: at,
-                                minutes,
-                                scope,
-                                limit,
-                            },
-                            &identities,
-                        )?,
-                    };
-                    if offset == 0 {
-                        windows.push(window);
-                    } else {
-                        previous_windows.push(window);
-                    }
+                        limit,
+                    })
+                })
+                .collect();
+            let exported = crate::traffic::export_windows_limit(
+                crate::traffic::ReadSource::Snapshot(&snapshots[index]),
+                config,
+                key,
+                &options,
+                &identities,
+            )?;
+            for (option, groups) in options.into_iter().zip(exported) {
+                let window = Window {
+                    minutes: option.minutes,
+                    scope: option.scope,
+                    window_start: at - option.minutes as i64 * 60_000,
+                    window_end: at,
+                    bucket_minutes: bucket_minutes(option.minutes).unwrap(),
+                    groups,
+                };
+                if offset == 0 {
+                    windows.push(window);
+                } else {
+                    previous_windows.push(window);
                 }
             }
         }
+
         let groups = windows
             .iter()
             .find(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model)

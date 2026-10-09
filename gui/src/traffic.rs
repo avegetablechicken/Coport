@@ -991,94 +991,215 @@ pub(crate) fn export_window_limit(
     options: ExportOptions,
     context: &ExportIdentities,
 ) -> Result<Vec<coport_gui::data_api::Group>, String> {
-    let ExportOptions {
-        end,
-        minutes,
-        scope,
-        limit,
-    } = options;
-    let bucket =
-        coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let start = end - minutes as i64 * 60_000;
-    let identities = &context.identities;
-    let references = &context.references;
-    let mut labels = context.labels.clone();
-    let entries = source.entries(start, end, scope, &mut labels)?;
-    let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
-    let mut groups = BTreeMap::new();
-    for entry in entries {
-        let service = entry.service().unwrap_or("Unknown").to_owned();
-        // Group keys must match `aggregate`, which keeps raw services such as CONNECT.
-        let group_service = entry
-            .service()
-            .or_else(|| entry.get("service"))
-            .unwrap_or("Unknown")
-            .to_owned();
-        let resolved = identities.resolve(&entry, &service, &labels);
-        let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
-        let proxy = entry
-            .get("proxy_endpoint")
-            .map(str::to_owned)
-            .or_else(|| {
-                entry
-                    .get("proxy")
-                    .and_then(|name| config.proxies.get(name))
-                    .cloned()
-            })
-            .unwrap_or_else(|| {
-                if entry.get("proxy") == Some("none") {
-                    "none"
-                } else {
-                    "unknown"
-                }
-                .into()
-            });
-        let mut proxy_ref = key.reference("proxy", &coport_gui::data_api::canonical(&proxy));
-        // Resolve/group locally first. Historical endpoints and names cannot
-        // create extra upstream accounts in the exported result.
-        let mut upstream_ref = key.reference("upstream", &format!("{service}\0{credential}"));
-        let mut account_ref = identities
-            .provider_reference(&service, &credential, references)
-            .or_else(|| {
-                coport_gui::data_api::account_reference(
-                    &service,
-                    entry.get("account_id").unwrap_or(""),
-                )
-            })
-            .or_else(|| {
-                if resolved.is_some() {
-                    return None;
-                }
-                entry
-                    .get("credential_ref")
-                    .filter(|r| r.len() == 64 && r.bytes().all(|c| c.is_ascii_hexdigit()))
-                    .map(str::to_owned)
-            });
-        let label = format!("{proxy_ref}/{upstream_ref}");
-        if groups.len() >= limit && !groups.contains_key(&(group_service.clone(), label)) {
-            proxy_ref = key.reference("proxy", "overflow");
-            upstream_ref = key.reference("upstream", "overflow");
-            account_ref = None;
+    Ok(export_windows_limit(source, config, key, &[options], context)?.remove(0))
+}
+
+/// Windows can share lifecycle merging and identity resolution only if they
+/// include exactly the same archives. Older archives can change both merged
+/// fields and identity evidence, even when their events lie outside a window.
+pub(crate) fn export_windows_limit(
+    source: ReadSource<'_>,
+    config: &coport::config::Config,
+    key: &coport::external_access::DataKey,
+    options: &[ExportOptions],
+    context: &ExportIdentities,
+) -> Result<Vec<Vec<coport_gui::data_api::Group>>, String> {
+    let mut cohorts: Vec<Vec<usize>> = Vec::new();
+    let signature = |option: &ExportOptions| match source {
+        ReadSource::Snapshot(snapshot) => {
+            let files = match option.scope {
+                TrafficScope::All => &snapshot.all,
+                TrafficScope::Model => &snapshot.model,
+            };
+            let start = option.end - option.minutes as i64 * 60_000;
+            Some(
+                files
+                    .iter()
+                    .map(|file| file.archived_modified.is_none_or(|at| at >= start))
+                    .collect::<Vec<_>>(),
+            )
         }
-        let label = format!("{proxy_ref}/{upstream_ref}");
-        account_refs
-            .entry((group_service, label.clone()))
-            .or_default()
-            .insert(account_ref);
-        aggregate(
-            &mut groups,
-            &entry,
-            start,
-            end,
-            bucket,
-            &labels,
-            Some(Resolution {
-                label,
-                source: None,
-            }),
-        );
+        // Path reads have no immutable file set; keep their independent reads.
+        ReadSource::Path(_) => None,
+    };
+    for (index, option) in options.iter().enumerate() {
+        crate::data_api::bucket_minutes(option.minutes).ok_or("Unsupported traffic range")?;
+        let found = cohorts.iter_mut().find(|cohort| {
+            let first = &options[cohort[0]];
+            first.end == option.end
+                && first.scope == option.scope
+                && signature(option).is_some_and(|files| Some(files) == signature(first))
+        });
+        if let Some(cohort) = found {
+            cohort.push(index);
+        } else {
+            cohorts.push(vec![index]);
+        }
     }
-    Ok(groups
+    let mut output = vec![Vec::new(); options.len()];
+    let mut references_cache = ExportReferences {
+        key,
+        proxy: HashMap::new(),
+        upstream: HashMap::new(),
+    };
+    for cohort in cohorts {
+        let first = options[cohort[0]];
+        let start = cohort
+            .iter()
+            .map(|i| options[*i].end - options[*i].minutes as i64 * 60_000)
+            .min()
+            .unwrap();
+        let mut labels = context.labels.clone();
+        let entries = source.entries(start, first.end, first.scope, &mut labels)?;
+        let identities = &context.identities;
+        let references = &context.references;
+        let mut windows: Vec<_> = cohort
+            .iter()
+            .map(|i| ExportWindow {
+                options: options[*i],
+                groups: BTreeMap::new(),
+                account_refs: BTreeMap::new(),
+            })
+            .collect();
+        for entry in entries {
+            let service = entry.service().unwrap_or("Unknown").to_owned();
+            // Group keys must match `aggregate`, which keeps raw services such as CONNECT.
+            let group_service = entry
+                .service()
+                .or_else(|| entry.get("service"))
+                .unwrap_or("Unknown")
+                .to_owned();
+            let resolved = identities.resolve(&entry, &service, &labels);
+            let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
+            let proxy = entry
+                .get("proxy_endpoint")
+                .map(str::to_owned)
+                .or_else(|| {
+                    entry
+                        .get("proxy")
+                        .and_then(|name| config.proxies.get(name))
+                        .cloned()
+                })
+                .unwrap_or_else(|| {
+                    if entry.get("proxy") == Some("none") {
+                        "none"
+                    } else {
+                        "unknown"
+                    }
+                    .into()
+                });
+            let proxy_ref =
+                references_cache.reference("proxy", &coport_gui::data_api::canonical(&proxy));
+            // Resolve/group locally first. Historical endpoints and names cannot
+            // create extra upstream accounts in the exported result.
+            let upstream_ref =
+                references_cache.reference("upstream", &format!("{service}\0{credential}"));
+            let account_ref = identities
+                .provider_reference(&service, &credential, references)
+                .or_else(|| {
+                    coport_gui::data_api::account_reference(
+                        &service,
+                        entry.get("account_id").unwrap_or(""),
+                    )
+                })
+                .or_else(|| {
+                    if resolved.is_some() {
+                        return None;
+                    }
+                    entry
+                        .get("credential_ref")
+                        .filter(|r| r.len() == 64 && r.bytes().all(|c| c.is_ascii_hexdigit()))
+                        .map(str::to_owned)
+                });
+
+            for window in &mut windows {
+                let ExportOptions {
+                    end,
+                    minutes,
+                    limit,
+                    ..
+                } = window.options;
+                let start = end - minutes as i64 * 60_000;
+                if !entry
+                    .time
+                    .is_some_and(|at| (start..end).contains(&at.timestamp_millis()))
+                {
+                    continue;
+                }
+                let mut proxy_ref = proxy_ref.clone();
+                let mut upstream_ref = upstream_ref.clone();
+                let mut account_ref = account_ref.clone();
+                let label = format!("{proxy_ref}/{upstream_ref}");
+                if window.groups.len() >= limit
+                    && !window.groups.contains_key(&(group_service.clone(), label))
+                {
+                    proxy_ref = references_cache.reference("proxy", "overflow");
+                    upstream_ref = references_cache.reference("upstream", "overflow");
+                    account_ref = None;
+                }
+                let label = format!("{proxy_ref}/{upstream_ref}");
+                window
+                    .account_refs
+                    .entry((group_service.clone(), label.clone()))
+                    .or_default()
+                    .insert(account_ref);
+                aggregate(
+                    &mut window.groups,
+                    &entry,
+                    start,
+                    end,
+                    crate::data_api::bucket_minutes(minutes).unwrap(),
+                    &labels,
+                    Some(Resolution {
+                        label,
+                        source: None,
+                    }),
+                );
+            }
+        }
+        for (index, window) in cohort.into_iter().zip(windows) {
+            output[index] = finish_export(window);
+        }
+    }
+    Ok(output)
+}
+
+/// This bounded cache lives for one export and one data key. Neither raw
+/// identities nor keyed references survive a refresh or a key change.
+struct ExportReferences<'a> {
+    key: &'a coport::external_access::DataKey,
+    proxy: HashMap<String, String>,
+    upstream: HashMap<String, String>,
+}
+impl ExportReferences<'_> {
+    fn reference(&mut self, kind: &str, value: &str) -> String {
+        let cache = if kind == "proxy" {
+            &mut self.proxy
+        } else {
+            &mut self.upstream
+        };
+        if let Some(reference) = cache.get(value) {
+            return reference.clone();
+        }
+        let reference = self.key.reference(kind, value);
+        if cache.len() < 1024 && value.len() <= 4096 {
+            cache.insert(value.to_owned(), reference.clone());
+        }
+        reference
+    }
+}
+struct ExportWindow {
+    options: ExportOptions,
+    groups: BTreeMap<(String, String), CredentialTraffic>,
+    account_refs: BTreeMap<(String, String), BTreeSet<Option<String>>>,
+}
+fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
+    let ExportWindow {
+        groups,
+        mut account_refs,
+        ..
+    } = window;
+    groups
         .into_values()
         .map(|g| {
             let (proxy_ref, upstream_ref) = g.credential.split_once('/').unwrap();
@@ -1113,7 +1234,7 @@ pub(crate) fn export_window_limit(
                 },
             }
         })
-        .collect())
+        .collect()
 }
 
 /// Calls `visit` for every entry of the log at `path` and its rotated history,
@@ -1205,6 +1326,478 @@ fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Keep the pre-batching implementation as an independent semantic oracle.
+    fn independent_export_reference(
+        source: ReadSource<'_>,
+        config: &coport::config::Config,
+        key: &coport::external_access::DataKey,
+        options: ExportOptions,
+        context: &ExportIdentities,
+    ) -> Result<Vec<coport_gui::data_api::Group>, String> {
+        let ExportOptions {
+            end,
+            minutes,
+            scope,
+            limit,
+        } = options;
+        let bucket =
+            coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+        let start = end - minutes as i64 * 60_000;
+        let identities = &context.identities;
+        let references = &context.references;
+        let mut labels = context.labels.clone();
+        let entries = source.entries(start, end, scope, &mut labels)?;
+        let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
+        let mut groups = BTreeMap::new();
+        for entry in entries {
+            let service = entry.service().unwrap_or("Unknown").to_owned();
+            let group_service = entry
+                .service()
+                .or_else(|| entry.get("service"))
+                .unwrap_or("Unknown")
+                .to_owned();
+            let resolved = identities.resolve(&entry, &service, &labels);
+            let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
+            let proxy = entry
+                .get("proxy_endpoint")
+                .map(str::to_owned)
+                .or_else(|| {
+                    entry
+                        .get("proxy")
+                        .and_then(|name| config.proxies.get(name))
+                        .cloned()
+                })
+                .unwrap_or_else(|| {
+                    if entry.get("proxy") == Some("none") {
+                        "none"
+                    } else {
+                        "unknown"
+                    }
+                    .into()
+                });
+            let mut proxy_ref = key.reference("proxy", &coport_gui::data_api::canonical(&proxy));
+            // Resolve/group locally first. Historical endpoints and names cannot
+            // create extra upstream accounts in the exported result.
+            let mut upstream_ref = key.reference("upstream", &format!("{service}\0{credential}"));
+            let mut account_ref = identities
+                .provider_reference(&service, &credential, references)
+                .or_else(|| {
+                    coport_gui::data_api::account_reference(
+                        &service,
+                        entry.get("account_id").unwrap_or(""),
+                    )
+                })
+                .or_else(|| {
+                    if resolved.is_some() {
+                        return None;
+                    }
+                    entry
+                        .get("credential_ref")
+                        .filter(|r| r.len() == 64 && r.bytes().all(|c| c.is_ascii_hexdigit()))
+                        .map(str::to_owned)
+                });
+            let label = format!("{proxy_ref}/{upstream_ref}");
+            if groups.len() >= limit && !groups.contains_key(&(group_service.clone(), label)) {
+                proxy_ref = key.reference("proxy", "overflow");
+                upstream_ref = key.reference("upstream", "overflow");
+                account_ref = None;
+            }
+            let label = format!("{proxy_ref}/{upstream_ref}");
+            account_refs
+                .entry((group_service, label.clone()))
+                .or_default()
+                .insert(account_ref);
+            aggregate(
+                &mut groups,
+                &entry,
+                start,
+                end,
+                bucket,
+                &labels,
+                Some(Resolution {
+                    label,
+                    source: None,
+                }),
+            );
+        }
+        Ok(groups
+            .into_values()
+            .map(|g| {
+                let (proxy_ref, upstream_ref) = g.credential.split_once('/').unwrap();
+                coport_gui::data_api::Group {
+                    service: match g.service.as_str() {
+                        "Codex" => coport_gui::data_api::Service::Codex,
+                        "Claude" => coport_gui::data_api::Service::Claude,
+                        _ => coport_gui::data_api::Service::Other,
+                    },
+                    proxy_ref: proxy_ref.into(),
+                    upstream_ref: upstream_ref.into(),
+                    account_ref: account_refs
+                        .remove(&(g.service.clone(), g.credential.clone()))
+                        .filter(|refs| refs.len() == 1)
+                        .and_then(|refs| refs.into_iter().next().flatten()),
+                    stats: coport_gui::data_api::Stats {
+                        requests: g.requests,
+                        errors: g.errors,
+                        bytes: g.bytes,
+                        input_tokens: g.input_tokens,
+                        output_tokens: g.output_tokens,
+                        cached_input_tokens: g.cached_input_tokens,
+                        uncached_input_tokens: g.uncached_input_tokens,
+                        cache_write_tokens: g.cache_write_tokens,
+                        cache_read: g.cache_read,
+                        cache_prompt: g.cache_prompt,
+                        latency_total_ms: g.latency_total,
+                        latency_samples: g.latency_count,
+                        counts: g.counts,
+                        error_counts: g.error_counts,
+                        token_counts: g.token_counts,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    #[test]
+    fn batched_exports_match_independent_windows_across_archives_and_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut old = String::new();
+        let mut current = String::new();
+        for i in 0..1200 {
+            let minutes = [
+                1, 29, 30, 31, 359, 360, 361, 719, 721, 1439, 1441, 10079, 10081, 43199,
+            ][i % 14];
+            let at = end - minutes * 60_000;
+            let service = if i % 3 == 0 { "claude" } else { "codex" };
+            let timestamp = chrono::DateTime::from_timestamp_millis(at)
+                .unwrap()
+                .to_rfc3339();
+            let mut row = serde_json::json!({"timestamp":timestamp,"event":"request_received","request_id":format!("r-{i}"),"service":service,"provider":format!("private-provider-{}",i%40),"method":"POST","path":"/v1/responses","proxy_endpoint":format!("http://private-proxy-{i}.invalid:7890"),"account_id":format!("00000000-0000-4000-8000-{i:012}"),"credential_ref":"a".repeat(64)});
+            old.push_str(&format!("{row}\n"));
+            row["event"] = "request_finished".into();
+            row["status"] = if i % 4 == 0 { "500" } else { "200" }.into();
+            row["input_tokens"] = "10".into();
+            row["output_tokens"] = "3".into();
+            row["cached_input_tokens"] = "4".into();
+            row["cache_creation_input_tokens"] = "2".into();
+            row["duration_ms"] = "120".into();
+            row["received_bytes"] = "1024".into();
+            current.push_str(&format!("{row}\n"));
+            if i % 5 == 0 {
+                // Requests merge in id order: one CONNECT group exists before the
+                // limit is reached, later CONNECT requests must still join it.
+                let connect = serde_json::json!({"timestamp":timestamp,"event":"request_finished","request_id":if i == 0 { "a-0".to_owned() } else { format!("z-{i}") },"service":"connect","method":"CONNECT","path":"example.com:443","proxy":"none","status":"200"});
+                current.push_str(&format!("{connect}\n"));
+            }
+            if i % 2 == 0 {
+                row["model_call_id"] = format!("call-{i}").into();
+                row["event"] = "model_call_finished".into();
+                current.push_str(&format!("{row}\n"));
+            }
+        }
+        std::fs::write(history.join("proxy.log.1.fixture.jsonl"), old).unwrap();
+        std::fs::write(&path, current).unwrap();
+        let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let context = ExportIdentities {
+            labels: (0..40)
+                .flat_map(|i| {
+                    ["Codex", "Claude"].map(move |service| {
+                        (
+                            (service.to_owned(), format!("private-provider-{i}")),
+                            format!("private-provider-{i}"),
+                        )
+                    })
+                })
+                .collect(),
+            identities: Identities::default(),
+            references: Vec::new(),
+        };
+        for at in [end, end - 60_000, end - 120_000] {
+            let mut snapshot = Snapshot::load(&path, at).unwrap();
+            // Simulate an archive excluded by short windows, including its
+            // identity evidence and lifecycle fields, but included by long ones.
+            for file in snapshot.all.iter_mut().chain(&mut snapshot.model) {
+                if file.archived_modified.is_some() {
+                    file.archived_modified = Some(end - 60 * 60_000);
+                }
+            }
+            let options: Vec<_> = crate::data_api::RANGES
+                .into_iter()
+                .rev()
+                .flat_map(|minutes| {
+                    [TrafficScope::All, TrafficScope::Model]
+                        .into_iter()
+                        .flat_map(move |scope| {
+                            [8, 24, 2048].map(move |limit| ExportOptions {
+                                end: at,
+                                minutes,
+                                scope,
+                                limit,
+                            })
+                        })
+                })
+                .collect();
+            for token in ["a", "b"] {
+                let key = coport::external_access::DataKey::new(&token.repeat(64)).unwrap();
+                let expected: Vec<_> = options
+                    .iter()
+                    .map(|option| {
+                        independent_export_reference(
+                            ReadSource::Snapshot(&snapshot),
+                            &config,
+                            &key,
+                            *option,
+                            &context,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let actual = export_windows_limit(
+                    ReadSource::Snapshot(&snapshot),
+                    &config,
+                    &key,
+                    &options,
+                    &context,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&actual).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                let encoded = serde_json::to_string(&actual).unwrap();
+                assert!(!encoded.contains("private-provider"));
+                assert!(!encoded.contains("private-proxy"));
+                assert!(
+                    export_windows_limit(
+                        ReadSource::Snapshot(&snapshot),
+                        &config,
+                        &key,
+                        &[],
+                        &context
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                let invalid = ExportOptions {
+                    minutes: 5,
+                    ..options[0]
+                };
+                assert!(
+                    export_windows_limit(
+                        ReadSource::Snapshot(&snapshot),
+                        &config,
+                        &key,
+                        &[invalid],
+                        &context
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    // Evict only this fixture: parallel tests may be checking their own caches.
+    fn evict_test_summaries(directory: &Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                evict_test_summaries(&entry.path());
+                continue;
+            }
+            #[cfg(unix)]
+            let node = {
+                use std::os::unix::fs::MetadataExt;
+                let meta = entry.metadata().unwrap();
+                (meta.dev(), meta.ino())
+            };
+            if let Some(cache) = SUMMARIES.lock().unwrap().as_mut() {
+                cache.retain(|(stamp, _), _| {
+                    #[cfg(unix)]
+                    {
+                        stamp.node != node
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        stamp.path != entry.path()
+                    }
+                });
+            }
+        }
+    }
+    #[test]
+    fn synthetic_log_performance() {
+        use std::io::Write;
+        // Use the larger matrix explicitly for release performance measurements;
+        // normal CI still exercises the same assertions and repeated exports.
+        let sizes = if std::env::var_os("COPORT_LOG_BENCH_LARGE").is_some() {
+            [2_000, 20_000, 100_000]
+        } else {
+            [20, 200, 1_200]
+        };
+        for requests in sizes {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("proxy.log");
+            let history = dir.path().join("history");
+            std::fs::create_dir(&history).unwrap();
+            let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+            let timestamp = chrono::DateTime::from_timestamp_millis(end - 300_000)
+                .unwrap()
+                .to_rfc3339();
+            let mut file = File::create(&path).unwrap();
+            let mut length = 0;
+            let mut total = 0;
+            let mut archives = 0;
+            for index in 0..requests {
+                for event in ["model_call_started", "model_call_finished"] {
+                    let row = serde_json::json!({"timestamp":timestamp,"event":event,"request_id":format!("req-{index}"),"model_call_id":format!("call-{index}"),"service":"codex","method":"POST","path":"/v1/responses","input_tokens":"10","output_tokens":"5","status":"200"}).to_string() + "\n";
+                    if length + row.len() > 5 * 1024 * 1024 {
+                        drop(file);
+                        std::fs::rename(
+                            &path,
+                            history.join(format!("proxy.log.{archives}.bench.jsonl")),
+                        )
+                        .unwrap();
+                        archives += 1;
+                        file = File::create(&path).unwrap();
+                        length = 0;
+                    }
+                    file.write_all(row.as_bytes()).unwrap();
+                    length += row.len();
+                    total += row.len();
+                }
+            }
+            drop(file);
+            for boundaries in [1, 3] {
+                evict_test_summaries(dir.path());
+                let ends: Vec<_> = (0..boundaries).map(|i| end - i * 60_000).collect();
+                for refresh in 0..4 {
+                    let begin = Instant::now();
+                    let snapshots = Snapshot::load_many(
+                        &path,
+                        &ends,
+                        30,
+                        &[TrafficScope::All, TrafficScope::Model],
+                    )
+                    .unwrap();
+                    let preparation = begin.elapsed();
+                    let mut queries = 0;
+                    for snapshot in &snapshots {
+                        for scope in [TrafficScope::All, TrafficScope::Model] {
+                            for minutes in crate::data_api::RANGES {
+                                let result = read_at(
+                                    ReadSource::Snapshot(snapshot),
+                                    minutes,
+                                    &BTreeMap::new(),
+                                    scope,
+                                    &Identities::default(),
+                                    snapshot.end,
+                                )
+                                .unwrap();
+                                if scope == TrafficScope::Model && minutes == 30 {
+                                    assert_eq!(
+                                        result.summary.input_tokens,
+                                        Some(requests as u64 * 10)
+                                    );
+                                }
+                                std::hint::black_box(result);
+                                queries += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "BENCH requests={requests} bytes={total} archives={archives} boundaries={boundaries} refresh={refresh} preparation_ms={:.3} total_ms={:.3} queries={queries}",
+                        preparation.as_secs_f64() * 1000.0,
+                        begin.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+            let key = coport::external_access::DataKey::new(crate::test_support::DATA_KEY).unwrap();
+            evict_test_summaries(dir.path());
+            for refresh in 0..4 {
+                let begin = Instant::now();
+                let bytes = crate::data_api::publish(
+                    &config,
+                    &path,
+                    &key,
+                    "00000000-0000-4000-8000-000000000001",
+                )
+                .unwrap();
+                eprintln!(
+                    "EXPORT requests={requests} refresh={refresh} total_ms={:.3} output_bytes={}",
+                    begin.elapsed().as_secs_f64() * 1000.0,
+                    bytes.len()
+                );
+                assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+            }
+            #[cfg(unix)]
+            {
+                struct Frames {
+                    started: Instant,
+                    first: Option<Duration>,
+                    bytes: Vec<u8>,
+                }
+                impl std::io::Write for Frames {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        self.bytes.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        self.first.get_or_insert_with(|| self.started.elapsed());
+                        Ok(())
+                    }
+                }
+                let logs = dir.path().join("logs");
+                std::fs::create_dir(&logs).unwrap();
+                std::fs::rename(&path, logs.join("proxy.log")).unwrap();
+                std::fs::rename(&history, logs.join("history")).unwrap();
+                std::fs::write(dir.path().join("config.yaml"), "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+                crate::data_api::prepare_identity(dir.path()).unwrap();
+                evict_test_summaries(dir.path());
+                for refresh in 0..4 {
+                    let mut frames = Frames {
+                        started: Instant::now(),
+                        first: None,
+                        bytes: Vec::new(),
+                    };
+                    crate::data_api::stream_summary(
+                        dir.path(),
+                        30,
+                        TrafficScope::Model,
+                        &mut frames,
+                    )
+                    .unwrap();
+                    let total = frames.started.elapsed();
+                    let summaries: Vec<crate::data_api::Summary> = frames
+                        .bytes
+                        .split(|b| *b == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| serde_json::from_slice(line).unwrap())
+                        .collect();
+                    assert_eq!(summaries.len(), 2);
+                    for summary in &summaries {
+                        summary.validate().unwrap();
+                    }
+                    assert_eq!(summaries[0].window_end, summaries[1].window_end);
+                    for summary in &summaries {
+                        assert_eq!(
+                            summary.groups.iter().map(|g| g.stats.requests).sum::<u64>(),
+                            requests as u64
+                        );
+                    }
+                    eprintln!(
+                        "STREAM requests={requests} refresh={refresh} first_frame_ms={:.3} total_ms={:.3}",
+                        frames.first.unwrap().as_secs_f64() * 1000.0,
+                        total.as_secs_f64() * 1000.0
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn batched_boundaries_match_independent_scans_without_future_events() {
         let dir = tempfile::tempdir().unwrap();
