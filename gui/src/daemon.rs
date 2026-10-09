@@ -527,7 +527,8 @@ async fn handle_control(
             },
             Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
             Action::CachedCredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
-            Action::CredentialLabels => Response::CredentialLabels(server.traffic_credential_labels().await.into_iter().collect()),
+            // Legacy statistics readers must obey the same no-network contract.
+            Action::CredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
             Action::RecordDeviceQuery(event) => {
                 if event.validate() {
                     server.logger.write(event.event(), event.fields());

@@ -743,3 +743,96 @@ fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
     }
     assert!(daemon::Client::discover(dir.path()).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    let port = fixture(dir.path(), None);
+    let forbidden = TcpListener::bind("127.0.0.1:0").unwrap();
+    forbidden.set_nonblocking(true).unwrap();
+    let upstream = format!("http://{}", forbidden.local_addr().unwrap());
+    let credentials = dir.path().join("claude");
+    std::fs::create_dir(&credentials).unwrap();
+    std::fs::write(
+        credentials.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"fixture-only-secret"}}"#,
+    )
+    .unwrap();
+    let config_text = format!(
+        "listen_port: {port}\nrequest_timeout_seconds: 1\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account: {{unresolved@example.invalid: none}}\n    account_probe: lookup\nproxies:\n  lookup: {upstream}\n",
+        serde_json::to_string(&credentials).unwrap()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config_text).unwrap();
+    let log = dir.path().join("proxy.log");
+    let (client, _) =
+        daemon::start(&helper(), dir.path(), &dir.path().join("config.yaml"), &log).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let config = coport::config::Config::parse(&config_text).unwrap();
+        let mut cache = coport_gui::data_client::MergeCache::default();
+        // First entry, repeat entry and timer reads use exactly the display-only metadata path.
+        for _ in 0..3 {
+            // Both old and new RPCs must stay offline even with missing OAuth identity.
+            client.credential_labels().await.unwrap();
+            client.cached_credential_labels().await.unwrap();
+            let labels = config.local_traffic_credential_labels().await;
+            cache
+                .views(Vec::new(), config.clone(), log.clone(), labels, false)
+                .await
+                .unwrap();
+        }
+        // Explicit statistics refresh also uses local/cached identity evidence.
+        let config_labels = config.local_traffic_credential_labels().await;
+        cache
+            .refresh_progressive(
+                Vec::new(),
+                config,
+                log,
+                config_labels,
+                (30, coport_gui::traffic::TrafficScope::Model),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+    });
+    let output = Command::new(helper())
+        .args(["--summary-stream", "--window", "30", "model", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count(),
+        2
+    );
+    assert!(
+        matches!(forbidden.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Display/statistics access connected to an upstream account endpoint"
+    );
+    client.stop().unwrap();
+    // The legacy GUI fallback with no daemon must not reintroduce profile probes.
+    let tasks = coport_gui::tasks::Tasks::new(
+        dir.path().into(),
+        dir.path().join("config.yaml"),
+        coport::config::Config::parse(&config_text).unwrap(),
+    );
+    rt.block_on(async {
+        for _ in 0..3 {
+            tasks.credential_labels().await.unwrap();
+        }
+    });
+    assert!(
+        matches!(forbidden.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Stopped-daemon metadata fallback contacted an upstream"
+    );
+}

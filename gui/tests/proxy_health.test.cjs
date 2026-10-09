@@ -120,3 +120,15 @@ test('every passive page refresh opts out of upstream account probes', async () 
     assert.ok(calls.filter(([command])=>command==='get_state').every(([,args])=>args.refreshAccounts===false),page);
   }
 });
+
+
+test('traffic IPC reads local identities without asking the daemon for account metadata', () => {
+  const commands = fs.readFileSync(path.join(__dirname, '../src/commands.rs'), 'utf8');
+  for (const name of ['get_traffic', 'get_merged_data']) {
+    const start = commands.indexOf(`pub async fn ${name}(`);
+    const next = commands.indexOf('#[tauri::command]', start);
+    const body = commands.slice(start, next < 0 ? undefined : next);
+    assert.match(body, /local_traffic_credential_labels/);
+    assert.doesNotMatch(body, /account_tasks|tasks\.credential_labels|cached_credential_labels/);
+  }
+});

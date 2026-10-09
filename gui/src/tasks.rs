@@ -85,7 +85,11 @@ impl Tasks {
         if let Some(client) = self.backend().await? {
             return client.credential_labels().await.map_err(|e| e.to_string());
         }
-        Ok(self.local_server().await.traffic_credential_labels().await)
+        Ok(self
+            .local_server()
+            .await
+            .cached_traffic_credential_labels()
+            .await)
     }
 }
 
