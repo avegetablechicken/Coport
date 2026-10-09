@@ -766,6 +766,12 @@ routed the request: an account route such as an email or `default`, an API Key
 variable or Codex provider ID, a Claude settings/profile name, or a URL route). Searches ignore case and surrounding whitespace; an
 empty search shows all entries in the selected tab and time range.
 
+Opening the panel does not automatically test proxies; use **Test** or **Test All**
+for reachability and exit-IP checks. Entering Settings reads local device definitions,
+uses cached account status, and does not poll remote device statistics. Remote
+statistics refresh on the Devices page. These UI controls do not stop health checks
+for routes already in use by the running proxy.
+
 Enable **Settings → General → Keep proxy running after quit** to leave the
 independent proxy daemon running when choosing Quit (including the tray menu and
 keyboard shortcut). The GUI process actually exits: its WebView, tray icon, and

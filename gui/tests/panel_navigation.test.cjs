@@ -14,6 +14,7 @@ function panel(page = "settings") {
   const content = { scrollTop: 120 };
   const ui = { page };
   const rendered = [];
+  const probes = [];
   vm.runInNewContext(handlers, {
     ui,
     Date: { now: () => now },
@@ -23,10 +24,11 @@ function panel(page = "settings") {
     render: () => rendered.push(ui.page),
     $: () => content,
     refresh: async () => {},
-    probeStale() {},
+    probeStale: () => probes.push("stale"),
+    invoke: command => probes.push(command),
     setInterval() {},
   });
-  return { ui, content, rendered, events, advance: (ms) => { now += ms; } };
+  return { ui, content, rendered, events, probes, advance: (ms) => { now += ms; } };
 }
 
 test("first show and short reopening preserve the current page", async () => {
@@ -71,4 +73,16 @@ test("each reopen clears the old hidden timestamp", async () => {
   p.advance(timeout * 12);
   await p.events["panel-shown"]();
   assert.equal(p.ui.page, "main");
+});
+
+
+test("startup and repeated panel reopening do not automatically test proxies", async () => {
+  const p = panel();
+  await Promise.resolve();
+  for (let i = 0; i < 5; i++) {
+    p.events['panel-hidden']();
+    p.advance(timeout * 3);
+    await p.events['panel-shown']();
+  }
+  assert.deepEqual(p.probes, []);
 });

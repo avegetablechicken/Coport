@@ -92,3 +92,21 @@ test('an exit IP service failure leaves proxy reachability unverified', () => {
   assert.match(html, /Exit IP lookup failed: HTTP 503/);
   assert.doesNotMatch(html, /Unreachable|dot failed|Route unavailable:/);
 });
+
+
+test("Settings state refresh opts out of account profile network lookups", async () => {
+  const calls = [];
+  const refresh = source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;'));
+  const context = {
+    ui: { page: 'settings', refreshRequest: 0 },
+    invoke: async (command, args) => {
+      calls.push([command, args]);
+      return command === 'get_state' ? { config: {} } : { rows: [] };
+    },
+    tagColors: () => ({}), render() {},
+  };
+  vm.runInNewContext(refresh, context);
+  await context.refresh();
+  assert.equal(calls[0][0], 'get_state');
+  assert.equal(calls[0][1].refreshAccounts, false);
+});

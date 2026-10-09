@@ -16,15 +16,22 @@ use tauri::{AppHandle, Manager, State};
 type Result<T = ()> = std::result::Result<T, String>;
 
 /// Returns immediately with the last account activation; a refresh of it runs
-/// in the background and emits `state-changed` when the result differs.
+/// in the background and emits `state-changed` when the result differs. Settings
+/// opts out of profile lookups and uses the cached result only.
 #[tauri::command]
-pub async fn get_state(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot> {
+pub async fn get_state(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    refresh_accounts: Option<bool>,
+) -> Result<Snapshot> {
     let mut core = state.core.lock().unwrap();
     let mut snapshot = core.snapshot();
     if let Some(states) = core.account_states() {
         snapshot.set_account_route_states(states);
     }
-    if let Some(probe) = core.begin_account_states() {
+    if refresh_accounts != Some(false)
+        && let Some(probe) = core.begin_account_states()
+    {
         tauri::async_runtime::spawn(async move {
             let states = probe.account_states().await;
             let state = app.state::<AppState>();

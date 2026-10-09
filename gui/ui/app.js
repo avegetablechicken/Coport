@@ -206,7 +206,7 @@ const ui = {
 async function refresh() {
   const request = ++ui.refreshRequest;
   const [snap, recent] = await Promise.all([
-    invoke("get_state"),
+    invoke("get_state", { refreshAccounts: ui.page !== "settings" }),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
   if (request !== ui.refreshRequest) return;
@@ -1451,6 +1451,7 @@ async function loadDevices() {
   ui.deviceRefresh = true;
   try {
     await loadDeviceDefinitions();
+    if (ui.page !== "devices") return;
     if (ui.page === "devices" && !(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
     loadMergedData();
@@ -1711,7 +1712,7 @@ async function act(action, el) {
       }
       if (ui.page === "main") loadHomeTraffic();
       if (ui.page === "devices") loadDevices();
-      if (ui.page === "settings") loadDevices();
+      if (ui.page === "settings") loadDeviceDefinitions();
       ui.pinLog = ui.page === "activity" && el.dataset.target === "log";
       render();
       $("content").scrollTop = 0;
@@ -2043,8 +2044,7 @@ setInterval(() => {
   if (el && ui.snap?.phase.state === "running") el.textContent = fmtUptime(uptime());
 }, 1000);
 
-// Exit addresses and reachability go stale; recheck old results on open.
-const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
+// Proxy tests are explicit actions, not a side effect of opening the panel.
 
 listen("state-changed", scheduleRefresh);
 const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;
@@ -2058,14 +2058,14 @@ listen("panel-shown", () => {
     render();
     $("content").scrollTop = 0;
   }
-  return refresh().then(probeStale);
+  return refresh();
 });
 listen("panel-hidden", () => {
   // Repeated native hide events must not extend the previous page's lifetime.
   panelHiddenAt ??= Date.now();
   closeSelect();
 });
-refresh().then(probeStale);
+refresh();
 
 // Refresh even when no new requests arrive, so the rolling window advances.
 setInterval(() => {
@@ -2074,6 +2074,5 @@ setInterval(() => {
     loadTraffic();
     scheduleActivityLog();
   } else if (ui.page === "devices") { refresh(); loadDevices(); }
-  else if (ui.page === "settings" && ui.devices.length) loadDevices();
   else if (ui.page === "main") refresh();
 }, 15000);

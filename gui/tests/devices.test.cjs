@@ -24,7 +24,8 @@ function harness(invoke) {
   vm.runInContext(source.slice(relabelStart,relabelEnd),context);
   vm.runInContext(code, context);
   context.fields = fields; context.listeners = listeners;
-  context.action = async name => {
+  context.action = async (name, el = { dataset: {} }) => {
+    context.el = el;
     const start = source.indexOf(`    case "${name}":`);
     const end = source.indexOf('    case ', start + 10);
     await vm.runInContext(`(async () => { switch ('${name}') { ${source.slice(start, end)} } })()`, context);
@@ -333,4 +334,51 @@ test('duplicate devices show an exclusion notice instead of a connection failure
   html = h.deviceSettings();
   assert.match(html, /Statistics available; already counted/);
   assert.doesNotMatch(html, /dot failed/);
+});
+
+
+test('entering Settings through navigation reads definitions without remote statistics', async () => {
+  const calls = [];
+  const h = harness(async command => { calls.push(command); return []; });
+  h.fields.content = { scrollTop: 100 };
+  h.render = () => {};
+  h.loadMergedData = () => calls.push('remote-statistics');
+  await h.action('page', { dataset: { page: 'settings' } });
+  await Promise.resolve();
+  assert.equal(h.ui.page, 'settings');
+  assert.deepEqual(calls, ['get_devices']);
+});
+
+test('leaving Devices while definitions load prevents starting remote statistics', async () => {
+  let resolve;
+  const calls = [];
+  const h = harness(() => new Promise(r => { resolve = r; }));
+  h.loadMergedData = () => calls.push('remote-statistics');
+  const loading = h.loadDevices();
+  h.ui.page = 'settings';
+  resolve([]);
+  await loading;
+  assert.deepEqual(calls, []);
+});
+
+test('Settings timer never polls remote devices', () => {
+  const calls = [];
+  let tick;
+  vm.runInNewContext(source.slice(source.indexOf('// Refresh even when no new requests arrive')), {
+    ui: { page: 'settings', devices: [{ id: 'remote' }] }, document: { hidden: false },
+    setInterval: callback => { tick = callback; },
+    refresh: () => calls.push('refresh'), loadDevices: () => calls.push('devices'),
+    loadMergedData: () => calls.push('remote-statistics'),
+  });
+  for (let i = 0; i < 5; i++) tick();
+  assert.deepEqual(calls, []);
+});
+
+test('explicit proxy Test and Test All still invoke the requested probe', async () => {
+  const calls = [];
+  const h = harness(async (command, args) => { calls.push([command, args.name]); return []; });
+  h.refresh = async () => {};
+  await h.action('probe', { dataset: { name: 'selected' } });
+  await h.action('probe');
+  assert.deepEqual(calls, [['probe_proxy', 'selected'], ['probe_proxy', null]]);
 });
