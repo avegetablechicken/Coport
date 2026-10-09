@@ -1300,9 +1300,11 @@ cached window with an optional `X-Coport-Window: MINUTES:model|all` header, then
 fetches the full cache. Partial responses use schema version four and retain
 the same two alignment boundaries and privacy/size limits.
 Once all twelve views are cached, range/category switches are immediate.
-Selecting an uncached range cancels the previous refresh and prioritizes the new
-selection. Background failures retain statistics already displayed. Periodic
-refresh updates the cache in the background. Expanded upstream accounts use the same order as Activity
+Background failures retain statistics already displayed. Page entry, periodic
+refresh and range/category switches read cached snapshots only; the explicit
+**Refresh** action retrieves remote statistics for the current selection. Local
+traffic assignments re-merge cached snapshots without reconnecting to devices.
+Expanded upstream accounts use the same order as Activity
 Traffic: known accounts by received bytes descending, unidentified accounts last.
 
 Each device selects one read-only transport: **HTTP/HTTPS** or **SSH**.
