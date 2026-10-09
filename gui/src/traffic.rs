@@ -992,6 +992,12 @@ pub(crate) fn export_window_limit(
     let mut groups = BTreeMap::new();
     for entry in entries {
         let service = entry.service().unwrap_or("Unknown").to_owned();
+        // Group keys must match `aggregate`, which keeps raw services such as CONNECT.
+        let group_service = entry
+            .service()
+            .or_else(|| entry.get("service"))
+            .unwrap_or("Unknown")
+            .to_owned();
         let resolved = identities.resolve(&entry, &service, &labels);
         let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
         let proxy = entry
@@ -1033,14 +1039,14 @@ pub(crate) fn export_window_limit(
                     .map(str::to_owned)
             });
         let label = format!("{proxy_ref}/{upstream_ref}");
-        if groups.len() >= limit && !groups.contains_key(&(service.clone(), label)) {
+        if groups.len() >= limit && !groups.contains_key(&(group_service.clone(), label)) {
             proxy_ref = key.reference("proxy", "overflow");
             upstream_ref = key.reference("upstream", "overflow");
             account_ref = None;
         }
         let label = format!("{proxy_ref}/{upstream_ref}");
         account_refs
-            .entry((service, label.clone()))
+            .entry((group_service, label.clone()))
             .or_default()
             .insert(account_ref);
         aggregate(
@@ -1784,6 +1790,51 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(old.iter().map(|c| c.requests).sum::<u64>(), 4);
         assert!(old.iter().all(|c| c.input_tokens.is_none()));
+    }
+
+    #[test]
+    fn export_limit_keeps_existing_connect_groups_out_of_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let timestamp = chrono::DateTime::from_timestamp_millis(end - 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let row = |id: &str| serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":id, "method":"CONNECT", "path":"example.com:443", "service":"connect", "proxy":"none", "status":"200"});
+        std::fs::write(&path, format!("{}\n{}\n", row("first"), row("second"))).unwrap();
+        let config = coport::config::Config::parse(
+            "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n",
+        )
+        .unwrap();
+        let key = coport::external_access::DataKey::new(&"e".repeat(64)).unwrap();
+        let context = ExportIdentities {
+            labels: BTreeMap::new(),
+            identities: Default::default(),
+            references: Vec::new(),
+        };
+        let exported = export_window_limit(
+            ReadSource::Path(&path),
+            &config,
+            &key,
+            ExportOptions {
+                end,
+                minutes: 30,
+                scope: TrafficScope::All,
+                limit: 1,
+            },
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            exported.len(),
+            1,
+            "The full group must not split into overflow"
+        );
+        assert_eq!(exported[0].stats.requests, 2);
+        assert_ne!(
+            exported[0].upstream_ref,
+            key.reference("upstream", "overflow")
+        );
     }
 
     #[test]
