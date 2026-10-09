@@ -629,7 +629,7 @@ function proxiesBlock() {
           if (state === "pending") value = `<span class="spinner"></span>`;
           else if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
           else if (state === "error") value = `<span class="bad">Unreachable</span>`;
-          else if (state === "unavailable") value = "Not tested";
+          else if (state === "unavailable") value = "Unverified";
           // Plain HTTP is the common case; other schemes stay visible.
           const shown = p.endpoint.replace(/^http:\/\//, "");
           const mark = flag(probe?.country);

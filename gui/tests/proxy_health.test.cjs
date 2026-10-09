@@ -81,7 +81,14 @@ test("route failures appear only after the proxy itself is reachable", () => {
 
 test("unavailable daemon is not reported as an unreachable proxy", () => {
   const html = render({ state: "unavailable", error: "Start the proxy daemon to test proxies." });
-  assert.match(html, /Not tested/);
+  assert.match(html, /Unverified/);
   assert.match(html, /Start the proxy daemon/);
   assert.doesNotMatch(html, /Unreachable|dot failed/);
+});
+
+test('an exit IP service failure leaves proxy reachability unverified', () => {
+  const html = render({ state: 'unavailable', error: 'Exit IP lookup failed: HTTP 503.' }, { routeFailures: ['https://example.invalid/'] });
+  assert.match(html, /Unverified/);
+  assert.match(html, /Exit IP lookup failed: HTTP 503/);
+  assert.doesNotMatch(html, /Unreachable|dot failed|Route unavailable:/);
 });

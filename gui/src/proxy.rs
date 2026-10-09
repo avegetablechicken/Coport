@@ -32,7 +32,7 @@ pub enum Probe {
         exit: Option<Exit>,
     },
     Unreachable(String),
-    /// The test could not be submitted; this is not a proxy connection failure.
+    /// The test could not establish reachability (submission or lookup failure).
     Unavailable(String),
 }
 
@@ -417,6 +417,10 @@ async fn connect(addr: (String, u16)) -> Probe {
 /// Fetches the trace endpoint through the proxy; the latency covers the whole
 /// request, so it reflects the proxy's real path rather than a local connect.
 async fn trace(endpoint: &str) -> Probe {
+    trace_at(endpoint, TRACE_URL).await
+}
+
+async fn trace_at(endpoint: &str, trace_url: &str) -> Probe {
     let client = reqwest::Proxy::all(endpoint).and_then(|proxy| {
         reqwest::Client::builder()
             .proxy(proxy)
@@ -427,19 +431,53 @@ async fn trace(endpoint: &str) -> Probe {
         return Probe::Unreachable("Invalid proxy URL".into());
     };
     let started = Instant::now();
-    let response = match client.get(TRACE_URL).send().await {
+    let response = match client.get(trace_url).send().await {
         Ok(response) => response,
-        Err(e) if e.is_timeout() => return Probe::Unreachable("timed out".into()),
-        Err(e) if e.is_connect() => return Probe::Unreachable("cannot connect".into()),
-        Err(_) => return Probe::Unreachable("request failed".into()),
+        Err(error) => {
+            // A failed lookup may be a destination/TLS failure. Only report
+            // the proxy unreachable if its own socket also cannot be reached.
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            while let Some(current) = cause {
+                if current
+                    .to_string()
+                    .ends_with("proxy authorization required")
+                {
+                    return Probe::Unreachable("Proxy authentication required (HTTP 407).".into());
+                }
+                cause = current.source();
+            }
+            // The lookup and fallback must fit inside the daemon's 10s reply deadline.
+            if let Some(addr) = host_port(endpoint)
+                && let Ok(unreachable @ Probe::Unreachable(_)) =
+                    tokio::time::timeout(Duration::from_secs(1), connect(addr)).await
+            {
+                return unreachable;
+            }
+            return Probe::Unavailable(if error.is_timeout() {
+                "Exit IP lookup timed out; proxy reachability is unverified.".into()
+            } else {
+                "Exit IP lookup failed; proxy reachability is unverified.".into()
+            });
+        }
     };
-    if !response.status().is_success() {
-        return Probe::Unreachable(format!("HTTP {}", response.status().as_u16()));
+    if response.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Probe::Unreachable("Proxy authentication required (HTTP 407).".into());
     }
-    let text = response.text().await.unwrap_or_default();
+    if !response.status().is_success() {
+        return Probe::Unavailable(format!(
+            "Exit IP lookup failed: HTTP {}.",
+            response.status().as_u16()
+        ));
+    }
+    let Ok(text) = response.text().await else {
+        return Probe::Unavailable("Cannot read the exit IP lookup response.".into());
+    };
+    let Some(exit) = parse_trace(&text) else {
+        return Probe::Unavailable("Exit IP lookup returned no valid IP address.".into());
+    };
     Probe::Reachable {
         latency: started.elapsed(),
-        exit: parse_trace(&text),
+        exit: Some(exit),
     }
 }
 
@@ -491,6 +529,42 @@ mod tests {
         while !predicate() {
             assert!(std::time::Instant::now() < deadline, "timed out");
             std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_lookup_failures_do_not_mark_a_reachable_proxy_down() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body) in [
+            (403, ""),
+            (429, ""),
+            (500, ""),
+            (200, "invalid"),
+            (200, "ip=203.0.113.8\nloc=JP\n"),
+            (407, ""),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let result = super::trace_at(&endpoint, "http://trace.invalid/cdn-cgi/trace").await;
+            server.await.unwrap();
+            if status == 407 {
+                assert!(matches!(result, Probe::Unreachable(_)));
+            } else if body.contains("ip=") {
+                assert!(matches!(result, Probe::Reachable { exit: Some(_), .. }));
+            } else {
+                assert!(
+                    matches!(result, Probe::Unavailable(_)),
+                    "{status}: {result:?}"
+                );
+            }
         }
     }
 
