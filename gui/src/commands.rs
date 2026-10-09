@@ -640,11 +640,24 @@ pub async fn get_merged_data(
     // resolve missing metadata by contacting upstream providers.
     let labels = config.local_traffic_credential_labels().await;
     if refresh_remote != Some(true) {
+        // Publish the selected range first; the 30-day views follow.
+        let publish = |views| {
+            on_update
+                .send(views)
+                .map_err(|_| "Traffic view closed".to_owned())
+        };
         return state
             .merged_cache
             .lock()
             .await
-            .views(sources, config, log, labels, false)
+            .views_selected_first(
+                sources,
+                config,
+                log,
+                labels,
+                false,
+                Some((minutes, scope, &publish)),
+            )
             .await;
     }
     let (cancel, cancelled) = tokio::sync::oneshot::channel();

@@ -659,10 +659,31 @@ impl MergeCache {
         credential_labels: BTreeMap<(String, String), String>,
         refresh_remote: bool,
     ) -> Result<Vec<Merged>, String> {
+        self.views_selected_first(
+            sources,
+            config,
+            log,
+            credential_labels,
+            refresh_remote,
+            None,
+        )
+        .await
+    }
+
+    /// Like `views`, but publishes `first` through `on_update` before merging
+    /// every range, so a page can render without waiting for 30-day views.
+    pub async fn views_selected_first(
+        &mut self,
+        sources: Vec<Source>,
+        config: Config,
+        log: PathBuf,
+        credential_labels: BTreeMap<(String, String), String>,
+        refresh_remote: bool,
+        first: Option<FirstView<'_>>,
+    ) -> Result<Vec<Merged>, String> {
         if sources.len() > crate::devices::LIMIT {
             return Err("At most 32 data sources are supported.".into());
         }
-        let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
         let selections: Vec<_> = crate::data_api::RANGES
             .into_iter()
             .flat_map(|minutes| {
@@ -686,14 +707,31 @@ impl MergeCache {
             self.errors.clear();
             self.key = key;
         }
-        if refresh_remote {
-            self.fetched = Some(align_sources(&context, sources.clone(), &selections).await?);
+        let (context, snapshot, end) = if refresh_remote {
+            let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
+            let fetched = align_sources(&context, sources.clone(), &selections).await?;
+            let end = fetched.1;
+            self.fetched = Some(fetched);
             self.errors.clear();
-        }
+            let snapshot = load_snapshot(&context.log, end).await?;
+            (context, snapshot, end)
+        } else {
+            // Without a refetch the boundary is already known, so identity
+            // evidence and the shared snapshot are read concurrently.
+            let at = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+            let end = self.fetched.as_ref().map_or(at, |(_, end)| *end);
+            let (context, snapshot) = tokio::join!(
+                prepare_merge(config, log.clone(), credential_labels),
+                load_snapshot(&log, end)
+            );
+            let mut context = context?;
+            context.at = at;
+            (std::sync::Arc::new(context), snapshot?, end)
+        };
         let pending = self.fetched.is_none();
         let empty: Fetched = Vec::new();
-        let (fetched, end) = match &mut self.fetched {
-            Some((fetched, end)) => {
+        let fetched = match &mut self.fetched {
+            Some((fetched, _)) => {
                 for (source, _) in fetched.iter_mut() {
                     let key = cache_source_key(source)?;
                     let current = keyed
@@ -703,22 +741,12 @@ impl MergeCache {
                         .0;
                     *source = current.clone();
                 }
-                (&*fetched, *end)
+                &*fetched
             }
-            None => (&empty, context.at),
+            None => &empty,
         };
-        let snapshot = load_snapshot(&context.log, end).await?;
-        let mut views = Vec::new();
-        for (minutes, scope) in selections {
-            let mut view = merge_fetched(
-                context.clone(),
-                fetched,
-                minutes,
-                scope,
-                end,
-                snapshot.clone(),
-            )
-            .await?;
+        let errors = &self.errors;
+        let decorate = |view: &mut Merged| {
             if pending {
                 view.sources = sources
                     .iter()
@@ -734,13 +762,29 @@ impl MergeCache {
             }
             for state in &mut view.sources {
                 if let Some((_, key)) = keyed.iter().find(|(source, _)| source.name == state.name)
-                    && let Some(error) = self.errors.get(key)
+                    && let Some(error) = errors.get(key)
                 {
                     state.error = Some(error.clone());
                 }
             }
-            views.push(view);
+        };
+        if let Some((minutes, scope, on_update)) =
+            first.filter(|(minutes, scope, _)| selections.contains(&(*minutes, *scope)))
+        {
+            let mut view = merge_fetched(
+                context.clone(),
+                fetched,
+                minutes,
+                scope,
+                end,
+                snapshot.clone(),
+            )
+            .await?;
+            decorate(&mut view);
+            on_update(vec![view])?;
         }
+        let mut views = merge_selections(&context, fetched, &selections, end, &snapshot).await?;
+        views.iter_mut().for_each(decorate);
         Ok(views)
     }
 }
@@ -900,20 +944,7 @@ async fn merge_progressive_snapshot(
     let context = std::sync::Arc::new(complete_context);
     let (fetched, end) = align_fetched(&context, fetched, &selections, false).await?;
     let snapshot = load_snapshot(&context.log, end).await?;
-    let mut views = Vec::new();
-    for (minutes, scope) in selections {
-        views.push(
-            merge_fetched(
-                context.clone(),
-                &fetched,
-                minutes,
-                scope,
-                end,
-                snapshot.clone(),
-            )
-            .await?,
-        );
-    }
+    let mut views = merge_selections(&context, &fetched, &selections, end, &snapshot).await?;
     for view in &mut views {
         for source in &mut view.sources {
             if let Some(error) = background_errors.get(&source.name) {
@@ -1068,6 +1099,37 @@ async fn align_fetched(
         }
     }
     Err("TRAFFIC_UPDATING".into())
+}
+/// A selected range/scope and where to publish it before the remaining views.
+pub type FirstView<'a> = (
+    u64,
+    crate::traffic::TrafficScope,
+    &'a (dyn Fn(Vec<Merged>) -> Result<(), String> + Sync),
+);
+/// Merge every range/scope from one shared snapshot. The views are independent,
+/// so their local reads run on separate blocking threads; order is preserved.
+async fn merge_selections(
+    context: &std::sync::Arc<MergeContext>,
+    fetched: &Fetched,
+    selections: &[(u64, crate::traffic::TrafficScope)],
+    end: i64,
+    snapshot: &std::sync::Arc<crate::traffic::Snapshot>,
+) -> Result<Vec<Merged>, String> {
+    let fetched = std::sync::Arc::new(fetched.clone());
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, &(minutes, scope)) in selections.iter().enumerate() {
+        let (context, fetched, snapshot) = (context.clone(), fetched.clone(), snapshot.clone());
+        tasks.spawn(async move {
+            let view = merge_fetched(context, &fetched, minutes, scope, end, snapshot).await;
+            (index, view)
+        });
+    }
+    let mut views: Vec<Option<Merged>> = selections.iter().map(|_| None).collect();
+    while let Some(result) = tasks.join_next().await {
+        let (index, view) = result.map_err(|_| "Cannot merge processed statistics")?;
+        views[index] = Some(view?);
+    }
+    Ok(views.into_iter().flatten().collect())
 }
 async fn merge_fetched(
     context: std::sync::Arc<MergeContext>,
@@ -1449,6 +1511,49 @@ mod tests {
             "One explicit refresh must contact each peer only once when boundaries disagree"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn passive_reads_publish_the_selected_range_before_all_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let updates = std::sync::Mutex::new(Vec::new());
+        let publish = |views: Vec<Merged>| {
+            let mut updates = updates.lock().unwrap();
+            updates.extend(views.iter().map(|view| (view.minutes, view.scope)));
+            Ok(())
+        };
+        let views = MergeCache::default()
+            .views_selected_first(
+                Vec::new(),
+                config,
+                log,
+                BTreeMap::new(),
+                false,
+                Some((1440, crate::traffic::TrafficScope::All, &publish)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *updates.lock().unwrap(),
+            [(1440, crate::traffic::TrafficScope::All)]
+        );
+        let order: Vec<_> = views
+            .iter()
+            .map(|view| (view.minutes, view.scope))
+            .collect();
+        let expected: Vec<_> = crate::data_api::RANGES
+            .into_iter()
+            .flat_map(|m| {
+                [
+                    (m, crate::traffic::TrafficScope::Model),
+                    (m, crate::traffic::TrafficScope::All),
+                ]
+            })
+            .collect();
+        assert_eq!(order, expected, "Parallel merging must keep view order");
     }
 
     #[tokio::test]
