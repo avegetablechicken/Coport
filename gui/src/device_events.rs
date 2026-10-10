@@ -170,13 +170,19 @@ pub(crate) async fn record(log: PathBuf, source: &Source, success: bool, elapsed
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record(&log, source, success, elapsed, Instant::now());
     if let Some(event) = event {
-        let result =
-            tokio::task::spawn_blocking(move || persist(&crate::settings::app_dir(), &log, event))
-                .await;
+        let result = tokio::task::spawn_blocking(move || persist(&daemon_dir(), &log, event)).await;
         if !matches!(result, Ok(Ok(()))) {
             eprintln!("Cannot record device statistics query");
         }
     }
+}
+/// Where the live daemon is discovered. Unit tests query fake peers with
+/// temporary logs and must never contact the user's running daemon.
+fn daemon_dir() -> PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join("coport-unit-tests-without-daemon");
+    #[cfg(not(test))]
+    crate::settings::app_dir()
 }
 fn persist(app_dir: &Path, log: &Path, event: QueryEvent) -> io::Result<()> {
     // The live daemon owns log rotation: enqueue through its authenticated local
@@ -284,6 +290,11 @@ mod tests {
             history.record(path, &source, true, duration, now);
         }
         assert_eq!(history.0.len(), CAPACITY);
+    }
+    #[test]
+    fn unit_tests_never_discover_the_users_daemon() {
+        assert_ne!(daemon_dir(), crate::settings::app_dir());
+        assert!(crate::daemon::Client::discover(&daemon_dir()).is_none());
     }
     #[test]
     fn audit_records_exclude_private_fields_and_do_not_change_traffic() {
