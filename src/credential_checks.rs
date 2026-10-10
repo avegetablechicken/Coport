@@ -14,6 +14,58 @@ pub struct CredentialReport {
     pub checked_at: u64,
 }
 
+impl Server {
+    /// Serialize checks and reuse both successful and failed results equally.
+    pub async fn credential_reports(&self) -> Vec<CredentialReport> {
+        let mut cache = self.credential_checks.lock().await;
+        if let Some((at, reports)) = cache.as_ref()
+            && at.elapsed() < INTERVAL
+        {
+            return reports.clone();
+        }
+        let check = |name: &str, result: Result<crate::Result<()>, tokio::time::error::Elapsed>| {
+            let reason = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.message.to_owned()),
+                Err(_) => Some("Credential check timed out.".to_owned()),
+            };
+            CredentialReport {
+                name: name.into(),
+                ok: reason.is_none(),
+                reason,
+                checked_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            }
+        };
+        let (codex, claude, _) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.config.check_codex_credentials()
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.config.claude.check_credentials()
+            ),
+            // Only the periodic worker requests enrichment. Display readers use
+            // cached_traffic_credential_labels and never initiate profile I/O.
+            tokio::time::timeout(Duration::from_secs(30), self.traffic_credential_labels()),
+        );
+        let reports = vec![check("Codex", codex), check("Claude", claude)];
+        *cache = Some((tokio::time::Instant::now(), reports.clone()));
+        reports
+    }
+
+    pub(super) async fn monitor_credentials(&self) {
+        loop {
+            self.credential_reports().await;
+            let next = self.credential_checks.lock().await.as_ref().unwrap().0 + INTERVAL;
+            tokio::time::sleep_until(next).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,57 +116,5 @@ mod tests {
                 .contains("ANTHROPIC_AUTH_TOKEN")
         );
         monitor.abort();
-    }
-}
-
-impl Server {
-    /// Serialize checks and reuse both successful and failed results equally.
-    pub async fn credential_reports(&self) -> Vec<CredentialReport> {
-        let mut cache = self.credential_checks.lock().await;
-        if let Some((at, reports)) = cache.as_ref()
-            && at.elapsed() < INTERVAL
-        {
-            return reports.clone();
-        }
-        let check = |name: &str, result: Result<crate::Result<()>, tokio::time::error::Elapsed>| {
-            let reason = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error.message.to_owned()),
-                Err(_) => Some("Credential check timed out.".to_owned()),
-            };
-            CredentialReport {
-                name: name.into(),
-                ok: reason.is_none(),
-                reason,
-                checked_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            }
-        };
-        let (codex, claude, _) = tokio::join!(
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                self.config.check_codex_credentials()
-            ),
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                self.config.claude.check_credentials()
-            ),
-            // Only the periodic worker requests enrichment. Display readers use
-            // cached_traffic_credential_labels and never initiate profile I/O.
-            tokio::time::timeout(Duration::from_secs(30), self.traffic_credential_labels()),
-        );
-        let reports = vec![check("Codex", codex), check("Claude", claude)];
-        *cache = Some((tokio::time::Instant::now(), reports.clone()));
-        reports
-    }
-
-    pub(super) async fn monitor_credentials(&self) {
-        loop {
-            self.credential_reports().await;
-            let next = self.credential_checks.lock().await.as_ref().unwrap().0 + INTERVAL;
-            tokio::time::sleep_until(next).await;
-        }
     }
 }
