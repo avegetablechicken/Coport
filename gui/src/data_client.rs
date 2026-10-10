@@ -563,8 +563,14 @@ fn cache_source_key(source: &Source) -> Result<Vec<u8>, String> {
 #[derive(Default)]
 pub struct MergeCache {
     key: Vec<u8>,
-    fetched: Option<(Fetched, i64)>,
+    fetched: Option<(std::sync::Arc<Fetched>, i64)>,
     errors: BTreeMap<Vec<u8>, String>,
+}
+/// Cached peer results captured under the cache lock and rendered without it.
+struct CachedState {
+    fetched: Option<(std::sync::Arc<Fetched>, i64)>,
+    errors: BTreeMap<Vec<u8>, String>,
+    keys: Vec<(String, Vec<u8>)>,
 }
 impl MergeCache {
     pub async fn refresh_progressive(
@@ -645,7 +651,7 @@ impl MergeCache {
                 self.errors.insert(cache_source_key(source)?, error.clone());
             }
         }
-        self.fetched = Some((result.fetched, result.end));
+        self.fetched = Some((std::sync::Arc::new(result.fetched), result.end));
         Ok(result.views)
     }
 
@@ -681,128 +687,174 @@ impl MergeCache {
         refresh_remote: bool,
         first: Option<FirstView<'_>>,
     ) -> Result<Vec<Merged>, String> {
-        if sources.len() > crate::devices::LIMIT {
-            return Err("At most 32 data sources are supported.".into());
-        }
-        let selections: Vec<_> = crate::data_api::RANGES
-            .into_iter()
-            .flat_map(|minutes| {
-                [
-                    crate::traffic::TrafficScope::Model,
-                    crate::traffic::TrafficScope::All,
-                ]
-                .into_iter()
-                .map(move |scope| (minutes, scope))
-            })
-            .collect();
-        let keyed: Vec<_> = sources
-            .iter()
-            .map(|source| Ok((source, cache_source_key(source)?)))
-            .collect::<Result<_, String>>()?;
-        let mut keys: Vec<_> = keyed.iter().map(|(_, key)| key.clone()).collect();
-        keys.sort();
-        let key = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
-        if key != self.key {
-            self.fetched = None;
-            self.errors.clear();
-            self.key = key;
-        }
-        let at = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        self.cached_state(&sources)?;
         let mut full = None;
         if refresh_remote {
             let context = std::sync::Arc::new(
                 prepare_merge(config.clone(), log.clone(), credential_labels.clone()).await?,
             );
-            self.fetched = Some(align_sources(&context, sources.clone(), &selections).await?);
+            let (fetched, end) =
+                align_sources(&context, sources.clone(), &all_selections()).await?;
+            self.fetched = Some((std::sync::Arc::new(fetched), end));
             self.errors.clear();
             full = Some(context);
         }
-        let pending = self.fetched.is_none();
-        let empty: Fetched = Vec::new();
-        let (fetched, end) = match &mut self.fetched {
-            Some((fetched, end)) => {
-                for (source, _) in fetched.iter_mut() {
-                    let key = cache_source_key(source)?;
-                    let current = keyed
-                        .iter()
-                        .find(|(_, candidate)| candidate == &key)
-                        .ok_or("Cached source is no longer configured")?
-                        .0;
-                    *source = current.clone();
-                }
-                (&*fetched, *end)
-            }
-            None => (&empty, at),
-        };
-        let errors = &self.errors;
-        let decorate = |view: &mut Merged| {
-            if pending {
-                view.sources = sources
+        let state = self.cached_state(&sources)?;
+        render_views(state, sources, config, log, credential_labels, first, full).await
+    }
+
+    /// Passive reads hold the cache lock only to capture its state, so a
+    /// later read's first frame never waits behind an earlier 30-day merge.
+    pub async fn views_shared(
+        cache: &tokio::sync::Mutex<Self>,
+        sources: Vec<Source>,
+        config: Config,
+        log: PathBuf,
+        credential_labels: BTreeMap<(String, String), String>,
+        first: Option<FirstView<'_>>,
+    ) -> Result<Vec<Merged>, String> {
+        let state = cache.lock().await.cached_state(&sources)?;
+        render_views(state, sources, config, log, credential_labels, first, None).await
+    }
+
+    /// Reset the cache for a changed device set and map cached results to
+    /// current device names.
+    fn cached_state(&mut self, sources: &[Source]) -> Result<CachedState, String> {
+        if sources.len() > crate::devices::LIMIT {
+            return Err("At most 32 data sources are supported.".into());
+        }
+        let keys: Vec<_> = sources
+            .iter()
+            .map(|source| Ok((source.name.clone(), cache_source_key(source)?)))
+            .collect::<Result<_, String>>()?;
+        let mut sorted: Vec<_> = keys.iter().map(|(_, key)| key.clone()).collect();
+        sorted.sort();
+        let key = serde_json::to_vec(&sorted).map_err(|e| e.to_string())?;
+        if key != self.key {
+            self.fetched = None;
+            self.errors.clear();
+            self.key = key;
+        }
+        if let Some((fetched, _)) = &mut self.fetched {
+            for (source, _) in std::sync::Arc::make_mut(fetched).iter_mut() {
+                let key = cache_source_key(source)?;
+                let current = sources
                     .iter()
-                    .map(|source| SourceState {
-                        name: source.name.clone(),
-                        included: false,
-                        exclusion: Some(SourceExclusion::NotRefreshed),
-                        error: None,
-                        traffic: None,
-                    })
-                    .collect();
-                view.sources.sort_by(|a, b| a.name.cmp(&b.name));
+                    .zip(&keys)
+                    .find(|(_, (_, candidate))| candidate == &key)
+                    .ok_or("Cached source is no longer configured")?
+                    .0;
+                *source = current.clone();
             }
-            for state in &mut view.sources {
-                if let Some((_, key)) = keyed.iter().find(|(source, _)| source.name == state.name)
-                    && let Some(error) = errors.get(key)
-                {
-                    state.error = Some(error.clone());
-                }
+        }
+        Ok(CachedState {
+            fetched: self.fetched.clone(),
+            errors: self.errors.clone(),
+            keys,
+        })
+    }
+}
+fn all_selections() -> Vec<(u64, crate::traffic::TrafficScope)> {
+    crate::data_api::RANGES
+        .into_iter()
+        .flat_map(|minutes| {
+            [
+                crate::traffic::TrafficScope::Model,
+                crate::traffic::TrafficScope::All,
+            ]
+            .into_iter()
+            .map(move |scope| (minutes, scope))
+        })
+        .collect()
+}
+async fn render_views(
+    state: CachedState,
+    sources: Vec<Source>,
+    config: Config,
+    log: PathBuf,
+    credential_labels: BTreeMap<(String, String), String>,
+    first: Option<FirstView<'_>>,
+    full: Option<std::sync::Arc<MergeContext>>,
+) -> Result<Vec<Merged>, String> {
+    let selections = all_selections();
+    let at = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+    let pending = state.fetched.is_none();
+    let empty: Fetched = Vec::new();
+    let (fetched, end): (&Fetched, i64) = match &state.fetched {
+        Some((fetched, end)) => (fetched, *end),
+        None => (&empty, at),
+    };
+    let decorate = |view: &mut Merged| {
+        if pending {
+            view.sources = sources
+                .iter()
+                .map(|source| SourceState {
+                    name: source.name.clone(),
+                    included: false,
+                    exclusion: Some(SourceExclusion::NotRefreshed),
+                    error: None,
+                    traffic: None,
+                })
+                .collect();
+            view.sources.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        for source in &mut view.sources {
+            if let Some((_, key)) = state.keys.iter().find(|(name, _)| name == &source.name)
+                && let Some(error) = state.errors.get(key)
+            {
+                source.error = Some(error.clone());
             }
-        };
-        if let Some((minutes, scope, on_update)) =
-            first.filter(|(minutes, scope, _)| selections.contains(&(*minutes, *scope)))
-        {
-            // The first frame reads only the files its range needs, like an
-            // explicit refresh. A cold start must not parse 30 days of archives
-            // first; the complete views below replace it with 30-day evidence.
+        }
+    };
+    if let Some((minutes, scope, on_update)) =
+        first.filter(|(minutes, scope, _)| selections.contains(&(*minutes, *scope)))
+    {
+        // The first frame reads only the files its range needs, like an
+        // explicit refresh. A cold start must not parse 30 days of archives
+        // first; the complete views below replace it with 30-day evidence.
+        // Evidence spans from the window start to now, so a cached boundary
+        // from an earlier refresh is still covered.
+        let behind = u64::try_from(at - end).unwrap_or(0).div_ceil(60_000);
+        let evidence = (minutes + behind).min(43200);
+        let (context, snapshot) = tokio::join!(
+            prepare_merge_range(
+                config.clone(),
+                log.clone(),
+                credential_labels.clone(),
+                evidence
+            ),
+            load_selected_snapshot(&log, end, minutes)
+        );
+        let mut context = context?;
+        context.at = at;
+        let mut view = merge_fetched(
+            std::sync::Arc::new(context),
+            fetched,
+            minutes,
+            scope,
+            end,
+            snapshot?,
+        )
+        .await?;
+        decorate(&mut view);
+        on_update(vec![view])?;
+    }
+    // Identity evidence and the shared snapshot are read concurrently.
+    let (context, snapshot) = match full {
+        Some(context) => (context, load_snapshot(&log, end).await?),
+        None => {
             let (context, snapshot) = tokio::join!(
-                prepare_merge_range(
-                    config.clone(),
-                    log.clone(),
-                    credential_labels.clone(),
-                    minutes
-                ),
-                load_selected_snapshot(&log, end, minutes)
+                prepare_merge(config, log.clone(), credential_labels),
+                load_snapshot(&log, end)
             );
             let mut context = context?;
             context.at = at;
-            let mut view = merge_fetched(
-                std::sync::Arc::new(context),
-                fetched,
-                minutes,
-                scope,
-                end,
-                snapshot?,
-            )
-            .await?;
-            decorate(&mut view);
-            on_update(vec![view])?;
+            (std::sync::Arc::new(context), snapshot?)
         }
-        // Identity evidence and the shared snapshot are read concurrently.
-        let (context, snapshot) = match full {
-            Some(context) => (context, load_snapshot(&log, end).await?),
-            None => {
-                let (context, snapshot) = tokio::join!(
-                    prepare_merge(config, log.clone(), credential_labels),
-                    load_snapshot(&log, end)
-                );
-                let mut context = context?;
-                context.at = at;
-                (std::sync::Arc::new(context), snapshot?)
-            }
-        };
-        let mut views = merge_selections(&context, fetched, &selections, end, &snapshot).await?;
-        views.iter_mut().for_each(decorate);
-        Ok(views)
-    }
+    };
+    let mut views = merge_selections(&context, fetched, &selections, end, &snapshot).await?;
+    views.iter_mut().for_each(decorate);
+    Ok(views)
 }
 /// Publish the selected view as peers respond, then fill the other cached views.
 pub async fn merge_progressive_with_labels(
@@ -1104,9 +1156,10 @@ async fn align_fetched(
             return Ok((fetched, end));
         }
         // Progressive refresh already has all frames from the authorized connection.
-        // A boundary mismatch must not launch another SSH connection behind the UI.
+        // A boundary mismatch must not launch another SSH connection behind the UI;
+        // keep the devices that agree and report the others instead.
         if !allow_refetch {
-            break;
+            return Ok(align_partially(context, fetched, selections));
         }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
@@ -1121,6 +1174,56 @@ async fn align_fetched(
         }
     }
     Err("TRAFFIC_UPDATING".into())
+}
+/// Choose the boundary shared by the most devices, latest first, and mark the
+/// devices that cannot provide it. Other devices stay visible and cached.
+fn align_partially(
+    context: &MergeContext,
+    mut fetched: Fetched,
+    selections: &[(u64, crate::traffic::TrafficScope)],
+) -> (Fetched, i64) {
+    let mut seen = BTreeSet::from([context.local_id.clone()]);
+    let valid: Vec<(usize, &Summary)> = fetched
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, result))| {
+            let summary = result.as_ref().ok()?;
+            let usable = seen.insert(summary.node_id.clone())
+                && selections.iter().any(|(minutes, scope)| {
+                    selected_groups(summary, *minutes, *scope, summary.window_end).is_ok()
+                });
+            usable.then_some((index, summary))
+        })
+        .collect();
+    let supports = |summary: &Summary, end: i64| {
+        selections.iter().all(|(minutes, scope)| {
+            selected_groups(summary, *minutes, *scope, summary.window_end).is_err()
+                || selected_groups(summary, *minutes, *scope, end).is_ok()
+        })
+    };
+    let candidates: BTreeSet<i64> = valid
+        .iter()
+        .flat_map(|(_, s)| {
+            std::iter::once(s.window_end).chain(s.previous_windows.iter().map(|w| w.window_end))
+        })
+        .filter(|end| *end <= context.at)
+        .collect();
+    // `max_by_key` keeps the last maximum, so ascending order prefers the latest tie.
+    let end = candidates
+        .into_iter()
+        .max_by_key(|end| valid.iter().filter(|(_, s)| supports(s, *end)).count())
+        .unwrap_or(context.at);
+    let mismatched: Vec<usize> = valid
+        .iter()
+        .filter(|(_, s)| !supports(s, end))
+        .map(|(index, _)| *index)
+        .collect();
+    for index in mismatched {
+        fetched[index].1 = Err(
+            "This device reported a different time boundary; press Refresh to try again.".into(),
+        );
+    }
+    (fetched, end)
 }
 /// A selected range/scope and where to publish it before the remaining views.
 pub type FirstView<'a> = (
@@ -1454,10 +1557,10 @@ mod tests {
         }
         let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         cache.fetched = Some((
-            vec![
+            std::sync::Arc::new(vec![
                 (sources[1].clone(), Err("error A".into())),
                 (sources[0].clone(), Err("error Z".into())),
-            ],
+            ]),
             end,
         ));
         sources[0].name = "First".into();
@@ -1511,7 +1614,7 @@ mod tests {
                 socket.write_all(&body).await.unwrap();
             }
         });
-        let sources = (0..2)
+        let sources: Vec<Source> = (0..2)
             .map(|i| Source {
                 name: format!("peer-{i}"),
                 device_id: None,
@@ -1524,23 +1627,156 @@ mod tests {
                 ssh_device: None,
             })
             .collect();
-        let result = MergeCache::default()
+        let mut cache = MergeCache::default();
+        let views = cache
             .refresh_progressive(
-                sources,
-                config,
-                log,
+                sources.clone(),
+                config.clone(),
+                log.clone(),
                 BTreeMap::new(),
                 (30, crate::traffic::TrafficScope::Model),
                 |_| Ok(()),
             )
-            .await;
-        assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
+            .await
+            .unwrap();
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "One explicit refresh must contact each peer only once when boundaries disagree"
         );
+        // The device on the latest boundary stays visible; the other is reported.
+        let check = |views: &[Merged]| {
+            let selected = views
+                .iter()
+                .find(|v| v.minutes == 30 && v.scope == crate::traffic::TrafficScope::Model)
+                .unwrap();
+            assert_eq!(selected.sources.iter().filter(|s| s.included).count(), 1);
+            assert_eq!(
+                selected
+                    .sources
+                    .iter()
+                    .filter(|s| s
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("different time boundary")))
+                    .count(),
+                1
+            );
+        };
+        check(&views);
+        // The partial result is cached; reading it never reconnects.
+        check(
+            &cache
+                .views(sources, config, log, BTreeMap::new(), false)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn first_frame_evidence_covers_a_cached_older_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let now = chrono::Utc::now().timestamp_millis();
+        // The last refresh ended two hours ago.
+        let end = now / 60_000 * 60_000 - 120 * 60_000;
+        let account = "00000000-0000-4000-8000-000000000123";
+        std::fs::write(&log, "").unwrap();
+        // The only evidence naming the peer's account lies in an archive
+        // rotated an hour ago: after the cached boundary, before the last 30 minutes.
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let archive = history.join(format!(
+            "proxy.log.{}.{}.jsonl",
+            now - 60 * 60_000,
+            uuid::Uuid::new_v4()
+        ));
+        let evidence = serde_json::json!({"timestamp":chrono::DateTime::from_timestamp_millis(now - 70 * 60_000).unwrap().to_rfc3339(),"event":"model_call_finished","service":"codex","model_call_id":"one","account_id":account,"account_label":"Known local account","status":"200"});
+        std::fs::write(&archive, format!("{evidence}\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis((now - 60 * 60_000) as u64))
+            .unwrap();
+        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: [{}]\n  routing:\n    account: {{'Known local account': none}}\nclaude:\n  config_dirs: []\n", serde_json::to_string(dir.path()).unwrap())).unwrap();
+        let labels = config.local_traffic_credential_labels().await;
+        let source = Source {
+            name: "peer".into(),
+            device_id: None,
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: "http://127.0.0.1:9".into(),
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+        summary.window_end = end;
+        summary.window_start = end - 30 * 60_000;
+        summary.groups[0].account_ref = crate::data_api::account_reference("Codex", account);
+        let mut cache = MergeCache::default();
+        cache.cached_state(std::slice::from_ref(&source)).unwrap();
+        cache.fetched = Some((
+            std::sync::Arc::new(vec![(source.clone(), Ok(summary))]),
+            end,
+        ));
+        let first = std::sync::Mutex::new(None);
+        let publish = |views: Vec<Merged>| {
+            *first.lock().unwrap() = Some(serde_json::to_value(&views[0]).unwrap());
+            Ok(())
+        };
+        let views = cache
+            .views_selected_first(
+                vec![source],
+                config,
+                log,
+                labels,
+                false,
+                Some((30, crate::traffic::TrafficScope::Model, &publish)),
+            )
+            .await
+            .unwrap();
+        let complete = views
+            .iter()
+            .find(|v| v.minutes == 30 && v.scope == crate::traffic::TrafficScope::Model)
+            .unwrap();
+        let complete = serde_json::to_value(complete).unwrap();
+        assert!(complete.to_string().contains("Known local account"));
+        assert_eq!(
+            first.into_inner().unwrap().unwrap(),
+            complete,
+            "The first frame must use the evidence of the window it shows"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_reads_render_without_holding_the_cache_lock() {
+        let (_dir, log, _) = archived_traffic_fixture();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let cache = tokio::sync::Mutex::new(MergeCache::default());
+        let free = std::sync::Mutex::new(None);
+        // Another page read or a refresh must be able to take the lock while
+        // this read is still merging its views.
+        let publish = |_views: Vec<Merged>| {
+            *free.lock().unwrap() = Some(cache.try_lock().is_ok());
+            Ok(())
+        };
+        let views = MergeCache::views_shared(
+            &cache,
+            Vec::new(),
+            config,
+            log,
+            BTreeMap::new(),
+            Some((30, crate::traffic::TrafficScope::Model, &publish)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(views.len(), 12);
+        assert_eq!(*free.lock().unwrap(), Some(true));
     }
 
     #[tokio::test]

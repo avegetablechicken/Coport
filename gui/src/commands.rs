@@ -646,19 +646,15 @@ pub async fn get_merged_data(
                 .send(views)
                 .map_err(|_| "Traffic view closed".to_owned())
         };
-        return state
-            .merged_cache
-            .lock()
-            .await
-            .views_selected_first(
-                sources,
-                config,
-                log,
-                labels,
-                false,
-                Some((minutes, scope, &publish)),
-            )
-            .await;
+        return coport_gui::data_client::MergeCache::views_shared(
+            &state.merged_cache,
+            sources,
+            config,
+            log,
+            labels,
+            Some((minutes, scope, &publish)),
+        )
+        .await;
     }
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {

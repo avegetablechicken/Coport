@@ -1304,7 +1304,8 @@ the same two alignment boundaries and privacy/size limits. Both SSH frames use
 one fixed snapshot boundary, even if computing the complete snapshot crosses a
 minute. The selected and full snapshots each parse every log file once for their
 scopes and boundaries. A progressive refresh does not reconnect automatically
-when peers cannot align; another remote fetch requires an explicit refresh.
+when peers cannot align: it keeps the boundary most devices share and reports
+the others, which the next explicit refresh retries.
 Once all twelve views are cached, range/category switches are immediate.
 Background failures retain statistics already displayed. The first Devices visit
 after the app starts refreshes once; later page entry, periodic refresh and
