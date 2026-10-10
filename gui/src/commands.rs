@@ -190,10 +190,14 @@ pub async fn get_traffic(
     minutes: u64,
     scope: Option<crate::traffic::TrafficScope>,
 ) -> Result<crate::traffic::Traffic> {
-    let (path, config) = {
+    let (path, config, task) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();
-        (core.logs.path(), core.loaded_config().cloned())
+        (
+            core.logs.path(),
+            core.loaded_config().cloned(),
+            core.account_tasks(),
+        )
     };
     // An unreadable file leaves every changed configuration to be reviewed.
     let assignments =
@@ -203,8 +207,8 @@ pub async fn get_traffic(
         .as_ref()
         .map(|config| crate::traffic_identity::Identities::from_config(config, &assignments))
         .unwrap_or_default();
-    let labels = match &config {
-        Some(config) => config.local_traffic_credential_labels().await,
+    let labels = match task {
+        Some(task) => task.cached_credential_labels().await,
         None => Default::default(),
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -644,7 +648,7 @@ pub async fn get_merged_data(
     refresh_remote: Option<bool>,
 ) -> Result<Vec<coport_gui::data_client::Merged>> {
     coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let (sources, config, log) = {
+    let (sources, config, log, task) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();
         (
@@ -653,12 +657,12 @@ pub async fn get_merged_data(
                 .cloned()
                 .ok_or("Cannot read local configuration")?,
             core.logs.path(),
+            core.account_tasks()
+                .ok_or("Cannot prepare credential cache")?,
         )
     };
-    // Statistics never request account metadata from the running proxy. Local
-    // files plus already logged identities are sufficient; old daemons may
-    // resolve missing metadata by contacting upstream providers.
-    let labels = config.local_traffic_credential_labels().await;
+    // Read identities learned by background probes without starting a probe.
+    let labels = task.cached_credential_labels().await;
     if refresh_remote != Some(true) {
         // Publish the selected range first; the 30-day views follow.
         let publish = |views| {

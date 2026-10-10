@@ -772,6 +772,13 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     let (client, _) =
         daemon::start(&helper(), dir.path(), &dir.path().join("config.yaml"), &log).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
+    // The explicit account_probe authorizes one background discovery attempt.
+    // Wait for that cycle, then prove display reads cause no additional I/O.
+    rt.block_on(client.credential_reports()).unwrap();
+    assert!(
+        forbidden.accept().is_ok(),
+        "Background identity discovery did not run"
+    );
     rt.block_on(async {
         let config = coport::config::Config::parse(&config_text).unwrap();
         let mut cache = coport_gui::data_client::MergeCache::default();
@@ -780,7 +787,12 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
             // Both old and new RPCs must stay offline even with missing OAuth identity.
             client.credential_labels().await.unwrap();
             client.cached_credential_labels().await.unwrap();
-            let labels = config.local_traffic_credential_labels().await;
+            let tasks = coport_gui::tasks::Tasks::new(
+                dir.path().into(),
+                dir.path().join("config.yaml"),
+                config.clone(),
+            );
+            let labels = tasks.cached_credential_labels().await;
             cache
                 .views(Vec::new(), config.clone(), log.clone(), labels, false)
                 .await
@@ -834,6 +846,7 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     rt.block_on(async {
         for _ in 0..3 {
             tasks.credential_labels().await.unwrap();
+            tasks.cached_credential_labels().await;
         }
     });
     assert!(

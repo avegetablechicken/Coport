@@ -102,6 +102,8 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                 else if profile {
                     let (status, body) = match response_mode {
                         "profile_unauthorized" => (401, "{}"),
+                        "profile_retry_identity" if attempt == 0 => (401, "{}"),
+                        "profile_retry_identity" => (200, r#"{"account":{"uuid":"12345678-1234-4234-8234-123456789abc","email":"remote@example.invalid"}}"#),
                         "profile_invalid" => (200, "{}"),
                         "profile_redirect" => (302, "{}"),
                         _ => (200, r#"{"account":{"uuid":"remote-account","email":"remote@example.invalid"}}"#),
@@ -196,6 +198,9 @@ async fn running(config: &str) -> Running {
         config.codex.homes = isolated("codex");
     }
     let server = Arc::new(Server::new(config, logger));
+    // Routing fixtures drive diagnostics explicitly after installing test TLS
+    // trust; background profile I/O would race their request assertions.
+    *server.credential_checks.lock().await = Some((tokio::time::Instant::now(), Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(
@@ -748,6 +753,149 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
                 .unwrap()
                 .0,
             before
+        );
+    }
+}
+
+#[tokio::test]
+async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_success() {
+    let mut lookup = fixture("http", "profile_retry_identity").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = dir.path().join(".credentials.json");
+    let saved = r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#;
+    std::fs::write(&credentials, saved).unwrap();
+    let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &lookup, &endpoint);
+    let identity = (
+        "Claude".into(),
+        "12345678-1234-4234-8234-123456789abc".into(),
+    );
+    *running.server.credential_checks.lock().await = None;
+    running.server.credential_reports().await;
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    assert!(
+        !running
+            .server
+            .cached_traffic_credential_labels()
+            .await
+            .contains_key(&identity)
+    );
+    for _ in 0..3 {
+        running.server.credential_reports().await;
+        running.server.cached_traffic_credential_labels().await;
+    }
+    assert!(
+        lookup.requests.try_recv().is_err(),
+        "Neither cached reports nor display reads retry a failed probe"
+    );
+    // Expire both periodic and failed-probe caches, without waiting a minute.
+    *running.server.credential_checks.lock().await = None;
+    for (at, _) in running.server.account_checks.lock().await.values_mut() {
+        *at = Instant::now() - Duration::from_secs(61);
+    }
+    running.server.credential_reports().await;
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    assert_eq!(
+        running
+            .server
+            .cached_traffic_credential_labels()
+            .await
+            .get(&identity)
+            .map(String::as_str),
+        Some("remote@example.invalid")
+    );
+    *running.server.credential_checks.lock().await = None;
+    running.server.credential_reports().await;
+    assert!(
+        lookup.requests.try_recv().is_err(),
+        "Successful identities are reused across cycles"
+    );
+    std::fs::write(
+        &credentials,
+        r#"{"claudeAiOauth":{"accessToken":"rotated-secret"}}"#,
+    )
+    .unwrap();
+    *running.server.credential_checks.lock().await = None;
+    running.server.credential_reports().await;
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .contains("authorization: Bearer rotated-secret")
+    );
+    assert!(
+        !dir.path().join(".claude.json").exists(),
+        "Probes must not rewrite Claude metadata"
+    );
+}
+
+#[tokio::test]
+async fn periodic_identity_probe_requires_explicit_probe_and_skips_known_local_identity() {
+    for (probe, metadata) in [(false, false), (false, true), (true, true)] {
+        let mut lookup = fixture("http", "sse").await;
+        let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        if metadata {
+            std::fs::write(dir.path().join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"local-account","emailAddress":"remote@example.invalid"}}"#).unwrap();
+        }
+        let probe = if probe {
+            "    account_probe: lookup\n"
+        } else {
+            ""
+        };
+        let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_fallback: lookup\n{probe}",serde_json::to_string(dir.path()).unwrap())).await;
+        trust(&running, &lookup, &endpoint);
+        *running.server.credential_checks.lock().await = None;
+        running.server.credential_reports().await;
+        assert!(
+            lookup.requests.try_recv().is_err(),
+            "Fallback alone cannot authorize identity discovery, and local metadata needs no probe"
         );
     }
 }

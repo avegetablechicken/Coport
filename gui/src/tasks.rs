@@ -90,10 +90,22 @@ impl Tasks {
     }
 
     pub async fn cached_credential_labels(&self) -> CredentialLabels {
-        if let Ok(Some(client)) = self.backend().await
-            && let Ok(labels) = client.cached_credential_labels().await
-        {
-            return labels;
+        // Require the current daemon capability before using its cache API;
+        // legacy metadata endpoints could perform an upstream lookup.
+        match self.backend_for(true).await {
+            Ok(Some(client)) => {
+                if let Ok(labels) = client.cached_credential_labels().await {
+                    return labels;
+                }
+            }
+            Ok(None) => {
+                return self
+                    .local_server()
+                    .await
+                    .cached_traffic_credential_labels()
+                    .await;
+            }
+            Err(_) => {}
         }
         self.config.local_traffic_credential_labels().await
     }
@@ -147,6 +159,7 @@ mod tests {
                     .contains("Restart")
             );
             assert!(tasks.credential_reports().await.is_err());
+            tasks.cached_credential_labels().await;
             assert!(tasks.local.lock().await.is_none());
             let lock = crate::daemon::lock_file(&dir.path().join("daemon.lock")).unwrap();
             lock.try_lock().unwrap();
@@ -166,6 +179,7 @@ mod tests {
                     .contains("control channel")
             );
             assert!(tasks.credential_reports().await.is_err());
+            tasks.cached_credential_labels().await;
             assert!(tasks.local.lock().await.is_none());
         });
     }

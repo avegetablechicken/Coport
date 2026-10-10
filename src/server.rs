@@ -192,7 +192,7 @@ impl Server {
         states
     }
     /// Read-only display metadata: local configuration plus identities already
-    /// observed by real requests. Never probe a profile endpoint or run a shell.
+    /// observed by requests or background probes. Never probe here or run a shell.
     pub async fn cached_traffic_credential_labels(
         &self,
     ) -> std::collections::BTreeMap<(String, String), String> {
@@ -216,14 +216,10 @@ impl Server {
     pub async fn traffic_credential_labels(
         &self,
     ) -> std::collections::BTreeMap<(String, String), String> {
-        let mut labels = self.config.traffic_credential_labels().await;
-        let Some(proxy) = self.config.claude.routing.account_probe.as_ref().or(self
-            .config
-            .claude
-            .routing
-            .account_fallback
-            .as_ref())
-        else {
+        let mut labels = self.config.local_traffic_credential_labels().await;
+        // Background identity discovery requires explicit consent to probing.
+        // A payload fallback route is not authorization for a profile request.
+        let Some(proxy) = self.config.claude.routing.account_probe.as_ref() else {
             return labels;
         };
         for (source, account) in self.config.claude.account_sources() {

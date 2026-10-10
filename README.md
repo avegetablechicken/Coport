@@ -1424,8 +1424,13 @@ regardless of success or failure, and continues when the GUI is closed. The GUI
 reads these results in the background and checks locally only when the daemon is
 confirmed absent; hiding the panel does not stop the GUI timer. An unavailable or
 older daemon is reported explicitly instead of checking under a different process
-environment. Warnings include the check time. These checks validate local credential
-resolution and routing, not upstream service availability. Configuration changes
+environment. Warnings include the check time. When `claude.routing.account_probe`
+is explicitly set, the background worker also resolves missing saved Claude account
+identities through that route. Successful identities are cached per credential;
+failed lookups are retried on later check cycles. `account_fallback` alone does not
+authorize this discovery. Statistics views read the cache without initiating probes,
+and neither credentials nor Claude metadata files are rewritten. Credential warnings
+validate local credential resolution and routing, not upstream service availability. Configuration changes
 still require restarting a running daemon.
 
 Startup is local by default. Enable **Restore on startup** to

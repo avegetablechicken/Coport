@@ -92,7 +92,7 @@ impl Server {
                     .as_secs(),
             }
         };
-        let (codex, claude) = tokio::join!(
+        let (codex, claude, _) = tokio::join!(
             tokio::time::timeout(
                 Duration::from_secs(30),
                 self.config.check_codex_credentials()
@@ -101,6 +101,9 @@ impl Server {
                 Duration::from_secs(30),
                 self.config.claude.check_credentials()
             ),
+            // Only the periodic worker requests enrichment. Display readers use
+            // cached_traffic_credential_labels and never initiate profile I/O.
+            tokio::time::timeout(Duration::from_secs(30), self.traffic_credential_labels()),
         );
         let reports = vec![check("Codex", codex), check("Claude", claude)];
         *cache = Some((tokio::time::Instant::now(), reports.clone()));
