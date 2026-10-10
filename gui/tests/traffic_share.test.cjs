@@ -164,7 +164,7 @@ test('review menu offers current configurations and Unidentified for each change
   assert.doesNotMatch(context.trafficReview({ ...group, sources: [group.sources[1]] }, targets), /traffic-review review/);
   assert.equal(context.trafficReview(credential('main', 3), targets), '');
 });
-test('Models charts retain idle baselines and omit calls without reported tokens', () => {
+test('Models charts draw one baseline for every bucket without reported tokens', () => {
   const context = setup('model');
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
@@ -173,11 +173,14 @@ test('Models charts retain idle baselines and omit calls without reported tokens
   assert.match(html, /No reported tokens/);
   assert.doesNotMatch(html, /calls|requests/);
   const groups = [...html.matchAll(/<g class="chart-bar"[^>]*>(.*?)<\/g>/g)].map(m => m[1]);
-  assert.match(groups[1], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
-  for (const i of [0, 2]) assert.doesNotMatch(groups[i], /<rect class="(?!chart-hit)/);
+  // Idle buckets and calls without reported tokens look the same, as on This Device.
+  for (const group of groups) {
+    assert.match(group, /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
+    assert.doesNotMatch(group, /class="err"/);
+  }
   assert.equal((html.match(/class="chart-hit"/g) || []).length, 3);
   const cancelled = context.chart({ ...failed, errorCounts: [0, 0, 0] }, 'model', true);
-  assert.equal((cancelled.match(/class="idle"/g) || []).length, 1);
+  assert.equal((cancelled.match(/class="idle"/g) || []).length, 3);
   assert.doesNotMatch(cancelled, /<rect class="(?:err|)"/);
   const requests = context.chart(failed, 'all', true);
   assert.equal((requests.match(/class="err"/g) || []).length, 2);
@@ -253,8 +256,7 @@ test('bar tooltips use their own time bucket and only the plotted metric', () =>
     assert.equal(groups.length, 3);
     for (const group of groups) assert.match(group, /<rect class="chart-hit"[^>]* y="0"[^>]* height="32"><\/rect>$/);
     assert.match(groups[0], /<rect class=""/);
-    assert.doesNotMatch(groups[1], /<rect class="(?!chart-hit)/);
-    assert.match(groups[2], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
+    for (const i of [1, 2]) assert.match(groups[i], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
   }
 });
 
