@@ -1487,6 +1487,12 @@ mod tests {
             row["duration_ms"] = "120".into();
             row["received_bytes"] = "1024".into();
             current.push_str(&format!("{row}\n"));
+            if i % 7 == 0 {
+                // Requests only in the archive: windows that include it must count
+                // them; the 30-minute window, which excludes it, must not.
+                let archived = serde_json::json!({"timestamp":chrono::DateTime::from_timestamp_millis(end - 5 * 60_000).unwrap().to_rfc3339(),"event":"request_finished","request_id":format!("o-{i}"),"service":service,"provider":format!("private-provider-{}",i%40),"method":"POST","path":"/v1/responses","proxy":"none","status":"200","received_bytes":"10"});
+                old.push_str(&format!("{archived}\n"));
+            }
             if i % 5 == 0 {
                 // Requests merge in id order: one CONNECT group exists before the
                 // limit is reached, later CONNECT requests must still join it.
