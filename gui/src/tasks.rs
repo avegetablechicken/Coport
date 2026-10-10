@@ -24,12 +24,19 @@ impl Tasks {
     }
 
     async fn backend(&self) -> Result<Option<daemon::Client>, String> {
+        self.backend_for(false).await
+    }
+
+    async fn backend_for(&self, credentials: bool) -> Result<Option<daemon::Client>, String> {
         let Some((client, status)) = daemon::task_backend(self.directory.clone())
             .await
             .map_err(|e| e.to_string())?
         else {
             return Ok(None);
         };
+        if credentials && !status.credential_checks_supported {
+            return Err("Restart the proxy daemon to enable periodic credential checks.".into());
+        }
         if !status.metadata_supported {
             return Err(
                 "Restart the proxy daemon to enable account and traffic metadata queries.".into(),
@@ -42,6 +49,15 @@ impl Tasks {
         }
         daemon::check_task_config(&status).map_err(|e| e.to_string())?;
         Ok(Some(client))
+    }
+
+    pub async fn credential_reports(
+        &self,
+    ) -> Result<Vec<coport::server::CredentialReport>, String> {
+        if let Some(client) = self.backend_for(true).await? {
+            return client.credential_reports().await.map_err(|e| e.to_string());
+        }
+        Ok(self.local_server().await.credential_reports().await)
     }
 
     pub async fn account_states(&self) -> Result<AccountStates, String> {
@@ -96,6 +112,17 @@ impl Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn credential_checks_fall_back_only_when_daemon_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
+        let reports = tasks.credential_reports().await.unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|report| report.ok));
+        assert!(tasks.local.lock().await.is_some());
+    }
+
     #[test]
     fn old_or_unresponsive_daemons_do_not_run_local_metadata_queries() {
         let dir = tempfile::tempdir().unwrap();
@@ -119,6 +146,7 @@ mod tests {
                     .unwrap_err()
                     .contains("Restart")
             );
+            assert!(tasks.credential_reports().await.is_err());
             assert!(tasks.local.lock().await.is_none());
             let lock = crate::daemon::lock_file(&dir.path().join("daemon.lock")).unwrap();
             lock.try_lock().unwrap();
@@ -137,6 +165,7 @@ mod tests {
                     .unwrap_err()
                     .contains("control channel")
             );
+            assert!(tasks.credential_reports().await.is_err());
             assert!(tasks.local.lock().await.is_none());
         });
     }

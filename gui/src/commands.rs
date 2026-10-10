@@ -15,6 +15,26 @@ use tauri::{AppHandle, Manager, State};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// Runs independently of WebView visibility, including GUI-only operation.
+pub(crate) async fn monitor_credentials(app: AppHandle) {
+    loop {
+        let task = {
+            let state = app.state::<AppState>();
+            let mut core = state.core.lock().unwrap();
+            core.begin_credential_check()
+        };
+        if let Some(task) = task {
+            let result = task.credential_reports().await;
+            app.state::<AppState>()
+                .core
+                .lock()
+                .unwrap()
+                .finish_credential_check(&task, result);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 /// Returns immediately with the last account activation; a refresh of it runs
 /// in the background and emits `state-changed` when the result differs. Settings
 /// opts out of profile lookups and uses the cached result only.

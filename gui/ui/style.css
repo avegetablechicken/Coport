@@ -1330,7 +1330,8 @@ details.disclosure[open] summary svg {
 .route-activation { flex: none; font-size: 10px; }
 .route-warning { display: inline-flex; width: 14px; height: 14px; color: var(--tertiary); cursor: help; }
 .route-warning svg { width: 100%; height: 100%; }
-.route-warning[data-tip]::after { content: none; }
+.route-warning[data-tip]::after, .credential-warning[data-tip]::after { content: none; }
+.credential-warning { cursor: help; }
 /* Outside the scrolling panel; JS keeps all edges inside the viewport. */
 .route-tooltip {
   position: fixed;

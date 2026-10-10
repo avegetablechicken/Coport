@@ -45,6 +45,8 @@ pub struct Status {
     pub proxy_probe_supported: bool,
     #[serde(default)]
     pub metadata_supported: bool,
+    #[serde(default)]
+    pub credential_checks_supported: bool,
     pub port: u16,
     #[serde(default)]
     pub allow_external_access: bool,
@@ -64,6 +66,7 @@ enum Action {
         name: String,
     },
     AccountStates,
+    CredentialReports,
     CredentialLabels,
     CachedCredentialLabels,
     SetForwarding {
@@ -89,6 +92,7 @@ enum Response {
     Stopped,
     Probe(crate::proxy::Probe),
     AccountStates([std::collections::BTreeMap<String, String>; 2]),
+    CredentialReports(Vec<coport::server::CredentialReport>),
     CredentialLabels(Vec<((String, String), String)>),
     Recorded,
     ForwardingSet,
@@ -191,6 +195,18 @@ impl Client {
         {
             Response::Probe(probe) => Ok(probe),
             _ => Err(io::Error::other("Unexpected daemon probe response")),
+        }
+    }
+
+    pub async fn credential_reports(&self) -> io::Result<Vec<coport::server::CredentialReport>> {
+        match self
+            .request_async(Action::CredentialReports, Duration::from_secs(65))
+            .await?
+        {
+            Response::CredentialReports(reports) => Ok(reports),
+            _ => Err(io::Error::other(
+                "Credential checks unavailable; restart the proxy daemon.",
+            )),
         }
     }
 
@@ -525,6 +541,7 @@ async fn handle_control(
                 Some(endpoint) => Response::Probe(crate::proxy::run_probe(endpoint).await),
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
             },
+            Action::CredentialReports => Response::CredentialReports(server.credential_reports().await),
             Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
             Action::CachedCredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
             // Legacy statistics readers must obey the same no-network contract.
@@ -674,6 +691,7 @@ async fn serve_until(
         forwarding: None,
         proxy_probe_supported: true,
         metadata_supported: true,
+        credential_checks_supported: true,
         port,
         uptime_ms: 0,
         allow_external_access,
@@ -797,6 +815,9 @@ pub(crate) mod tests {
             .request_async(Action::Status, Duration::from_secs(2))
             .await
             .unwrap();
+        let reports = client.credential_reports().await.unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|report| report.ok));
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();
         let mut byte = [0];
@@ -895,6 +916,7 @@ pub(crate) mod tests {
                     forwarding: None,
                     proxy_probe_supported: false,
                     metadata_supported: false,
+                    credential_checks_supported: false,
                     port,
                     uptime_ms: 0,
                     allow_external_access: false,

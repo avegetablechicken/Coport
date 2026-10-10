@@ -27,6 +27,10 @@ pub struct Core {
     account_states: Option<AccountStates>,
     account_states_error: Option<String>,
     account_states_pending: bool,
+    credential_reports: Vec<coport::server::CredentialReport>,
+    credential_error: Option<String>,
+    credential_pending: bool,
+    credential_updated: Option<Instant>,
     notify: Notify,
     /// Config file modification time when the proxy last started.
     started_stamp: Option<Option<SystemTime>>,
@@ -119,6 +123,10 @@ impl Core {
             account_states: None,
             account_states_error: None,
             account_states_pending: false,
+            credential_reports: Vec::new(),
+            credential_error: None,
+            credential_pending: false,
+            credential_updated: None,
             notify,
             started_stamp,
             attached_pid: attached.map(|s| s.pid),
@@ -153,6 +161,10 @@ impl Core {
         cache.exists = path.is_file();
         self.account_probe = None;
         self.account_states_pending = false;
+        self.credential_reports.clear();
+        self.credential_error = None;
+        self.credential_pending = false;
+        self.credential_updated = None;
         cache.parsed = Some(match std::fs::read_to_string(&path) {
             Ok(text) => parse_config(&text),
             Err(_) => Err("Cannot read configuration file.".to_owned()),
@@ -169,6 +181,52 @@ impl Core {
     fn reset_account_probe(&mut self) {
         self.account_probe = None;
         self.account_states_pending = false;
+        self.credential_reports.clear();
+        self.credential_error = None;
+        self.credential_pending = false;
+        self.credential_updated = None;
+    }
+
+    pub(crate) fn begin_credential_check(
+        &mut self,
+    ) -> Option<std::sync::Arc<coport_gui::tasks::Tasks>> {
+        self.refresh_config();
+        self.sync_daemon();
+        if self.credential_pending
+            || self
+                .credential_updated
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(15))
+        {
+            return None;
+        }
+        let task = self.account_tasks()?;
+        self.credential_pending = true;
+        Some(task)
+    }
+
+    pub(crate) fn finish_credential_check(
+        &mut self,
+        task: &std::sync::Arc<coport_gui::tasks::Tasks>,
+        result: Result<Vec<coport::server::CredentialReport>, String>,
+    ) {
+        if !self
+            .account_probe
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, task))
+        {
+            return;
+        }
+        self.credential_pending = false;
+        self.credential_updated = Some(Instant::now());
+        let (reports, error) = match result {
+            Ok(reports) => (reports, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if self.credential_reports != reports || self.credential_error != error {
+            self.credential_reports = reports;
+            self.credential_error = error;
+            (self.notify)();
+        }
     }
 
     pub(crate) fn account_states(&self) -> Option<AccountStates> {
@@ -357,22 +415,8 @@ impl Core {
                 per_minute: stats.per_minute.to_vec(),
                 errors_per_minute: stats.errors_per_minute.to_vec(),
             },
-            routes: stats
-                .routes
-                .iter()
-                .map(|e| RouteReport {
-                    name: e
-                        .get("provider")
-                        .or_else(|| e.get("service"))
-                        .unwrap_or_default()
-                        .to_owned(),
-                    proxies: e
-                        .get("proxy")
-                        .map(|p| p.split(", ").map(str::to_owned).collect()),
-                    ok: e.event == "current_route",
-                    reason: e.get("reason").map(str::to_owned),
-                })
-                .collect(),
+            routes: self.credential_reports.clone(),
+            credential_error: self.credential_error.clone(),
             urls: Urls {
                 claude: format!("{base}/anthropic"),
                 codex: format!("{base}/v1"),
@@ -651,7 +695,8 @@ pub struct Snapshot {
     version: &'static str,
     phase: PhaseDto,
     stats: StatsDto,
-    routes: Vec<RouteReport>,
+    routes: Vec<coport::server::CredentialReport>,
+    credential_error: Option<String>,
     urls: Urls,
     config: ConfigDto,
     settings: SettingsDto,
@@ -693,14 +738,6 @@ struct StatsDto {
     avg_ms: Option<u64>,
     per_minute: Vec<u32>,
     errors_per_minute: Vec<u32>,
-}
-
-#[derive(Serialize)]
-struct RouteReport {
-    name: String,
-    proxies: Option<Vec<String>>,
-    ok: bool,
-    reason: Option<String>,
 }
 
 #[derive(Serialize)]

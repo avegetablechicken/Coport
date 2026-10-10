@@ -791,13 +791,13 @@ function showRouteTooltip(owner) {
 
 for (const type of ["pointerover", "focusin"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning, .chart-bar");
+    const owner = event.target.closest?.(".route-warning, .credential-warning, .chart-bar");
     if (owner) showRouteTooltip(owner);
   });
 }
 for (const type of ["pointerout", "focusout"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning, .chart-bar");
+    const owner = event.target.closest?.(".route-warning, .credential-warning, .chart-bar");
     if (!owner || owner.contains(event.relatedTarget)) return;
     if (type === "pointerout" && document.activeElement === owner) return;
     if (type === "focusout" && owner.matches(":hover")) return;
@@ -816,13 +816,9 @@ function routingBlock() {
   const report = Object.fromEntries(s.routes.map((r) => [r.name.toLowerCase(), r]));
   const section = (name, svc) => {
     const r = report[name.toLowerCase()];
-    // Startup credential checks do not establish whole-service availability.
-    // Older daemons also reported a missing local identity as a route failure
-    // even when the configured account probe can resolve it.
-    const profileWarning = name === "Claude" && r?.reason === "Claude account has no proxy route."
-      && svc.accountRoutes.some((route) => ["unknown", "remote", "probe_failed"].includes(route.activation));
-    const badge = r && !r.ok && !profileWarning
-      ? `<span class="bad" data-tip="${esc(r.reason ?? "")}">Credential warning</span>` : "";
+    const checked = r?.checkedAt ? `Last checked: ${new Date(r.checkedAt * 1000).toLocaleTimeString()}` : "";
+    const badge = r && !r.ok
+      ? `<span class="bad credential-warning" tabindex="0" data-tip="${esc(`${r.reason ?? ""}\n${checked}`)}">Credential warning</span>` : "";
     const configured = svc.configured || svc.fallbacks.some((f) => f.proxies);
     if (!configured) {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
@@ -836,7 +832,8 @@ function routingBlock() {
       ${fallbacks ? `<div class="route-defaults"><div class="route-defaults-title">Defaults &amp; helpers</div>${fallbacks}</div>` : ""}</div>`;
   };
   const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
-  return block("Routing", "", accountError + section("Codex", d.codex) + section("Claude", d.claude));
+  const credentialError = s.credentialError ? `<div class="placeholder">Credential checks unavailable: ${esc(s.credentialError)}</div>` : "";
+  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude));
 }
 
 // ---------------------------------------------------------------- activity

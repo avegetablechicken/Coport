@@ -1418,6 +1418,16 @@ local routes, and the selected remote mode stays active for subsequent retries.
 **Stop forwarding** restores local handling on the same port. Editing/removing the
 selected device also restores local handling. The daemon owns forwarding, so closing
 the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
+Home's credential warnings use current diagnostic results rather than startup logs.
+The daemon checks Codex and Claude credentials every 60 seconds after each check,
+regardless of success or failure, and continues when the GUI is closed. The GUI
+reads these results in the background and checks locally only when the daemon is
+confirmed absent; hiding the panel does not stop the GUI timer. An unavailable or
+older daemon is reported explicitly instead of checking under a different process
+environment. Warnings include the check time. These checks validate local credential
+resolution and routing, not upstream service availability. Configuration changes
+still require restarting a running daemon.
+
 Startup is local by default. Enable **Restore on startup** to
 restore the selected remote before accepting any requests. An offline destination
 stays selected and returns 502 until it recovers; it never falls back to local.

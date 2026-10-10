@@ -43,8 +43,11 @@ pub type ConnectionHandler = Arc<
 >;
 
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
+#[path = "credential_checks.rs"]
+mod credential_checks;
 #[path = "relay.rs"]
 mod relay;
+pub use credential_checks::CredentialReport;
 #[path = "server_transport.rs"]
 mod transport;
 #[path = "websocket_relay.rs"]
@@ -63,6 +66,7 @@ pub struct Server {
     // UI checks are serialized and cached briefly, including failures. The key
     // is the credential, so switching a saved login forces a new check.
     account_checks: tokio::sync::Mutex<HashMap<String, AccountCheck>>,
+    credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 }
 impl Server {
@@ -74,6 +78,7 @@ impl Server {
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Mutex::new(HashMap::new()),
             account_checks: tokio::sync::Mutex::new(HashMap::new()),
+            credential_checks: Default::default(),
             tls: None,
         }
     }
@@ -1063,11 +1068,14 @@ impl Server {
         let mut tasks = tokio::task::JoinSet::new();
         let monitor = self.monitor_probes();
         tokio::pin!(monitor);
+        let credentials = self.monitor_credentials();
+        tokio::pin!(credentials);
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 _=&mut shutdown=>break,
                 _=&mut monitor=>{},
+                _=&mut credentials=>{},
                 Some(_)=tasks.join_next(), if !tasks.is_empty()=>{},
                 accepted=listener.accept()=> {
                     // One failed connection must not stop the listener; the pause

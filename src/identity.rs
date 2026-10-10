@@ -850,6 +850,10 @@ impl Config {
     }
     pub async fn check_credentials(&self) -> Result<()> {
         self.claude.check_credentials().await?;
+        self.check_codex_credentials().await
+    }
+
+    pub(crate) async fn check_codex_credentials(&self) -> Result<()> {
         let mut keys = HashSet::new();
         if self.codex.account_auth_file_only {
             for (label, source) in &self.codex.account_sources() {
