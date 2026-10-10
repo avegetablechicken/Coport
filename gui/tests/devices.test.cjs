@@ -309,6 +309,39 @@ test('first Devices render reuses local Traffic before remote statistics arrive'
   assert.match(h.devicesPage(), /local:model:18:0/);
 });
 
+test('switching range during a remote refresh waits for it instead of reading the cache', async () => {
+  const pending = [];
+  const h = harness((command, args) => command === 'get_merged_data' ? new Promise(resolve => pending.push({ args, resolve })) : Promise.resolve([]));
+  h.Channel = class {};
+  vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('), source.indexOf('function deviceTrafficContent(')), h);
+  h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
+  h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
+  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model'; h.ui.mergedDataRequest = 0;
+  const view = minutes => ({ minutes, scope: 'model', local: { requests: minutes }, traffic: { requests: minutes }, sources: [{ name: 'MS', included: true, traffic: { requests: minutes } }] });
+  const refresh = h.loadMergedData(true, true);
+  pending[0].args.onUpdate.onmessage([view(30)]);
+  const start = source.indexOf('  if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {');
+  const handler = vm.runInContext(`(async event => { ${source.slice(start, source.indexOf('  if (event.target.id === "home-traffic-scope"', start))} })`, h);
+  const switching = handler({ target: { id: 'devices-traffic-range', value: '10080' } });
+  await Promise.resolve();
+  assert.equal(pending.length, 1, 'A cache read must not supersede the remote refresh');
+  await switching;
+  assert.equal(h.ui.mergedData, null);
+  assert.match(h.devicesPage(), /MS[\s\S]*Loading traffic…/);
+  assert.doesNotMatch(h.devicesPage(), /Not refreshed/);
+  pending[0].resolve([view(30), view(10080)]);
+  await refresh;
+  assert.equal(h.ui.mergedData.minutes, 10080);
+  assert.match(h.devicesPage(), /device\/ms:model:10080/);
+  // Without a remote refresh in flight, a missing range is read from the cache.
+  const cacheRead = handler({ target: { id: 'devices-traffic-range', value: '360' } });
+  assert.equal(pending.length, 2);
+  assert.equal(pending[1].args.refreshRemote, false);
+  pending[1].resolve([view(360)]);
+  await cacheRead;
+  assert.equal(h.ui.mergedData.minutes, 360);
+});
+
 test('This Device distinguishes failures and pending operations from stopped', () => {
   const h = harness(async () => []);
   h.message = (_, text) => `<warning>${text}</warning>`;

@@ -1395,6 +1395,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
   ui.mergedDataLoading = true;
+  ui.mergedDataRemote = refreshRemote;
   let completed = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
   try {
@@ -1426,7 +1427,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
       ui.mergedDataError = ui.mergedDataUpdating ? "" : String(e);
     }
   }
-  finally { completed = true; if (request === ui.mergedDataRequest) { ui.mergedDataLoading = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
+  finally { completed = true; if (request === ui.mergedDataRequest) { ui.mergedDataLoading = ui.mergedDataRemote = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
 }
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
   const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
@@ -2062,6 +2063,9 @@ document.addEventListener("change", async (event) => {
       ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
     } else { ui.deviceTrafficMinutes = Number(event.target.value); }
     if (selectDeviceTraffic()) { render(); return; }
+    // A remote refresh delivers every range when it completes. A cache read now
+    // would supersede it and show peers as not refreshed, so wait for it instead.
+    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); return; }
     const loading = loadMergedData(true); render(); await loading;
     return;
   }
