@@ -432,7 +432,8 @@ test('Devices statistics start without waiting for forwarding or capability read
   h.loadMergedData = (force, refreshRemote) => { calls.push(['statistics', refreshRemote]); };
   const loading = h.loadDevices();
   for (let i = 0; i < 5; i++) await Promise.resolve();
-  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities', ['statistics', false]]);
+  // The first visit after start also refreshes remote statistics, without waiting for local reads.
+  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities', ['statistics', true]]);
   for (const resolve of pending) resolve([]);
   await loading;
   assert.deepEqual(h.ui.deviceForwarders, []);
@@ -617,19 +618,20 @@ test('a background failure retains the selected traffic already rendered', async
   assert.equal(context.ui.mergedDataError, 'Background statistics failed');
 });
 
-test('reentering Devices and periodic refreshes never authorize a remote refresh', async () => {
+test('only the first Devices visit after start refreshes remote statistics automatically', async () => {
   const calls=[];
   const h=harness(async(command,args)=>{calls.push([command,args]);return command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : [];});
   h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
   for(let i=0;i<4;i++) {h.ui.page='devices';await h.loadDevices();h.ui.page='settings';await h.loadDevices();}
   const reads=calls.filter(([command])=>command==='get_merged_data');
-  assert.equal(reads.length,4);assert.ok(reads.every(([,args])=>args.refreshRemote===false));
+  assert.equal(reads.length,4);
+  assert.deepEqual(reads.map(([,args])=>args.refreshRemote),[true,false,false,false]);
   assert.equal(h.ui.mergedDataError,'');
   await h.action('merged-refresh');
-  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,1);
+  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,2);
   h.ui.page='devices';await h.loadDevices();
-  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,1);
+  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,2);
 });
 
 

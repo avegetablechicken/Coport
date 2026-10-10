@@ -774,9 +774,11 @@ Opening the panel again does not repeat the startup check.
 
 Configured proxies are also tested automatically at app startup. Reopening the
 panel does not repeat these checks; use **Test** or **Test All** to run them again. Entering Settings reads local device definitions,
-uses cached account status, and does not poll remote device statistics. Entering
-or revisiting Devices and its periodic refresh also read local caches only.
-Use the Devices **Refresh** action to explicitly retrieve remote statistics. These UI controls do not stop health checks
+uses cached account status, and does not poll remote device statistics. Devices
+is read-only: the first visit after the app starts retrieves remote statistics
+once, showing this device immediately and each peer as it answers. Later visits
+and its periodic refresh read cached statistics; use the Devices **Refresh**
+action to retrieve them again. These UI controls do not stop health checks
 for routes already in use by the running proxy.
 
 Enable **Settings → General → Keep proxy running after quit** to leave the
@@ -1304,9 +1306,10 @@ minute. The selected and full snapshots each parse every log file once for their
 scopes and boundaries. A progressive refresh does not reconnect automatically
 when peers cannot align; another remote fetch requires an explicit refresh.
 Once all twelve views are cached, range/category switches are immediate.
-Background failures retain statistics already displayed. Page entry, periodic
-refresh and range/category switches read cached snapshots only; the explicit
-**Refresh** action retrieves remote statistics for the current selection. Local
+Background failures retain statistics already displayed. The first Devices visit
+after the app starts refreshes once; later page entry, periodic refresh and
+range/category switches read cached snapshots only, and the explicit **Refresh**
+action retrieves remote statistics for the current selection. Local
 traffic assignments re-merge cached snapshots without reconnecting to devices.
 Expanded upstream accounts use the same order as Activity
 Traffic: known accounts by received bytes descending, unidentified accounts last.

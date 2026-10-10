@@ -1534,7 +1534,11 @@ async function loadDevices(refreshRemote = false) {
     if (ui.page !== "devices") { await local; return; }
     if (!(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
-    await Promise.all([local, loadMergedData(false, refreshRemote)]);
+    // The first Devices visit after start reads remote statistics once; later
+    // visits and timers use the cache until the user presses Refresh.
+    const remote = refreshRemote || !ui.deviceStartupRefreshDone;
+    ui.deviceStartupRefreshDone = true;
+    await Promise.all([local, loadMergedData(remote, remote)]);
 
   } catch (error) { toast(String(error)); }
   finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
