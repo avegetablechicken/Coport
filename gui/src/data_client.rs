@@ -707,31 +707,20 @@ impl MergeCache {
             self.errors.clear();
             self.key = key;
         }
-        let (context, snapshot, end) = if refresh_remote {
-            let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
-            let fetched = align_sources(&context, sources.clone(), &selections).await?;
-            let end = fetched.1;
-            self.fetched = Some(fetched);
-            self.errors.clear();
-            let snapshot = load_snapshot(&context.log, end).await?;
-            (context, snapshot, end)
-        } else {
-            // Without a refetch the boundary is already known, so identity
-            // evidence and the shared snapshot are read concurrently.
-            let at = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-            let end = self.fetched.as_ref().map_or(at, |(_, end)| *end);
-            let (context, snapshot) = tokio::join!(
-                prepare_merge(config, log.clone(), credential_labels),
-                load_snapshot(&log, end)
+        let at = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut full = None;
+        if refresh_remote {
+            let context = std::sync::Arc::new(
+                prepare_merge(config.clone(), log.clone(), credential_labels.clone()).await?,
             );
-            let mut context = context?;
-            context.at = at;
-            (std::sync::Arc::new(context), snapshot?, end)
-        };
+            self.fetched = Some(align_sources(&context, sources.clone(), &selections).await?);
+            self.errors.clear();
+            full = Some(context);
+        }
         let pending = self.fetched.is_none();
         let empty: Fetched = Vec::new();
-        let fetched = match &mut self.fetched {
-            Some((fetched, _)) => {
+        let (fetched, end) = match &mut self.fetched {
+            Some((fetched, end)) => {
                 for (source, _) in fetched.iter_mut() {
                     let key = cache_source_key(source)?;
                     let current = keyed
@@ -741,9 +730,9 @@ impl MergeCache {
                         .0;
                     *source = current.clone();
                 }
-                &*fetched
+                (&*fetched, *end)
             }
-            None => &empty,
+            None => (&empty, at),
         };
         let errors = &self.errors;
         let decorate = |view: &mut Merged| {
@@ -771,18 +760,45 @@ impl MergeCache {
         if let Some((minutes, scope, on_update)) =
             first.filter(|(minutes, scope, _)| selections.contains(&(*minutes, *scope)))
         {
+            // The first frame reads only the files its range needs, like an
+            // explicit refresh. A cold start must not parse 30 days of archives
+            // first; the complete views below replace it with 30-day evidence.
+            let (context, snapshot) = tokio::join!(
+                prepare_merge_range(
+                    config.clone(),
+                    log.clone(),
+                    credential_labels.clone(),
+                    minutes
+                ),
+                load_selected_snapshot(&log, end, minutes)
+            );
+            let mut context = context?;
+            context.at = at;
             let mut view = merge_fetched(
-                context.clone(),
+                std::sync::Arc::new(context),
                 fetched,
                 minutes,
                 scope,
                 end,
-                snapshot.clone(),
+                snapshot?,
             )
             .await?;
             decorate(&mut view);
             on_update(vec![view])?;
         }
+        // Identity evidence and the shared snapshot are read concurrently.
+        let (context, snapshot) = match full {
+            Some(context) => (context, load_snapshot(&log, end).await?),
+            None => {
+                let (context, snapshot) = tokio::join!(
+                    prepare_merge(config, log.clone(), credential_labels),
+                    load_snapshot(&log, end)
+                );
+                let mut context = context?;
+                context.at = at;
+                (std::sync::Arc::new(context), snapshot?)
+            }
+        };
         let mut views = merge_selections(&context, fetched, &selections, end, &snapshot).await?;
         views.iter_mut().for_each(decorate);
         Ok(views)
@@ -1554,6 +1570,105 @@ mod tests {
             })
             .collect();
         assert_eq!(order, expected, "Parallel merging must keep view order");
+    }
+
+    fn archived_traffic_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let now = chrono::Utc::now();
+        let row = |id: &str, at: chrono::DateTime<chrono::Utc>| {
+            format!(
+                "{}\n",
+                serde_json::json!({"timestamp":at.to_rfc3339(),"event":"request_finished","request_id":id,"method":"POST","path":"/v1/responses","service":"codex","provider":"openai","status":"200","received_bytes":"42","input_tokens":"12","duration_ms":"100"})
+            )
+        };
+        std::fs::write(&log, row("recent", now - chrono::Duration::minutes(2))).unwrap();
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let old = now - chrono::Duration::days(2);
+        let archive = history.join(format!(
+            "proxy.log.{}.{}.jsonl",
+            old.timestamp_millis(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&archive, row("archived", old)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(old.into())
+            .unwrap();
+        (dir, log, archive)
+    }
+
+    #[tokio::test]
+    async fn first_frame_matches_the_complete_view_for_its_range() {
+        let (_dir, log, _) = archived_traffic_fixture();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let first = std::sync::Mutex::new(None);
+        let publish = |views: Vec<Merged>| {
+            *first.lock().unwrap() = Some(serde_json::to_value(&views[0]).unwrap());
+            Ok(())
+        };
+        let views = MergeCache::default()
+            .views_selected_first(
+                Vec::new(),
+                config,
+                log,
+                BTreeMap::new(),
+                false,
+                Some((30, crate::traffic::TrafficScope::Model, &publish)),
+            )
+            .await
+            .unwrap();
+        let complete = views
+            .iter()
+            .find(|v| v.minutes == 30 && v.scope == crate::traffic::TrafficScope::Model)
+            .unwrap();
+        assert_eq!(complete.traffic.stats.requests, 1);
+        assert_eq!(
+            first.into_inner().unwrap().unwrap(),
+            serde_json::to_value(complete).unwrap()
+        );
+        let month = views
+            .iter()
+            .find(|v| v.minutes == 43200 && v.scope == crate::traffic::TrafficScope::Model)
+            .unwrap();
+        assert_eq!(
+            month.traffic.stats.requests, 2,
+            "The archive belongs to 30-day views"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_frame_does_not_read_archives_outside_its_range() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no pointers or side effects.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root ignores file permissions.
+        }
+        let (_dir, log, archive) = archived_traffic_fixture();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let first = std::sync::Mutex::new(None);
+        let publish = |views: Vec<Merged>| {
+            *first.lock().unwrap() = Some(views[0].traffic.stats.requests);
+            Ok(())
+        };
+        let result = MergeCache::default()
+            .views_selected_first(
+                Vec::new(),
+                config,
+                log,
+                BTreeMap::new(),
+                false,
+                Some((30, crate::traffic::TrafficScope::Model, &publish)),
+            )
+            .await;
+        // Only the complete 30-day views need the old archive.
+        assert_eq!(*first.lock().unwrap(), Some(1));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
