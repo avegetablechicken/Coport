@@ -253,7 +253,13 @@ impl BackgroundController {
     }
 
     fn diagnostic(&self, run: Operation) {
-        if !self.busy() && !self.closing.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+        // Startup probes are requested once. Queue them behind discovery/start
+        // instead of losing them while the control worker is busy. Serialize
+        // submission with shutdown so no diagnostic is queued after exit.
+        let Ok(_submission) = self.submission.lock() else {
+            return;
+        };
+        if !self.closing.load(Ordering::Acquire) && !self.shared.is_poisoned() {
             let _ = self.jobs.try_send(Job {
                 run,
                 reply: None,
@@ -319,6 +325,62 @@ mod tests {
         endpoints.insert("same".into(), "http://127.0.0.1:23456".into());
         assert!(controller.probes_for(&endpoints).is_empty());
         assert!(controller.probes_for(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn startup_and_manual_probes_wait_for_busy_worker_then_fall_back_locally() {
+        for automatic in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let controller = BackgroundController::with_daemon(
+                Arc::new(|| {}),
+                dir.path().into(),
+                dir.path().join("missing-daemon"),
+            );
+            let (entered, started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let operation = controller
+                .operation(
+                    Box::new(move |_| {
+                        entered.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    }),
+                    false,
+                )
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let name = "startup".to_owned();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            if automatic {
+                controller.probe_stale([(&name, &endpoint)], Duration::from_secs(120));
+            } else {
+                controller.probe(&name, &endpoint);
+            }
+            assert!(controller.probes().is_empty());
+            release.send(()).unwrap();
+            operation.blocking_recv().unwrap().unwrap();
+            let mut incoming = None;
+            super::super::tests::wait_for(|| {
+                incoming = listener.accept().ok();
+                incoming.is_some()
+            });
+            // A real local connection proves the queued test reached GUI fallback.
+            drop(incoming);
+            super::super::tests::wait_for(|| {
+                matches!(
+                    controller.probes().get(&name),
+                    Some((Probe::Unreachable(_), _))
+                )
+            });
+            controller
+                .on_app_exit(true)
+                .unwrap()
+                .blocking_recv()
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]

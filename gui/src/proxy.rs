@@ -295,7 +295,6 @@ impl Controller {
         };
         let directory = self.daemon_dir.clone();
         let endpoint = endpoint.to_owned();
-        let generation = self.lock().generation;
         let started = (Instant::now(), SystemTime::now());
         {
             let mut shared = self.lock();
@@ -341,9 +340,10 @@ impl Controller {
                     shared.testing.remove(&testing_key);
                 }
             }
-            // A test started later, such as a manual one, has the newer result.
-            if shared.generation == generation
-                && shared.probe_endpoints.get(&name) == Some(&endpoint)
+            // Proxy measurements belong to the endpoint, not the daemon's
+            // lifecycle. Attaching a daemon must not discard a GUI test already
+            // in flight. A changed endpoint or newer test still takes precedence.
+            if shared.probe_endpoints.get(&name) == Some(&endpoint)
                 && shared
                     .probes
                     .get(&name)
@@ -541,7 +541,7 @@ mod tests {
     use super::{Controller, Exit, Phase, Probe, host_port, is_local_network, parse_trace};
     use std::sync::Arc;
 
-    fn wait_for(mut predicate: impl FnMut() -> bool) {
+    pub(super) fn wait_for(mut predicate: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !predicate() {
             assert!(std::time::Instant::now() < deadline, "timed out");
@@ -642,6 +642,37 @@ mod tests {
         ));
         wait_for(|| matches!(controller.probes()[&name].0, Probe::Unreachable(_)));
         assert_eq!(controller.lock().probe_endpoints[&name], changed);
+    }
+
+    #[test]
+    fn attaching_daemon_preserves_inflight_gui_probe_result() {
+        use std::io::Write;
+        let _guard = crate::daemon::spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        controller.probe("local", &endpoint);
+        let mut incoming = None;
+        wait_for(|| {
+            incoming = listener.accept().ok();
+            incoming.is_some()
+        });
+        let (mut socket, _) = incoming.unwrap();
+        let (_signal, daemon) = crate::daemon::tests::serve_in_thread(dir.path());
+        let (client, status) = crate::daemon::tests::wait_for_daemon(dir.path());
+        controller.attach(client, status);
+        socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        drop(socket);
+        wait_for(|| matches!(controller.probes()["local"].0, Probe::Unreachable(_)));
+        assert!(controller.is_running());
+        controller.stop().unwrap();
+        daemon.join().unwrap().unwrap();
     }
 
     #[test]
