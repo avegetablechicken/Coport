@@ -18,9 +18,7 @@ impl Server {
     /// Serialize checks and reuse both successful and failed results equally.
     pub async fn credential_reports(&self) -> Vec<CredentialReport> {
         let mut cache = self.credential_checks.lock().await;
-        if let Some((at, reports)) = cache.as_ref()
-            && at.elapsed() < INTERVAL
-        {
+        if let Some((_, reports)) = cache.as_ref().filter(|(at, _)| at.elapsed() < INTERVAL) {
             return reports.clone();
         }
         let check = |name: &str, result: Result<crate::Result<()>, tokio::time::error::Elapsed>| {
