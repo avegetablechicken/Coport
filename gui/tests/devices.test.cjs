@@ -311,8 +311,14 @@ test('first Devices render reuses local Traffic before remote statistics arrive'
 
 test('switching range during a remote refresh waits for it instead of reading the cache', async () => {
   const pending = [];
-  const h = harness((command, args) => command === 'get_merged_data' ? new Promise(resolve => pending.push({ args, resolve })) : Promise.resolve([]));
+  const local = [];
+  const h = harness((command, args) => {
+    if (command === 'get_merged_data') return new Promise(resolve => pending.push({ args, resolve }));
+    if (command === 'get_traffic') { local.push(args); return Promise.resolve({ summary: { requests: 7 }, credentials: [], targets: [] }); }
+    return Promise.resolve([]);
+  });
   h.Channel = class {};
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), h);
   vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('), source.indexOf('function deviceTrafficContent(')), h);
   h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
@@ -327,6 +333,9 @@ test('switching range during a remote refresh waits for it instead of reading th
   assert.equal(pending.length, 1, 'A cache read must not supersede the remote refresh');
   await switching;
   assert.equal(h.ui.mergedData, null);
+  // This device is read locally at once; only the peer waits for the refresh.
+  assert.equal(JSON.stringify(local), JSON.stringify([{ minutes: 10080, scope: 'model' }]));
+  assert.match(h.devicesPage(), /local:model:7/);
   assert.match(h.devicesPage(), /MS[\s\S]*Loading traffic…/);
   assert.doesNotMatch(h.devicesPage(), /Not refreshed/);
   pending[0].resolve([view(30), view(10080)]);

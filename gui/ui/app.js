@@ -1391,6 +1391,14 @@ function selectDeviceTraffic() {
   ui.mergedData = cached;
   return true;
 }
+// This device's statistics are local, so a range switch can show them while
+// a remote refresh is still collecting peers. Errors leave the placeholder.
+async function loadLocalDeviceTraffic() {
+  const minutes = ui.deviceTrafficMinutes || 30, scope = ui.trafficScope || "model";
+  try { rememberLocalTraffic(await invoke("get_traffic", { minutes, scope }), minutes, scope); }
+  catch { return; }
+  if (ui.page === "devices") render();
+}
 async function loadMergedData(force = false, refreshRemote = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
@@ -2065,7 +2073,7 @@ document.addEventListener("change", async (event) => {
     if (selectDeviceTraffic()) { render(); return; }
     // A remote refresh delivers every range when it completes. A cache read now
     // would supersede it and show peers as not refreshed, so wait for it instead.
-    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); return; }
+    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); await loadLocalDeviceTraffic(); return; }
     const loading = loadMergedData(true); render(); await loading;
     return;
   }
