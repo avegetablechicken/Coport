@@ -957,6 +957,13 @@ async fn merge_progressive_snapshot(
     on_update(vec![
         merge_fetched(context.clone(), &fetched, minutes, scope, context.at, local).await?,
     ])?;
+    // While peers answer, parse this device's 30-day archives into the cache.
+    // Archives never change, so the complete views below reuse them at any
+    // boundary; a scan still running is awaited there, never repeated.
+    let warm_log = context.log.clone();
+    let _warm = tokio::task::spawn_blocking(move || {
+        crate::traffic::observed_identity_labels_range(&warm_log, BTreeMap::new(), 43200)
+    });
     let mut background_errors = BTreeMap::new();
     while let Some((index, result)) = rx.recv().await {
         if let Err(error) = &result {
@@ -1930,6 +1937,110 @@ mod tests {
         // Only the complete 30-day views need the old archive.
         assert_eq!(*first.lock().unwrap(), Some(1));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn local_archives_are_parsed_while_peers_answer() {
+        if data_key_in_subprocess(
+            "data_client::tests::local_archives_are_parsed_while_peers_answer",
+        ) {
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_dir, log, archive) = archived_traffic_fixture();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer_log = peer_dir.path().join("proxy.log");
+        std::fs::write(&peer_log, "").unwrap();
+        let bytes = crate::data_api::publish(
+            &config,
+            &peer_log,
+            &DataKey::new(KEY).unwrap(),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = {
+            let release = release.clone();
+            tokio::spawn(async move {
+                let mut first = true;
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(socket.read_u8().await.unwrap());
+                    }
+                    if std::mem::take(&mut first) {
+                        release.notified().await;
+                    }
+                    let mut summary: Summary = serde_json::from_slice(&bytes).unwrap();
+                    if String::from_utf8(header)
+                        .unwrap()
+                        .to_lowercase()
+                        .contains("x-coport-window: 30:model")
+                    {
+                        summary.schema_version = 4;
+                        summary.groups.clear();
+                        summary.windows.retain(|w| {
+                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
+                        });
+                        summary.previous_windows.retain(|w| {
+                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
+                        });
+                    }
+                    let body = serde_json::to_vec(&summary).unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            })
+        };
+        let source = Source {
+            name: "peer".into(),
+            device_id: None,
+            transport: Transport::Http,
+            ssh_connection: None,
+            url,
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let refresh = tokio::spawn(async move {
+            MergeCache::default()
+                .refresh_progressive(
+                    vec![source],
+                    config,
+                    log,
+                    BTreeMap::new(),
+                    (30, crate::traffic::TrafficScope::Model),
+                    |_| Ok(()),
+                )
+                .await
+        });
+        // The peer is still holding its answer; the archive is parsed meanwhile.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while crate::traffic::archive_scans(&archive) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The 30-day archive was not parsed while peers answered");
+        release.notify_one();
+        let views = tokio::time::timeout(Duration::from_secs(10), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(views.len(), 12);
+        assert!(views.iter().all(|view| view.sources[0].included));
+        assert_eq!(
+            crate::traffic::archive_scans(&archive),
+            1,
+            "The complete views reuse it"
+        );
+        server.abort();
     }
 
     #[tokio::test]
