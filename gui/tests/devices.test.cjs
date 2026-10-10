@@ -351,6 +351,110 @@ test('switching range during a remote refresh waits for it instead of reading th
   assert.equal(h.ui.mergedData.minutes, 360);
 });
 
+function devicesHarness(invoke) {
+  const h = harness(invoke);
+  h.Channel = class {};
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), h);
+  vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('), source.indexOf('function deviceTrafficContent(')), h);
+  vm.runInContext(source.slice(source.indexOf('function mergedDataBlock('), source.indexOf('function deviceConnectionKey(')), h);
+  h.trafficControls = () => '';
+  h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
+  h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
+  h.ui.devicesLoaded = true;
+  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model'; h.ui.mergedDataRequest = 0;
+  return h;
+}
+
+test('cache reads keep peer states steady and Refresh stays available', async () => {
+  const pending = [];
+  const h = devicesHarness((command, args) => command === 'get_merged_data' ? new Promise((resolve, reject) => pending.push({ args, resolve, reject })) : Promise.resolve([]));
+  const cached = { minutes: 30, scope: 'model', local: { requests: 1 }, traffic: { requests: 1 }, sources: [{ name: 'MS', included: false, exclusion: 'not_refreshed' }] };
+  h.ui.mergedData = cached;
+  const read = h.loadMergedData(true, false);
+  // A timer's cache read must not flash loading states or block Refresh.
+  assert.match(h.devicesPage(), /MS[\s\S]*Not refreshed/);
+  assert.doesNotMatch(h.mergedDataBlock(), /merged-refresh" disabled/);
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).label, 'Not checked');
+  const refreshing = h.action('merged-refresh');
+  await Promise.resolve();
+  assert.equal(pending.length, 2, 'Refresh supersedes the cache read');
+  assert.equal(pending[1].args.refreshRemote, true);
+  assert.match(h.devicesPage(), /MS[\s\S]*Loading traffic…/);
+  assert.match(h.mergedDataBlock(), /merged-refresh" disabled/);
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).label, 'Refreshing statistics…');
+  // A refresh that cannot align asks for another Refresh instead of "Updating traffic…".
+  pending[1].reject('TRAFFIC_UPDATING');
+  await refreshing;
+  pending[0].resolve([cached]);
+  await read;
+  assert.match(h.ui.mergedDataError, /Press Refresh/);
+  assert.equal(h.ui.mergedDataUpdating, false);
+  assert.ok(!h.ui.deviceTrafficFetchedAt, 'Only a completed refresh counts as fresh');
+});
+
+test('waiting for a range keeps peer errors, statuses and queued work intact', async () => {
+  const pending = [];
+  const calls = [];
+  const h = devicesHarness((command, args) => {
+    calls.push([command, args]);
+    if (command === 'get_merged_data') return new Promise(resolve => pending.push({ args, resolve }));
+    if (command === 'get_devices') return Promise.resolve([{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }]);
+    if (command === 'get_traffic') return Promise.resolve({ summary: { requests: 3 }, credentials: [], targets: [] });
+    return Promise.resolve([]);
+  });
+  const refresh = h.loadMergedData(true, true);
+  pending[0].args.onUpdate.onmessage([{ minutes: 30, scope: 'model', local: { requests: 1 }, traffic: { requests: 1 }, sources: [{ name: 'MS', included: false, error: 'Permission denied' }] }]);
+  const start = source.indexOf('  if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {');
+  const handler = vm.runInContext(`(async event => { ${source.slice(start, source.indexOf('  if (event.target.id === "home-traffic-scope"', start))} })`, h);
+  await handler({ target: { id: 'devices-traffic-range', value: '10080' } });
+  assert.equal(h.ui.mergedData, null);
+  assert.match(h.devicesPage(), /MS: Permission denied|Permission denied/);
+  assert.match(h.devicesPage(), /Traffic unavailable/);
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'failed');
+  assert.match(h.mergedDataBlock(), /Loading traffic…/);
+  // Saving an unchanged device set in Settings must not supersede the refresh.
+  await h.action('device-new');
+  h.fields['device-host'].value = 'MS';
+  await h.action('device-save');
+  assert.equal(calls.filter(([command]) => command === 'get_merged_data').length, 1);
+  pending[0].resolve([]);
+  await refresh;
+});
+
+test('a known capability failure outranks an older successful SSH check', () => {
+  const h = devicesHarness(async () => []);
+  h.ui.deviceStates = { ms: { host: 'MS', state: 'running', label: 'SSH reachable at startup' } };
+  h.ui.deviceCapabilities = { ms: { error: 'Permission denied', capabilities: null } };
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'failed');
+  h.ui.deviceCapabilities = { ms: { capabilities: { version: '1' } } };
+  h.ui.deviceStates.ms = { host: 'MS', state: 'failed', label: 'Startup SSH check failed' };
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'failed');
+});
+
+test('a Devices visit during another device load is queued, not dropped', async () => {
+  let resolveForwarders;
+  const calls = [];
+  const h = devicesHarness((command, args) => {
+    calls.push([command, args]);
+    if (command === 'get_device_forwarders' && !resolveForwarders) return new Promise(resolve => { resolveForwarders = resolve; });
+    if (command === 'get_devices') return Promise.resolve([{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }]);
+    return Promise.resolve([]);
+  });
+  // Settings is still reading forwarding status when the user opens Devices.
+  h.ui.page = 'settings';
+  const settings = h.loadDevices();
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  h.ui.page = 'devices';
+  await h.loadDevices();
+  assert.equal(calls.filter(([command]) => command === 'get_merged_data').length, 0);
+  resolveForwarders([]);
+  await settings;
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  const reads = calls.filter(([command]) => command === 'get_merged_data');
+  assert.equal(reads.length, 1, 'The queued first visit starts its refresh');
+  assert.equal(reads[0][1].refreshRemote, true);
+});
+
 test('This Device distinguishes failures and pending operations from stopped', () => {
   const h = harness(async () => []);
   h.message = (_, text) => `<warning>${text}</warning>`;
@@ -715,7 +819,8 @@ test('Devices Refresh performs only one explicitly authorized statistics read', 
   h.ui.trafficScope = 'model';
   h.selectDeviceTraffic = () => false;
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('), source.indexOf('function deviceTrafficContent(')), h);
-  await h.action('devices-refresh');
+  h.ui.deviceStartupRefreshDone = true;
+  await h.action('merged-refresh');
   const reads = calls.filter(([command]) => command === 'get_merged_data');
   assert.equal(reads.length, 1, 'Refresh must not wait for a redundant local full-history merge');
   assert.equal(reads[0][1].refreshRemote, true);

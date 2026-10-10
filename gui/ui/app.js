@@ -1414,7 +1414,8 @@ async function loadMergedData(force = false, refreshRemote = false) {
       ui.deviceTrafficViews ||= Object.create(null);
       for (const view of data) ui.deviceTrafficViews[`${view.minutes}:${view.scope}`] = view;
       selectDeviceTraffic();
-      if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
+      // Statuses and errors stay visible while another range waits for peers.
+      ui.mergedDataLatest = ui.mergedData || data[0];
       ui.mergedDataError = ""; ui.mergedDataUpdating = false;
       if (ui.page === "devices" || ui.page === "settings") render();
     };
@@ -1427,12 +1428,15 @@ async function loadMergedData(force = false, refreshRemote = false) {
       ui.deviceTrafficViews = Object.fromEntries(data.map(view => [`${view.minutes}:${view.scope}`, view]));
       selectDeviceTraffic();
     } else { ui.mergedData = data; }
+    ui.mergedDataLatest = ui.mergedData || ui.deviceTrafficViews?.["30:model"] || ui.mergedDataLatest;
     if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
     ui.mergedDataError = ""; ui.mergedDataUpdating = false;
   } catch (e) {
     if (request === ui.mergedDataRequest) {
-      ui.mergedDataUpdating = String(e).includes("TRAFFIC_UPDATING");
-      ui.mergedDataError = ui.mergedDataUpdating ? "" : String(e);
+      // A cache read retries on its own; a refresh needs the user to press Refresh again.
+      const skew = String(e).includes("TRAFFIC_UPDATING");
+      ui.mergedDataUpdating = skew && !refreshRemote;
+      ui.mergedDataError = skew && refreshRemote ? "Devices reported different time boundaries. Press Refresh to try again." : ui.mergedDataUpdating ? "" : String(e);
     }
   }
   finally { completed = true; if (request === ui.mergedDataRequest) { ui.mergedDataLoading = ui.mergedDataRemote = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
@@ -1461,6 +1465,7 @@ function mergedDataBlock() {
   let body = `<div class="devices-traffic-range">${range}</div>`;
   if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
   if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
+  if (!data && ui.mergedDataLoading) body += `<div class="placeholder">Loading traffic…</div>`;
   if (data) {
     body += deviceTrafficContent(data.traffic, data.scope, "merged", data);
     for (const source of data.sources) {
@@ -1469,7 +1474,7 @@ function mergedDataBlock() {
       else if (source.exclusion === "duplicate") body += `<div class="placeholder">${esc(source.name)}: Already counted via another entry.</div>`;
     }
   }
-  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading ? "disabled" : ""}>Refresh</button>`, body);
+  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading && ui.mergedDataRemote ? "disabled" : ""}>Refresh</button>`, body);
 }
 function deviceConnectionKey(devices) {
   return JSON.stringify(devices.map(d => {
@@ -1492,7 +1497,7 @@ async function loadDeviceDefinitions() {
     changed = ui.devicesLoaded && deviceConnectionKey(devices) !== deviceConnectionKey(ui.devices);
     if (changed) {
       ++ui.mergedDataRequest; ui.mergedDataLoading = false;
-      ui.deviceTrafficViews = Object.create(null); ui.mergedData = null;
+      ui.deviceTrafficViews = Object.create(null); ui.mergedData = ui.mergedDataLatest = null;
     } else {
       relabelDeviceViews([...Object.values(ui.deviceTrafficViews || {}), ui.mergedData], ui.devices, devices);
     }
@@ -1529,7 +1534,9 @@ async function checkConfiguredSsh() {
   }));
 }
 async function loadDevices(refreshRemote = false) {
-  if (ui.deviceRefresh) return;
+  // A visit arriving during another load (e.g. from Settings) runs afterwards,
+  // so the first Devices visit still starts its refresh.
+  if (ui.deviceRefresh) { ui.deviceRefreshQueued = true; return; }
   ui.deviceRefresh = true;
   try {
     await loadDeviceDefinitions();
@@ -1550,7 +1557,11 @@ async function loadDevices(refreshRemote = false) {
     await Promise.all([local, loadMergedData(remote, remote)]);
 
   } catch (error) { toast(String(error)); }
-  finally { ui.deviceRefresh = false; if (ui.page === "devices" || ui.page === "settings") render(); }
+  finally {
+    ui.deviceRefresh = false;
+    if (ui.page === "devices" || ui.page === "settings") render();
+    if (ui.deviceRefreshQueued) { ui.deviceRefreshQueued = false; if (ui.page === "devices") loadDevices(); }
+  }
 }
 
 async function loadDeviceCapabilities() {
@@ -1599,30 +1610,35 @@ function devicesPage() {
     (local.error ? message("warn", esc(local.error)) : "") +
     (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local", data || localTraffic)}` : `<div class="placeholder">Loading traffic…</div>`));
   for (const device of ui.devices) {
-    const source = data?.sources.find(source => source.name === device.name);
-    const traffic = source?.traffic;
+    const source = (data || ui.mergedDataLatest)?.sources.find(source => source.name === device.name);
+    const traffic = data && source?.traffic;
     const ssh = device.data?.transport === "ssh" || !device.data;
     const protocol = ssh ? "SSH" : device.data.url.startsWith("https:") ? "HTTPS" : "HTTP";
     const status = deviceConnectionStatus(device);
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading ? "Loading traffic…" : "Not refreshed"}</div>`));
+      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
 function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
-  const source = (ui.mergedData || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
+  const source = (ui.mergedData || ui.mergedDataLatest || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
   if (source?.error && source.error !== "TRAFFIC_UPDATING") return { state: "failed", label: String(source.error) };
   if (source?.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
   if (source?.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
   if (source?.included) return { state: "running", label: age < 0 || age > 45000 || ui.mergedDataError ? "Last statistics refresh succeeded (cached)" : "Read-only statistics available" };
   if (!source || source.exclusion === "not_refreshed") {
+    // Any known failure outranks an older success.
     const startup = ui.deviceStates?.[device.id];
-    if (startup && startup.host === device.ssh?.host && startup.state !== "warn") return startup;
-    if (ui.deviceCapabilities?.[device.id]?.capabilities) return { state: "running", label: "SSH capability check succeeded (cached)" };
-    return { state: ui.mergedDataLoading ? "warn" : "", label: ui.mergedDataLoading ? "Loading cached statistics…" : "Not checked" };
+    const current = startup && startup.host === device.ssh?.host && startup.state !== "warn" ? startup : null;
+    const cap = ui.deviceCapabilities?.[device.id];
+    if (cap?.error) return { state: "failed", label: `SSH check failed: ${cap.error}` };
+    if (current?.state === "failed") return current;
+    if (cap?.capabilities) return { state: "running", label: "SSH capability check succeeded (cached)" };
+    if (current) return current;
+    return ui.mergedDataRemote ? { state: "warn", label: "Refreshing statistics…" } : { state: "", label: "Not checked" };
   }
   return { state: "warn", label: "Statistics not included" };
 }
@@ -1889,10 +1905,8 @@ async function act(action, el) {
       break;
     }
     case "merged-refresh":
-      await loadMergedData(false, true);
-      break;
-    case "devices-refresh":
-      await loadDevices(true);
+      if (ui.mergedDataLoading && ui.mergedDataRemote) break;
+      await loadMergedData(true, true);
       break;
     case "device-save": {
       captureDeviceDraft(); const d = ui.deviceDraft;
@@ -1900,7 +1914,7 @@ async function act(action, el) {
       const device = { id: d.id || null, name: d.name.trim() || (ssh ? d.host.trim() : d.url.trim()),
         ssh: ssh ? { host: d.host.trim(), binary: d.binary.trim() } : null,
         data: { transport: d.transport, url: ssh ? "" : d.url.trim(), tokenFile: ssh ? null : d.key.trim() || null, tokenEnv: ssh ? null : d.env.trim() || null, caCertificate: ssh ? null : d.ca.trim() || null } };
-      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || !ui.mergedData) loadMergedData(true); }
+      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || (!ui.mergedData && !(ui.mergedDataLoading && ui.mergedDataRemote))) loadMergedData(true); }
       catch (e) { toast(String(e)); }
       break;
     }
