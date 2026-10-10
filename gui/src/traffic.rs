@@ -492,6 +492,7 @@ impl Drop for ParseWorkers {
 }
 
 struct ScannedFile {
+    #[cfg(unix)]
     stamp: FileStamp,
     archived_modified: Option<i64>,
     results: Vec<Arc<FileTraffic>>,
@@ -609,6 +610,7 @@ fn summarize_file(
         }
     }
     Ok(Some(ScannedFile {
+        #[cfg(unix)]
         stamp,
         archived_modified,
         results: results.into_iter().map(Option::unwrap).collect(),
