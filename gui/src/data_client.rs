@@ -1852,6 +1852,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_evidence_caches_archives_for_the_snapshot() {
+        let (_dir, log, archive) = archived_traffic_fixture();
+        // Evidence is read first here (it usually races the snapshot); the
+        // snapshot must then reuse the archive for both scopes.
+        crate::traffic::observed_identity_labels_range(&log, BTreeMap::new(), 43200).unwrap();
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        crate::traffic::Snapshot::load(&log, end).unwrap();
+        assert_eq!(crate::traffic::archive_scans(&archive), 1);
+    }
+
+    #[tokio::test]
     async fn first_frame_matches_the_complete_view_for_its_range() {
         let (_dir, log, _) = archived_traffic_fixture();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();

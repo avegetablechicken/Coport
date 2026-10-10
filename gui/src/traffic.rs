@@ -273,8 +273,23 @@ struct FileStamp {
 /// are dropped, so a long range read once does not stay in memory.
 type Summaries = HashMap<(FileStamp, bool), (Instant, Arc<FileTraffic>)>;
 static SUMMARIES: Mutex<Option<Summaries>> = Mutex::new(None);
+/// One lock per rotated file being summarized: a concurrent reader waits for
+/// the scan in progress and reuses its cached result instead of parsing again.
+static SCANNING: Mutex<Option<HashMap<FileStamp, Arc<Mutex<()>>>>> = Mutex::new(None);
 #[cfg(test)]
 static LIVE_SCANS: Mutex<Option<HashMap<std::path::PathBuf, usize>>> = Mutex::new(None);
+#[cfg(test)]
+static ARCHIVE_SCANS: Mutex<Option<HashMap<std::path::PathBuf, usize>>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) fn archive_scans(path: &Path) -> usize {
+    ARCHIVE_SCANS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|counts| counts.get(path))
+        .copied()
+        .unwrap_or(0)
+}
 #[cfg(test)]
 pub(crate) fn live_scans(path: &Path) -> usize {
     LIVE_SCANS
@@ -393,94 +408,211 @@ fn file_summaries_many(
     start: i64,
     selections: &[(TrafficScope, i64)],
 ) -> Result<Vec<Vec<SnapshotFile>>, String> {
-    let mut summaries: Vec<Vec<SnapshotFile>> = selections.iter().map(|_| Vec::new()).collect();
-    for_each_file(path, start, |file, live, file_path| {
-        let meta = file
-            .metadata()
-            .map_err(|_| "Cannot read traffic history".to_owned())?;
-        let backup = path.with_file_name(format!(
-            "{}.1",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        let archived_modified = if live || file_path == backup {
-            None
-        } else {
-            meta.modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|t| t.as_millis() as i64)
-        };
-        let stamp = FileStamp {
-            #[cfg(unix)]
-            node: {
-                use std::os::unix::fs::MetadataExt;
-                (meta.dev(), meta.ino())
-            },
-            #[cfg(not(unix))]
-            path: file_path.to_owned(),
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        };
-        let mut results: Vec<Option<Arc<FileTraffic>>> = selections.iter().map(|_| None).collect();
-        if !live {
-            let mut cache = SUMMARIES.lock().unwrap();
-            let cache = cache.get_or_insert_with(HashMap::new);
-            cache.retain(|_, (used, _)| used.elapsed() < SUMMARY_TTL);
-            for (result, (scope, end)) in results.iter_mut().zip(selections) {
-                if let Some((used, summary)) =
-                    cache.get_mut(&(stamp.clone(), *scope == TrafficScope::Model))
-                {
-                    let complete = summary
-                        .latest_event
-                        .is_none_or(|last| last < summary.scan_end && last < *end);
-                    if summary.scan_end == *end || complete {
-                        *used = Instant::now();
-                        *result = Some(summary.clone());
+    let backup = path.with_file_name(format!(
+        "{}.1",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    // Files are independent: parse them on a bounded set of threads and
+    // combine the results in file order, exactly as a sequential read would.
+    let jobs: Vec<_> = ordered_files(path, start)?
+        .into_iter()
+        .map(|job| Mutex::new(Some((job.0 == path, job))))
+        .collect();
+    let results: Vec<_> = jobs.iter().map(|_| Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = ParseWorkers::claim(jobs.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers.count {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else { break };
+                    let Some((live, (file_path, file))) = job.lock().unwrap().take() else {
+                        continue;
+                    };
+                    #[cfg(test)]
+                    if live && !selections.is_empty() {
+                        *LIVE_SCANS
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(HashMap::new)
+                            .entry(path.to_owned())
+                            .or_default() += 1;
                     }
+                    let result = summarize_file(&backup, live, &file_path, file, selections);
+                    *results[index].lock().unwrap() = Some(result);
+                }
+            });
+        }
+    });
+    let mut summaries: Vec<Vec<SnapshotFile>> = selections.iter().map(|_| Vec::new()).collect();
+    #[cfg(unix)]
+    let mut identities = std::collections::HashSet::new();
+    for result in results {
+        let Some(scanned) = result.into_inner().unwrap().transpose()? else {
+            continue;
+        };
+        let Some(scanned) = scanned else { continue };
+        // Rotation between the two opens can return the same file twice.
+        #[cfg(unix)]
+        if !identities.insert(scanned.stamp.node) {
+            continue;
+        }
+        for (summaries, summary) in summaries.iter_mut().zip(scanned.results) {
+            summaries.push(SnapshotFile {
+                summary,
+                archived_modified: scanned.archived_modified,
+            });
+        }
+    }
+    Ok(summaries)
+}
+
+/// Parse threads across all concurrent reads stay within the machine's cores;
+/// every read keeps at least its own thread, so it never waits for a budget.
+static PARSE_WORKERS: Mutex<usize> = Mutex::new(0);
+struct ParseWorkers {
+    count: usize,
+}
+impl ParseWorkers {
+    fn claim(files: usize) -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut active = PARSE_WORKERS.lock().unwrap();
+        let count = cores.saturating_sub(*active).clamp(1, 8).min(files.max(1));
+        *active += count;
+        Self { count }
+    }
+}
+impl Drop for ParseWorkers {
+    fn drop(&mut self) {
+        *PARSE_WORKERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= self.count;
+    }
+}
+
+struct ScannedFile {
+    stamp: FileStamp,
+    archived_modified: Option<i64>,
+    results: Vec<Arc<FileTraffic>>,
+}
+
+/// Summarize one file for every selection, reusing cached archive summaries.
+/// A missing archive (pruned meanwhile) yields `None`.
+fn summarize_file(
+    backup: &Path,
+    live: bool,
+    file_path: &Path,
+    file: Option<File>,
+    selections: &[(TrafficScope, i64)],
+) -> Result<Option<ScannedFile>, String> {
+    let file = match file {
+        Some(file) => file,
+        None => match File::open(file_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Cannot read traffic history".to_owned()),
+        },
+    };
+    let meta = file
+        .metadata()
+        .map_err(|_| "Cannot read traffic history".to_owned())?;
+    let archived_modified = if live || file_path == backup {
+        None
+    } else {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| t.as_millis() as i64)
+    };
+    let stamp = FileStamp {
+        #[cfg(unix)]
+        node: {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        },
+        #[cfg(not(unix))]
+        path: file_path.to_owned(),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    };
+    // The live file changes and is never cached, so it needs no scan lock.
+    let scan_lock = (!live).then(|| {
+        SCANNING
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(stamp.clone())
+            .or_default()
+            .clone()
+    });
+    let guard = scan_lock.as_ref().map(|lock| lock.lock().unwrap());
+    let mut results: Vec<Option<Arc<FileTraffic>>> = selections.iter().map(|_| None).collect();
+    if !live {
+        let mut cache = SUMMARIES.lock().unwrap();
+        let cache = cache.get_or_insert_with(HashMap::new);
+        cache.retain(|_, (used, _)| used.elapsed() < SUMMARY_TTL);
+        for (result, (scope, end)) in results.iter_mut().zip(selections) {
+            if let Some((used, summary)) =
+                cache.get_mut(&(stamp.clone(), *scope == TrafficScope::Model))
+            {
+                let complete = summary
+                    .latest_event
+                    .is_none_or(|last| last < summary.scan_end && last < *end);
+                if summary.scan_end == *end || complete {
+                    *used = Instant::now();
+                    *result = Some(summary.clone());
                 }
             }
         }
-        let missing: Vec<_> = results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, value)| value.is_none().then_some(i))
-            .collect();
-        if !missing.is_empty() {
-            #[cfg(test)]
-            if live {
-                *LIVE_SCANS
+    }
+    let missing: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, value)| value.is_none().then_some(i))
+        .collect();
+    if !missing.is_empty() {
+        #[cfg(test)]
+        if !live {
+            *ARCHIVE_SCANS
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .entry(file_path.to_owned())
+                .or_default() += 1;
+        }
+        let pending: Vec<_> = missing.iter().map(|i| selections[*i]).collect();
+        let scanned = FileTraffic::scan_many(file, &pending)?;
+        for (i, summary) in missing.into_iter().zip(scanned) {
+            let summary = Arc::new(summary);
+            if !live {
+                SUMMARIES
                     .lock()
                     .unwrap()
                     .get_or_insert_with(HashMap::new)
-                    .entry(path.to_owned())
-                    .or_default() += 1;
+                    .insert(
+                        (stamp.clone(), selections[i].0 == TrafficScope::Model),
+                        (Instant::now(), summary.clone()),
+                    );
             }
-            let pending: Vec<_> = missing.iter().map(|i| selections[*i]).collect();
-            let scanned = FileTraffic::scan_many(file, &pending)?;
-            for (i, summary) in missing.into_iter().zip(scanned) {
-                let summary = Arc::new(summary);
-                if !live {
-                    SUMMARIES
-                        .lock()
-                        .unwrap()
-                        .get_or_insert_with(HashMap::new)
-                        .insert(
-                            (stamp.clone(), selections[i].0 == TrafficScope::Model),
-                            (Instant::now(), summary.clone()),
-                        );
-                }
-                results[i] = Some(summary);
-            }
+            results[i] = Some(summary);
         }
-        for (summaries, summary) in summaries.iter_mut().zip(results) {
-            summaries.push(SnapshotFile {
-                summary: summary.unwrap(),
-                archived_modified,
-            });
+    }
+    drop(guard);
+    if let Some(lock) = scan_lock {
+        let mut scanning = SCANNING.lock().unwrap();
+        // Only the registry and this reader hold it: nobody else is waiting.
+        if Arc::strong_count(&lock) == 2
+            && let Some(map) = scanning.as_mut()
+        {
+            map.remove(&stamp);
         }
-        Ok(())
-    })?;
-    Ok(summaries)
+    }
+    Ok(Some(ScannedFile {
+        stamp,
+        archived_modified,
+        results: results.into_iter().map(Option::unwrap).collect(),
+    }))
 }
 
 #[derive(Serialize)]
@@ -864,7 +996,14 @@ pub(crate) fn observed_identity_labels_range(
     let end = chrono::Utc::now().timestamp_millis();
     let start = end - minutes as i64 * 60_000;
     // Only identity evidence is needed; do not materialize the window's entries.
-    let files = file_summaries(path, start, TrafficScope::Model, end)?;
+    // Both scopes are summarized in the same pass, so a concurrent snapshot
+    // read reuses the cached archives instead of parsing them again.
+    let files = file_summaries_many(
+        path,
+        start,
+        &[(TrafficScope::Model, end), (TrafficScope::All, end)],
+    )?
+    .remove(0);
     apply_identity_evidence(&files, start, &mut labels);
     Ok(labels)
 }
@@ -1252,35 +1391,18 @@ fn for_each_file(
     start: i64,
     mut visit: impl FnMut(File, bool, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    let backup = path.with_file_name(format!(
-        "{}.1",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    // Open handles before reading so appends and rotations do not restart a scan.
-    let open = |p: &Path| match File::open(p) {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("Cannot read traffic history".to_owned()),
-    };
-    let current = [path, backup.as_path()].map(|p| (p.to_owned(), open(p)));
-    let archives = coport::logger::history_paths(path)
-        .map_err(|_| "Cannot read traffic archives".to_owned())?;
-    // Archived files are immutable. Skip files last written before the selected
-    // window, and open one at a time to avoid exhausting file descriptors.
-    let archives = archives.into_iter().filter(|p| {
-        p.metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_none_or(|t| t.as_millis() as i64 >= start)
-    });
-    let files = current
-        .into_iter()
-        .chain(archives.map(|p| (p.clone(), open(&p))));
     #[cfg(unix)]
     let mut identities = std::collections::HashSet::new();
-    for (index, (file_path, file)) in files.enumerate() {
-        let Some(file) = file? else { continue };
+    let files = ordered_files(path, start)?;
+    for (file_path, file) in files {
+        let file = match file {
+            Some(file) => file,
+            None => match File::open(&file_path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("Cannot read traffic history".to_owned()),
+            },
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1292,9 +1414,47 @@ fn for_each_file(
                 continue;
             }
         }
-        visit(file, index == 0, &file_path)?;
+        visit(file, file_path == path, &file_path)?;
     }
     Ok(())
+}
+
+/// The log's files in read order: the live log, its backup, then archives.
+/// The live log and backup are opened at once so appends and rotations do not
+/// restart a scan; archives (`None`) are opened on use, one at a time per
+/// reader, so long histories cannot exhaust file descriptors. Archives last
+/// written before `start` (epoch milliseconds) are skipped.
+fn ordered_files(
+    path: &Path,
+    start: i64,
+) -> Result<Vec<(std::path::PathBuf, Option<File>)>, String> {
+    let backup = path.with_file_name(format!(
+        "{}.1",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut files = Vec::new();
+    for current in [path, backup.as_path()] {
+        match File::open(current) {
+            Ok(file) => files.push((current.to_owned(), Some(file))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("Cannot read traffic history".to_owned()),
+        }
+    }
+    let archives = coport::logger::history_paths(path)
+        .map_err(|_| "Cannot read traffic archives".to_owned())?;
+    files.extend(
+        archives
+            .into_iter()
+            .filter(|p| {
+                p.metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .is_none_or(|t| t.as_millis() as i64 >= start)
+            })
+            .map(|p| (p, None)),
+    );
+    Ok(files)
 }
 
 fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String> {
@@ -2789,6 +2949,95 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn concurrent_cold_reads_parse_each_archive_once_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let history = dir.path().join("history");
+        std::fs::create_dir(&history).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = |id: usize, at: i64| {
+            serde_json::json!({"timestamp":chrono::DateTime::from_timestamp_millis(at).unwrap().to_rfc3339(),"event":"request_finished","request_id":format!("r{id}"),"method":"POST","path":"/v1/responses","service":"codex","status":"200","received_bytes":"1"}).to_string() + "\n"
+        };
+        let mut archives = Vec::new();
+        for k in 0..6 {
+            let at = now - (k as i64 + 2) * 3_600_000;
+            let archive = history.join(format!("proxy.log.{at}.{k}.jsonl"));
+            std::fs::write(
+                &archive,
+                (0..20_000)
+                    .map(|i| row(k * 100_000 + i, at - 60_000))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            archives.push(archive);
+        }
+        std::fs::write(&path, row(9_999_999, now - 60_000)).unwrap();
+        let end = now / 60_000 * 60_000;
+        let barrier = std::sync::Barrier::new(2);
+        let [first, second] = std::thread::scope(|scope| {
+            [TrafficScope::Model, TrafficScope::Model]
+                .map(|scope_kind| {
+                    let (barrier, path) = (&barrier, &path);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        read_at(
+                            ReadSource::Path(path),
+                            43200,
+                            &BTreeMap::new(),
+                            scope_kind,
+                            &Identities::default(),
+                            end,
+                        )
+                        .unwrap()
+                        .summary
+                        .requests
+                    })
+                })
+                .map(|handle| handle.join().unwrap())
+        });
+        assert_eq!(first, 6 * 20_000 + 1);
+        assert_eq!(second, first);
+        // A concurrent reader waits for a scan in progress rather than
+        // parsing the archive again.
+        for archive in &archives {
+            assert_eq!(archive_scans(archive), 1, "{}", archive.display());
+        }
+        let before: Vec<_> = archives.iter().map(|a| archive_scans(a)).collect();
+        assert_eq!(
+            read_at(
+                ReadSource::Path(&path),
+                43200,
+                &BTreeMap::new(),
+                TrafficScope::Model,
+                &Identities::default(),
+                end
+            )
+            .unwrap()
+            .summary
+            .requests,
+            first
+        );
+        assert_eq!(
+            archives
+                .iter()
+                .map(|a| archive_scans(a))
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn parse_threads_stay_within_the_core_budget() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let first = ParseWorkers::claim(100);
+        assert!((1..=cores.min(8)).contains(&first.count));
+        let second = ParseWorkers::claim(100);
+        assert!(second.count >= 1, "A read always keeps its own thread");
+        assert!(first.count + second.count <= cores.max(first.count + 1));
+        assert_eq!(ParseWorkers::claim(1).count, 1);
+    }
+
     #[test]
     fn rotated_files_are_summarized_once_until_they_change() {
         let dir = tempfile::tempdir().unwrap();
