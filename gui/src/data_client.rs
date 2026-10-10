@@ -898,7 +898,13 @@ async fn merge_progressive_snapshot(
     let context =
         std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
 
+    // Show this device at once; peers replace their placeholders as they answer.
     let mut snapshots = BTreeMap::new();
+    let local = load_selected_snapshot(&context.log, context.at, minutes).await?;
+    snapshots.insert(context.at, local.clone());
+    on_update(vec![
+        merge_fetched(context.clone(), &fetched, minutes, scope, context.at, local).await?,
+    ])?;
     let mut background_errors = BTreeMap::new();
     while let Some((index, result)) = rx.recv().await {
         if let Err(error) = &result {
@@ -1352,6 +1358,14 @@ mod tests {
                     let included = views[0].sources.iter().filter(|s| s.included).count();
                     let mut updates = updates.lock().unwrap();
                     if updates.is_empty() {
+                        assert_eq!(included, 0, "This device renders before any peer");
+                        assert!(
+                            views[0]
+                                .sources
+                                .iter()
+                                .all(|s| s.error.as_deref() == Some("TRAFFIC_UPDATING"))
+                        );
+                    } else if updates.len() == 1 {
                         assert_eq!(
                             included, 1,
                             "Fast peer must render while slow peer is blocked"
@@ -1379,7 +1393,7 @@ mod tests {
                 .iter()
                 .all(|view| view.sources.iter().all(|s| s.included))
         );
-        assert_eq!(updates.lock().unwrap()[0], 1);
+        assert_eq!(updates.lock().unwrap()[..2], [0, 1]);
         for server in servers {
             server.await.unwrap();
         }
