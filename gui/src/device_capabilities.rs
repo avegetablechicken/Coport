@@ -6,13 +6,19 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub device_id: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub binary: String,
+    #[serde(default)]
+    pub checked_at: Option<u64>,
     pub pending: bool,
     pub capabilities: Option<Capabilities>,
     pub error: Option<String>,
@@ -80,6 +86,9 @@ impl Checks {
                 Entry {
                     result: Status {
                         device_id: device.name.clone(),
+                        host: device.host.clone(),
+                        binary: device.binary.clone(),
+                        checked_at: None,
                         pending: true,
                         capabilities: None,
                         error: None,
@@ -112,6 +121,13 @@ impl Checks {
         {
             entry.result.pending = false;
             entry.checked = true;
+            entry.result.checked_at = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            );
             match result {
                 Ok(caps) => {
                     entry.result.capabilities = Some(caps);
@@ -191,9 +207,14 @@ mod tests {
         let device = checks.take_pending().pop().unwrap();
         assert!(checks.take_pending().is_empty());
         checks.finish(device, Err("Access denied".into()));
+        let observed = checks.statuses().remove(0);
+        assert!(observed.checked_at.is_some());
+        assert_eq!(observed.host, "old-host");
+        assert_eq!(observed.binary, "coportd");
         for _ in 0..10 {
             checks.refresh().unwrap();
             assert!(checks.take_pending().is_empty());
+            assert_eq!(checks.statuses()[0].checked_at, observed.checked_at);
         }
         std::fs::write(dir.path().join("gui.json"), "{not json").unwrap();
         assert!(checks.refresh().is_err());

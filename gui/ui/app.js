@@ -211,6 +211,7 @@ async function refresh() {
   ]);
   if (request !== ui.refreshRequest) return;
   ui.snap = snap;
+  if (ui.devicesLoaded) setDeviceForwarders(snap.forwarding ? [snap.forwarding] : []);
   ui.recent = recent.rows.slice(0, 5);
   const proxies = snap.config.details?.proxies ?? [];
   ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
@@ -1399,6 +1400,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
   const request = ++ui.mergedDataRequest;
   ui.mergedDataLoading = true;
   ui.mergedDataRemote = refreshRemote;
+  if (refreshRemote) ui.deviceTrafficRecoveryPending = false;
   let completed = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
   try {
@@ -1434,7 +1436,14 @@ async function loadMergedData(force = false, refreshRemote = false) {
       ui.mergedDataError = skew && refreshRemote ? "Devices reported different time boundaries. Press Refresh to try again." : ui.mergedDataUpdating ? "" : String(e);
     }
   }
-  finally { completed = true; if (request === ui.mergedDataRequest) { ui.mergedDataLoading = ui.mergedDataRemote = false; if (ui.page === "devices" || ui.page === "settings") render(); } }
+  finally {
+    completed = true;
+    if (request === ui.mergedDataRequest) {
+      ui.mergedDataLoading = ui.mergedDataRemote = false;
+      if (ui.page === "devices" || ui.page === "settings") render();
+      if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
+    }
+  }
 }
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
   const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
@@ -1510,7 +1519,7 @@ async function checkConfiguredSsh() {
   ui.deviceStates ||= Object.create(null);
   const update = () => { if (ui.snap && (ui.page === "settings" || ui.page === "devices")) render(); };
   for (const device of pending) {
-    ui.deviceStates[device.id] = { host: device.ssh.host, state: "warn", label: "Checking SSH…" };
+    ui.deviceStates[device.id] = { host: device.ssh.host, state: "warn", label: "Checking SSH…", checkedAt: Date.now() };
   }
   update();
   // Bound startup connections and check each configured device only once.
@@ -1518,6 +1527,7 @@ async function checkConfiguredSsh() {
     while (pending.length) {
       const device = pending.shift();
       const result = ui.deviceStates[device.id];
+      result.checkedAt = Date.now();
       try {
         await invoke("check_ssh_device", { id: device.id });
         result.state = "running"; result.label = "SSH reachable at startup";
@@ -1538,7 +1548,7 @@ async function loadDevices(refreshRemote = false) {
     // Forwarding status comes only from the local daemon; read it alongside
     // statistics instead of delaying the first traffic frame behind it.
     const local = Promise.all([
-      invoke("get_device_forwarders").then(forwarders => { ui.deviceForwarders = forwarders; }),
+      invoke("get_device_forwarders").then(setDeviceForwarders),
       loadDeviceCapabilities(),
     ]);
     // Remote statistics must not start when Settings is open or the user has left Devices.
@@ -1556,19 +1566,61 @@ async function loadDevices(refreshRemote = false) {
     ui.deviceRefresh = false;
     if (ui.page === "devices" || ui.page === "settings") render();
     if (ui.deviceRefreshQueued) { ui.deviceRefreshQueued = false; if (ui.page === "devices") loadDevices(); }
+    if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
   }
 }
 
+function synchronizeDeviceRecovery(before) {
+  for (const device of ui.devices) {
+    if (before.get(device.id) === "failed" && deviceConnectionStatus(device).state === "running"
+        && ui.deviceStartupRefreshDone) ui.deviceTrafficRecoveryPending = true;
+  }
+  if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
+}
+function setDeviceForwarders(forwarders) {
+  const before = new Map(ui.devices.map(device => [device.id, deviceConnectionStatus(device).state]));
+  ui.deviceForwarders = forwarders;
+  synchronizeDeviceRecovery(before);
+}
+async function refreshRecoveredDeviceTraffic() {
+  if (!ui.deviceStartupRefreshDone || !ui.deviceTrafficRecoveryPending || ui.mergedDataLoading || ui.deviceRefresh) return;
+  ui.deviceTrafficRecoveryPending = false;
+  // Visiting Devices authorizes keeping its cached view in sync after recovery,
+  // including while the user is back in Settings or on Home.
+  await loadMergedData(true, true);
+}
+function matchingDeviceCapability(device) {
+  const entry = ui.deviceCapabilities?.[device.id];
+  if (entry?.host && (entry.host !== device.ssh?.host
+      || (entry.binary || "coportd") !== (device.ssh?.binary || "coportd"))) return null;
+  return entry;
+}
 async function loadDeviceCapabilities() {
+  if (ui.deviceCapabilitiesLoading) return;
+  ui.deviceCapabilitiesLoading = true;
   try {
     const values = await invoke("get_device_capabilities");
-    ui.deviceCapabilities = Object.fromEntries(values.map(value => [value.deviceId, value]));
+    const previous = ui.deviceCapabilities || {};
+    const before = new Map(ui.devices.map(device => [device.id, deviceConnectionStatus(device).state]));
+    const signature = entry => JSON.stringify([entry?.host, entry?.binary, entry?.capabilities, entry?.error]);
+    ui.deviceCapabilities = Object.fromEntries(values.map(value => {
+      const old = previous[value.deviceId];
+      // Legacy daemons have no timestamps. Re-reading an unchanged cache must
+      // not make that evidence newer than a real SSH/statistics failure.
+      const checkedAt = value.checkedAt ?? (signature(old) === signature(value) ? old?.checkedAt : Date.now());
+      return [value.deviceId, { ...value, checkedAt }];
+    }));
     ui.deviceCapabilitiesError = "";
-  } catch (error) { ui.deviceCapabilities = {}; ui.deviceCapabilitiesError = String(error); }
+    synchronizeDeviceRecovery(before);
+  } catch (error) { ui.deviceCapabilitiesError = String(error); }
+  finally {
+    ui.deviceCapabilitiesLoading = false;
+    if (ui.snap && (ui.page === "settings" || ui.page === "devices")) render();
+  }
 }
 function deviceCapabilities(device) {
   if (!device.ssh) return "";
-  const entry = ui.deviceCapabilities?.[device.id];
+  const entry = matchingDeviceCapability(device);
   const caps = entry?.capabilities;
   const error = entry?.error || ui.deviceCapabilitiesError;
   const text = error ? "Version unavailable" : entry?.pending ? "Checking…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${esc(caps.runningVersion)}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Unavailable" : " · Offline"}` : "Checking…";
@@ -1576,7 +1628,7 @@ function deviceCapabilities(device) {
 }
 async function refreshForwardingStatus() {
   try {
-    ui.deviceForwarders = await invoke("get_device_forwarders");
+    setDeviceForwarders(await invoke("get_device_forwarders"));
     await loadDeviceCapabilities();
     if (ui.snap) ui.snap.forwarding = ui.deviceForwarders[0] || null;
     if (ui.page === "settings") render();
@@ -1587,7 +1639,7 @@ function forwardingSettings() {
   const rows = devices.map(device => {
     const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
     const busy = ui.deviceForwardingBusy === device.id;
-    const caps = ui.deviceCapabilities?.[device.id]?.capabilities;
+    const caps = matchingDeviceCapability(device)?.capabilities;
     const unavailable = !status && !(caps?.forwarding && caps.forwardingAvailable);
     return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy || unavailable ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
   }).join("");
@@ -1620,21 +1672,30 @@ function devicesPage() {
 function deviceConnectionStatus(device) {
   const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
   const source = (ui.mergedData || ui.mergedDataLatest || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
-  if (source?.error && source.error !== "TRAFFIC_UPDATING") return { state: "failed", label: String(source.error) };
-  if (source?.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
-  if (source?.exclusion === "duplicate") return { state: "warn", label: "Statistics available; already counted via another entry." };
-  if (source?.included) return { state: "running", label: age < 0 || age > 45000 || ui.mergedDataError ? "Last statistics refresh succeeded (cached)" : "Read-only statistics available" };
-  if (!source || source.exclusion === "not_refreshed") {
-    // Any known failure outranks an older success.
+  const evidence = [];
+  const ssh = device.ssh && (!device.data || device.data.transport === "ssh");
+  if (ssh) {
     const startup = ui.deviceStates?.[device.id];
-    const current = startup && startup.host === device.ssh?.host && startup.state !== "warn" ? startup : null;
-    const cap = ui.deviceCapabilities?.[device.id];
-    if (cap?.error) return { state: "failed", label: `SSH check failed: ${cap.error}` };
-    if (current?.state === "failed") return current;
-    if (cap?.capabilities) return { state: "running", label: "SSH capability check succeeded (cached)" };
-    if (current) return current;
-    return ui.mergedDataRemote ? { state: "warn", label: "Refreshing statistics…" } : { state: "", label: "Not checked" };
+    if (startup?.host === device.ssh.host && startup.state !== "warn") evidence.push(startup);
+    const cap = matchingDeviceCapability(device);
+    if (cap?.error) evidence.push({ state: "failed", label: `SSH check failed: ${cap.error}`, checkedAt: cap.checkedAt });
+    else if (cap?.capabilities) evidence.push({ state: "running", label: "SSH capability check succeeded (cached)", checkedAt: cap.checkedAt });
+    const forwarding = ui.deviceForwarders?.find(item => item.deviceId === device.id);
+    if (forwarding?.health?.state === "connected") evidence.push({ state: "running", label: "SSH forwarding connection verified", checkedAt: forwarding.health.lastCheckedAt });
+    else if (forwarding?.health?.state === "disconnected") evidence.push({ state: "failed", label: forwarding.health.error || "SSH forwarding disconnected", checkedAt: forwarding.health.lastCheckedAt });
+    if (forwarding?.remoteTrafficError && forwarding.remoteTrafficCheckedAt) evidence.push({ state: "failed", label: forwarding.remoteTrafficError, checkedAt: forwarding.remoteTrafficCheckedAt });
+    else if (forwarding?.remoteTraffic) evidence.push({ state: "running", label: "Read-only statistics available", checkedAt: forwarding.remoteTraffic.fetchedAt });
   }
+  let statistics;
+  if (source?.error && source.error !== "TRAFFIC_UPDATING") statistics = { state: "failed", label: String(source.error) };
+  else if (source?.exclusion === "duplicate") statistics = { state: "warn", label: "Statistics available; already counted via another entry." };
+  else if (source?.included) statistics = { state: "running", label: age < 0 || age > 45000 || ui.mergedDataError ? "Last statistics refresh succeeded (cached)" : "Read-only statistics available" };
+  if (statistics) evidence.push({ ...statistics, checkedAt: ui.deviceTrafficFetchedAt });
+  // Compare evidence by time, not by whether it succeeded. A startup failure
+  // cannot permanently override a later successful capability/statistics check.
+  if (evidence.length) return evidence.reduce((latest, item) => (item.checkedAt || 0) >= (latest.checkedAt || 0) ? item : latest);
+  if (source?.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
+  if (!source || source.exclusion === "not_refreshed") return ui.mergedDataRemote ? { state: "warn", label: "Refreshing statistics…" } : { state: "", label: "Not checked" };
   return { state: "warn", label: "Statistics not included" };
 }
 function deviceSettings() {
@@ -1877,7 +1938,7 @@ async function act(action, el) {
       ui.deviceForwardingBusy = el.dataset.id; render();
       try {
         await invoke("set_device_forwarding", { id: el.dataset.id, enabled: el.dataset.enabled === "true" });
-        ui.deviceForwarders = await invoke("get_device_forwarders");
+        setDeviceForwarders(await invoke("get_device_forwarders"));
         ui.snap.forwarding = ui.deviceForwarders[0] || null;
       } catch (error) { toast(String(error)); }
       finally { ui.deviceForwardingBusy = null; render(); }
@@ -2225,6 +2286,7 @@ listen("panel-shown", () => {
     render();
     $("content").scrollTop = 0;
   }
+  if (ui.devicesLoaded) loadDeviceCapabilities();
   return refresh();
 });
 listen("panel-hidden", () => {
@@ -2239,9 +2301,10 @@ checkConfiguredSsh();
 setInterval(() => {
   if (document.hidden) return;
   if (ui.page === "activity") {
+    loadDeviceCapabilities();
     loadTraffic();
     scheduleActivityLog();
   } else if (ui.page === "devices") { refresh(); loadDevices(); }
-  else if (ui.page === "main") refresh();
+  else if (ui.page === "main") { refresh(); loadDeviceCapabilities(); }
   else if (ui.page === "settings") refreshForwardingStatus();
 }, 15000);

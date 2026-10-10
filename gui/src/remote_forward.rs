@@ -223,6 +223,8 @@ pub struct Status {
     pub remote_traffic: Option<RemoteTraffic>,
     #[serde(default)]
     pub remote_traffic_error: Option<String>,
+    #[serde(default)]
+    pub remote_traffic_checked_at: Option<u64>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +245,7 @@ struct Metadata {
     capabilities_error: Option<String>,
     traffic: Option<RemoteTraffic>,
     traffic_error: Option<String>,
+    traffic_checked_at: Option<u64>,
 }
 impl Mode {
     fn new(target: Option<Target>) -> Self {
@@ -386,6 +389,7 @@ impl Routing {
                 capabilities_error: metadata.capabilities_error.clone(),
                 remote_traffic: metadata.traffic.clone(),
                 remote_traffic_error: metadata.traffic_error.clone(),
+                remote_traffic_checked_at: metadata.traffic_checked_at,
             }
         })
     }
@@ -451,6 +455,7 @@ impl Routing {
                                 }
                                 Err(error) => metadata.capabilities_error = Some(error),
                             }
+                            metadata.traffic_checked_at = Some(telemetry::now_ms());
                             match summary.and_then(RemoteTraffic::from_summary) {
                                 Ok(value) => {
                                     metadata.traffic = Some(value);

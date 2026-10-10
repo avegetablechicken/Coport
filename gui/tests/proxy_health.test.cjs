@@ -37,15 +37,16 @@ test("visible home refresh does not start another proxy probe", async () => {
     ui, document,
     setInterval: (callback) => { tick = callback; },
     refresh: async () => { calls.push("refresh"); },
+    loadDeviceCapabilities: () => { calls.push("cached-device-status"); },
     probeStale: () => { calls.push("probeStale"); },
   });
   tick();
   await Promise.resolve();
-  assert.deepEqual(calls, ["refresh"]);
+  assert.deepEqual(calls, ["refresh", "cached-device-status"]);
   document.hidden = true;
   tick();
   await Promise.resolve();
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
 });
 
 test("LAN proxy renders the measured exit IP", () => {
@@ -122,13 +123,13 @@ test('every passive page refresh opts out of upstream account probes', async () 
 });
 
 
-test('traffic IPC reads local identities without asking the daemon for account metadata', () => {
+test('traffic IPC reads cached identities without starting account probes', () => {
   const commands = fs.readFileSync(path.join(__dirname, '../src/commands.rs'), 'utf8');
   for (const name of ['get_traffic', 'get_merged_data']) {
     const start = commands.indexOf(`pub async fn ${name}(`);
     const next = commands.indexOf('#[tauri::command]', start);
     const body = commands.slice(start, next < 0 ? undefined : next);
-    assert.match(body, /local_traffic_credential_labels/);
-    assert.doesNotMatch(body, /account_tasks|tasks\.credential_labels|cached_credential_labels/);
+    assert.match(body, /cached_credential_labels/);
+    assert.doesNotMatch(body, /\.credential_labels\(|account_states\(|credential_reports\(/);
   }
 });

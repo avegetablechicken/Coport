@@ -1470,13 +1470,16 @@ Metadata is refreshed 30 seconds after each retrieval completes, independently o
 health checks. Unavailable or stale statistics are marked explicitly and do not
 make a working forwarding connection unhealthy.
 
-Settings shows a compact version and capability status. The daemon automatically
-checks each configured SSH connection once per configuration, with at most four
-checks in flight. Successes and failures are retained; neither page visits nor
-timers retry a denied or unavailable device. A changed connection or daemon restart
-allows another check. Saving or removing devices reloads local configuration;
-opening Settings only reads cached results. Status lights retain the last verified
-result with a cached tooltip instead of expiring to gray or starting a new check.
+Settings shows a compact version and capability status. The daemon checks each
+configured SSH connection once per configuration, with at most four checks in flight.
+Page visits and status reads do not start additional SSH checks. Existing capability,
+statistics, and active-forwarding health results carry observation times; Settings
+and Devices use the newest result rather than letting a startup failure override a
+later success. Once Devices has been visited, an observed connection recovery also
+refreshes its statistics, even while another page is open. Recoveries during an
+in-flight statistics request are queued and coalesced. Before the first Devices
+visit, recovery updates status only. The GUI reads local cached status every 15 seconds
+while visible and on reopening; it does not add a periodic SSH probe.
 No manual version-check
 button is needed. Unverified or unsupported destinations have a disabled forwarding
 switch; an already active destination can always be switched off. Errors are shown

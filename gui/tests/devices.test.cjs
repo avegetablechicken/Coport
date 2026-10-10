@@ -428,7 +428,7 @@ test('a known capability failure outranks an older successful SSH check', () => 
   assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'failed');
   h.ui.deviceCapabilities = { ms: { capabilities: { version: '1' } } };
   h.ui.deviceStates.ms = { host: 'MS', state: 'failed', label: 'Startup SSH check failed' };
-  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'failed');
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state, 'running');
 });
 
 test('a Devices visit during another device load is queued, not dropped', async () => {
@@ -840,4 +840,116 @@ test('Settings status uses successful cached SSH capabilities without connecting
   assert.match(h.deviceConnectionStatus(device).label, /cached/);
   h.ui.deviceCapabilities = {};
   assert.equal(h.deviceConnectionStatus(device).state, '');
+});
+
+
+test('newest SSH evidence wins across startup, capabilities and statistics', () => {
+  const h = harness(async () => []);
+  const device = {id:'ms', name:'MS', ssh:{host:'MS'}};
+  h.ui.deviceStates = {ms:{host:'MS', state:'failed', label:'startup failed', checkedAt:100}};
+  h.ui.mergedData = {sources:[{name:'MS',error:'old statistics failure'}]};
+  h.ui.deviceTrafficFetchedAt = 150;
+  h.ui.deviceCapabilities = {ms:{host:'MS', checkedAt:200, capabilities:{statistics:true,forwarding:true}}};
+  assert.equal(h.deviceConnectionStatus(device).state, 'running');
+  h.ui.deviceTrafficFetchedAt = 300;
+  assert.equal(h.deviceConnectionStatus(device).label, 'old statistics failure');
+  h.ui.deviceCapabilities.ms.checkedAt = 400;
+  assert.equal(h.deviceConnectionStatus(device).state, 'running');
+  h.ui.deviceCapabilities.ms.host = 'other';
+  assert.equal(h.deviceConnectionStatus(device).state, 'failed', 'A previous host must not mark an edited device reachable');
+});
+
+test('SSH recovery refreshes previously visited Devices even from Settings or Home', async () => {
+  for (const page of ['settings','main','devices']) {
+    let value = {deviceId:'ms',host:'MS',checkedAt:200,capabilities:{statistics:true,forwarding:true},error:null};
+    const h = harness(async () => [value]);
+    const reads=[];
+    h.loadMergedData = async (...args) => { reads.push(args); };
+    h.ui.page=page; h.ui.devices=[{id:'ms',name:'MS',ssh:{host:'MS'}}];
+    h.ui.deviceStartupRefreshDone=true;
+    h.ui.deviceCapabilities={ms:{host:'MS',checkedAt:100,error:'offline'}};
+    await h.loadDeviceCapabilities();
+    assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state,'running');
+    assert.deepEqual(reads,[[true,true]]);
+    await h.loadDeviceCapabilities();
+    value={...value,checkedAt:300};
+    await h.loadDeviceCapabilities();
+    assert.equal(reads.length,1,'Healthy polling must not repeatedly refresh remote statistics');
+  }
+});
+
+test('SSH recovery does not read remote statistics before Devices has been visited', async () => {
+  const h=harness(async()=>[{deviceId:'ms',host:'MS',checkedAt:200,capabilities:{statistics:true}}]);
+  h.ui.page='settings';h.ui.devices=[{id:'ms',name:'MS',ssh:{host:'MS'}}];
+  h.ui.deviceStates={ms:{host:'MS',checkedAt:100,state:'failed'}};
+  h.loadMergedData=()=>{throw new Error('Unexpected statistics request')};
+  await h.loadDeviceCapabilities();
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state,'running');
+  assert.ok(!h.ui.deviceTrafficRecoveryPending);
+});
+
+test('recovery during an in-flight statistics request queues exactly one refresh', async () => {
+  const pending=[];
+  const h=harness(async (command,args)=>{
+    if(command==='get_device_capabilities') return [{deviceId:'ms',host:'MS',checkedAt:200,capabilities:{statistics:true}}];
+    assert.equal(command,'get_merged_data');
+    return new Promise(resolve=>pending.push({args,resolve}));
+  });
+  h.Channel=class {};h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';
+  h.ui.devices=[{id:'ms',name:'MS',ssh:{host:'MS'}}];
+  h.ui.deviceStartupRefreshDone=true;h.ui.deviceCapabilities={ms:{host:'MS',checkedAt:100,error:'offline'}};
+  vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('),source.indexOf('function deviceTrafficContent(')),h);
+  const first=h.loadMergedData(true,true);
+  await h.loadDeviceCapabilities();
+  await h.loadDeviceCapabilities();
+  assert.equal(pending.length,1);
+  assert.equal(h.ui.deviceTrafficRecoveryPending,true);
+  pending[0].resolve([{minutes:30,scope:'model',sources:[]}]);await first;
+  assert.equal(pending.length,2);
+  assert.equal(pending[1].args.refreshRemote,true);
+  pending[1].resolve([{minutes:30,scope:'model',sources:[]}]);
+  for(let i=0;i<5;i++) await Promise.resolve();
+  assert.equal(h.ui.mergedDataLoading,false);
+  assert.equal(h.ui.deviceTrafficRecoveryPending,false);
+});
+
+test('unchanged legacy capability results retain their original observation time', async () => {
+  const h=harness(async()=>[{deviceId:'ms',capabilities:{statistics:true}}]);
+  h.ui.devices=[{id:'ms',name:'MS',ssh:{host:'MS'}}];
+  await h.loadDeviceCapabilities();
+  const at=h.ui.deviceCapabilities.ms.checkedAt;
+  h.ui.mergedData={sources:[{name:'MS',error:'new failure'}]};h.ui.deviceTrafficFetchedAt=at+1;
+  await h.loadDeviceCapabilities();
+  assert.equal(h.ui.deviceCapabilities.ms.checkedAt,at);
+  assert.equal(h.deviceConnectionStatus(h.ui.devices[0]).state,'failed');
+});
+
+
+test('existing forwarding and statistics probes synchronize lights and recover visited Devices', () => {
+  const h=harness(()=>{throw new Error('Synchronizing cached evidence must not start a probe')});
+  const device={id:'ms',name:'MS',ssh:{host:'MS'}};
+  h.ui.devices=[device];h.ui.page='settings';h.ui.deviceStartupRefreshDone=true;
+  h.ui.deviceStates={ms:{host:'MS',state:'failed',checkedAt:100,label:'old startup failure'}};
+  let refreshes=0;h.loadMergedData=async(force,remote)=>{assert.ok(force&&remote);refreshes++;};
+  h.setDeviceForwarders([{deviceId:'ms',health:{state:'connected',lastCheckedAt:200},remoteTraffic:{fetchedAt:220}}]);
+  assert.equal(h.deviceConnectionStatus(device).state,'running');assert.equal(refreshes,1);
+  h.setDeviceForwarders([{deviceId:'ms',health:{state:'connected',lastCheckedAt:300},remoteTraffic:{fetchedAt:320}}]);
+  assert.equal(refreshes,1,'Repeated successes only synchronize status');
+  h.setDeviceForwarders([{deviceId:'ms',health:{state:'connected',lastCheckedAt:300},remoteTraffic:{fetchedAt:320},remoteTrafficError:'statistics disconnected',remoteTrafficCheckedAt:400}]);
+  assert.equal(h.deviceConnectionStatus(device).label,'statistics disconnected');
+  assert.equal(refreshes,1);
+  h.setDeviceForwarders([{deviceId:'ms',health:{state:'connected',lastCheckedAt:500},remoteTraffic:{fetchedAt:520},remoteTrafficError:null,remoteTrafficCheckedAt:520}]);
+  assert.equal(h.deviceConnectionStatus(device).state,'running');assert.equal(refreshes,2);
+});
+
+test('forwarding evidence never changes an HTTP statistics connection or starts an unvisited Devices refresh', () => {
+  const h=harness(()=>{throw new Error('No IPC expected')});
+  const ssh={id:'ssh',name:'SSH',ssh:{host:'MS'}};
+  const http={id:'http',name:'HTTP',ssh:{host:'MS'},data:{transport:'http',url:'https://example.invalid'}};
+  h.ui.devices=[ssh,http];h.ui.deviceTrafficFetchedAt=100;
+  h.ui.mergedData={sources:[{name:'SSH',error:'old failure'},{name:'HTTP',error:'HTTP failed'}]};
+  h.loadMergedData=()=>{throw new Error('Devices has not been visited')};
+  h.setDeviceForwarders([{deviceId:'ssh',health:{state:'connected',lastCheckedAt:200}},{deviceId:'http',health:{state:'connected',lastCheckedAt:200}}]);
+  assert.equal(h.deviceConnectionStatus(ssh).state,'running');
+  assert.equal(h.deviceConnectionStatus(http).state,'failed');
 });
