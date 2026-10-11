@@ -451,7 +451,7 @@ test('a Devices visit during another device load is queued, not dropped', async 
   await settings;
   for (let i = 0; i < 10; i++) await Promise.resolve();
   const reads = calls.filter(([command]) => command === 'get_merged_data');
-  assert.equal(reads.length, 1, 'The queued first visit starts its refresh');
+  assert.equal(reads.length, 1, 'The queued visit starts its due refresh');
   assert.equal(reads[0][1].refreshRemote, true);
 });
 
@@ -602,7 +602,7 @@ test('Devices statistics start without waiting for forwarding or capability read
   h.loadMergedData = (force, refreshRemote) => { calls.push(['statistics', refreshRemote]); };
   const loading = h.loadDevices();
   for (let i = 0; i < 5; i++) await Promise.resolve();
-  // The first visit after start also refreshes remote statistics, without waiting for local reads.
+  // A visit with no recent refresh reads remote statistics without waiting for local reads.
   assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities', ['statistics', true]]);
   for (const resolve of pending) resolve([]);
   await loading;
@@ -788,22 +788,53 @@ test('a background failure retains the selected traffic already rendered', async
   assert.equal(context.ui.mergedDataError, 'Background statistics failed');
 });
 
-test('only the first Devices visit after start refreshes remote statistics automatically', async () => {
+test('open Devices refreshes remote statistics every 30 seconds; Settings never does', async () => {
   const calls=[];
   const h=harness(async(command,args)=>{calls.push([command,args]);return command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : [];});
   h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
+  const remote=()=>calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length;
+  // Repeated visits and timer ticks within 30 seconds read the cache.
   for(let i=0;i<4;i++) {h.ui.page='devices';await h.loadDevices();h.ui.page='settings';await h.loadDevices();}
   const reads=calls.filter(([command])=>command==='get_merged_data');
-  assert.equal(reads.length,4);
+  assert.equal(reads.length,4,'Settings must not read statistics');
   assert.deepEqual(reads.map(([,args])=>args.refreshRemote),[true,false,false,false]);
   assert.equal(h.ui.mergedDataError,'');
-  await h.action('merged-refresh');
-  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,2);
+  // Once the last attempt is 30 seconds old, the next visit or tick refreshes.
+  h.ui.deviceRemoteAttemptAt=Date.now()-30000;
   h.ui.page='devices';await h.loadDevices();
-  assert.equal(calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length,2);
+  assert.equal(remote(),2);
+  await h.loadDevices();
+  assert.equal(remote(),2);
+  // Refresh is always available and restarts the interval.
+  await h.action('merged-refresh');
+  assert.equal(remote(),3);
+  await h.loadDevices();
+  assert.equal(remote(),3);
+  // Leaving Devices stops automatic refreshes even when one is due.
+  h.ui.deviceRemoteAttemptAt=Date.now()-30000;
+  h.ui.page='settings';await h.loadDevices();
+  assert.equal(remote(),3);
 });
 
+test('a slow remote refresh is neither repeated nor superseded by the next tick', async () => {
+  const pending=[];
+  const h=harness((command,args)=>command==='get_merged_data' ? new Promise(resolve=>pending.push({args,resolve})) : Promise.resolve(command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : []));
+  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
+  vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
+  const first=h.loadDevices();
+  for(let i=0;i<5 && !pending.length;i++) await Promise.resolve();
+  assert.equal(pending.length,1);
+  assert.equal(pending[0].args.refreshRemote,true);
+  // The peer takes longer than the interval to answer.
+  h.ui.deviceRemoteAttemptAt=Date.now()-30000;
+  h.ui.deviceRefresh=false;
+  const tick=h.loadDevices();
+  for(let i=0;i<5;i++) await Promise.resolve();
+  assert.equal(pending.length,1,'A due tick must not start a second SSH read');
+  pending[0].resolve([]);
+  await Promise.all([first,tick]);
+});
 
 test('cached statistics retain success without hiding a later failure', () => {
   const h=harness(async()=>[]);const device={id:'peer',name:'Peer',ssh:{host:'test'}};

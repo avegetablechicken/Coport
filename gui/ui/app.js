@@ -1431,7 +1431,11 @@ async function loadMergedData(force = false, refreshRemote = false) {
   const request = ++ui.mergedDataRequest;
   ui.mergedDataLoading = true;
   ui.mergedDataRemote = refreshRemote;
-  if (refreshRemote) ui.deviceTrafficRecoveryPending = false;
+  if (refreshRemote) {
+    ui.deviceTrafficRecoveryPending = false;
+    // Failed attempts count too, so an unreachable peer is not retried sooner.
+    ui.deviceRemoteAttemptAt = Date.now();
+  }
   let completed = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
   try {
@@ -1569,9 +1573,11 @@ async function checkConfiguredSsh() {
     }
   }));
 }
+/// While Devices is open, its visits and timer refresh peers this often.
+const DEVICE_REFRESH_MS = 30000;
 async function loadDevices(refreshRemote = false) {
   // A visit arriving during another load (e.g. from Settings) runs afterwards,
-  // so the first Devices visit still starts its refresh.
+  // so the visit still starts a due refresh.
   if (ui.deviceRefresh) { ui.deviceRefreshQueued = true; return; }
   ui.deviceRefresh = true;
   try {
@@ -1586,9 +1592,10 @@ async function loadDevices(refreshRemote = false) {
     if (ui.page !== "devices") { await local; return; }
     if (!(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
         && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
-    // The first Devices visit after start reads remote statistics once; later
-    // visits and timers use the cache until the user presses Refresh.
-    const remote = refreshRemote || !ui.deviceStartupRefreshDone;
+    // Visits and timer ticks refresh peers once the last attempt is old enough;
+    // a refresh still in flight is neither repeated nor superseded.
+    const due = refreshRemote || Date.now() - (ui.deviceRemoteAttemptAt || 0) >= DEVICE_REFRESH_MS;
+    const remote = due && !(ui.mergedDataLoading && ui.mergedDataRemote);
     ui.deviceStartupRefreshDone = true;
     await Promise.all([local, loadMergedData(remote, remote)]);
 
