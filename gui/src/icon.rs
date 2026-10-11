@@ -52,27 +52,14 @@ const SWELL: Wave = Wave {
 /// Monochrome glyph for the macOS menu bar; only alpha is significant.
 #[cfg(target_os = "macos")]
 pub fn template(size: u32, status: Status) -> Vec<u8> {
-    // Shrink the glyph towards the top to leave room below for both waves,
-    // drawn thicker and lower than on the badge so they stay apart at 22pt.
     const SCALE: f32 = 0.88;
-    const TOP: f32 = 0.03;
-    const WATER: Wave = Wave {
-        base: 0.95,
-        radius: 0.040,
-        ..WAVE
-    };
-    const SWELL_BELOW: Wave = Wave {
-        base: 1.10,
-        radius: 0.030,
-        ..SWELL
-    };
+    // Center between the roof tip (including its stroke) and the tower base.
+    const CENTER_Y: f32 = (0.13 - 0.012 + 0.84) * 0.5;
     let lit = status == Status::Running;
     let alpha = if lit { 1.0 } else { 0.6 };
     raster(size, |x, y| {
-        let (gx, gy) = ((x - 0.5) / SCALE + 0.5, (y - TOP) / SCALE + 0.13);
-        let d = tower_sdf(gx, gy, lit)
-            .min(WATER.sdf(gx, gy))
-            .min(SWELL_BELOW.sdf(gx, gy));
+        let (gx, gy) = ((x - 0.5) / SCALE + 0.5, (y - 0.5) / SCALE + CENTER_Y);
+        let d = tower_sdf(gx, gy, lit);
         let mut a = coverage(d);
         if lit {
             // Beams fade as they travel away from the lantern.
