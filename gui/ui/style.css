@@ -26,11 +26,11 @@
   --teal: #30b0c7;
   --indigo: #5856d6;
   --brown: #a2845e;
-  /* Traffic share hues: Codex gray, Claude orange; fainter shades rank lower. */
-  --codex-1: #3a3a3c;
-  --codex-2: #707075;
-  --codex-3: #a5a5aa;
-  --codex-4: #c7c7cc;
+  /* Traffic share hues: Codex teal after OpenQuota, Claude orange; fainter shades rank lower. */
+  --codex-1: #10a37f;
+  --codex-2: #74cda8;
+  --codex-3: #9fdacc;
+  --codex-4: #caebe3;
   --claude-1: #e8622c;
   --claude-2: #f28a5c;
   --claude-3: #f7b292;
@@ -67,10 +67,6 @@
     --teal: #40c8e0;
     --indigo: #5e5ce6;
     --brown: #ac8e68;
-    --codex-1: #f2f2f7;
-    --codex-2: #c2c2c7;
-    --codex-3: #8e8e93;
-    --codex-4: #636366;
   }
 }
 
