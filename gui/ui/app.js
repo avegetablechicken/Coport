@@ -437,9 +437,9 @@ function stat(label, value, cls = "") {
 
 function main() {
   if (ui.snap.forwarding) {
-    return remoteForwardingBlock() + connectBlock() + `<details class="disclosure"><summary>${ICON.chevron}Local proxy configuration and history (inactive)</summary>${[proxiesBlock(), routingBlock(), trafficBlock(), recentBlock()].join("")}</details>`;
+    return remoteForwardingBlock() + connectBlock() + `<details class="disclosure"><summary>${ICON.chevron}Local proxy configuration and history (inactive)</summary>${[trafficBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("")}</details>`;
   }
-  return [proxyBlock(), trafficBlock(), connectBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("");
+  return [proxyBlock(), connectBlock(), trafficBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("");
 }
 
 function remoteForwardingBlock() {

@@ -537,10 +537,10 @@ test('home highlights remote mode and collapses inactive local configuration', (
   assert.match(html, /MS/);
   assert.match(html, /127\.0\.0\.1:8787/);
   assert.match(html, /Client address unchanged/);
-  assert.match(html, /<details[^>]*><summary>Local proxy configuration and history \(inactive\)<\/summary>\[Proxies\]/);
+  assert.match(html, /<details[^>]*><summary>Local proxy configuration and history \(inactive\)<\/summary>\[Traffic\]\[Recent\]\[Proxies\]\[Routing\]<\/details>/);
   assert.doesNotMatch(html, /<details[^>]*open/);
   context.ui.snap.forwarding = null;
-  assert.equal(context.main(), '[Proxy][Traffic][Connect][Recent][Proxies][Routing]');
+  assert.equal(context.main(), '[Proxy][Connect][Traffic][Recent][Proxies][Routing]');
 });
 
 test('entering Settings through navigation reads definitions without remote statistics', async () => {
