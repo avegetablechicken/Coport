@@ -85,6 +85,7 @@ enum Action {
         minutes: u64,
         scope: crate::traffic::TrafficScope,
     },
+    ForwardingSummary,
     RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
@@ -106,6 +107,7 @@ enum Response {
     ForwardingSet,
     DeviceCapabilities(Vec<crate::device_capabilities::Status>),
     ForwardingTraffic(Box<crate::remote_forward::RemoteWindow>),
+    ForwardingSummary(Option<Box<crate::remote_forward::RemoteSummary>>),
     Error(String),
 }
 
@@ -168,6 +170,18 @@ impl Client {
         {
             Response::ForwardingTraffic(window) => Ok(*window),
             _ => Err(io::Error::other("Unexpected daemon traffic response")),
+        }
+    }
+    /// The forwarded device's summary as last read by the daemon's monitor.
+    pub async fn forwarding_summary(
+        &self,
+    ) -> io::Result<Option<crate::remote_forward::RemoteSummary>> {
+        match self
+            .request_async(Action::ForwardingSummary, STATUS_TIMEOUT)
+            .await?
+        {
+            Response::ForwardingSummary(summary) => Ok(summary.map(|summary| *summary)),
+            _ => Err(io::Error::other("Unexpected daemon summary response")),
         }
     }
     pub async fn set_forwarding_restore(&self, enabled: bool) -> io::Result<()> {
@@ -551,6 +565,7 @@ async fn handle_control(
                 ..Status::clone(&status)
             })),
             Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
+            Action::ForwardingSummary => Response::ForwardingSummary(routing.summary().map(Box::new)),
             Action::ForwardingTraffic { minutes, scope } => match routing.traffic_window(minutes, scope) {
                 Ok(window) => Response::ForwardingTraffic(Box::new(window)),
                 Err(error) => Response::Error(error),

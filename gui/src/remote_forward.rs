@@ -1,5 +1,6 @@
 //! Explicit, session-scoped access to a remote daemon's loopback proxy over SSH.
 //! No remote credentials or configuration are copied to the local machine.
+use crate::data_api::Summary;
 use crate::remote::{Device, helper_command};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,7 +20,7 @@ use tokio::{
 #[path = "forwarding_status.rs"]
 mod telemetry;
 use telemetry::{Active, CountWriter, Counters};
-pub use telemetry::{Health, RemoteTraffic, RemoteWindow, Traffic};
+pub use telemetry::{Health, RemoteSummary, RemoteTraffic, RemoteWindow, Traffic};
 
 const READY: &[u8] = b"COPORT-FORWARD/1\n";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
@@ -423,6 +424,17 @@ impl Routing {
             error: metadata.traffic_error.clone(),
             node_id: summary.node_id.clone(),
             window: window.clone(),
+        })
+    }
+    /// The monitor's last summary of the forwarded device; never contacts it.
+    pub fn summary(&self) -> Option<RemoteSummary> {
+        let mode = self.mode.borrow();
+        let target = mode.target.as_ref()?;
+        let metadata = mode.metadata.lock().unwrap();
+        Some(RemoteSummary {
+            device_id: target.device_id.clone(),
+            fetched_at: metadata.traffic.as_ref()?.fetched_at,
+            summary: Summary::clone(metadata.summary.as_ref()?),
         })
     }
     pub async fn set(&self, target: Option<Target>) -> Result<(), String> {
@@ -920,6 +932,7 @@ mod tests {
             routing.traffic_window(30, TrafficScope::All).unwrap_err(),
             "TRAFFIC_UPDATING"
         );
+        assert!(routing.summary().is_none());
         let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         let mut summary = Summary {
             schema_version: 2,
@@ -968,6 +981,10 @@ mod tests {
             metadata.summary = Some(Arc::new(summary));
             metadata.traffic_error = Some("statistics offline".into());
         }
+        // Devices reuses the full summary for this device instead of reading it again.
+        let reused = routing.summary().unwrap();
+        assert_eq!(reused.device_id, "ms");
+        assert_eq!(reused.summary.windows.len(), 12);
         let window = routing.traffic_window(360, TrafficScope::Model).unwrap();
         assert_eq!(
             (window.device_id.as_str(), window.name.as_str()),
@@ -993,6 +1010,7 @@ mod tests {
                 .unwrap_err(),
             "TRAFFIC_UPDATING"
         );
+        assert!(routing.summary().is_none());
     }
     fn device_for_window() -> Device {
         Device {

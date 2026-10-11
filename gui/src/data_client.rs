@@ -614,16 +614,9 @@ impl MergeCache {
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
         let key = self.begin_refresh(&sources)?;
-        let result = merge_progressive_snapshot(
-            sources,
-            config,
-            log,
-            labels,
-            selection.0,
-            selection.1,
-            on_update,
-        )
-        .await?;
+        let result =
+            merge_progressive_snapshot(sources, config, log, labels, selection.into(), on_update)
+                .await?;
         self.commit_refresh(&key, result)
     }
 
@@ -635,20 +628,12 @@ impl MergeCache {
         config: Config,
         log: PathBuf,
         labels: BTreeMap<(String, String), String>,
-        selection: (u64, crate::traffic::TrafficScope),
+        refresh: Refresh,
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
         let key = cache.lock().await.begin_refresh(&sources)?;
-        let result = merge_progressive_snapshot(
-            sources,
-            config,
-            log,
-            labels,
-            selection.0,
-            selection.1,
-            on_update,
-        )
-        .await?;
+        let result =
+            merge_progressive_snapshot(sources, config, log, labels, refresh, on_update).await?;
         cache.lock().await.commit_refresh(&key, result)
     }
 
@@ -886,12 +871,28 @@ pub async fn merge_progressive_with_labels(
         config,
         log,
         credential_labels,
-        minutes,
-        scope,
+        (minutes, scope).into(),
         on_update,
     )
     .await?
     .views)
+}
+/// A refresh of one range/category first. Devices whose summary was just read
+/// elsewhere (the forwarded device, by the daemon's monitor) are not read again.
+pub struct Refresh {
+    pub minutes: u64,
+    pub scope: crate::traffic::TrafficScope,
+    /// Summaries by device id; one that no longer validates is read as usual.
+    pub reused: BTreeMap<String, Summary>,
+}
+impl From<(u64, crate::traffic::TrafficScope)> for Refresh {
+    fn from((minutes, scope): (u64, crate::traffic::TrafficScope)) -> Self {
+        Self {
+            minutes,
+            scope,
+            reused: BTreeMap::new(),
+        }
+    }
 }
 struct ProgressiveResult {
     views: Vec<Merged>,
@@ -904,10 +905,14 @@ async fn merge_progressive_snapshot(
     config: Config,
     log: PathBuf,
     credential_labels: BTreeMap<(String, String), String>,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
+    refresh: Refresh,
     on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
 ) -> Result<ProgressiveResult, String> {
+    let Refresh {
+        minutes,
+        scope,
+        reused,
+    } = refresh;
     crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
     if sources.len() > crate::devices::LIMIT {
         return Err("At most 32 data sources are supported.".into());
@@ -920,6 +925,17 @@ async fn merge_progressive_snapshot(
         .map(|s| (s, Err("TRAFFIC_UPDATING".into())))
         .collect();
     for (index, source) in sources.iter().cloned().enumerate() {
+        // Nothing is queried for a reused summary, so there is no query to record.
+        if let Some(summary) = source
+            .device_id
+            .as_ref()
+            .and_then(|id| reused.get(id))
+            .filter(|summary| summary.validate().is_ok())
+        {
+            tx.send((index, Ok(summary.clone())))
+                .map_err(|_| "Data reader closed")?;
+            continue;
+        }
         let tx = tx.clone();
         let log = log.clone();
         tasks.spawn(async move {
@@ -2044,7 +2060,7 @@ mod tests {
                     config,
                     log,
                     BTreeMap::new(),
-                    (30, crate::traffic::TrafficScope::Model),
+                    (30, crate::traffic::TrafficScope::Model).into(),
                     |_| Ok(()),
                 )
                 .await
@@ -3066,5 +3082,90 @@ mod tests {
                 .is_err(),
             "Forwarded traffic must not connect to an upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn a_summary_reused_from_forwarding_opens_no_connection() {
+        if data_key_in_subprocess(
+            "data_client::tests::a_summary_reused_from_forwarding_opens_no_connection",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        // The forwarded device's address is a trap: reading it again is a failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = Source {
+            name: "Forwarded".into(),
+            device_id: Some("fw".into()),
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token_env: Some(DATA_KEY_ENV.into()),
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        };
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+        summary.window_end = end;
+        summary.window_start = end - 30 * 60_000;
+        let refresh = |summary: Summary| Refresh {
+            minutes: 30,
+            scope: crate::traffic::TrafficScope::Model,
+            reused: BTreeMap::from([("fw".to_owned(), summary)]),
+        };
+        let cache = tokio::sync::Mutex::new(MergeCache::default());
+        let views = MergeCache::refresh_shared(
+            &cache,
+            vec![source.clone()],
+            config.clone(),
+            log.clone(),
+            BTreeMap::new(),
+            refresh(summary.clone()),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.minutes == 30 && v.scope == crate::traffic::TrafficScope::Model)
+            .unwrap();
+        assert!(view.sources[0].included, "{:?}", view.sources[0].error);
+        assert_eq!(view.sources[0].traffic.as_ref().unwrap().stats.requests, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "A reused summary must not open a connection"
+        );
+        // Nothing was queried, so no device query is recorded.
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("device_statistics")
+        );
+        // A summary too old to validate is not reused; the device is read as usual.
+        let mut stale = summary;
+        stale.window_end -= 10 * 60_000;
+        stale.window_start -= 10 * 60_000;
+        let (result, accepted) = tokio::join!(
+            MergeCache::refresh_shared(
+                &cache,
+                vec![source],
+                config,
+                log,
+                BTreeMap::new(),
+                refresh(stale),
+                |_| Ok(()),
+            ),
+            tokio::time::timeout(Duration::from_secs(5), async {
+                drop(listener.accept().await.unwrap());
+            })
+        );
+        assert!(accepted.is_ok(), "A stale summary must be read again");
+        assert!(!result.unwrap()[0].sources[0].included);
     }
 }

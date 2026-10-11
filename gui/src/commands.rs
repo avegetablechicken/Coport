@@ -674,6 +674,25 @@ pub async fn get_forwarding_traffic(
     let labels = task.cached_credential_labels().await;
     coport_gui::data_client::forwarded_traffic(window, config, log, labels).await
 }
+/// The forwarded device's summary if the daemon read it within the last minute.
+/// Reading it never contacts the device; without one, the refresh reads as usual.
+async fn forwarded_summary() -> std::collections::BTreeMap<String, coport_gui::data_api::Summary> {
+    let Ok(Some((client, status))) = local_daemon().await else {
+        return Default::default();
+    };
+    if !status.forwarding_traffic_supported || status.forwarding.is_none() {
+        return Default::default();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    match client.forwarding_summary().await {
+        Ok(Some(reused)) if now.saturating_sub(reused.fetched_at) <= 60_000 => {
+            [(reused.device_id, reused.summary)].into()
+        }
+        _ => Default::default(),
+    }
+}
 #[tauri::command]
 pub async fn get_merged_data(
     state: State<'_, AppState>,
@@ -719,6 +738,13 @@ pub async fn get_merged_data(
     if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {
         let _ = previous.send(());
     }
+    // The daemon's monitor has just read the forwarded device; reuse that
+    // summary instead of opening another SSH connection to it.
+    let refresh = coport_gui::data_client::Refresh {
+        minutes,
+        scope,
+        reused: forwarded_summary().await,
+    };
     // Cached views remain readable while peers respond to this refresh.
     let operation = coport_gui::data_client::MergeCache::refresh_shared(
         &state.merged_cache,
@@ -726,7 +752,7 @@ pub async fn get_merged_data(
         config,
         log,
         labels,
-        (minutes, scope),
+        refresh,
         move |views| {
             on_update
                 .send(views)

@@ -211,6 +211,15 @@ pub struct RemoteWindow {
     pub node_id: String,
     pub window: crate::data_api::Window,
 }
+/// The forwarded device's last full summary, so a Devices refresh can count
+/// that device without another SSH connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSummary {
+    pub device_id: String,
+    pub fetched_at: u64,
+    pub summary: crate::data_api::Summary,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
