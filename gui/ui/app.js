@@ -547,16 +547,133 @@ function chart(stats, scope, showPeak = false, window = stats) {
   </div>`;
 }
 
-function rememberLocalTraffic(traffic, minutes, scope) {
-  (ui.localTrafficViews ||= Object.create(null))[`${minutes}:${scope}`] = {
+/// The share ring, chart and totals of one traffic view, as Home, each device
+/// card and Merged Traffic show it. An unchanged view reuses its markup.
+const trafficMarkup = new WeakMap();
+function trafficSummary(view, scope, window = view) {
+  const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}`;
+  const cached = trafficMarkup.get(view);
+  if (cached?.key === key) return cached.html;
+  let rate = "—";
+  let rateClass = "";
+  if (view.requests) {
+    const r = (view.errors / view.requests) * 100;
+    rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
+    rateClass = r >= 10 ? "bad" : "";
+  }
+  const html = `${trafficShare(view.credentials ?? [], scope)}${chart(view, scope, false, window)}
+     <div class="strip">
+       ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
+       ${stat("Error Rate", rate, rateClass)}
+       ${stat("Avg. Time", fmtMs(view.avgMs))}
+       ${stat("Received", fmtBytes(view.bytes))}
+     </div>${modelTokenStats(view, scope)}`;
+  trafficMarkup.set(view, { key, html });
+  return html;
+}
+
+const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "latencyTotalMs", "latencySamples"];
+const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
+function addTraffic(to, from) {
+  for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
+  // Unreported usage stays unknown unless some part reported it.
+  for (const key of REPORTED_TOKENS) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
+  for (const key of ["counts", "errorCounts", "tokenCounts"]) {
+    const values = from[key] ?? [];
+    to[key] ||= Array(values.length).fill(0);
+    values.forEach((value, i) => { to[key][i] = (to[key][i] || 0) + value; });
+  }
+}
+function finishTraffic(traffic) {
+  for (const key of REPORTED_TOKENS) traffic[key] ??= null;
+  traffic.avgMs = traffic.latencySamples ? Math.floor(traffic.latencyTotalMs / traffic.latencySamples) : null;
+  traffic.cacheHitRate = traffic.cachePrompt ? traffic.cacheRead / traffic.cachePrompt : null;
+  return traffic;
+}
+let lastTrafficSum = null;
+/// Merged Traffic is exactly the sum of the views its device cards show: an
+/// account with the same name on several devices is one account, and each
+/// service's Unidentified traffic is one entry. Bars add bucket by bucket.
+function sumTrafficViews(views) {
+  if (lastTrafficSum?.views.length === views.length && lastTrafficSum.views.every((view, i) => view === views[i])) return lastTrafficSum.total;
+  const total = { counts: [], errorCounts: [], tokenCounts: [] };
+  const accounts = new Map();
+  for (const view of views) {
+    addTraffic(total, view);
+    for (const c of view.credentials ?? []) {
+      const key = `${c.service}\0${c.credential}`;
+      if (!accounts.has(key)) accounts.set(key, { service: c.service, credential: c.credential, sources: [], counts: [], errorCounts: [], tokenCounts: [] });
+      const account = accounts.get(key);
+      addTraffic(account, c);
+      account.sources.push(...(c.sources ?? []));
+    }
+  }
+  // As each device orders them: known accounts by received bytes, Unidentified last.
+  total.credentials = [...accounts.values()].map(finishTraffic)
+    .sort((a, b) => (a.credential === "Unidentified") - (b.credential === "Unidentified") || b.bytes - a.bytes);
+  total.targets = views.find((view) => view.targets?.length)?.targets ?? [];
+  finishTraffic(total);
+  lastTrafficSum = { views: [...views], total };
+  return total;
+}
+
+/// A view read within this long is reused by every page that shows it.
+const TRAFFIC_REUSE_MS = 15000;
+
+/// One read per view: a fresh view is reused and a read in flight is joined,
+/// so Home, Activity and Devices never read the same traffic twice.
+function sharedTrafficLoad(views, loads, key, read) {
+  const cached = ui[views]?.[key];
+  if (cached && Date.now() - cached.loadedAt < TRAFFIC_REUSE_MS) return Promise.resolve(cached);
+  const pending = (ui[loads] ||= Object.create(null));
+  if (pending[key]) return pending[key];
+  const generation = ui.trafficGeneration || 0;
+  const load = read().then((view) => {
+    // A reset while reading (reassigned traffic) discards the old result.
+    if (generation !== (ui.trafficGeneration || 0)) return sharedTrafficLoad(views, loads, key, read);
+    view.loadedAt = Date.now();
+    return ((ui[views] ||= Object.create(null))[key] = view);
+  }).finally(() => { if (pending[key] === load) delete pending[key]; });
+  pending[key] = load;
+  return load;
+}
+
+/// Drops every shared view, e.g. after traffic is reassigned; reads in flight are repeated.
+function resetTrafficViews() {
+  ui.trafficGeneration = (ui.trafficGeneration || 0) + 1;
+  ui.localTrafficViews = Object.create(null);
+  ui.localTrafficLoads = Object.create(null);
+  ui.forwardedTrafficViews = Object.create(null);
+  ui.forwardedTrafficLoads = Object.create(null);
+}
+
+function localTrafficView(traffic, scope) {
+  return {
     ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, targets: traffic.targets, scope,
   };
 }
 
-/// Home shows the forwarded device's traffic while SSH forwarding is on, else
-/// this machine's. Devices always reads this machine's for its local cache.
+/// This device's traffic, as Home, Activity and This Device show it.
+function loadLocalTraffic(minutes, scope) {
+  return sharedTrafficLoad("localTrafficViews", "localTrafficLoads", `${minutes}:${scope}`,
+    async () => localTrafficView(await invoke("get_traffic", { minutes, scope }), scope));
+}
+
+/// The forwarded device's traffic, as Home and its Devices card show it. The
+/// daemon answers from its last forwarding summary; nothing is contacted.
+function loadForwardedTraffic(device, minutes, scope) {
+  return sharedTrafficLoad("forwardedTrafficViews", "forwardedTrafficLoads", `${device}:${minutes}:${scope}`, async () => {
+    const remote = await invoke("get_forwarding_traffic", { minutes, scope });
+    return {
+      ...remote.traffic, start: remote.windowStart, end: remote.windowEnd, bucketMinutes: remote.bucketMinutes, scope,
+      device: remote.deviceId, deviceName: remote.name, fetchedAt: remote.fetchedAt, remoteError: remote.error,
+    };
+  });
+}
+
+/// Home shows the forwarded device's traffic while SSH forwarding is on, else this machine's.
 function homeTrafficDevice() {
-  return ui.page === "devices" ? null : ui.snap?.forwarding?.deviceId ?? null;
+  return ui.snap?.forwarding?.deviceId ?? null;
 }
 
 async function loadHomeTraffic(force = false) {
@@ -568,20 +685,9 @@ async function loadHomeTraffic(force = false) {
   const minutes = ui.homeTrafficMinutes;
   const device = homeTrafficDevice();
   try {
-    if (device) {
-      // Answered from the daemon's last forwarding summary; nothing is contacted.
-      const remote = await invoke("get_forwarding_traffic", { minutes, scope });
-      if (request !== ui.homeTrafficRequest) return;
-      ui.homeTraffic = {
-        ...remote.traffic, start: remote.windowStart, end: remote.windowEnd, bucketMinutes: remote.bucketMinutes, scope,
-        device: remote.deviceId, deviceName: remote.name, fetchedAt: remote.fetchedAt, remoteError: remote.error,
-      };
-    } else {
-      const traffic = await invoke("get_traffic", { minutes, scope });
-      if (request !== ui.homeTrafficRequest) return;
-      rememberLocalTraffic(traffic, minutes, scope);
-      ui.homeTraffic = { ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, scope, device: null };
-    }
+    const view = await (device ? loadForwardedTraffic(device, minutes, scope) : loadLocalTraffic(minutes, scope));
+    if (request !== ui.homeTrafficRequest) return;
+    ui.homeTraffic = view;
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
   } catch (error) {
@@ -590,7 +696,7 @@ async function loadHomeTraffic(force = false) {
   } finally {
     if (request === ui.homeTrafficRequest) ui.homeTrafficLoading = false;
   }
-  if (ui.page === "main" || ui.page === "devices") render();
+  if (ui.page === "main") render();
 }
 
 function trafficBlock() {
@@ -599,25 +705,12 @@ function trafficBlock() {
   const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
   const error = ui.homeTrafficError === "TRAFFIC_UPDATING" ? "" : ui.homeTrafficError || st?.remoteError || "";
   if (!st) return block("Traffic", range, `<div class="placeholder">${esc(error || "Loading traffic…")}</div>`);
-  let rate = "—";
-  let rateClass = "";
-  if (st.requests) {
-    const r = (st.errors / st.requests) * 100;
-    rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
-    rateClass = r >= 10 ? "bad" : "";
-  }
   return block(
     "Traffic",
     range,
     `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
      ${error ? `<span class="traffic-update-error" title="${esc(error)}">Update failed</span>` : ""}
-     ${trafficShare(st.credentials ?? [], st.scope)}${chart(st, st.scope)}
-     <div class="strip">
-       ${stat(st.scope === "model" ? "Calls" : "Requests", st.requests)}
-       ${stat("Error Rate", rate, rateClass)}
-       ${stat("Avg. Time", fmtMs(st.avgMs))}
-       ${stat("Received", fmtBytes(st.bytes))}
-     </div>${modelTokenStats(st, st.scope)}
+     ${trafficSummary(st, st.scope)}
      ${st.device ? `<div class="placeholder">Includes other clients on ${esc(st.deviceName)}. Updated ${esc(new Date(st.fetchedAt).toLocaleTimeString())}${Date.now() - st.fetchedAt > 90000 || st.remoteError ? " · stale" : ""}.</div>` : ""}</div>`
   );
 }
@@ -992,10 +1085,9 @@ async function loadTraffic() {
   const scope = ui.trafficScope;
   const minutes = ui.trafficMinutes;
   try {
-    const traffic = await invoke("get_traffic", { minutes, scope });
+    const traffic = await loadLocalTraffic(minutes, scope);
     if (request !== ui.trafficRequest) return;
-    rememberLocalTraffic(traffic, minutes, scope);
-    ui.traffic = { ...traffic, scope };
+    ui.traffic = traffic;
     ui.trafficError = "";
   } catch (error) {
     if (request !== ui.trafficRequest) return;
@@ -1181,7 +1273,7 @@ async function assignTraffic(choice) {
     else renderActivityTraffic();
     return;
   }
-  ui.localTrafficViews = Object.create(null);
+  resetTrafficViews();
   ui.deviceTrafficViews = Object.create(null);
   await Promise.all([loadTraffic(), loadMergedData(true), refresh()]);
 }
@@ -1418,14 +1510,6 @@ function selectDeviceTraffic() {
   ui.mergedData = cached;
   return true;
 }
-// This device's statistics are local, so a range switch can show them while
-// a remote refresh is still collecting peers. Errors leave the placeholder.
-async function loadLocalDeviceTraffic() {
-  const minutes = ui.deviceTrafficMinutes || 30, scope = ui.trafficScope || "model";
-  try { rememberLocalTraffic(await invoke("get_traffic", { minutes, scope }), minutes, scope); }
-  catch { return; }
-  if (ui.page === "devices") render();
-}
 async function loadMergedData(force = false, refreshRemote = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
@@ -1481,11 +1565,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
   }
 }
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
-  const rate = traffic.requests ? (100 * traffic.errors / traffic.requests).toFixed(1) + "%" : "—";
-  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">
-    ${trafficShare(traffic.credentials, scope)}${chart(traffic, scope, false, window)}
-    <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", traffic.requests)}${stat("Error Rate", rate, traffic.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(traffic.avgMs))}${stat("Received", fmtBytes(traffic.bytes))}</div>
-    ${modelTokenStats(traffic, scope)}</div>`;
+  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window)}</div>`;
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
@@ -1504,9 +1584,17 @@ function mergedDataBlock() {
   let body = `<div class="devices-traffic-range">${range}</div>`;
   if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
   if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
-  if (!data && ui.mergedDataLoading) body += `<div class="placeholder">Loading traffic…</div>`;
+  const { local, cards, scope } = deviceCardViews();
+  const parts = [...(local ? [{ view: local, window: local }] : []), ...cards.values()];
+  // Peers still loading are added once they arrive; the sum so far stays visible.
+  if (!local || (!data && ui.mergedDataLoading)) body += `<div class="placeholder">Loading traffic…</div>`;
+  if (local) {
+    // The newest part sets the time axis; older parts show their delay in the last bars.
+    const end = (window) => window.end ?? window.windowEnd;
+    const window = parts.reduce((latest, part) => end(part.window) > end(latest) ? part.window : latest, local);
+    body += deviceTrafficContent(sumTrafficViews(parts.map((part) => part.view)), scope, "merged", window);
+  }
   if (data) {
-    body += deviceTrafficContent(data.traffic, data.scope, "merged", data);
     for (const source of data.sources) {
       if (source.error === "TRAFFIC_UPDATING") body += `<div class="placeholder">${esc(source.name)}: Loading traffic…</div>`;
       else if (source.error) body += message("warn", `${esc(source.name)}: ${esc(source.error)}`);
@@ -1573,6 +1661,17 @@ async function checkConfiguredSsh() {
     }
   }));
 }
+// This device's card and the forwarded device's come from the shared views, so
+// they show while a remote refresh is still collecting peers. Errors leave the placeholder.
+async function loadDeviceCards() {
+  const minutes = ui.deviceTrafficMinutes || 30, scope = ui.trafficScope || "model";
+  const forwarded = ui.snap?.forwarding?.deviceId;
+  await Promise.all([
+    loadLocalTraffic(minutes, scope).catch(() => {}),
+    forwarded && loadForwardedTraffic(forwarded, minutes, scope).catch(() => {}),
+  ]);
+  if (ui.page === "devices") render();
+}
 /// While Devices is open, its visits and timer refresh peers this often.
 const DEVICE_REFRESH_MS = 30000;
 async function loadDevices(refreshRemote = false) {
@@ -1590,14 +1689,14 @@ async function loadDevices(refreshRemote = false) {
     ]);
     // Remote statistics must not start when Settings is open or the user has left Devices.
     if (ui.page !== "devices") { await local; return; }
-    if (!(ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`])
-        && (ui.deviceTrafficMinutes || 30) === ui.homeTrafficMinutes) loadHomeTraffic();
     // Visits and timer ticks refresh peers once the last attempt is old enough;
-    // a refresh still in flight is neither repeated nor superseded.
+    // a refresh still in flight is neither repeated nor superseded. Between
+    // refreshes the peers' views stay as they are, so they are not merged again.
     const due = refreshRemote || Date.now() - (ui.deviceRemoteAttemptAt || 0) >= DEVICE_REFRESH_MS;
     const remote = due && !(ui.mergedDataLoading && ui.mergedDataRemote);
+    const missing = !ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`];
     ui.deviceStartupRefreshDone = true;
-    await Promise.all([local, loadMergedData(remote, remote)]);
+    await Promise.all([local, loadDeviceCards(), (remote || missing) && loadMergedData(remote, remote)]);
 
   } catch (error) { toast(String(error)); }
   finally {
@@ -1685,25 +1784,41 @@ function forwardingSettings() {
   const hint = !devices.length ? "Add an SSH device above." : !ui.snap.forwardingRestoreSupported ? "Update the local proxy to enable startup restore." : "";
   return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "") + (hint ? `<div class="placeholder">${hint}</div>` : ""));
 }
+/// The views the Devices cards show for the selected range and category: this
+/// device's own, the forwarded device's from the daemon, other peers' from the
+/// last refresh. Each card and Merged Traffic use exactly these objects.
+function deviceCardViews() {
+  const minutes = ui.deviceTrafficMinutes || 30;
+  const scope = ui.trafficScope || "model";
+  const data = ui.mergedData?.minutes === minutes && ui.mergedData.scope === scope ? ui.mergedData : null;
+  const forwarded = ui.snap?.forwarding?.deviceId;
+  const cards = new Map();
+  for (const device of ui.devices) {
+    const live = device.id === forwarded && ui.forwardedTrafficViews?.[`${device.id}:${minutes}:${scope}`];
+    if (live?.device === device.id) { cards.set(device.id, { view: live, window: live }); continue; }
+    const traffic = data?.sources.find((source) => source.name === device.name)?.traffic;
+    if (traffic) cards.set(device.id, { view: traffic, window: data });
+  }
+  return { local: ui.localTrafficViews?.[`${minutes}:${scope}`], cards, scope };
+}
 function devicesPage() {
   const local = ui.snap.phase;
   const data = ui.mergedData;
-  const localTraffic = data?.local || ui.localTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`];
-  const localScope = data?.scope || ui.trafficScope || "model";
+  const { local: localTraffic, cards: views, scope } = deviceCardViews();
   let cards = block("This Device", "",
     `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
     (local.error ? message("warn", esc(local.error)) : "") +
-    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, localScope, "local", data || localTraffic)}` : `<div class="placeholder">Loading traffic…</div>`));
+    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : `<div class="placeholder">Loading traffic…</div>`));
   for (const device of ui.devices) {
     const source = (data || ui.mergedDataLatest)?.sources.find(source => source.name === device.name);
-    const traffic = data && source?.traffic;
+    const card = views.get(device.id);
     const ssh = device.data?.transport === "ssh" || !device.data;
     const protocol = ssh ? "SSH" : device.data.url.startsWith("https:") ? "HTTPS" : "HTTP";
     const status = deviceConnectionStatus(device);
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
-      (traffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(traffic, data.scope, `device/${device.id}`, data)}` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`));
+      (card ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(card.view, scope, `device/${device.id}`, card.window)}<div class="placeholder">Data through ${esc(new Date(card.window.end ?? card.window.windowEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</div>` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`));
   }
   return mergedDataBlock() + cards;
 }
@@ -2178,11 +2293,12 @@ document.addEventListener("change", async (event) => {
       ++ui.trafficRequest; ++ui.homeTrafficRequest;
       ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
     } else { ui.deviceTrafficMinutes = Number(event.target.value); }
-    if (selectDeviceTraffic()) { render(); return; }
+    const cards = loadDeviceCards();
+    if (selectDeviceTraffic()) { render(); await cards; return; }
     // A remote refresh delivers every range when it completes. A cache read now
     // would supersede it and show peers as not refreshed, so wait for it instead.
-    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); await loadLocalDeviceTraffic(); return; }
-    const loading = loadMergedData(true); render(); await loading;
+    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); await cards; return; }
+    const loading = loadMergedData(true); render(); await Promise.all([loading, cards]);
     return;
   }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {

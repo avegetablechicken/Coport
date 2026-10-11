@@ -314,9 +314,11 @@ pub(crate) struct Snapshot {
     model: Vec<SnapshotFile>,
 }
 impl Snapshot {
+    #[cfg(test)]
     pub(crate) fn load(path: &Path, end: i64) -> Result<Self, String> {
         Self::load_range(path, end, 43200)
     }
+    #[cfg(test)]
     pub(crate) fn load_range(path: &Path, end: i64, minutes: u64) -> Result<Self, String> {
         Ok(Self::load_many(
             path,
@@ -665,13 +667,13 @@ pub struct CredentialTraffic {
     sources: Vec<SourceTraffic>,
     #[serde(skip)]
     source_counts: BTreeMap<Source, (Option<Reason>, u64)>,
-    #[serde(skip)]
+    /// Raw totals under the names `data_api::Stats` uses, so views from this
+    /// device and from peers add up exactly.
+    #[serde(rename = "latencyTotalMs")]
     latency_total: u64,
-    #[serde(skip)]
+    #[serde(rename = "latencySamples")]
     latency_count: u64,
-    #[serde(skip)]
     cache_read: u64,
-    #[serde(skip)]
     cache_prompt: u64,
 }
 
@@ -1009,76 +1011,6 @@ pub(crate) fn observed_identity_labels_range(
     apply_identity_evidence(&files, start, &mut labels);
     Ok(labels)
 }
-/// This device uses exactly Activity Traffic's own identity resolution. It must
-/// not be passed through the remote privacy projection and then re-identified.
-pub(crate) struct LocalTraffic {
-    pub groups: Vec<(
-        coport_gui::data_api::Service,
-        String,
-        coport_gui::data_api::Stats,
-    )>,
-    pub reviews: BTreeMap<(String, String), Vec<SourceTraffic>>,
-    pub targets: Vec<Target>,
-}
-
-pub(crate) fn local_named_groups(
-    source: ReadSource<'_>,
-    config: &coport::config::Config,
-    labels: &BTreeMap<(String, String), String>,
-    end: i64,
-    minutes: u64,
-    scope: TrafficScope,
-) -> Result<LocalTraffic, String> {
-    let assignments = crate::traffic_identity::Compatibility::load(
-        &crate::settings::traffic_compatibility_path(),
-    )
-    .unwrap_or_default();
-    let identities = Identities::from_config(config, &assignments.assignments);
-    let traffic = read_at(source, minutes, labels, scope, &identities, end)?;
-    let reviews = traffic
-        .credentials
-        .iter()
-        .filter(|g| !g.sources.is_empty())
-        .map(|g| ((g.service.clone(), g.credential.clone()), g.sources.clone()))
-        .collect();
-    let groups = traffic
-        .credentials
-        .into_iter()
-        .map(|g| {
-            (
-                match g.service.as_str() {
-                    "Codex" => coport_gui::data_api::Service::Codex,
-                    "Claude" => coport_gui::data_api::Service::Claude,
-                    _ => coport_gui::data_api::Service::Other,
-                },
-                g.credential,
-                coport_gui::data_api::Stats {
-                    requests: g.requests,
-                    errors: g.errors,
-                    bytes: g.bytes,
-                    input_tokens: g.input_tokens,
-                    output_tokens: g.output_tokens,
-                    cached_input_tokens: g.cached_input_tokens,
-                    uncached_input_tokens: g.uncached_input_tokens,
-                    cache_write_tokens: g.cache_write_tokens,
-                    cache_read: g.cache_read,
-                    cache_prompt: g.cache_prompt,
-                    latency_total_ms: g.latency_total,
-                    latency_samples: g.latency_count,
-                    counts: g.counts,
-                    error_counts: g.error_counts,
-                    token_counts: g.token_counts,
-                },
-            )
-        })
-        .collect();
-    Ok(LocalTraffic {
-        groups,
-        reviews,
-        targets: traffic.targets,
-    })
-}
-
 /// Only numeric results and keyed opaque references leave the device.
 #[derive(Clone, Copy)]
 pub(crate) struct ExportOptions {
@@ -2872,6 +2804,12 @@ mod tests {
         assert_eq!(model.summary.errors, 1);
         assert_eq!(model.summary.bytes, 110);
         assert_eq!(model.summary.avg_ms, Some(26));
+        let summary = serde_json::to_value(&model.summary).unwrap();
+        assert_eq!(
+            summary["latencyTotalMs"].as_u64().unwrap()
+                / summary["latencySamples"].as_u64().unwrap(),
+            26
+        );
         assert_eq!(model.summary.counts.iter().sum::<u64>(), 3);
         assert_eq!(model.summary.error_counts.iter().sum::<u64>(), 1);
         assert_eq!(model.credentials.len(), 1);
@@ -3352,6 +3290,15 @@ mod tests {
         assert_eq!(rate("Claude"), Some(0.6));
         assert_eq!(rate("Codex"), Some(0.25));
         assert_eq!(model.summary.cache_hit_rate, Some(40.0 / 90.0));
+        // Raw totals use the peer `Stats` names, so Merged Traffic adds them exactly.
+        let summary = serde_json::to_value(&model.summary).unwrap();
+        assert_eq!(
+            (
+                summary["cacheRead"].as_u64(),
+                summary["cachePrompt"].as_u64()
+            ),
+            (Some(40), Some(90))
+        );
         let input = |service| {
             let group = model
                 .credentials

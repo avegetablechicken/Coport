@@ -225,8 +225,6 @@ pub struct Merged {
     pub minutes: u64,
     pub scope: crate::traffic::TrafficScope,
     pub bucket_minutes: u64,
-    pub traffic: TrafficView,
-    pub local: TrafficView,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -306,21 +304,6 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
         stats: total,
         credentials,
         targets: Vec::new(),
-    }
-}
-fn attach_local_reviews(view: &mut TrafficView, local: &crate::traffic::LocalTraffic) {
-    view.targets = local.targets.clone();
-    for credential in &mut view.credentials {
-        let service = match credential.service {
-            Service::Codex => "Codex",
-            Service::Claude => "Claude",
-            Service::Other => "Unknown",
-        };
-        credential.sources = local
-            .reviews
-            .get(&(service.into(), credential.credential.clone()))
-            .cloned()
-            .unwrap_or_default();
     }
 }
 fn selected_groups(
@@ -585,8 +568,7 @@ pub async fn merge_with_labels(
     }
     let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
     let (fetched, end) = align_sources(&context, sources, &[(minutes, scope)]).await?;
-    let snapshot = load_snapshot(&context.log, end).await?;
-    merge_fetched(context, &fetched, minutes, scope, end, snapshot).await
+    merge_fetched(&context, &fetched, minutes, scope, end)
 }
 
 pub async fn merge_views_with_labels(
@@ -865,43 +847,27 @@ async fn render_views(
         // from an earlier refresh is still covered.
         let behind = u64::try_from(at - end).unwrap_or(0).div_ceil(60_000);
         let evidence = (minutes + behind).min(43200);
-        let (context, snapshot) = tokio::join!(
-            prepare_merge_range(
-                config.clone(),
-                log.clone(),
-                credential_labels.clone(),
-                evidence
-            ),
-            load_selected_snapshot(&log, end, minutes)
-        );
-        let mut context = context?;
-        context.at = at;
-        let mut view = merge_fetched(
-            std::sync::Arc::new(context),
-            fetched,
-            minutes,
-            scope,
-            end,
-            snapshot?,
+        let mut context = prepare_merge_range(
+            config.clone(),
+            log.clone(),
+            credential_labels.clone(),
+            evidence,
         )
         .await?;
+        context.at = at;
+        let mut view = merge_fetched(&context, fetched, minutes, scope, end)?;
         decorate(&mut view);
         on_update(vec![view])?;
     }
-    // Identity evidence and the shared snapshot are read concurrently.
-    let (context, snapshot) = match full {
-        Some(context) => (context, load_snapshot(&log, end).await?),
+    let context = match full {
+        Some(context) => context,
         None => {
-            let (context, snapshot) = tokio::join!(
-                prepare_merge(config, log.clone(), credential_labels),
-                load_snapshot(&log, end)
-            );
-            let mut context = context?;
+            let mut context = prepare_merge(config, log, credential_labels).await?;
             context.at = at;
-            (std::sync::Arc::new(context), snapshot?)
+            std::sync::Arc::new(context)
         }
     };
-    let mut views = merge_selections(&context, fetched, &selections, end, &snapshot).await?;
+    let mut views = merge_selections(&context, fetched, &selections, end)?;
     views.iter_mut().for_each(decorate);
     Ok(views)
 }
@@ -999,13 +965,10 @@ async fn merge_progressive_snapshot(
     let context =
         std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
 
-    // Show this device at once; peers replace their placeholders as they answer.
-    let mut snapshots = BTreeMap::new();
-    let local = load_selected_snapshot(&context.log, context.at, minutes).await?;
-    snapshots.insert(context.at, local.clone());
-    on_update(vec![
-        merge_fetched(context.clone(), &fetched, minutes, scope, context.at, local).await?,
-    ])?;
+    // Placeholders show at once; peers replace them as they answer.
+    on_update(vec![merge_fetched(
+        &context, &fetched, minutes, scope, context.at,
+    )?])?;
     // While peers answer, parse this device's 30-day archives into the cache.
     // Archives never change, so the complete views below reuse them at any
     // boundary; a scan still running is awaited there, never repeated.
@@ -1032,18 +995,7 @@ async fn merge_progressive_snapshot(
         let Some(end) = common_end(&summaries, context.at, minutes, scope) else {
             continue;
         };
-        if let std::collections::btree_map::Entry::Vacant(entry) = snapshots.entry(end) {
-            entry.insert(load_selected_snapshot(&context.log, end, minutes).await?);
-        }
-        let mut view = merge_fetched(
-            context.clone(),
-            &fetched,
-            minutes,
-            scope,
-            end,
-            snapshots[&end].clone(),
-        )
-        .await?;
+        let mut view = merge_fetched(&context, &fetched, minutes, scope, end)?;
         for source in &mut view.sources {
             if let Some(error) = background_errors.get(&source.name) {
                 source.error = Some(error.clone());
@@ -1073,8 +1025,7 @@ async fn merge_progressive_snapshot(
     complete_context.at = context.at;
     let context = std::sync::Arc::new(complete_context);
     let (fetched, end) = align_fetched(&context, fetched, &selections, false).await?;
-    let snapshot = load_snapshot(&context.log, end).await?;
-    let mut views = merge_selections(&context, &fetched, &selections, end, &snapshot).await?;
+    let mut views = merge_selections(&context, &fetched, &selections, end)?;
     for view in &mut views {
         for source in &mut view.sources {
             if let Some(error) = background_errors.get(&source.name) {
@@ -1088,19 +1039,6 @@ async fn merge_progressive_snapshot(
         end,
         errors: background_errors,
     })
-}
-
-async fn load_selected_snapshot(
-    log: &std::path::Path,
-    end: i64,
-    minutes: u64,
-) -> Result<std::sync::Arc<crate::traffic::Snapshot>, String> {
-    let log = log.to_owned();
-    tokio::task::spawn_blocking(move || {
-        crate::traffic::Snapshot::load_range(&log, end, minutes).map(std::sync::Arc::new)
-    })
-    .await
-    .map_err(|_| "Cannot read local traffic snapshot")?
 }
 
 struct MergeContext {
@@ -1155,17 +1093,6 @@ async fn prepare_merge_range(
     })
 }
 type Fetched = Vec<(Source, Result<Summary, String>)>;
-async fn load_snapshot(
-    log: &std::path::Path,
-    end: i64,
-) -> Result<std::sync::Arc<crate::traffic::Snapshot>, String> {
-    let log = log.to_owned();
-    tokio::task::spawn_blocking(move || {
-        crate::traffic::Snapshot::load(&log, end).map(std::sync::Arc::new)
-    })
-    .await
-    .map_err(|_| "Cannot read local traffic snapshot")?
-}
 async fn align_sources(
     context: &MergeContext,
     sources: Vec<Source>,
@@ -1287,84 +1214,29 @@ pub type FirstView<'a> = (
     crate::traffic::TrafficScope,
     &'a (dyn Fn(Vec<Merged>) -> Result<(), String> + Sync),
 );
-/// Merge every range/scope from one shared snapshot. The views are independent,
-/// so their local reads run on separate blocking threads; order is preserved.
-async fn merge_selections(
-    context: &std::sync::Arc<MergeContext>,
+/// Merge every range/scope from one set of fetched summaries; order is preserved.
+fn merge_selections(
+    context: &MergeContext,
     fetched: &Fetched,
     selections: &[(u64, crate::traffic::TrafficScope)],
     end: i64,
-    snapshot: &std::sync::Arc<crate::traffic::Snapshot>,
 ) -> Result<Vec<Merged>, String> {
-    let fetched = std::sync::Arc::new(fetched.clone());
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, &(minutes, scope)) in selections.iter().enumerate() {
-        let (context, fetched, snapshot) = (context.clone(), fetched.clone(), snapshot.clone());
-        tasks.spawn(async move {
-            let view = merge_fetched(context, &fetched, minutes, scope, end, snapshot).await;
-            (index, view)
-        });
-    }
-    let mut views: Vec<Option<Merged>> = selections.iter().map(|_| None).collect();
-    while let Some(result) = tasks.join_next().await {
-        let (index, view) = result.map_err(|_| "Cannot merge processed statistics")?;
-        views[index] = Some(view?);
-    }
-    Ok(views.into_iter().flatten().collect())
+    selections
+        .iter()
+        .map(|&(minutes, scope)| merge_fetched(context, fetched, minutes, scope, end))
+        .collect()
 }
-async fn merge_fetched(
-    context: std::sync::Arc<MergeContext>,
+/// Each device's view of one range/category at the shared boundary. Totals
+/// across devices are their sum, taken where the views are shown.
+fn merge_fetched(
+    context: &MergeContext,
     fetched: &Fetched,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
     end: i64,
-    snapshot: std::sync::Arc<crate::traffic::Snapshot>,
 ) -> Result<Merged, String> {
     let bucket = crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
     let buckets = (minutes / bucket) as usize;
-    let local_context = context.clone();
-    let local = tokio::task::spawn_blocking(move || {
-        crate::traffic::local_named_groups(
-            crate::traffic::ReadSource::Snapshot(&snapshot),
-            &local_context.config,
-            &local_context.credential_labels,
-            end,
-            minutes,
-            scope,
-        )
-    })
-    .await
-    .map_err(|_| "Cannot read local processed statistics")??;
-    let mut groups = BTreeMap::new();
-    for (service, credential, stats) in &local.groups {
-        let anonymous = credential == crate::traffic_identity::UNIDENTIFIED;
-        groups.insert(
-            (*service, "local".into(), credential.clone()),
-            MergedGroup {
-                service: *service,
-                proxy: "Unidentified proxy".into(),
-                upstream: credential.clone(),
-                anonymous_proxy: true,
-                anonymous_upstream: anonymous,
-                stats: stats.clone(),
-            },
-        );
-    }
-    let mut local_view = traffic_view(
-        &groups
-            .values()
-            .map(|g| MergedGroup {
-                service: g.service,
-                proxy: g.proxy.clone(),
-                upstream: g.upstream.clone(),
-                anonymous_proxy: g.anonymous_proxy,
-                anonymous_upstream: g.anonymous_upstream,
-                stats: g.stats.clone(),
-            })
-            .collect::<Vec<_>>(),
-        buckets,
-    );
-    attach_local_reviews(&mut local_view, &local);
     let mut seen = BTreeSet::from([context.local_id.clone()]);
     let mut states = Vec::new();
     for (source, result) in fetched {
@@ -1390,13 +1262,6 @@ async fn merge_fetched(
                         &source_groups.into_values().collect::<Vec<_>>(),
                         buckets,
                     ));
-                    add_groups(
-                        &mut groups,
-                        &(BTreeMap::new(), BTreeMap::new()),
-                        &summary.node_id,
-                        selected,
-                        &context.accounts,
-                    );
                     (true, None)
                 }
                 Err(error) => (false, Some(error.clone())),
@@ -1412,9 +1277,6 @@ async fn merge_fetched(
         });
     }
     states.sort_by(|a, b| a.name.cmp(&b.name));
-    let groups: Vec<_> = groups.into_values().collect();
-    let mut traffic = traffic_view(&groups, buckets);
-    attach_local_reviews(&mut traffic, &local);
     Ok(Merged {
         window_start: end - minutes as i64 * 60_000,
         window_end: end,
@@ -1422,8 +1284,6 @@ async fn merge_fetched(
         minutes,
         scope,
         bucket_minutes: bucket,
-        traffic,
-        local: local_view,
     })
 }
 
@@ -1878,6 +1738,26 @@ mod tests {
         assert_eq!(order, expected, "Parallel merging must keep view order");
     }
 
+    /// This device's traffic exactly as its card reads it (`get_traffic`).
+    fn local_traffic(
+        config: &Config,
+        log: &std::path::Path,
+        labels: &BTreeMap<(String, String), String>,
+        minutes: u64,
+    ) -> serde_json::Value {
+        let identities = crate::traffic_identity::Identities::from_config(config, &[]);
+        serde_json::to_value(
+            crate::traffic::read(
+                log,
+                minutes,
+                labels,
+                crate::traffic::TrafficScope::Model,
+                &identities,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
     fn archived_traffic_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
@@ -1919,7 +1799,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_frame_matches_the_complete_view_for_its_range() {
+    async fn merged_views_leave_this_device_to_its_card() {
+        // Merged Traffic adds this device's card to the peers' views; a merged
+        // view that counted local traffic too would count it twice.
         let (_dir, log, _) = archived_traffic_fixture();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let first = std::sync::Mutex::new(None);
@@ -1942,19 +1824,12 @@ mod tests {
             .iter()
             .find(|v| v.minutes == 30 && v.scope == crate::traffic::TrafficScope::Model)
             .unwrap();
-        assert_eq!(complete.traffic.stats.requests, 1);
-        assert_eq!(
-            first.into_inner().unwrap().unwrap(),
-            serde_json::to_value(complete).unwrap()
-        );
-        let month = views
-            .iter()
-            .find(|v| v.minutes == 43200 && v.scope == crate::traffic::TrafficScope::Model)
-            .unwrap();
-        assert_eq!(
-            month.traffic.stats.requests, 2,
-            "The archive belongs to 30-day views"
-        );
+        let complete = serde_json::to_value(complete).unwrap();
+        assert_eq!(first.into_inner().unwrap().unwrap(), complete);
+        for key in ["traffic", "local"] {
+            assert!(complete.get(key).is_none(), "{key} must not be merged");
+        }
+        assert_eq!(complete["sources"], serde_json::json!([]));
     }
 
     #[cfg(unix)]
@@ -1970,7 +1845,7 @@ mod tests {
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let first = std::sync::Mutex::new(None);
         let publish = |views: Vec<Merged>| {
-            *first.lock().unwrap() = Some(views[0].traffic.stats.requests);
+            *first.lock().unwrap() = Some(views[0].minutes);
             Ok(())
         };
         let result = MergeCache::default()
@@ -1984,7 +1859,7 @@ mod tests {
             )
             .await;
         // Only the complete 30-day views need the old archive.
-        assert_eq!(*first.lock().unwrap(), Some(1));
+        assert_eq!(*first.lock().unwrap(), Some(30));
         assert!(result.is_err());
     }
 
@@ -2402,12 +2277,13 @@ mod tests {
                 assert!(view.sources.iter().all(|source| source.included));
                 let json = serde_json::to_value(view).unwrap();
                 assert!(json.get("groups").is_none());
-                assert!(json.get("traffic").is_some());
-                assert!(json.get("local").is_some());
+                // This device's traffic is its card's; merging only labels peers.
+                assert!(json.get("traffic").is_none());
+                assert!(json.get("local").is_none());
                 assert!(json.get("sources").is_some());
             }
-            // One identity-evidence scan plus one scan shared by both scopes.
-            assert_eq!(crate::traffic::live_scans(&log) - before, 2);
+            // Only the identity-evidence scan reads this device's log.
+            assert_eq!(crate::traffic::live_scans(&log) - before, 1);
         } else {
             assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
             assert_eq!(crate::traffic::live_scans(&log) - before, 1);
@@ -2600,13 +2476,12 @@ mod tests {
         let row = serde_json::json!({"timestamp":(chrono::Utc::now()-chrono::Duration::minutes(3)).to_rfc3339(),"event":"model_call_finished","service":"codex","model_call_id":"one","account_id":"legacy-non-uuid","account_label":"Known local account","status":"200","received_bytes":"17"});
         std::fs::write(&log, format!("{row}\n")).unwrap();
         let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: [{}]\n  routing:\n    account: {{'Known local account': none}}\nclaude:\n  config_dirs: []\n", serde_json::to_string(dir.path()).unwrap())).unwrap();
-        let view = merge(vec![], config, log, 30, crate::traffic::TrafficScope::Model)
-            .await
-            .unwrap();
-        assert_eq!(view.local.credentials.len(), 1);
-        assert_eq!(view.local.credentials[0].credential, "Known local account");
-        assert!(!view.local.credentials[0].anonymous);
-        assert_eq!(view.traffic.stats.requests, 1);
+        let labels = config.local_traffic_credential_labels().await;
+        let view = local_traffic(&config, &log, &labels, 30);
+        let credentials = view["credentials"].as_array().unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0]["credential"], "Known local account");
+        assert_eq!(view["summary"]["requests"], 1);
     }
     #[test]
     fn credential_order_matches_activity_traffic_with_unknown_accounts_last() {
@@ -2685,16 +2560,11 @@ mod tests {
         let context = prepare_merge(config.clone(), log.clone(), labels.clone())
             .await
             .unwrap();
-        let local = crate::traffic::local_named_groups(
-            crate::traffic::ReadSource::Path(&log),
-            &config,
-            &labels,
-            context.at,
-            30,
-            crate::traffic::TrafficScope::Model,
-        )
-        .unwrap();
-        assert_eq!(local.groups.len(), 2);
+        // Merged Traffic adds accounts by name, so this device's card must
+        // name them exactly as the peer's view does.
+        let local = local_traffic(&config, &log, &labels, 30);
+        let local = local["credentials"].as_array().unwrap();
+        assert_eq!(local.len(), 2);
         let mut groups = BTreeMap::new();
         add_groups(
             &mut groups,
@@ -2705,7 +2575,8 @@ mod tests {
         );
         let remote = traffic_view(&groups.into_values().collect::<Vec<_>>(), 30);
         assert_eq!(remote.credentials.len(), 2);
-        for (_, label, stats) in local.groups {
+        for group in local {
+            let label = group["credential"].as_str().unwrap();
             assert!(label.starts_with("Shared (https://"));
             let matched = remote
                 .credentials
@@ -2713,8 +2584,8 @@ mod tests {
                 .find(|g| g.credential == label)
                 .unwrap();
             assert!(!matched.anonymous);
-            assert_eq!(matched.stats.requests, stats.requests);
-            assert_eq!(matched.stats.bytes, stats.bytes);
+            assert_eq!(group["requests"], matched.stats.requests);
+            assert_eq!(group["bytes"], matched.stats.bytes);
         }
     }
 
@@ -2885,6 +2756,7 @@ mod tests {
             ssh_device: None,
         };
         let labels = config.local_traffic_credential_labels().await;
+        let (config_for_views, labels_for_views) = (config.clone(), labels.clone());
         let views = merge_views_with_labels(vec![source], config, log.clone(), labels)
             .await
             .unwrap();
@@ -2920,19 +2792,23 @@ mod tests {
         server.await.unwrap();
         assert!(result.sources[0].included, "{:?}", result.sources[0].error);
         assert_eq!(result.bucket_minutes, 15);
-        assert_eq!(result.local.stats.counts.len(), 24);
-        assert_eq!(result.local.stats.requests, 1);
+        let local = local_traffic(&config_for_views, &log, &labels_for_views, 360);
+        assert_eq!(local["summary"]["counts"].as_array().unwrap().len(), 24);
+        assert_eq!(local["summary"]["requests"], 1);
         let remote = result.sources[0].traffic.as_ref().unwrap();
         assert_eq!(remote.stats.requests, 1);
         assert_eq!(remote.avg_ms, Some(200));
         assert_eq!(remote.cache_hit_rate, Some(0.3));
         assert_eq!(remote.credentials[0].credential, "known@example.invalid");
-        assert_eq!(result.traffic.stats.requests, 2);
-        assert_eq!(result.traffic.credentials.len(), 1);
-        assert_eq!(result.traffic.stats.input_tokens, Some(200));
+        // The card names the account as the peer does, so Merged Traffic adds
+        // both into one account.
+        assert_eq!(
+            local["credentials"][0]["credential"],
+            "known@example.invalid"
+        );
     }
     #[tokio::test]
-    async fn renamed_claude_review_survives_local_and_merged_views() {
+    async fn renamed_claude_review_survives_on_this_device_card() {
         let dir = tempfile::tempdir().unwrap();
         let base = "https://renamed-review.invalid";
         std::fs::write(
@@ -2955,32 +2831,13 @@ mod tests {
             "request_id": "renamed-request", "service": "claude", "provider": "api",
             "upstream_base_url": base, "path": "/v1/messages", "method": "POST", "status": "200"
         }).to_string() + "\n").unwrap();
-        let context = std::sync::Arc::new(MergeContext {
-            config,
-            log: log.clone(),
-            accounts: BTreeMap::new(),
-            credential_labels: BTreeMap::new(),
-            local_id: "local-test".into(),
-            at: end,
-        });
-        let merged = merge_fetched(
-            context,
-            &vec![],
-            30,
-            crate::traffic::TrafficScope::Model,
-            end,
-            load_snapshot(&log, end).await.unwrap(),
-        )
-        .await
-        .unwrap();
-        for view in [&merged.local, &merged.traffic] {
-            let value = serde_json::to_value(view).unwrap();
-            assert_eq!(value["requests"], 1);
-            assert_eq!(value["credentials"][0]["credential"], "myServer");
-            assert_eq!(value["credentials"][0]["sources"][0]["name"], "api");
-            assert_eq!(value["credentials"][0]["sources"][0]["reason"], "renamed");
-            assert_eq!(value["targets"][0]["name"], "myServer");
-        }
+        // This device's card carries the review that Merged Traffic keeps.
+        let value = local_traffic(&config, &log, &BTreeMap::new(), 30);
+        assert_eq!(value["summary"]["requests"], 1);
+        assert_eq!(value["credentials"][0]["credential"], "myServer");
+        assert_eq!(value["credentials"][0]["sources"][0]["name"], "api");
+        assert_eq!(value["credentials"][0]["sources"][0]["reason"], "renamed");
+        assert_eq!(value["targets"][0]["name"], "myServer");
     }
 
     #[tokio::test]
@@ -2995,14 +2852,14 @@ mod tests {
             "https://example.invalid",
         );
         let end = summary.window_end;
-        let context = std::sync::Arc::new(MergeContext {
+        let context = MergeContext {
             config,
             log: log.clone(),
             accounts: BTreeMap::new(),
             credential_labels: BTreeMap::new(),
             local_id: "local-test".into(),
             at: end,
-        });
+        };
         let source = |name: &str| Source {
             name: name.into(),
             transport: Transport::Http,
@@ -3020,18 +2877,16 @@ mod tests {
             (source("failed"), Err("connection refused".into())),
         ];
         let merged = merge_fetched(
-            context,
+            &context,
             &fetched,
             30,
             crate::traffic::TrafficScope::Model,
             end,
-            load_snapshot(&log, end).await.unwrap(),
         )
-        .await
         .unwrap();
-        assert_eq!(merged.traffic.stats.requests, 1);
         let first = merged.sources.iter().find(|s| s.name == "first").unwrap();
         assert!(first.included && first.error.is_none() && first.exclusion.is_none());
+        assert_eq!(first.traffic.as_ref().unwrap().stats.requests, 1);
         let duplicate = merged.sources.iter().find(|s| s.name == "second").unwrap();
         assert!(!duplicate.included && duplicate.error.is_none());
         assert_eq!(duplicate.exclusion, Some(SourceExclusion::Duplicate));

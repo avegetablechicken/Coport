@@ -14,6 +14,13 @@ function setup(scope = 'model') {
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const credential = (credential, requests, service = 'Codex', tokens = {}) => ({ service, credential, requests, inputTokens: null, outputTokens: null, cachedInputTokens: null, ...tokens });
 const requests = (c) => c.requests;
+// Shared traffic views, markup and merging, as every page uses them.
+function loadSharedViews(context) {
+  vm.runInContext(source.slice(source.indexOf('const trafficMarkup = new WeakMap();'), source.indexOf('/// Home shows the forwarded device')), context);
+}
+function loadHome(context) {
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nfunction trafficBlock(')), context);
+}
 test('groups by service with one hue each and keeps unidentified last', () => {
   const { shareGroups } = setup();
   const groups = shareGroups([credential('Unidentified', 50), credential('a', 10), credential('b', 30, 'Claude'), credential('c', 20), credential('idle', 0)], requests);
@@ -77,7 +84,7 @@ test('traffic data keeps the category it was read for', async () => {
   const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, page: 'main' };
   const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
   const load = context.loadTraffic();
   // The selector already shows the new category while the old data renders.
@@ -92,31 +99,36 @@ test('a traffic read still running is not started again', async () => {
   const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 43200, page: 'activity' };
   const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
   const first = context.loadTraffic();
   context.loadTraffic();
   assert.equal(pending.length, 1);
-  // Another range starts at once, and so does any read after a switch.
+  // Another range starts at once.
   ui.trafficMinutes = 30;
   const second = context.loadTraffic();
   assert.equal(pending.length, 2);
+  // Switching back joins the read still running instead of repeating it.
   ui.trafficMinutes = 43200;
   ++ui.trafficRequest;
   const third = context.loadTraffic();
-  assert.equal(pending.length, 3);
+  assert.equal(pending.length, 2);
   for (const { resolve } of pending) resolve({ credentials: [] });
   await Promise.all([first, second, third]);
+  // A view read moments ago is reused; an older one is read again.
+  await context.loadTraffic();
+  assert.equal(pending.length, 2);
+  ui.localTrafficViews['43200:all'].loadedAt -= 15000;
   context.loadTraffic();
-  assert.equal(pending.length, 4);
+  assert.equal(pending.length, 3);
 });
 test('home traffic keeps the category it was read for', async () => {
   const pending = [];
   const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'activity' };
   const context = { ui, render() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('async function loadHomeTraffic(')), context);
-  vm.runInContext(source.slice(source.indexOf('async function loadHomeTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
+  loadSharedViews(context);
+  loadHome(context);
   const load = context.loadHomeTraffic();
   ui.trafficScope = 'model';
   pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, summary: { requests: 3 }, credentials: [credential('a', 3)] });
@@ -317,6 +329,7 @@ test('device traffic exposes renamed local sources with assignment choices', () 
     trafficShare: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '',
   });
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function deviceTrafficContent('), source.indexOf('document.addEventListener("toggle"')), context);
   const traffic = { requests: 2, errors: 0, credentials: [{ service: 'Claude', credential: 'myServer', requests: 2,
     sources: [{ name: 'api', base: 'https://example.invalid', reason: 'renamed', requests: 2 }] }],
@@ -338,12 +351,16 @@ test('assigning traffic refreshes device views and removes stale cached mappings
   Object.assign(context, { invoke: async () => calls.push('assign'),
     loadTraffic: async () => calls.push('activity'), loadMergedData: async force => calls.push(force),
     refresh: async () => calls.push('refresh') });
+  loadSharedViews(context);
   context.ui.localTrafficViews = { old: {} };
+  context.ui.localTrafficLoads = { old: Promise.resolve() };
+  context.ui.forwardedTrafficViews = { old: {} };
   context.ui.deviceTrafficViews = { old: {} };
   await context.assignTraffic({});
   assert.deepEqual(calls, ['assign', 'activity', true, 'refresh']);
-  assert.equal(Object.keys(context.ui.localTrafficViews).length, 0);
-  assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 0);
+  for (const views of ['localTrafficViews', 'localTrafficLoads', 'forwardedTrafficViews', 'deviceTrafficViews']) {
+    assert.equal(Object.keys(context.ui[views]).length, 0, views);
+  }
 });
 
 test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
@@ -361,12 +378,13 @@ test('home traffic draws the share ring above its chart', () => {
   const context = setup('all');
   context.ui.homeTraffic = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nfunction rememberLocalTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
   const html = context.trafficBlock();
   assert.match(html, /class="traffic-share"[\s\S]*class="chart"/);
   assert.match(html, /\[Codex\][\s\S]*\[Claude\]/);
   // Before credentials arrive, the block still renders without a ring.
+  context.ui.homeTraffic = { ...context.ui.homeTraffic };
   delete context.ui.homeTraffic.credentials;
   assert.doesNotMatch(context.trafficBlock(), /traffic-share/);
 });
@@ -379,23 +397,26 @@ test('forwarding Home reads the destination from the daemon cache, never local h
   };
   const context = { ui, render() {}, invoke: async (command, args) => { calls.push([command, args]); return remote; } };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
+  loadSharedViews(context);
+  loadHome(context);
   await context.loadHomeTraffic();
   assert.deepEqual(plain(calls), [['get_forwarding_traffic', { minutes: 360, scope: 'all' }]]);
   // A remote view must not enter this machine's cache used by Devices.
   assert.equal(ui.localTrafficViews, undefined);
   assert.equal(ui.homeTraffic.device, 'ms');
   assert.deepEqual([ui.homeTraffic.start, ui.homeTraffic.end, ui.homeTraffic.bucketMinutes], [0, 21600000, 10]);
-  // Devices still reads this machine while forwarding.
-  ui.page = 'devices';
-  await context.loadHomeTraffic();
+  // The Devices card of the forwarded device reuses Home's view instead of asking again.
+  assert.equal(await context.loadForwardedTraffic('ms', 360, 'all'), ui.homeTraffic);
+  assert.equal(calls.length, 1);
+  // This device's own view is still read locally.
+  await context.loadLocalTraffic(360, 'all');
   assert.equal(calls[1][0], 'get_traffic');
 });
 test('forwarding Home Traffic labels the destination and hides another source', () => {
   const context = setup('all');
   vm.runInContext(source.slice(source.indexOf('function homeTrafficDevice('), source.indexOf('async function loadHomeTraffic(')), context);
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '' });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nfunction rememberLocalTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
   const { ui } = context;
   ui.page = 'main';
@@ -418,4 +439,84 @@ test('forwarding Home Traffic labels the destination and hides another source', 
   ui.homeTraffic = null;
   ui.homeTrafficError = 'TRAFFIC_UPDATING';
   assert.match(context.trafficBlock(), /Loading traffic…/);
+});
+test('Merged Traffic is exactly the sum of the device views', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  const stats = (requests, extra = {}) => ({ requests, errors: 1, bytes: requests * 10, latencyTotalMs: requests * 100, latencySamples: requests, cacheRead: 1, cachePrompt: 4,
+    counts: [requests, 0], errorCounts: [1, 0], tokenCounts: [0, requests], inputTokens: null, outputTokens: null, ...extra });
+  const local = { ...stats(3, { inputTokens: 30 }), targets: [{ name: 'target' }], credentials: [
+    { service: 'Codex', credential: 'shared', ...stats(2, { inputTokens: 20 }), sources: [{ name: 'old', reason: 'renamed' }] },
+    { service: 'Codex', credential: 'Unidentified', ...stats(1, { inputTokens: 10 }) },
+  ] };
+  const peer = { ...stats(5), credentials: [
+    { service: 'Codex', credential: 'Unidentified', ...stats(1) },
+    { service: 'Codex', credential: 'shared', ...stats(4) },
+  ] };
+  const total = context.sumTrafficViews([local, peer]);
+  assert.deepEqual(plain([total.requests, total.errors, total.bytes, total.counts, total.errorCounts, total.tokenCounts]), [8, 2, 80, [8, 0], [2, 0], [0, 8]]);
+  assert.equal(total.avgMs, 100);
+  assert.equal(total.cacheHitRate, 2 / 8);
+  // Usage reported by some devices counts; none reported stays unknown.
+  assert.equal(total.inputTokens, 30);
+  assert.equal(total.outputTokens, null);
+  // An account named alike on both devices is one account; Unidentified is one entry, last.
+  assert.deepEqual(plain(total.credentials.map((c) => [c.credential, c.requests, c.bytes])), [['shared', 6, 60], ['Unidentified', 2, 20]]);
+  assert.deepEqual(plain(total.credentials[0].sources), [{ name: 'old', reason: 'renamed' }]);
+  assert.deepEqual(plain(total.targets), [{ name: 'target' }]);
+  // The same views are not added again on the next render.
+  assert.equal(context.sumTrafficViews([local, peer]), total);
+  assert.notEqual(context.sumTrafficViews([local]), total);
+});
+test('an unchanged view reuses its markup', () => {
+  const context = setup('all');
+  loadSharedViews(context);
+  let charts = 0;
+  Object.assign(context, { chart: () => { charts++; return '<chart>'; }, stat: () => '', fmtMs: String, fmtBytes: String, modelTokenStats: () => '' });
+  const view = { requests: 1, errors: 0, credentials: [credential('a', 1)], start: 0, end: 60000, bucketMinutes: 1 };
+  const html = context.trafficSummary(view, 'all');
+  assert.equal(context.trafficSummary(view, 'all'), html);
+  assert.equal(charts, 1);
+  // Another window or category is drawn afresh.
+  context.trafficSummary(view, 'model');
+  context.trafficSummary(view, 'all', { start: 0, end: 120000, bucketMinutes: 1 });
+  assert.equal(charts, 3);
+});
+test('Home, Activity and This Device share one read of the same traffic', async () => {
+  const pending = [];
+  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'main' };
+  const context = { ui, $: () => null, render() {}, renderActivityTraffic() {}, invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) };
+  vm.createContext(context);
+  loadSharedViews(context);
+  loadHome(context);
+  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
+  const reads = [context.loadHomeTraffic(), context.loadTraffic(), context.loadLocalTraffic(30, 'all')];
+  assert.equal(pending.length, 1);
+  pending[0].resolve({ start: 0, end: 1800000, bucketMinutes: 1, summary: { requests: 4 }, credentials: [], targets: [] });
+  const [, , card] = await Promise.all(reads);
+  assert.equal(ui.homeTraffic, card);
+  assert.equal(ui.traffic, card);
+  assert.equal(card.requests, 4);
+  // A different range is its own read.
+  ui.homeTrafficMinutes = 360;
+  context.loadHomeTraffic();
+  assert.equal(pending.length, 2);
+  assert.equal(pending[1].query.minutes, 360);
+});
+test('a reset while reading discards the old result and reads again', async () => {
+  const pending = [];
+  const ui = {};
+  const context = { ui, invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) };
+  vm.createContext(context);
+  loadSharedViews(context);
+  const read = context.loadLocalTraffic(30, 'all');
+  // Traffic is reassigned while the read runs.
+  context.resetTrafficViews();
+  pending[0].resolve({ summary: { requests: 1 }, credentials: [] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(pending.length, 2, 'the stale result is read again');
+  assert.equal(ui.localTrafficViews['30:all'], undefined);
+  pending[1].resolve({ summary: { requests: 2 }, credentials: [] });
+  assert.equal((await read).requests, 2);
+  assert.equal(ui.localTrafficViews['30:all'].requests, 2);
 });
