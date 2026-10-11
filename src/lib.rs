@@ -3,6 +3,7 @@ mod claude_api;
 mod claude_settings;
 mod codex_env;
 pub mod config;
+pub mod credential_proxy;
 pub mod external_access;
 pub mod identity;
 mod keychain;

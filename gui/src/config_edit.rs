@@ -15,10 +15,13 @@ enum Kind {
 type Getter = fn(&Config) -> Value;
 
 /// Configuration values the Settings page may change, as dotted YAML keys.
-const EDITABLE: [(&str, Kind, Getter); 10] = [
+const EDITABLE: [(&str, Kind, Getter); 11] = [
     ("listen_port", Kind::Port, |c| json!(c.listen_port)),
     ("allow_external_access", Kind::Flag, |c| {
         json!(c.allow_external_access)
+    }),
+    ("connect_credential_routing", Kind::Flag, |c| {
+        json!(c.connect_credential_routing)
     }),
     ("request_timeout_seconds", Kind::Seconds, |c| {
         json!(c.request_timeout_seconds)
@@ -234,6 +237,18 @@ mod tests {
         set_value(&path, "allow_external_access", &json!(false)).unwrap();
         assert!(!Config::read(&path).unwrap().allow_external_access);
         assert!(set_value(&path, "allow_external_access", &json!("true")).is_err());
+    }
+    #[test]
+    fn proxy_port_credential_routing_defaults_off_and_can_be_toggled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, BASE).unwrap();
+        assert!(!Config::read(&path).unwrap().connect_credential_routing);
+        set_value(&path, "connect_credential_routing", &json!(true)).unwrap();
+        assert!(Config::read(&path).unwrap().connect_credential_routing);
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(BASE));
+        set_value(&path, "connect_credential_routing", &json!(false)).unwrap();
+        assert!(!Config::read(&path).unwrap().connect_credential_routing);
     }
     #[test]
     fn replaces_only_the_value_and_keeps_comments() {

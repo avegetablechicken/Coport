@@ -40,6 +40,12 @@ proxies:
 # Unlisted destinations are denied; none explicitly enables direct TCP.
 # Lists attempt connection establishment in order; established tunnels never replay.
 
+# Route proxy-port (HTTPS_PROXY) clients by credential: CONNECT to the API hosts
+# of the codex and claude sections is decrypted locally and routed like base URL
+# requests. Clients must trust tls/proxy-ca.pem. Other destinations keep the
+# connect routes above.
+connect_credential_routing: false
+
 codex:
   base_url:
     account: "https://chatgpt.com/backend-api"

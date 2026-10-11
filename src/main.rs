@@ -93,7 +93,16 @@ async fn run(args: Args) -> Result<()> {
         config.listen_port
     );
     let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
+    let credential_proxy = coport::credential_proxy::CredentialProxy::prepare(&config, &tls_dir)?;
     let mut server = Server::new(config, logger.clone());
+    if let Some(proxy) = credential_proxy {
+        println!(
+            "Proxy port routes {} by credential; clients trust {}",
+            proxy.authorities().join(", "),
+            tls_dir.join(coport::local_tls::PROXY_CA_FILE).display()
+        );
+        server = server.with_credential_proxy(proxy);
+    }
     match coport::local_tls::acceptor(&tls_dir) {
         Ok(tls) => {
             server = server.with_tls(tls);

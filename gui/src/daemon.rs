@@ -684,9 +684,16 @@ async fn serve_until(
         port: control.local_addr()?.port(),
         token: uuid::Uuid::new_v4().to_string(),
     };
+    let tls_dir = coport::local_tls::dir_for(&config_path);
+    // Enabled in Settings; without its CA, proxy-port clients could not be routed.
+    let credential_proxy = coport::credential_proxy::CredentialProxy::prepare(&config, &tls_dir)
+        .map_err(|e| io::Error::other(e.message))?;
     let mut server = Server::new(config, logger.clone());
+    if let Some(proxy) = credential_proxy {
+        server = server.with_credential_proxy(proxy);
+    }
     // Without TLS, plain-HTTP clients still work; HTTPS base URLs fail to connect.
-    match coport::local_tls::acceptor(&coport::local_tls::dir_for(&config_path)) {
+    match coport::local_tls::acceptor(&tls_dir) {
         Ok(tls) => server = server.with_tls(tls),
         Err(e) => logger.write(
             "tls_disabled",

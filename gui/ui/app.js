@@ -730,6 +730,8 @@ function connectBlock() {
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Top of ~/.codex/config.toml, then restart Codex. Codex 0.156+ requires an HTTPS chatgpt_base_url", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
+       ${ui.snap.config.details?.editable?.connect_credential_routing ? `
+       ${snippet("Proxy port instead of base URLs: environment for Claude Code and Codex, which keep their original API URLs", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
      </details>`
   );
 }
@@ -1977,6 +1979,7 @@ function configSettings() {
     "",
     `${field("listen_port", "Listen port")}
      ${flag("allow_external_access", "Share statistics", "Enable the separate read-only data API. Configure external_data in YAML first; restart to apply.", true)}
+     ${flag("connect_credential_routing", "Proxy port credential routing", "Decrypt HTTPS_PROXY clients' API traffic with a separate local CA and route it by credential, like base URL clients. Restart to apply.", true)}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}

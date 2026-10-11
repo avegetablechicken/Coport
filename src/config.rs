@@ -136,6 +136,8 @@ struct Raw {
     proxies: BTreeMap<String, String>,
     #[serde(default)]
     connect: BTreeMap<String, Choice>,
+    #[serde(default)]
+    connect_credential_routing: bool,
 }
 
 /// Responses WebSockets use protocol phases, independently of HTTP/CONNECT idle time.
@@ -205,6 +207,9 @@ pub struct Config {
     pub websocket: WebSocketTimeouts,
     pub proxies: BTreeMap<String, String>,
     pub connect: BTreeMap<String, Choice>,
+    /// Decrypt CONNECT tunnels to credential-routed API hosts and route their
+    /// requests by credential, as for base URL clients.
+    pub connect_credential_routing: bool,
 }
 impl Config {
     /// Validate private credentials and TLS before stopping an existing daemon.
@@ -258,6 +263,7 @@ impl Config {
             websocket: raw.websocket,
             proxies: raw.proxies,
             connect: raw.connect,
+            connect_credential_routing: raw.connect_credential_routing,
         };
         c.validate()?;
         Ok(c)

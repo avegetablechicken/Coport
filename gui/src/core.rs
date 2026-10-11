@@ -425,6 +425,10 @@ impl Core {
                     .join(coport::local_tls::CA_FILE)
                     .display()
                     .to_string(),
+                proxy_ca_certificate: coport::local_tls::dir_for(&self.config_path())
+                    .join(coport::local_tls::PROXY_CA_FILE)
+                    .display()
+                    .to_string(),
                 base,
             },
             config: ConfigDto {
@@ -749,6 +753,8 @@ struct Urls {
     /// Codex 0.156+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
     chatgpt: String,
     ca_certificate: String,
+    /// Trusted by proxy-port clients when credential routing decrypts CONNECT.
+    proxy_ca_certificate: String,
 }
 
 #[derive(Serialize)]
@@ -1122,10 +1128,12 @@ mod tests {
             codex: "codex".into(),
             chatgpt: "chatgpt".into(),
             ca_certificate: "/tls/ca.pem".into(),
+            proxy_ca_certificate: "/tls/proxy-ca.pem".into(),
         })
         .unwrap();
-        // The panel's setup snippets read `urls.caCertificate`.
+        // The panel's setup snippets read `urls.caCertificate` and `urls.proxyCaCertificate`.
         assert_eq!(urls["caCertificate"], "/tls/ca.pem");
+        assert_eq!(urls["proxyCaCertificate"], "/tls/proxy-ca.pem");
         for key in ["base", "claude", "codex", "chatgpt"] {
             assert!(urls[key].is_string());
         }

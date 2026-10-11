@@ -2,6 +2,9 @@
 //! requires an HTTPS `chatgpt_base_url`). A private CA is created once and
 //! kept beside the configuration; clients trust `ca.pem`. The serving
 //! certificate is reissued from that CA on every start.
+//!
+//! Proxy-port credential routing uses a second CA, constrained to the API
+//! hosts it decrypts, so trusting it never covers loopback or other sites.
 use crate::{Error, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
@@ -9,6 +12,7 @@ use rcgen::{
     NameConstraints, PublicKeyData,
 };
 use std::{
+    collections::{BTreeSet, HashMap},
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -26,6 +30,8 @@ use tokio_rustls::{
 
 pub const CA_FILE: &str = "ca.pem";
 const CA_KEY_FILE: &str = "ca-key.pem";
+pub const PROXY_CA_FILE: &str = "proxy-ca.pem";
+const PROXY_CA_KEY_FILE: &str = "proxy-ca-key.pem";
 /// Held while a CA is created, so concurrent first starts write one pair.
 const CA_LOCK_FILE: &str = "ca.lock";
 
@@ -44,9 +50,42 @@ pub fn acceptor(dir: &Path) -> Result<TlsAcceptor> {
     // name under a CA with IP name constraints. Each certificate holds one
     // name and is chosen by SNI: localhost by name, 127.0.0.1 (no SNI) by IP.
     let certs = Arc::new(LoopbackCerts {
-        localhost: leaf("localhost", &issuer)?,
-        ip: leaf("127.0.0.1", &issuer)?,
+        localhost: leaf("localhost", "coport loopback", &issuer)?,
+        ip: leaf("127.0.0.1", "coport loopback", &issuer)?,
     });
+    server_acceptor(certs).map_err(failed)
+}
+
+/// Load (or create) the proxy-port CA in `dir`, valid for every name in
+/// `hosts`, and build one acceptor per host. A stored CA whose constraints
+/// omit a host is replaced, and must then be trusted again.
+pub fn proxy_acceptors(
+    dir: &Path,
+    hosts: &BTreeSet<String>,
+) -> Result<HashMap<String, TlsAcceptor>> {
+    fn failed<E>(_: E) -> Error {
+        Error::config("Cannot prepare the proxy port certificate.")
+    }
+    let ca_key = load_or_create(dir, &PROXY, &proxy_ca_params(hosts), &|cert| {
+        hosts.iter().all(|host| permits(cert, host))
+    })
+    .map_err(failed)?;
+    let issuer = Issuer::new(proxy_ca_params(hosts), &ca_key);
+    hosts
+        .iter()
+        .map(|host| {
+            let cert = leaf(host, "coport proxy", &issuer).map_err(failed)?;
+            let acceptor = server_acceptor(Arc::new(SingleName {
+                name: host.clone(),
+                cert,
+            }))
+            .map_err(failed)?;
+            Ok((host.clone(), acceptor))
+        })
+        .collect()
+}
+
+fn server_acceptor(certs: Arc<dyn ResolvesServerCert>) -> Result<TlsAcceptor> {
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -56,6 +95,22 @@ pub fn acceptor(dir: &Path) -> Result<TlsAcceptor> {
     .with_cert_resolver(certs);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// The certificate for the CONNECT destination; a client naming another
+/// host in SNI is refused rather than shown a certificate it would reject.
+#[derive(Debug)]
+struct SingleName {
+    name: String,
+    cert: Arc<CertifiedKey>,
+}
+impl ResolvesServerCert for SingleName {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        hello
+            .server_name()
+            .is_none_or(|sni| sni.eq_ignore_ascii_case(&self.name))
+            .then(|| self.cert.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -73,11 +128,11 @@ impl ResolvesServerCert for LoopbackCerts {
     }
 }
 
-fn leaf(name: &str, issuer: &Issuer<'_, &KeyPair>) -> Result<Arc<CertifiedKey>> {
+fn leaf(name: &str, common_name: &str, issuer: &Issuer<'_, &KeyPair>) -> Result<Arc<CertifiedKey>> {
     let mut params = CertificateParams::new(vec![name.into()]).map_err(failed)?;
     params
         .distinguished_name
-        .push(DnType::CommonName, "coport loopback");
+        .push(DnType::CommonName, common_name);
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.use_authority_key_identifier_extension = true;
@@ -102,10 +157,24 @@ fn failed<E>(_: E) -> Error {
     Error::config("Cannot prepare the loopback TLS certificate.")
 }
 
-fn ca_params() -> CertificateParams {
+/// Certificate and key file names of one CA.
+struct Authority {
+    cert: &'static str,
+    key: &'static str,
+}
+const LOOPBACK: Authority = Authority {
+    cert: CA_FILE,
+    key: CA_KEY_FILE,
+};
+const PROXY: Authority = Authority {
+    cert: PROXY_CA_FILE,
+    key: PROXY_CA_KEY_FILE,
+};
+
+fn ca_template(common_name: &str, permitted: Vec<GeneralSubtree>) -> CertificateParams {
     let mut params = CertificateParams::default();
     let mut name = DistinguishedName::new();
-    name.push(DnType::CommonName, "coport local CA");
+    name.push(DnType::CommonName, common_name);
     params.distinguished_name = name;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![
@@ -113,46 +182,89 @@ fn ca_params() -> CertificateParams {
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
-    // Safe to add to a system trust store: the CA can only vouch for loopback.
     params.name_constraints = Some(NameConstraints {
-        permitted_subtrees: vec![
-            GeneralSubtree::DnsName("localhost".into()),
-            GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([127, 0, 0, 1], 32)),
-        ],
+        permitted_subtrees: permitted,
         excluded_subtrees: vec![],
     });
     params
 }
 
+fn ca_params() -> CertificateParams {
+    // Safe to add to a system trust store: the CA can only vouch for loopback.
+    ca_template(
+        "coport local CA",
+        vec![
+            GeneralSubtree::DnsName("localhost".into()),
+            GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([127, 0, 0, 1], 32)),
+        ],
+    )
+}
+
+fn proxy_ca_params(hosts: &BTreeSet<String>) -> CertificateParams {
+    ca_template(
+        "coport proxy CA",
+        hosts.iter().cloned().map(GeneralSubtree::DnsName).collect(),
+    )
+}
+
+/// Whether the DER certificate `cert` lists `host` as a permitted dNSName.
+fn permits(cert: &[u8], host: &str) -> bool {
+    // A context-specific [2] IA5String: the tag, a DER length, then the name.
+    let mut encoded = vec![0x82];
+    match host.len() {
+        n @ 0..=0x7f => encoded.push(n as u8),
+        n @ 0x80..=0xff => encoded.extend([0x81, n as u8]),
+        _ => return false,
+    }
+    encoded.extend_from_slice(host.as_bytes());
+    cert.windows(encoded.len()).any(|w| w == encoded)
+}
+
 fn load_or_create_ca(dir: &Path) -> std::io::Result<KeyPair> {
-    if let Some(key) = load_ca(dir) {
+    load_or_create(dir, &LOOPBACK, &ca_params(), &|_| true)
+}
+
+/// The stored key of `authority` if its certificate is acceptable, otherwise
+/// a newly created pair from `params` replacing it.
+fn load_or_create(
+    dir: &Path,
+    authority: &Authority,
+    params: &CertificateParams,
+    acceptable: &dyn Fn(&[u8]) -> bool,
+) -> std::io::Result<KeyPair> {
+    if let Some(key) = load(dir, authority, acceptable) {
         return Ok(key);
     }
     std::fs::create_dir_all(dir)?;
     let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE), Duration::from_secs(30))?;
     // Another instance may have created the pair while this one waited.
-    if let Some(key) = load_ca(dir) {
+    if let Some(key) = load(dir, authority, acceptable) {
         return Ok(key);
     }
     let key = KeyPair::generate().map_err(std::io::Error::other)?;
-    let cert = ca_params()
-        .self_signed(&key)
-        .map_err(std::io::Error::other)?;
+    let cert = params.self_signed(&key).map_err(std::io::Error::other)?;
     // NamedTempFile is created owner-only; the key keeps that mode.
-    persist(dir, &dir.join(CA_KEY_FILE), key.serialize_pem().as_bytes())?;
-    persist(dir, &dir.join(CA_FILE), cert.pem().as_bytes())?;
+    persist(
+        dir,
+        &dir.join(authority.key),
+        key.serialize_pem().as_bytes(),
+    )?;
+    persist(dir, &dir.join(authority.cert), cert.pem().as_bytes())?;
     Ok(key)
 }
 
-/// The stored key, only if `ca.pem` certifies it. A certificate for another
-/// key can never be verified, so such a pair is replaced like a missing one.
+#[cfg(test)]
 fn load_ca(dir: &Path) -> Option<KeyPair> {
-    let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join(CA_KEY_FILE)).ok()?).ok()?;
-    let cert = CertificateDer::from_pem_file(dir.join(CA_FILE)).ok()?;
+    load(dir, &LOOPBACK, &|_| true)
+}
+
+/// The stored key, only if its certificate certifies it. A certificate for
+/// another key can never be verified, so such a pair is replaced like a missing one.
+fn load(dir: &Path, authority: &Authority, acceptable: &dyn Fn(&[u8]) -> bool) -> Option<KeyPair> {
+    let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join(authority.key)).ok()?).ok()?;
+    let cert = CertificateDer::from_pem_file(dir.join(authority.cert)).ok()?;
     let public = key.subject_public_key_info();
-    cert.windows(public.len())
-        .any(|w| w == public.as_slice())
-        .then_some(key)
+    (cert.windows(public.len()).any(|w| w == public.as_slice()) && acceptable(&cert)).then_some(key)
 }
 
 /// An operating system lock on a file beside the CA, held while the CA is
@@ -304,5 +416,83 @@ mod tests {
         assert!(CreationLock::acquire(&path, Duration::ZERO).is_err());
         drop(second);
         CreationLock::acquire(&path, Duration::ZERO).unwrap();
+    }
+
+    fn hosts(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn proxy_ca_is_reused_while_it_covers_every_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = hosts(&["api.anthropic.com", "chatgpt.com"]);
+        let acceptors = proxy_acceptors(dir.path(), &both).unwrap();
+        assert_eq!(acceptors.len(), 2);
+        let first = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        // The loopback CA is separate and untouched.
+        assert!(!dir.path().join(CA_FILE).exists());
+        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com"])).unwrap();
+        assert_eq!(
+            first,
+            std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap()
+        );
+        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com", "api.openai.com"])).unwrap();
+        let replaced = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        assert_ne!(first, replaced);
+        let cert = CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap();
+        assert!(permits(&cert, "api.openai.com"));
+        assert!(!permits(&cert, "api.anthropic.com"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(PROXY_CA_KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn proxy_ca_constraints_match_whole_names_only() {
+        let key = KeyPair::generate().unwrap();
+        let cert = proxy_ca_params(&hosts(&["xapi.anthropic.com", &"a".repeat(130)]))
+            .self_signed(&key)
+            .unwrap();
+        let der = cert.der();
+        assert!(permits(der, "xapi.anthropic.com"));
+        assert!(permits(der, &"a".repeat(130)));
+        assert!(!permits(der, "api.anthropic.com"));
+        assert!(!permits(der, "anthropic.com"));
+        assert!(!permits(der, &"a".repeat(129)));
+    }
+
+    #[tokio::test]
+    async fn proxy_certificates_are_only_offered_for_their_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let acceptors = proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com"])).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap())
+            .unwrap();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        ));
+        for (name, accepted) in [("api.anthropic.com", true), ("chatgpt.com", false)] {
+            let (near, far) = tokio::io::duplex(65536);
+            let acceptor = acceptors["api.anthropic.com"].clone();
+            let server = tokio::spawn(async move { acceptor.accept(far).await.is_ok() });
+            let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap();
+            // Kept open until the server finishes writing its session tickets.
+            let connected = client.connect(server_name, near).await;
+            assert_eq!(server.await.unwrap(), accepted, "{name}");
+            assert_eq!(connected.is_ok(), accepted, "{name}");
+        }
     }
 }

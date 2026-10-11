@@ -589,7 +589,60 @@ Clients that support an HTTP proxy can then use
 secure WebSocket connections through CONNECT. TLS stays between client and
 server, so the proxy cannot inspect the API path or token, apply per-account
 routing, or change headers inside the tunnel. CONNECT routes use the destination
-alone and are independent of `codex.routing` and `claude.routing`.
+alone and are independent of `codex.routing` and `claude.routing`, unless
+credential routing (below) decrypts that destination.
+
+### Credential routing on the proxy port
+
+To route proxy-port clients by credential, as for base URL clients, enable
+**Settings → Network → Proxy port credential routing** or set:
+
+```yaml
+connect_credential_routing: true # Default false; restart to apply.
+```
+
+CONNECT requests to the API hosts that the `codex` and `claude` sections route by
+credential are then answered locally instead of tunnelled: the client's TLS is
+terminated with a certificate from a second private CA, `tls/proxy-ca.pem` (with
+an owner-only `tls/proxy-ca-key.pem`), and each request inside is handled exactly
+like the explicit URL form `/anthropic/https://<host>/...` or
+`/codex/https://<host>/...`. Account, API Key and URL routes, fallbacks, OAuth
+refresh and WebSocket upgrades therefore select the outbound proxy as they do for
+base URL clients, and unmatched credentials are rejected before any outbound
+connection. These hosts are decrypted:
+
+| Service | Hosts |
+| --- | --- |
+| Claude, with any account or non-URL API Key route or fallback | `claude.base_url` and `platform.claude.com` |
+| Codex, with account routes or `account_fallback` | `codex.base_url.account` and `auth.openai.com` |
+| Codex, with non-URL API Key routes or `api_key_fallback` | `codex.base_url.api_key` |
+| Either, for each hostname URL route | that route's host and port |
+
+A host routed by both services uses the unprefixed `/https://` form and its usual
+conflict rules. Public IP URL routes, Claude settings-file upstreams and Codex
+`config.toml` provider URLs are not decrypted; use base URLs for them, or list
+them under `connect` as opaque tunnels. All other destinations keep their
+`connect` routes or remain denied. Requests inside a decrypted tunnel must target
+its destination (origin-form, or absolute-form naming that host), and the client
+must name the CONNECT host in SNI.
+
+The proxy CA is separate from the loopback CA and carries critical name
+constraints permitting only the decrypted hostnames, so trusting it does not
+cover loopback or any other site. If a later configuration decrypts a host the
+stored CA does not permit, the CA is replaced on start and must be trusted again;
+otherwise it is reused. Point clients at it rather than replacing their CA
+bundles:
+
+```sh
+export HTTPS_PROXY=http://127.0.0.1:8787
+export NODE_EXTRA_CA_CERTS="$HOME/.local/share/coport-rust/tls/proxy-ca.pem" # Claude Code
+export CODEX_CA_CERTIFICATE="$HOME/.local/share/coport-rust/tls/proxy-ca.pem" # Codex
+```
+
+Clients keep their original HTTPS API URLs. The GUI's setup snippets show the
+exact path while the setting is on. Each decrypted connection carries one request,
+like base URL connections. Request logs include `client_connect` with the
+decrypted host.
 
 Outbound HTTP and HTTPS proxies support Basic proxy authentication; SOCKS5
 supports optional username/password authentication and resolves destination
@@ -607,7 +660,12 @@ without data progress in either direction. Active tunnels have no total lifetime
 limit. Failure logs retain transferred byte counts and sanitized error side,
 operation, and kind (without payloads or credentials). They preserve buffered
 early data and TCP half-closes. This listener supports CONNECT authority-form and
-API origin-form requests; it does not accept absolute-form plain HTTP proxy requests.
+API origin-form requests. While proxy port credential routing (below) is on,
+absolute-form requests that name this listener on a loopback address are also
+served, as proxy clients send for loopback base URLs (for example
+`GET http://127.0.0.1:8787/backend-api/wham/usage`). The listener never forwards
+plain HTTP to other hosts, and with that setting off every absolute-form target
+returns 400.
 
 ## Connect Claude Code / Anthropic
 
@@ -756,7 +814,7 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 | Page | Content |
 | --- | --- |
 | Activity | Traffic charts, and a searchable log for a time range chosen in the Log header (Last hour, Last 6 hours, Today, Yesterday or a custom From–To range; newest first, 500 rows per page with Load More for older entries; the range is read once and reused by filters and searches); click a request for all fields |
-| Settings | Launch at Login, auto-start, keep running after quit, appearance, config file status and `--check` equivalent, log folder |
+| Settings | Launch at Login, auto-start, keep running after quit, appearance, proxy port credential routing, config file status and `--check` equivalent, log folder |
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the
 search condition dropdown for Keyword (all string fields), Path (contains),

@@ -29,6 +29,11 @@ use url::Url;
 
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
+enum Tunnel {
+    Open(crate::tunnel::Socket),
+    Decrypt(Arc<crate::credential_proxy::Destination>),
+}
+
 /// A decrypted client connection; routing happens after local TLS termination.
 pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientStream for T {}
@@ -68,6 +73,9 @@ pub struct Server {
     account_checks: tokio::sync::Mutex<HashMap<String, AccountCheck>>,
     credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    credential_proxy: Option<crate::credential_proxy::CredentialProxy>,
+    /// The bound port, which absolute-form requests name to address this listener.
+    local_port: std::sync::OnceLock<u16>,
 }
 impl Server {
     pub fn new(config: Config, logger: Arc<Logger>) -> Self {
@@ -80,11 +88,21 @@ impl Server {
             account_checks: tokio::sync::Mutex::new(HashMap::new()),
             credential_checks: Default::default(),
             tls: None,
+            credential_proxy: None,
+            local_port: std::sync::OnceLock::new(),
         }
     }
     /// Also accept TLS on the listening port; plain HTTP keeps working.
     pub fn with_tls(mut self, tls: tokio_rustls::TlsAcceptor) -> Self {
         self.tls = Some(tls);
+        self
+    }
+    /// Decrypt CONNECT tunnels to credential-routed API hosts.
+    pub fn with_credential_proxy(
+        mut self,
+        proxy: crate::credential_proxy::CredentialProxy,
+    ) -> Self {
+        self.credential_proxy = Some(proxy);
         self
     }
 
@@ -420,6 +438,15 @@ impl Server {
         Ok(())
     }
     pub async fn startup_log(&self) {
+        if let Some(proxy) = &self.credential_proxy {
+            self.logger.write(
+                "credential_proxy",
+                json!({"destinations": proxy.authorities()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
         for (label, source) in &self.config.codex.account_sources() {
             match self
                 .config
@@ -488,14 +515,31 @@ impl Server {
         self: Arc<Self>,
         mut incoming: Request<Incoming>,
         relay: tokio::sync::mpsc::UnboundedSender<Relay>,
+        destination: Option<Arc<crate::credential_proxy::Destination>>,
     ) -> std::result::Result<Response<Body>, Infallible> {
-        let target = incoming
+        let mut target = incoming
             .uri()
             .path_and_query()
             .map(|v| v.as_str())
             .unwrap_or("/")
             .to_owned();
-        if incoming.method() == "GET" && target == "/health" {
+        // Absolute-form targets (RFC 9112, section 3.2.2) are served when they
+        // name this listener, or inside a decrypted CONNECT its destination;
+        // proxy clients send them for loopback base URLs. Other absolute-form
+        // targets would be plain HTTP forwarding, which is not offered.
+        let connect = incoming.method() == "CONNECT";
+        let origin_form = incoming.uri().scheme().is_none() && incoming.uri().authority().is_none();
+        let addressed_here =
+            !origin_form && !connect && self.addressed_here(incoming.uri(), destination.as_deref());
+        let valid = match &destination {
+            // Inside a decrypted CONNECT, targets take the explicit upstream form.
+            Some(_) => !connect && (origin_form && target.starts_with('/') || addressed_here),
+            None => connect || origin_form || addressed_here,
+        };
+        if let Some(destination) = destination.as_ref().filter(|_| valid) {
+            target = format!("{}{target}", destination.scope);
+        }
+        if valid && destination.is_none() && incoming.method() == "GET" && target == "/health" {
             return Ok(response(200, "{\"ok\":true}"));
         }
         let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
@@ -504,12 +548,40 @@ impl Server {
             log.field("model_transport", "http");
         }
         crate::request_ids::headers(incoming.headers(), &mut log.fields);
+        if let Some(destination) = &destination {
+            log.field(
+                "client_connect",
+                destination.scope.rsplit("://").next().unwrap_or(""),
+            );
+        }
         log.event("request_received");
+        if !valid {
+            return Ok(reject(
+                &mut log,
+                Error::new(
+                    400,
+                    if destination.is_some() {
+                        "Requests in a decrypted tunnel must target its destination."
+                    } else if self.credential_proxy.is_none() {
+                        "Absolute-form requests require proxy port credential routing; use origin-form base URLs."
+                    } else {
+                        "Plain HTTP proxy requests are only served for this listener; use CONNECT for other destinations."
+                    },
+                ),
+            ));
+        }
         if incoming.method() == "CONNECT" {
             log.field("service", "connect");
             let upstream = self.connect(&incoming, &mut log).await;
             return Ok(match upstream {
-                Ok(upstream) => {
+                Ok(Tunnel::Decrypt(destination)) => {
+                    log.status = 200;
+                    log.field("routing", "credential");
+                    let upgraded = hyper::upgrade::on(&mut incoming);
+                    let _ = relay.send(self.clone().decrypt(upgraded, destination, log));
+                    Response::builder().status(200).body(empty()).unwrap()
+                }
+                Ok(Tunnel::Open(upstream)) => {
                     log.status = 200;
                     let upgraded = hyper::upgrade::on(&mut incoming);
                     let _ = relay.send(relay_stream(
@@ -680,14 +752,8 @@ impl Server {
         if incoming.headers().contains_key("expect") {
             return Err(Error::new(417, "Expect is unsupported."));
         }
-        if incoming.method() == "CONNECT"
-            || incoming.uri().scheme().is_some()
-            || incoming.uri().authority().is_some()
-        {
-            return Err(Error::new(
-                400,
-                "Only origin-form HTTP request targets are supported.",
-            ));
+        if incoming.method() == "CONNECT" {
+            return Err(Error::new(400, "Invalid CONNECT request."));
         }
         let codex_scoped = target.starts_with("/codex/https://");
         let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
@@ -957,11 +1023,7 @@ impl Server {
         .await
     }
 
-    async fn connect(
-        &self,
-        incoming: &Request<Incoming>,
-        log: &mut RequestLog,
-    ) -> Result<crate::tunnel::Socket> {
+    async fn connect(&self, incoming: &Request<Incoming>, log: &mut RequestLog) -> Result<Tunnel> {
         if incoming.uri().scheme().is_some()
             || incoming.uri().path_and_query().is_some()
             || incoming.headers().contains_key("transfer-encoding")
@@ -978,6 +1040,14 @@ impl Server {
             .authority()
             .ok_or(Error::new(400, "CONNECT requires host:port."))?;
         let (host, port) = crate::tunnel::authority(authority.as_str())?;
+        if let Some(destination) = self
+            .credential_proxy
+            .as_ref()
+            .and_then(|proxy| proxy.destination(&host, port))
+        {
+            log.field("destination", format!("{host}:{port}"));
+            return Ok(Tunnel::Decrypt(destination));
+        }
         let choice = self
             .config
             .connect
@@ -1002,6 +1072,91 @@ impl Server {
             log,
         )
         .await
+        .map(Tunnel::Open)
+    }
+
+    /// Whether an absolute-form target names this listener on a loopback
+    /// address or, inside a decrypted CONNECT, that tunnel's destination.
+    /// Both apply only while the listener serves as a proxy port.
+    fn addressed_here(
+        &self,
+        uri: &hyper::Uri,
+        destination: Option<&crate::credential_proxy::Destination>,
+    ) -> bool {
+        let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
+            return false;
+        };
+        if self.credential_proxy.is_none() {
+            return false;
+        }
+        let default_port = if scheme.eq_ignore_ascii_case("https") {
+            443
+        } else if scheme.eq_ignore_ascii_case("http") {
+            80
+        } else {
+            return false;
+        };
+        if authority.as_str().contains('@') {
+            return false;
+        }
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let port = authority.port_u16().unwrap_or(default_port);
+        match destination {
+            Some(d) => default_port == 443 && host == d.host && port == d.port,
+            None => {
+                port == self
+                    .local_port
+                    .get()
+                    .copied()
+                    .unwrap_or(self.config.listen_port)
+                    && (host == "localhost"
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback()))
+            }
+        }
+    }
+
+    /// Terminate the client's TLS inside an accepted CONNECT with the proxy
+    /// CA, then serve its requests under the destination's explicit scope.
+    fn decrypt(
+        self: Arc<Self>,
+        upgrade: hyper::upgrade::OnUpgrade,
+        destination: Arc<crate::credential_proxy::Destination>,
+        mut log: RequestLog,
+    ) -> Relay {
+        Box::pin(async move {
+            let handshake = async {
+                let downstream = upgrade.await.ok()?;
+                destination
+                    .acceptor
+                    .accept(TokioIo::new(downstream))
+                    .await
+                    .ok()
+            };
+            match tokio::time::timeout(Duration::from_secs(30), handshake).await {
+                Ok(Some(tls)) => {
+                    log.outcome = "request_finished";
+                    drop(log);
+                    self.serve_http(tls, Some(destination)).await;
+                }
+                result => {
+                    log.outcome = "request_failed";
+                    log.field(
+                        "reason",
+                        if result.is_err() {
+                            "client_tls_timeout"
+                        } else {
+                            "client_tls_failed"
+                        },
+                    );
+                }
+            }
+        })
     }
 
     async fn forward_token_refresh(
@@ -1060,6 +1215,9 @@ impl Server {
         shutdown: impl std::future::Future<Output = ()>,
         handler: Option<ConnectionHandler>,
     ) -> std::io::Result<()> {
+        if let Ok(address) = listener.local_addr() {
+            let _ = self.local_port.set(address.port());
+        }
         let limit = Arc::new(Semaphore::new(128));
         let mut tasks = tokio::task::JoinSet::new();
         let monitor = self.monitor_probes();
@@ -1120,45 +1278,62 @@ impl Server {
         }
     }
 
-    pub async fn connection<S>(self: Arc<Self>, mut socket: S)
+    pub async fn connection<S>(self: Arc<Self>, socket: S)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let prefix = match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket))
-            .await
-        {
-            Ok(Ok(prefix)) => prefix,
-            result => {
-                let status = match result {
-                    Ok(Err(e)) => e.status,
-                    _ => 408,
-                };
-                use tokio::io::AsyncWriteExt;
-                let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
-                close_http(&mut socket).await;
-                return;
+        self.serve_http(socket, None).await
+    }
+
+    /// Boxed, since a decrypted CONNECT serves its own connection from a relay.
+    fn serve_http<S>(
+        self: Arc<Self>,
+        mut socket: S,
+        destination: Option<Arc<crate::credential_proxy::Destination>>,
+    ) -> Relay
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Box::pin(async move {
+            let prefix = match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket))
+                .await
+            {
+                Ok(Ok(prefix)) => prefix,
+                result => {
+                    let status = match result {
+                        Ok(Err(e)) => e.status,
+                        _ => 408,
+                    };
+                    use tokio::io::AsyncWriteExt;
+                    let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
+                    close_http(&mut socket).await;
+                    return;
+                }
+            };
+            let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
+            // Keep Hyper's upgrade handshake intact. Disabling keep-alive
+            // overwrites Connection: Upgrade with Connection: close.
+            // Ordinary HTTP responses explicitly send Connection: close.
+            let mut connection = http1::Builder::new()
+                .max_buf_size(65536)
+                .timer(TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(30))
+                .serve_connection(
+                    TokioIo::new(PrefixedSocket { prefix, socket }),
+                    service_fn(move |r| {
+                        self.clone()
+                            .handle(r, relay_tx.clone(), destination.clone())
+                    }),
+                )
+                .with_upgrades();
+            let _ = (&mut connection).await;
+            if let Some(parts) = connection.into_parts() {
+                close_http(&mut parts.io.into_inner()).await;
             }
-        };
-        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
-        // Keep Hyper's upgrade handshake intact. Disabling keep-alive
-        // overwrites Connection: Upgrade with Connection: close.
-        // Ordinary HTTP responses explicitly send Connection: close.
-        let mut connection = http1::Builder::new()
-            .max_buf_size(65536)
-            .timer(TokioTimer::new())
-            .header_read_timeout(Duration::from_secs(30))
-            .serve_connection(
-                TokioIo::new(PrefixedSocket { prefix, socket }),
-                service_fn(move |r| self.clone().handle(r, relay_tx.clone())),
-            )
-            .with_upgrades();
-        let _ = (&mut connection).await;
-        if let Some(parts) = connection.into_parts() {
-            close_http(&mut parts.io.into_inner()).await;
-        }
-        if let Ok(relay) = relay_rx.try_recv() {
-            relay.await;
-        }
+            if let Ok(relay) = relay_rx.try_recv() {
+                relay.await;
+            }
+        })
     }
 }
 

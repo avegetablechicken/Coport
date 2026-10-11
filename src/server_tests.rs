@@ -197,7 +197,14 @@ async fn running(config: &str) -> Running {
     if config.codex.homes == crate::config::default_codex_homes() {
         config.codex.homes = isolated("codex");
     }
-    let server = Arc::new(Server::new(config, logger));
+    let credential_proxy =
+        crate::credential_proxy::CredentialProxy::prepare(&config, &temp.path().join("tls"))
+            .unwrap();
+    let mut server = Server::new(config, logger);
+    if let Some(proxy) = credential_proxy {
+        server = server.with_credential_proxy(proxy);
+    }
+    let server = Arc::new(server);
     // Routing fixtures drive diagnostics explicitly after installing test TLS
     // trust; background profile I/O would race their request assertions.
     *server.credential_checks.lock().await = Some((tokio::time::Instant::now(), Vec::new()));
@@ -2942,4 +2949,239 @@ async fn statistics_preserve_aged_claude_identity() {
         "statistics invalidated request cache: retained={retained}, sent_lookup={sent_lookup}, has_label={}",
         labels.contains_key(&("Claude".into(), "remote-account".into()))
     );
+}
+
+fn proxy_port_client(running: &Running) -> reqwest::Client {
+    let ca = std::fs::read(
+        running
+            ._temp
+            .path()
+            .join("tls")
+            .join(crate::local_tls::PROXY_CA_FILE),
+    )
+    .unwrap();
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .proxy(reqwest::Proxy::https(&running.url).unwrap())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+// Synthetic upstream.invalid stays on loopback; the client trusts only the
+// generated proxy CA, which must vouch for the decrypted destination.
+#[tokio::test]
+async fn proxy_port_requests_are_routed_by_credential() {
+    let mut fixture = fixture("http", "oauth_json").await;
+    let port = fixture.addr.port();
+    let dirs = tempfile::tempdir().unwrap();
+    for label in ["a", "b"] {
+        let home = dirs.path().join(label);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".credentials.json"),
+            json!({"claudeAiOauth":{"accessToken":format!("token-{label}")}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            json!({"oauthAccount":{"accountUuid":label,"emailAddress":format!("{label}@example.invalid")}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let dir = |label: &str| serde_json::to_string(&dirs.path().join(label)).unwrap();
+    let opaque = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let opaque_port = opaque.local_addr().unwrap().port();
+    let running = running(&format!(
+        "connect_credential_routing: true\nproxies:\n  pa: http://a:x@127.0.0.1:{port}\n  pb: http://b:y@127.0.0.1:{port}\nconnect:\n  127.0.0.1:{opaque_port}: none\nclaude:\n  config_dirs: [{}, {}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      a@example.invalid: pa\n      b@example.invalid: pb\n",
+        dir("a"),
+        dir("b")
+    ))
+    .await;
+    for endpoint in ["a:x", "b:y"] {
+        trust(
+            &running,
+            &fixture,
+            &format!("http://{endpoint}@127.0.0.1:{port}"),
+        );
+    }
+    let client = proxy_port_client(&running);
+    for (token, authorization) in [("token-a", "YTp4"), ("token-b", "Yjp5")] {
+        let response = client
+            .get("https://upstream.invalid/api/oauth/usage?scope=all")
+            .bearer_auth(token)
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(value["five_hour"]["utilization"], 42);
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(
+            connect.starts_with("CONNECT upstream.invalid:443"),
+            "{connect}"
+        );
+        assert!(
+            connect.contains(&format!("Proxy-Authorization: Basic {authorization}")),
+            "{connect}"
+        );
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(
+            request.starts_with("GET /api/oauth/usage?scope=all "),
+            "{request}"
+        );
+        assert!(request.contains(&format!("authorization: Bearer {token}")));
+    }
+    // An unmatched login is rejected locally, before any outbound connection.
+    let response = client
+        .get("https://upstream.invalid/v1/messages")
+        .bearer_auth("token-unknown")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error(), "{}", response.status());
+    // Other destinations keep their opaque CONNECT routes or remain denied.
+    let opaque_destination = format!("127.0.0.1:{opaque_port}");
+    for (destination, status) in [
+        (opaque_destination.as_str(), "HTTP/1.1 200"),
+        ("other.invalid:443", "HTTP/1.1 403"),
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with(status), "{destination}: {head}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn decrypted_tunnels_only_serve_their_destination() {
+    let running = running(
+        "connect_credential_routing: true\nclaude:\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: none\n",
+    )
+    .await;
+    use rustls::pki_types::pem::PemObject;
+    let ca = running
+        ._temp
+        .path()
+        .join("tls")
+        .join(crate::local_tls::PROXY_CA_FILE);
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from_pem_file(ca).unwrap())
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    ));
+    for (request, status) in [
+        (
+            "CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n",
+            "400",
+        ),
+        (
+            "GET https://other.invalid/v1/models HTTP/1.1\r\nHost: other.invalid\r\n\r\n",
+            "400",
+        ),
+        // Absolute-form naming the tunnel's own destination is routed as usual.
+        (
+            "GET https://upstream.invalid/v1/models HTTP/1.1\r\nHost: upstream.invalid\r\n\r\n",
+            "401",
+        ),
+        // Local endpoints stay on the listener itself, not inside tunnels.
+        (
+            "GET /health HTTP/1.1\r\nHost: upstream.invalid\r\n\r\n",
+            "401",
+        ),
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                b"CONNECT upstream.invalid:443 HTTP/1.1\r\nHost: upstream.invalid:443\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_response_head(&mut socket)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        let name = rustls::pki_types::ServerName::try_from("upstream.invalid").unwrap();
+        let mut tls = connector.connect(name, socket).await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{request}: {response}"
+        );
+    }
+}
+
+// Proxy clients (Copool with chatgpt_base_url on this listener) send loopback
+// base URLs through the proxy as absolute-form requests naming the listener.
+// They are served only while the listener is used as a proxy port.
+#[tokio::test]
+async fn absolute_form_requests_are_served_only_for_this_proxy_port() {
+    let routes = "claude:\n  routing:\n    account_fallback: none\n";
+    for enabled in [true, false] {
+        let running = running(&format!("connect_credential_routing: {enabled}\n{routes}")).await;
+        let address = running.url.trim_start_matches("http://").to_owned();
+        let port = address.rsplit(':').next().unwrap().to_owned();
+        let served = |status: &'static str| if enabled { status } else { "400" };
+        for (target, status) in [
+            (format!("http://{address}/health"), served("200")),
+            (format!("http://localhost:{port}/health"), served("200")),
+            (
+                format!("HTTP://127.0.0.1:{port}/backend-api/wham/usage"),
+                served("401"),
+            ),
+            (
+                format!("http://127.0.0.1:{port}/backend-api/wham/usage?x=1"),
+                served("401"),
+            ),
+            ("http://example.invalid/health".to_owned(), "400"),
+            ("http://127.0.0.1:9/health".to_owned(), "400"),
+            (format!("http://user@127.0.0.1:{port}/health"), "400"),
+        ] {
+            let mut socket = tokio::net::TcpStream::connect(&address).await.unwrap();
+            socket
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: ignored\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let head = read_response_head(&mut socket).await;
+            assert!(
+                head.starts_with(&format!("HTTP/1.1 {status}")),
+                "{enabled} {target}: {head}"
+            );
+        }
+        // Origin-form base URL requests are unaffected by the setting.
+        let response = http()
+            .get(format!("{}/health", running.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
 }
