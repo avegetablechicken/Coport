@@ -217,7 +217,8 @@ async function refresh() {
   ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
-  if (ui.page === "main" && Date.now() - ui.homeTrafficFetchedAt >= 15000) loadHomeTraffic();
+  // Switching forwarding on or off changes which source Home reads at once.
+  if (ui.page === "main" && (Date.now() - ui.homeTrafficFetchedAt >= 15000 || (ui.homeTraffic?.device ?? null) !== homeTrafficDevice())) loadHomeTraffic();
   if (ui.page === "activity") scheduleActivityLog();
   render();
 }
@@ -437,7 +438,7 @@ function stat(label, value, cls = "") {
 
 function main() {
   if (ui.snap.forwarding) {
-    return remoteForwardingBlock() + connectBlock() + `<details class="disclosure"><summary>${ICON.chevron}Local proxy configuration and history (inactive)</summary>${[trafficBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("")}</details>`;
+    return remoteForwardingBlock() + connectBlock() + trafficBlock() + `<details class="disclosure"><summary>${ICON.chevron}Local proxy configuration and history (inactive)</summary>${[recentBlock(), proxiesBlock(), routingBlock()].join("")}</details>`;
   }
   return [proxyBlock(), connectBlock(), trafficBlock(), recentBlock(), proxiesBlock(), routingBlock()].join("");
 }
@@ -454,13 +455,6 @@ function remoteForwardingBlock() {
   else if (health.recoveredAt && Date.now() - health.recoveredAt < 120000) body += message("info", `Connection restored at ${esc(stamp(health.recoveredAt))}.`);
   const traffic = target.traffic || {};
   body += `<div class="block-head"><span class="block-title">This forwarding session</span></div><div class="row"><span class="row-label">Connections / active / failed</span><span class="row-value">${traffic.connections || 0} / ${traffic.active || 0} / ${traffic.failures || 0}</span></div><div class="row"><span class="row-label">Upload / download</span><span class="row-value">${fmtBytes(traffic.uploadBytes || 0)} / ${fmtBytes(traffic.downloadBytes || 0)}</span></div><div class="row"><span class="row-label">Upload / download speed</span><span class="row-value">${fmtBytes(traffic.uploadBytesPerSecond || 0)}/s / ${fmtBytes(traffic.downloadBytesPerSecond || 0)}/s</span></div>`;
-  const remote = target.remoteTraffic;
-  body += `<div class="block-head"><span class="block-title">Remote device · all requests · 30 min</span></div>`;
-  if (remote) {
-    const stale = Date.now() - remote.fetchedAt > 90000 || target.remoteTrafficError;
-    body += `<div class="row"><span class="row-label">Requests / error rate</span><span class="row-value">${remote.requests} / ${remote.requests ? (remote.errors / remote.requests * 100).toFixed(1) : "0.0"}%</span></div><div class="placeholder">Includes other clients on ${esc(target.name)}. Updated ${esc(stamp(remote.fetchedAt))}${stale ? " · stale" : ""}.</div>`;
-  } else body += `<div class="placeholder">${target.remoteTrafficError ? "Remote statistics unavailable" : "Loading remote statistics…"}</div>`;
-  if (target.remoteTrafficError) body += message("warn", esc(target.remoteTrafficError));
   return block("SSH forwarding", "", body);
 }
 
@@ -558,6 +552,12 @@ function rememberLocalTraffic(traffic, minutes, scope) {
   };
 }
 
+/// Home shows the forwarded device's traffic while SSH forwarding is on, else
+/// this machine's. Devices always reads this machine's for its local cache.
+function homeTrafficDevice() {
+  return ui.page === "devices" ? null : ui.snap?.forwarding?.deviceId ?? null;
+}
+
 async function loadHomeTraffic(force = false) {
   if (ui.homeTrafficLoading && !force) return;
   const request = ++ui.homeTrafficRequest;
@@ -565,11 +565,22 @@ async function loadHomeTraffic(force = false) {
   // As on the Activity page, stats follow the category their data was read for.
   const scope = ui.trafficScope;
   const minutes = ui.homeTrafficMinutes;
+  const device = homeTrafficDevice();
   try {
-    const traffic = await invoke("get_traffic", { minutes, scope });
-    if (request !== ui.homeTrafficRequest) return;
-    rememberLocalTraffic(traffic, minutes, scope);
-    ui.homeTraffic = { ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, scope };
+    if (device) {
+      // Answered from the daemon's last forwarding summary; nothing is contacted.
+      const remote = await invoke("get_forwarding_traffic", { minutes, scope });
+      if (request !== ui.homeTrafficRequest) return;
+      ui.homeTraffic = {
+        ...remote.traffic, start: remote.windowStart, end: remote.windowEnd, bucketMinutes: remote.bucketMinutes, scope,
+        device: remote.deviceId, deviceName: remote.name, fetchedAt: remote.fetchedAt, remoteError: remote.error,
+      };
+    } else {
+      const traffic = await invoke("get_traffic", { minutes, scope });
+      if (request !== ui.homeTrafficRequest) return;
+      rememberLocalTraffic(traffic, minutes, scope);
+      ui.homeTraffic = { ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, scope, device: null };
+    }
     ui.homeTrafficError = "";
     ui.homeTrafficFetchedAt = Date.now();
   } catch (error) {
@@ -582,9 +593,11 @@ async function loadHomeTraffic(force = false) {
 }
 
 function trafficBlock() {
-  const st = ui.homeTraffic;
+  // Traffic read for another source (this machine or a former destination) is not shown.
+  const st = ui.homeTraffic && (ui.homeTraffic.device ?? null) === homeTrafficDevice() ? ui.homeTraffic : null;
   const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
-  if (!st) return block("Traffic", range, `<div class="placeholder">${esc(ui.homeTrafficError || "Loading traffic…")}</div>`);
+  const error = ui.homeTrafficError === "TRAFFIC_UPDATING" ? "" : ui.homeTrafficError || st?.remoteError || "";
+  if (!st) return block("Traffic", range, `<div class="placeholder">${esc(error || "Loading traffic…")}</div>`);
   let rate = "—";
   let rateClass = "";
   if (st.requests) {
@@ -596,14 +609,15 @@ function trafficBlock() {
     "Traffic",
     range,
     `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
-     ${ui.homeTrafficError ? `<span class="traffic-update-error" title="${esc(ui.homeTrafficError)}">Update failed</span>` : ""}
-     ${chart(st, st.scope)}
+     ${error ? `<span class="traffic-update-error" title="${esc(error)}">Update failed</span>` : ""}
+     ${trafficShare(st.credentials ?? [], st.scope)}${chart(st, st.scope)}
      <div class="strip">
        ${stat(st.scope === "model" ? "Calls" : "Requests", st.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(st.avgMs))}
        ${stat("Received", fmtBytes(st.bytes))}
-     </div>${modelTokenStats(st, st.scope)}</div>`
+     </div>${modelTokenStats(st, st.scope)}
+     ${st.device ? `<div class="placeholder">Includes other clients on ${esc(st.deviceName)}. Updated ${esc(new Date(st.fetchedAt).toLocaleTimeString())}${Date.now() - st.fetchedAt > 90000 || st.remoteError ? " · stale" : ""}.</div>` : ""}</div>`
   );
 }
 

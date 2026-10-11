@@ -100,6 +100,7 @@ fn main() {
             commands::set_forwarding_restore,
             commands::get_device_capabilities,
             commands::get_merged_data,
+            commands::get_forwarding_traffic,
             commands::save_device,
             commands::remove_device,
             commands::get_activity,

@@ -119,11 +119,12 @@ test('home traffic keeps the category it was read for', async () => {
   vm.runInContext(source.slice(source.indexOf('async function loadHomeTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
   const load = context.loadHomeTraffic();
   ui.trafficScope = 'model';
-  pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, summary: { requests: 3 } });
+  pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, summary: { requests: 3 }, credentials: [credential('a', 3)] });
   await load;
   assert.equal(pending[0].query.scope, 'all');
   assert.equal(ui.homeTraffic.scope, 'all');
   assert.equal(ui.homeTraffic.requests, 3);
+  assert.deepEqual(plain(ui.homeTraffic.credentials.map((c) => [c.credential, c.requests])), [['a', 3]]);
   for (const stats of [ui.homeTraffic, ui.localTrafficViews['30:all']]) {
     assert.equal(stats.start, 1000);
     assert.equal(stats.end, 181000);
@@ -355,4 +356,66 @@ test('every bucket in an idle chart retains its one-pixel baseline in both scope
     assert.equal((html.match(/class="chart-hit"/g) || []).length, 3);
     assert.doesNotMatch(html, /class="err"/);
   }
+});
+test('home traffic draws the share ring above its chart', () => {
+  const context = setup('all');
+  context.ui.homeTraffic = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
+  Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nfunction rememberLocalTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  const html = context.trafficBlock();
+  assert.match(html, /class="traffic-share"[\s\S]*class="chart"/);
+  assert.match(html, /\[Codex\][\s\S]*\[Claude\]/);
+  // Before credentials arrive, the block still renders without a ring.
+  delete context.ui.homeTraffic.credentials;
+  assert.doesNotMatch(context.trafficBlock(), /traffic-share/);
+});
+test('forwarding Home reads the destination from the daemon cache, never local history', async () => {
+  const calls = [];
+  const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 360, page: 'main', snap: { forwarding: { deviceId: 'ms', name: 'MS' } } };
+  const remote = {
+    deviceId: 'ms', name: 'MS', fetchedAt: Date.now(), error: null, scope: 'all', windowStart: 0, windowEnd: 21600000, bucketMinutes: 10,
+    traffic: { requests: 5, errors: 1, avgMs: 20, bytes: 9, counts: [5], errorCounts: [1], tokenCounts: [0], credentials: [credential('remote-account', 5)] },
+  };
+  const context = { ui, render() {}, invoke: async (command, args) => { calls.push([command, args]); return remote; } };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function rememberLocalTraffic('), source.indexOf('\nfunction trafficBlock(')), context);
+  await context.loadHomeTraffic();
+  assert.deepEqual(plain(calls), [['get_forwarding_traffic', { minutes: 360, scope: 'all' }]]);
+  // A remote view must not enter this machine's cache used by Devices.
+  assert.equal(ui.localTrafficViews, undefined);
+  assert.equal(ui.homeTraffic.device, 'ms');
+  assert.deepEqual([ui.homeTraffic.start, ui.homeTraffic.end, ui.homeTraffic.bucketMinutes], [0, 21600000, 10]);
+  // Devices still reads this machine while forwarding.
+  ui.page = 'devices';
+  await context.loadHomeTraffic();
+  assert.equal(calls[1][0], 'get_traffic');
+});
+test('forwarding Home Traffic labels the destination and hides another source', () => {
+  const context = setup('all');
+  vm.runInContext(source.slice(source.indexOf('function homeTrafficDevice('), source.indexOf('async function loadHomeTraffic(')), context);
+  Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '' });
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nfunction rememberLocalTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  const { ui } = context;
+  ui.page = 'main';
+  ui.snap = { forwarding: { deviceId: 'ms' } };
+  ui.homeTrafficError = '';
+  // Local history read before forwarding started is not shown as the destination's.
+  ui.homeTraffic = { requests: 7, errors: 0, counts: [7], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('local', 7)], device: null };
+  assert.match(context.trafficBlock(), /Loading traffic…/);
+  ui.homeTraffic = { requests: 5, errors: 0, counts: [5], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('remote-account', 5)], device: 'ms', deviceName: 'MS', fetchedAt: Date.now(), remoteError: null };
+  let html = context.trafficBlock();
+  assert.match(html, /class="traffic-share"[\s\S]*remote-account/);
+  assert.match(html, /Includes other clients on MS/);
+  assert.doesNotMatch(html, /stale|Update failed/);
+  // A failed later read keeps the last window, marked stale.
+  ui.homeTraffic.remoteError = 'statistics offline';
+  html = context.trafficBlock();
+  assert.match(html, /stale/);
+  assert.match(html, /Update failed/);
+  // Before the daemon's first summary, the block waits instead of reporting failure.
+  ui.homeTraffic = null;
+  ui.homeTrafficError = 'TRAFFIC_UPDATING';
+  assert.match(context.trafficBlock(), /Loading traffic…/);
 });

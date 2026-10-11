@@ -19,7 +19,7 @@ use tokio::{
 #[path = "forwarding_status.rs"]
 mod telemetry;
 use telemetry::{Active, CountWriter, Counters};
-pub use telemetry::{Health, RemoteTraffic, Traffic};
+pub use telemetry::{Health, RemoteTraffic, RemoteWindow, Traffic};
 
 const READY: &[u8] = b"COPORT-FORWARD/1\n";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
@@ -244,6 +244,9 @@ struct Metadata {
     capabilities: Option<crate::remote::Capabilities>,
     capabilities_error: Option<String>,
     traffic: Option<RemoteTraffic>,
+    /// The summary behind `traffic`, kept so Home can show any range without
+    /// another SSH read.
+    summary: Option<Arc<crate::data_api::Summary>>,
     traffic_error: Option<String>,
     traffic_checked_at: Option<u64>,
 }
@@ -393,6 +396,35 @@ impl Routing {
             }
         })
     }
+    /// Answers from the monitor's last summary only; never contacts the device.
+    pub fn traffic_window(
+        &self,
+        minutes: u64,
+        scope: crate::traffic::TrafficScope,
+    ) -> Result<RemoteWindow, String> {
+        let mode = self.mode.borrow();
+        let target = mode.target.as_ref().ok_or("SSH forwarding is off")?;
+        let metadata = mode.metadata.lock().unwrap();
+        let (Some(summary), Some(traffic)) = (&metadata.summary, &metadata.traffic) else {
+            return Err(metadata
+                .traffic_error
+                .clone()
+                .unwrap_or_else(|| "TRAFFIC_UPDATING".into()));
+        };
+        let window = summary
+            .windows
+            .iter()
+            .find(|w| w.minutes == minutes && w.scope == scope)
+            .ok_or("Update this device's Coport to read this traffic range/category.")?;
+        Ok(RemoteWindow {
+            device_id: target.device_id.clone(),
+            name: target.name.clone(),
+            fetched_at: traffic.fetched_at,
+            error: metadata.traffic_error.clone(),
+            node_id: summary.node_id.clone(),
+            window: window.clone(),
+        })
+    }
     pub async fn set(&self, target: Option<Target>) -> Result<(), String> {
         let _guard = self.updates.lock().await;
         let mode = Arc::new(Mode::new(target.clone()));
@@ -456,9 +488,12 @@ impl Routing {
                                 Err(error) => metadata.capabilities_error = Some(error),
                             }
                             metadata.traffic_checked_at = Some(telemetry::now_ms());
-                            match summary.and_then(RemoteTraffic::from_summary) {
-                                Ok(value) => {
+                            match summary.and_then(|summary| {
+                                RemoteTraffic::from_summary(&summary).map(|value| (value, summary))
+                            }) {
+                                Ok((value, summary)) => {
                                     metadata.traffic = Some(value);
+                                    metadata.summary = Some(Arc::new(summary));
                                     metadata.traffic_error = None;
                                 }
                                 Err(error) => metadata.traffic_error = Some(error),
@@ -860,5 +895,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(serve_stdio(dir.path()).await.is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn traffic_window_answers_from_the_last_summary_only() {
+        use crate::data_api::{Group, RANGES, Stats, Summary, Window, bucket_minutes};
+        use crate::traffic::TrafficScope;
+        let routing = Routing::default();
+        assert_eq!(
+            routing.traffic_window(30, TrafficScope::All).unwrap_err(),
+            "SSH forwarding is off"
+        );
+        routing.mode.send_replace(Arc::new(Mode::new(Some(Target {
+            device_id: "ms".into(),
+            name: "MS".into(),
+            connection: Device {
+                name: "test".into(),
+                host: "test-host".into(),
+                binary: "coportd".into(),
+            },
+        }))));
+        // Before the monitor's first summary, Home waits rather than reading the device.
+        assert_eq!(
+            routing.traffic_window(30, TrafficScope::All).unwrap_err(),
+            "TRAFFIC_UPDATING"
+        );
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut summary = Summary {
+            schema_version: 2,
+            node_id: uuid::Uuid::new_v4().to_string(),
+            window_start: end - 30 * 60_000,
+            window_end: end,
+            bucket_minutes: 1,
+            groups: Vec::new(),
+            windows: Vec::new(),
+            previous_windows: Vec::new(),
+        };
+        for minutes in RANGES {
+            for scope in [TrafficScope::Model, TrafficScope::All] {
+                let bucket = bucket_minutes(minutes).unwrap();
+                let buckets = (minutes / bucket) as usize;
+                let mut counts = vec![0; buckets];
+                counts[0] = minutes;
+                summary.windows.push(Window {
+                    minutes,
+                    scope,
+                    window_start: end - (minutes * 60_000) as i64,
+                    window_end: end,
+                    bucket_minutes: bucket,
+                    groups: vec![Group {
+                        service: crate::data_api::Service::Codex,
+                        proxy_ref: "a".repeat(64),
+                        upstream_ref: "b".repeat(64),
+                        account_ref: None,
+                        stats: Stats {
+                            requests: minutes,
+                            counts,
+                            error_counts: vec![0; buckets],
+                            token_counts: vec![0; buckets],
+                            ..Default::default()
+                        },
+                    }],
+                });
+            }
+        }
+        // The default window mirrors the 30-minute Model window.
+        summary.groups = summary.windows[0].groups.clone();
+        {
+            let mode = routing.mode.borrow().clone();
+            let mut metadata = mode.metadata.lock().unwrap();
+            metadata.traffic = Some(RemoteTraffic::from_summary(&summary).unwrap());
+            metadata.summary = Some(Arc::new(summary));
+            metadata.traffic_error = Some("statistics offline".into());
+        }
+        let window = routing.traffic_window(360, TrafficScope::Model).unwrap();
+        assert_eq!(
+            (window.device_id.as_str(), window.name.as_str()),
+            ("ms", "MS")
+        );
+        assert_eq!(
+            (window.window.minutes, window.window.scope),
+            (360, TrafficScope::Model)
+        );
+        assert_eq!(window.window.groups[0].stats.requests, 360);
+        // A later failed read keeps the last summary and reports the failure.
+        assert_eq!(window.error.as_deref(), Some("statistics offline"));
+        assert!(routing.traffic_window(45, TrafficScope::All).is_err());
+        // A new destination never shows the previous destination's summary.
+        routing.mode.send_replace(Arc::new(Mode::new(Some(Target {
+            device_id: "other".into(),
+            name: "Other".into(),
+            connection: device_for_window(),
+        }))));
+        assert_eq!(
+            routing
+                .traffic_window(360, TrafficScope::Model)
+                .unwrap_err(),
+            "TRAFFIC_UPDATING"
+        );
+    }
+    fn device_for_window() -> Device {
+        Device {
+            name: "other".into(),
+            host: "other-host".into(),
+            binary: "coportd".into(),
+        }
     }
 }

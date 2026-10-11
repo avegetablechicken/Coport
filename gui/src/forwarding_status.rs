@@ -169,7 +169,7 @@ pub struct RemoteTraffic {
     pub bytes: u64,
 }
 impl RemoteTraffic {
-    pub fn from_summary(summary: crate::data_api::Summary) -> Result<Self, String> {
+    pub fn from_summary(summary: &crate::data_api::Summary) -> Result<Self, String> {
         summary.validate()?;
         let window = summary
             .windows
@@ -197,6 +197,19 @@ impl RemoteTraffic {
         }
         Ok(result)
     }
+}
+/// One range and category of the forwarded device's last summary. Upstream and
+/// account references stay hashed; only this machine resolves its own labels.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWindow {
+    pub device_id: String,
+    pub name: String,
+    pub fetched_at: u64,
+    /// The latest read failed; the window is from the last successful one.
+    pub error: Option<String>,
+    pub node_id: String,
+    pub window: crate::data_api::Window,
 }
 #[cfg(test)]
 mod tests {
@@ -252,13 +265,13 @@ mod tests {
                 account_ref: None,
                 stats,
             });
-        let totals = RemoteTraffic::from_summary(summary.clone()).unwrap();
+        let totals = RemoteTraffic::from_summary(&summary).unwrap();
         assert_eq!(
             (totals.requests, totals.errors, totals.bytes),
             (10, 1, 2048)
         );
         summary.window_end -= 3_600_000;
-        assert!(RemoteTraffic::from_summary(summary).is_err());
+        assert!(RemoteTraffic::from_summary(&summary).is_err());
     }
     #[test]
     fn recovery_and_old_results_preserve_the_latest_observation() {

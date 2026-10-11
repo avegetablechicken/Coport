@@ -512,6 +512,55 @@ fn add_groups(
         add_stats(&mut group.stats, stats);
     }
 }
+/// The forwarded device's traffic, labelled as Devices labels that device.
+/// Only this machine's configuration, cached labels and logs are read.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardedTraffic {
+    device_id: String,
+    name: String,
+    fetched_at: u64,
+    error: Option<String>,
+    scope: crate::traffic::TrafficScope,
+    window_start: i64,
+    window_end: i64,
+    bucket_minutes: u64,
+    traffic: TrafficView,
+}
+pub async fn forwarded_traffic(
+    remote: crate::remote_forward::RemoteWindow,
+    config: Config,
+    log: PathBuf,
+    credential_labels: BTreeMap<(String, String), String>,
+) -> Result<ForwardedTraffic, String> {
+    let window = remote.window;
+    let bucket = crate::data_api::bucket_minutes(window.minutes)
+        .filter(|bucket| *bucket == window.bucket_minutes)
+        .ok_or("Invalid remote traffic window")?;
+    let context = prepare_merge_range(config, log, credential_labels, window.minutes).await?;
+    let mut groups = BTreeMap::new();
+    add_groups(
+        &mut groups,
+        &(BTreeMap::new(), BTreeMap::new()),
+        &remote.node_id,
+        &window.groups,
+        &context.accounts,
+    );
+    Ok(ForwardedTraffic {
+        device_id: remote.device_id,
+        name: remote.name,
+        fetched_at: remote.fetched_at,
+        error: remote.error,
+        scope: window.scope,
+        window_start: window.window_start,
+        window_end: window.window_end,
+        bucket_minutes: bucket,
+        traffic: traffic_view(
+            &groups.into_values().collect::<Vec<_>>(),
+            (window.minutes / bucket) as usize,
+        ),
+    })
+}
 pub async fn merge(
     sources: Vec<Source>,
     config: Config,
@@ -3063,5 +3112,104 @@ mod tests {
         assert!(make("https://example.com:8788").validate().is_ok());
         assert!(!lan("8.8.8.8".parse().unwrap()));
         assert!(!lan("169.254.169.254".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn forwarded_traffic_labels_accounts_like_devices_without_connecting_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every upstream route goes through a trap proxy: labelling must never connect.
+        let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = "https://private.example/v1";
+        std::fs::write(dir.path().join("config.toml"), format!("[model_providers.Trap]\nname = \"Trap\"\nbase_url = \"{base}\"\nenv_key = \"FORWARDED_TEST_KEY\"\n")).unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "FORWARDED_TEST_KEY=sk-synthetic-forwarded-0123456789ABCDEFGHIJKLMNOP\n",
+        )
+        .unwrap();
+        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 30\nproxies:\n  trap: http://{}\ncodex:\n  homes: [{}]\n  routing:\n    account: {{'Known local account': trap}}\n    api_key: {{Trap: trap}}\nclaude:\n  config_dirs: []\n", trap.local_addr().unwrap(), serde_json::to_string(dir.path()).unwrap())).unwrap();
+        let labels = config.local_traffic_credential_labels().await;
+        let account = "00000000-0000-4000-8000-000000000123";
+        let log = dir.path().join("proxy.log");
+        let evidence = serde_json::json!({"timestamp":(chrono::Utc::now()-chrono::Duration::minutes(3)).to_rfc3339(),"event":"model_call_finished","service":"codex","model_call_id":"one","account_id":account,"account_label":"Known local account","status":"200"});
+        std::fs::write(&log, format!("{evidence}\n")).unwrap();
+        let provider = config
+            .traffic_provider_references()
+            .await
+            .remove(0)
+            .reference;
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let group = |account_ref: Option<String>, requests: u64| {
+            let mut counts = vec![0; 30];
+            counts[29] = requests;
+            Group {
+                service: Service::Codex,
+                proxy_ref: "a".repeat(64),
+                upstream_ref: "b".repeat(64),
+                account_ref,
+                stats: Stats {
+                    requests,
+                    bytes: requests,
+                    counts,
+                    error_counts: vec![0; 30],
+                    token_counts: vec![0; 30],
+                    ..Default::default()
+                },
+            }
+        };
+        let remote = crate::remote_forward::RemoteWindow {
+            device_id: "ms".into(),
+            name: "MS".into(),
+            fetched_at: 1,
+            error: Some("statistics offline".into()),
+            node_id: uuid::Uuid::new_v4().to_string(),
+            window: crate::data_api::Window {
+                minutes: 30,
+                scope: crate::traffic::TrafficScope::Model,
+                window_start: end - 30 * 60_000,
+                window_end: end,
+                bucket_minutes: 1,
+                groups: vec![
+                    group(crate::data_api::account_reference("Codex", account), 3),
+                    group(Some(provider), 2),
+                    group(None, 1),
+                ],
+            },
+        };
+        let view = forwarded_traffic(remote.clone(), config.clone(), log.clone(), labels.clone())
+            .await
+            .unwrap();
+        let view = serde_json::to_value(view).unwrap();
+        let credentials: Vec<_> = view["traffic"]["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["credential"].as_str().unwrap(),
+                    c["requests"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            credentials,
+            [("Known local account", 3), ("Trap", 2), ("Unidentified", 1)]
+        );
+        assert_eq!(view["traffic"]["requests"], 6);
+        assert_eq!(view["windowEnd"], end);
+        assert_eq!(view["error"], "statistics offline");
+        // A window whose buckets do not match its range is rejected.
+        let mut invalid = remote;
+        invalid.window.bucket_minutes = 10;
+        assert!(
+            forwarded_traffic(invalid, config, log, labels)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), trap.accept())
+                .await
+                .is_err(),
+            "Forwarded traffic must not connect to an upstream"
+        );
     }
 }

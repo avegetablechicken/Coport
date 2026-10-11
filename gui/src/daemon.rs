@@ -19,6 +19,8 @@ use tokio::{
 
 const ENDPOINT: &str = "daemon.json";
 const MAX_MESSAGE: usize = 64 * 1024;
+/// A forwarded traffic window can approach the 1 MiB remote summary it comes from.
+const MAX_RESPONSE: usize = 1024 * 1024;
 const STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const STOP_TIMEOUT: Duration = Duration::from_secs(7);
 
@@ -41,6 +43,8 @@ pub struct Status {
     pub forwarding_supported: bool,
     #[serde(default)]
     pub forwarding: Option<crate::remote_forward::Status>,
+    #[serde(default)]
+    pub forwarding_traffic_supported: bool,
     #[serde(default)]
     pub proxy_probe_supported: bool,
     #[serde(default)]
@@ -77,6 +81,10 @@ enum Action {
     },
     DeviceCapabilities,
     RefreshDeviceCapabilities,
+    ForwardingTraffic {
+        minutes: u64,
+        scope: crate::traffic::TrafficScope,
+    },
     RecordDeviceQuery(crate::device_events::QueryEvent),
 }
 
@@ -97,6 +105,7 @@ enum Response {
     Recorded,
     ForwardingSet,
     DeviceCapabilities(Vec<crate::device_capabilities::Status>),
+    ForwardingTraffic(Box<crate::remote_forward::RemoteWindow>),
     Error(String),
 }
 
@@ -145,6 +154,20 @@ impl Client {
             _ => Err(io::Error::other(
                 "Update the local proxy for automatic capability checks.",
             )),
+        }
+    }
+    /// The forwarded device's statistics as last read by the daemon's monitor.
+    pub async fn forwarding_traffic(
+        &self,
+        minutes: u64,
+        scope: crate::traffic::TrafficScope,
+    ) -> io::Result<crate::remote_forward::RemoteWindow> {
+        match self
+            .request_async(Action::ForwardingTraffic { minutes, scope }, STATUS_TIMEOUT)
+            .await?
+        {
+            Response::ForwardingTraffic(window) => Ok(*window),
+            _ => Err(io::Error::other("Unexpected daemon traffic response")),
         }
     }
     pub async fn set_forwarding_restore(&self, enabled: bool) -> io::Result<()> {
@@ -256,7 +279,7 @@ impl Client {
             stream.write_u32(bytes.len() as u32).await?;
             stream.write_all(&bytes).await?;
             let length = stream.read_u32().await? as usize;
-            if length > MAX_MESSAGE {
+            if length > MAX_RESPONSE {
                 return Err(io::Error::other("Daemon response too large"));
             }
             let mut bytes = vec![0; length];
@@ -313,7 +336,7 @@ impl Client {
         let mut length = [0; 4];
         stream.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if length > MAX_MESSAGE {
+        if length > MAX_RESPONSE {
             return Err(io::Error::other("Daemon response too large"));
         }
         let mut bytes = vec![0; length];
@@ -528,6 +551,10 @@ async fn handle_control(
                 ..Status::clone(&status)
             })),
             Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
+            Action::ForwardingTraffic { minutes, scope } => match routing.traffic_window(minutes, scope) {
+                Ok(window) => Response::ForwardingTraffic(Box::new(window)),
+                Err(error) => Response::Error(error),
+            },
             Action::RefreshDeviceCapabilities => match routing.device_checks.refresh() { Ok(())=>Response::Recorded, Err(error)=>Response::Error(error.to_string()) },
             Action::SetForwardRestore { enabled } => match routing.set_restore(enabled).await {
                 Ok(()) => Response::ForwardingSet,
@@ -689,6 +716,7 @@ async fn serve_until(
         forwarding_restore: false,
         forwarding_supported: true,
         forwarding: None,
+        forwarding_traffic_supported: true,
         proxy_probe_supported: true,
         metadata_supported: true,
         credential_checks_supported: true,
@@ -914,6 +942,7 @@ pub(crate) mod tests {
                     forwarding_restore: false,
                     forwarding_supported: false,
                     forwarding: None,
+                    forwarding_traffic_supported: false,
                     proxy_probe_supported: false,
                     metadata_supported: false,
                     credential_checks_supported: false,

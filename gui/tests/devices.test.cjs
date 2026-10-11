@@ -537,7 +537,9 @@ test('home highlights remote mode and collapses inactive local configuration', (
   assert.match(html, /MS/);
   assert.match(html, /127\.0\.0\.1:8787/);
   assert.match(html, /Client address unchanged/);
-  assert.match(html, /<details[^>]*><summary>Local proxy configuration and history \(inactive\)<\/summary>\[Traffic\]\[Recent\]\[Proxies\]\[Routing\]<\/details>/);
+  // Traffic shows the forwarded device, so it stays outside the inactive local section.
+  assert.match(html, /Client address unchanged[\s\S]*\[Connect\]\[Traffic\]<details[^>]*><summary>Local proxy configuration and history \(inactive\)<\/summary>\[Recent\]\[Proxies\]\[Routing\]<\/details>/);
+  assert.doesNotMatch(html, /Remote device · all requests/);
   assert.doesNotMatch(html, /<details[^>]*open/);
   context.ui.snap.forwarding = null;
   assert.equal(context.main(), '[Proxy][Connect][Traffic][Recent][Proxies][Routing]');
@@ -648,7 +650,7 @@ test('startup SSH checks have at most four connections in flight', async () => {
   assert.equal(maximum, 4);
 });
 
-test('remote home distinguishes health, recovery and whole-device statistics', () => {
+test('remote home distinguishes health and recovery from whole-device statistics', () => {
   const start = source.indexOf('function main()');
   const end = source.indexOf('function message(', start);
   const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
@@ -656,11 +658,11 @@ test('remote home distinguishes health, recovery and whole-device statistics', (
   let html = context.remoteForwardingBlock();
   assert.match(html,/Connected/); assert.match(html,/52 ms/); assert.match(html,/Connection restored/);
   assert.match(html,/3 \/ 1 \/ 1/); assert.match(html,/8 B\/s/);
-  assert.match(html,/10 \/ 20.0%/); assert.match(html,/Includes other clients on MS/);
+  // Whole-device statistics belong to Home Traffic, not to this session's block.
+  assert.doesNotMatch(html,/10 \/ 20.0%/);
   context.ui.snap.forwarding.health.state='disconnected'; context.ui.snap.forwarding.error='offline';
-  context.ui.snap.forwarding.remoteTrafficError='statistics offline';
   html=context.remoteForwardingBlock();
-  assert.match(html,/Disconnected · retrying/); assert.match(html,/never fall back/); assert.match(html,/stale/);
+  assert.match(html,/Disconnected · retrying/); assert.match(html,/never fall back/);
   assert.doesNotMatch(html,/Connection restored/);
 });
 

@@ -639,6 +639,41 @@ pub async fn remove_device(state: State<'_, AppState>, id: String) -> Result {
     refresh_device_capabilities().await;
     Ok(())
 }
+/// While forwarding, Home shows the destination's traffic from the daemon's
+/// last summary. Neither the device nor any upstream is contacted.
+#[tauri::command]
+pub async fn get_forwarding_traffic(
+    state: State<'_, AppState>,
+    minutes: u64,
+    scope: crate::traffic::TrafficScope,
+) -> Result<coport_gui::data_client::ForwardedTraffic> {
+    coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
+    let (client, status) = local_daemon()
+        .await?
+        .ok_or("Start the local proxy to show forwarded traffic.")?;
+    if !status.forwarding_traffic_supported {
+        return Err("Restart the local proxy to show the forwarded device's traffic.".into());
+    }
+    let window = client
+        .forwarding_traffic(minutes, scope)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (config, log, task) = {
+        let mut core = state.core.lock().unwrap();
+        core.refresh_config();
+        (
+            core.loaded_config()
+                .cloned()
+                .ok_or("Cannot read local configuration")?,
+            core.logs.path(),
+            core.account_tasks()
+                .ok_or("Cannot prepare credential cache")?,
+        )
+    };
+    // Cached identities only; reading traffic never starts an account probe.
+    let labels = task.cached_credential_labels().await;
+    coport_gui::data_client::forwarded_traffic(window, config, log, labels).await
+}
 #[tauri::command]
 pub async fn get_merged_data(
     state: State<'_, AppState>,
