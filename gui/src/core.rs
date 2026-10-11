@@ -517,7 +517,7 @@ fn matches_search(e: &Entry, mode: &str, needle: &str) -> bool {
                 })
         }
         "path" => e
-            .get("path")
+            .path()
             .is_some_and(|path| path.to_lowercase().contains(needle)),
         // Configuration names: the matched account route, or the API Key
         // variable, provider ID, Claude settings name or URL route.
@@ -909,7 +909,7 @@ impl From<Entry> for EntryDto {
             time: e.time.map(|t| t.timestamp_millis()),
             status: e.status(),
             method: e.get("method").map(str::to_owned),
-            path: e.get("path").map(str::to_owned),
+            path: e.path().map(str::to_owned),
             service: e.get("path").and(e.service()),
             proxy: e.get("proxy").map(str::to_owned),
             duration_ms: e.duration_ms(),

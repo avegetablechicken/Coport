@@ -640,7 +640,14 @@ export CODEX_CA_CERTIFICATE="$HOME/.local/share/coport-rust/tls/proxy-ca.pem" # 
 ```
 
 Clients keep their original HTTPS API URLs. The GUI's setup snippets show the
-exact path while the setting is on. Each decrypted connection carries one request,
+exact path while the setting is on. Apps started from Finder, such as Copool,
+see no shell variables; for those, add the proxy CA to the trust store as for the
+loopback CA above (its name constraints limit it to the decrypted hosts), then
+restart the app. A client that does not trust it, or still trusts a replaced
+proxy CA, refuses the handshake; the CONNECT is then logged with reason
+`client_rejected_proxy_ca` and nothing is forwarded. A decrypted tunnel that
+closes or times out without a valid request is logged as `request_rejected`
+with its `client_connect` host. Each decrypted connection carries one request,
 like base URL connections. Request logs include `client_connect` with the
 decrypted host.
 
@@ -817,7 +824,7 @@ country or region looked up through `https://1.1.1.1/cdn-cgi/trace`), and routin
 | Settings | Launch at Login, auto-start, keep running after quit, appearance, proxy port credential routing, config file status and `--check` equivalent, log folder |
 
 The Activity log keeps its Requests, Models, Errors and All Events tabs. Use the
-search condition dropdown for Keyword (all string fields), Path (contains),
+search condition dropdown for Keyword (all string fields), Path (contains; a CONNECT shows and matches its `host:port`),
 Proxy (exact name, or `direct` for a direct connection), Status (exact
 three-digit HTTP status), or Credential (contains; the configuration name that
 routed the request: an account route such as an email or `default`, an API Key

@@ -542,7 +542,19 @@ impl Server {
         if valid && destination.is_none() && incoming.method() == "GET" && target == "/health" {
             return Ok(response(200, "{\"ok\":true}"));
         }
-        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":target.split('?').next().unwrap_or("/")}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
+        // A CONNECT target is its authority (host:port); one carrying user
+        // information is not logged.
+        let logged_path = if connect {
+            incoming
+                .uri()
+                .authority()
+                .map(|a| a.as_str())
+                .filter(|a| !a.contains('@'))
+                .unwrap_or("/")
+        } else {
+            target.split('?').next().unwrap_or("/")
+        };
+        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":logged_path}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
         if incoming.method() == "POST" && crate::model_calls::is_model_endpoint("POST", &target) {
             log.field("model_call_id", uuid::Uuid::new_v4());
             log.field("model_transport", "http");
@@ -1040,12 +1052,13 @@ impl Server {
             .authority()
             .ok_or(Error::new(400, "CONNECT requires host:port."))?;
         let (host, port) = crate::tunnel::authority(authority.as_str())?;
+        // Logged before routing, so a denied destination is visible too.
+        log.field("destination", format!("{host}:{port}"));
         if let Some(destination) = self
             .credential_proxy
             .as_ref()
             .and_then(|proxy| proxy.destination(&host, port))
         {
-            log.field("destination", format!("{host}:{port}"));
             return Ok(Tunnel::Decrypt(destination));
         }
         let choice = self
@@ -1057,7 +1070,6 @@ impl Server {
                     .then_some(choice)
             })
             .ok_or(Error::new(403, "CONNECT destination is not configured."))?;
-        log.field("destination", format!("{host}:{port}"));
         let authority = if host.contains(':') {
             format!("[{host}]:{port}")
         } else {
@@ -1131,29 +1143,26 @@ impl Server {
     ) -> Relay {
         Box::pin(async move {
             let handshake = async {
-                let downstream = upgrade.await.ok()?;
+                let downstream = upgrade.await.map_err(|_| "upgrade_failed")?;
                 destination
                     .acceptor
                     .accept(TokioIo::new(downstream))
                     .await
-                    .ok()
+                    .map_err(|error| client_tls_failure(&error))
             };
             match tokio::time::timeout(Duration::from_secs(30), handshake).await {
-                Ok(Some(tls)) => {
+                Ok(Ok(tls)) => {
                     log.outcome = "request_finished";
                     drop(log);
                     self.serve_http(tls, Some(destination)).await;
                 }
-                result => {
+                Ok(Err(reason)) => {
                     log.outcome = "request_failed";
-                    log.field(
-                        "reason",
-                        if result.is_err() {
-                            "client_tls_timeout"
-                        } else {
-                            "client_tls_failed"
-                        },
-                    );
+                    log.field("reason", reason);
+                }
+                Err(_) => {
+                    log.outcome = "request_failed";
+                    log.field("reason", "client_tls_timeout");
                 }
             }
         })
@@ -1300,10 +1309,25 @@ impl Server {
             {
                 Ok(Ok(prefix)) => prefix,
                 result => {
-                    let status = match result {
-                        Ok(Err(e)) => e.status,
-                        _ => 408,
+                    let (status, reason) = match result {
+                        Ok(Err(e)) => (e.status, e.message),
+                        _ => (408, "Request headers timed out."),
                     };
+                    // A decrypted tunnel was opened for its requests, so a
+                    // missing or invalid one is recorded rather than dropped.
+                    if let Some(destination) = &destination {
+                        self.logger.write(
+                            "request_rejected",
+                            json!({
+                                "client_connect": destination.scope.rsplit("://").next().unwrap_or(""),
+                                "status": status.to_string(),
+                                "reason": reason,
+                            })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        );
+                    }
                     use tokio::io::AsyncWriteExt;
                     let _=socket.write_all(format!("HTTP/1.1 {status} Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
                     close_http(&mut socket).await;
@@ -1351,6 +1375,26 @@ async fn close_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(soc
         .await
     })
     .await;
+}
+
+/// Why a client's TLS handshake in a decrypted CONNECT failed. A client that
+/// does not trust the proxy CA rejects its certificate with an alert; one
+/// still trusting a replaced CA of the same name reports a bad signature.
+fn client_tls_failure(error: &std::io::Error) -> &'static str {
+    use tokio_rustls::rustls::{AlertDescription, Error as TlsError};
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<TlsError>())
+    {
+        Some(TlsError::AlertReceived(
+            AlertDescription::UnknownCA
+            | AlertDescription::BadCertificate
+            | AlertDescription::CertificateUnknown
+            | AlertDescription::UnsupportedCertificate
+            | AlertDescription::DecryptError,
+        )) => "client_rejected_proxy_ca",
+        _ => "client_tls_failed",
+    }
 }
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {

@@ -82,6 +82,15 @@ impl Entry {
             || self.event == "route_unavailable"
             || self.status().is_some_and(|s| s >= 400)
     }
+    /// The request path; for a CONNECT, its destination. Older logs recorded
+    /// a CONNECT's path as `/` and its destination separately.
+    pub fn path(&self) -> Option<&str> {
+        let path = self.get("path")?;
+        if path == "/" && self.get("method") == Some("CONNECT") {
+            return Some(self.get("destination").unwrap_or(path));
+        }
+        Some(path)
+    }
     /// Which client the request belongs to, inferred from its path.
     pub fn service(&self) -> Option<&'static str> {
         if let Some(service) = self.get("service") {
@@ -358,6 +367,28 @@ pub struct Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_rows_show_their_destination_as_path() {
+        let entry = |fields: serde_json::Value| Entry {
+            seq: 0,
+            time: None,
+            event: "request_finished".into(),
+            fields: fields.as_object().unwrap().clone(),
+        };
+        // Current logs record the CONNECT target as its path.
+        let current = entry(serde_json::json!({"method":"CONNECT","path":"api.anthropic.com:443"}));
+        assert_eq!(current.path(), Some("api.anthropic.com:443"));
+        // Older logs recorded `/` with a separate destination.
+        let older = entry(
+            serde_json::json!({"method":"CONNECT","path":"/","destination":"chatgpt.com:443"}),
+        );
+        assert_eq!(older.path(), Some("chatgpt.com:443"));
+        let unknown = entry(serde_json::json!({"method":"CONNECT","path":"/"}));
+        assert_eq!(unknown.path(), Some("/"));
+        let root = entry(serde_json::json!({"method":"GET","path":"/","destination":"x:1"}));
+        assert_eq!(root.path(), Some("/"));
+    }
 
     #[test]
     fn runtime_health_uses_latest_observation_from_current_server() {
