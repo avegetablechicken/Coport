@@ -545,6 +545,28 @@ test('home highlights remote mode and collapses inactive local configuration', (
   assert.equal(context.main(), '[Proxy][Connect][Traffic][Recent][Proxies][Routing]');
 });
 
+test('Activity says forwarded requests are logged on the destination', () => {
+  const start = source.indexOf('function renderActivityForwarding(');
+  const end = source.indexOf('function activityShell(', start);
+  const el = { hidden: true, innerHTML: '' };
+  const context = { ui: { snap: { forwarding: { name: 'MS' } } }, esc: v => v, $: id => id === 'activity-forwarding' ? el : null };
+  vm.createContext(context); vm.runInContext(source.slice(start, end), context);
+  context.renderActivityForwarding();
+  assert.equal(el.hidden, false);
+  assert.match(el.innerHTML, /Forwarding to MS/);
+  assert.match(el.innerHTML, /logged on MS/);
+  assert.match(el.innerHTML, /data-action="page" data-page="devices"/);
+  // Repeated refreshes keep the same nodes.
+  const html = el.innerHTML;
+  Object.defineProperty(el, 'innerHTML', { get: () => html, set: () => assert.fail('re-rendered unchanged notice'), configurable: true });
+  context.renderActivityForwarding();
+  Object.defineProperty(el, 'innerHTML', { value: html, writable: true, configurable: true });
+  context.ui.snap.forwarding = null;
+  context.renderActivityForwarding();
+  assert.equal(el.hidden, true);
+  assert.equal(el.innerHTML, '');
+});
+
 test('entering Settings through navigation reads definitions without remote statistics', async () => {
   const calls = [];
   const h = harness(async command => { calls.push(command); return []; });

@@ -1369,6 +1369,7 @@ details.disclosure[open] summary svg {
 
 /* Refreshes retain the previous chart geometry, including on failure. */
 .traffic-content, #activity-traffic { position: relative; }
+#activity-forwarding[hidden] { display: none; }
 .traffic-update-error { position: absolute; right: 4px; bottom: 0; font-size: 9px; color: var(--orange); background: var(--window); padding: 1px 4px; border-radius: 3px; }
 
 /* In-panel options keep native focus on the tray window. */

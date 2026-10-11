@@ -403,6 +403,7 @@ function renderPage() {
       ui.builtPage = "activity";
       renderActivityTraffic();
     }
+    renderActivityForwarding();
     renderActivityList();
     return;
   }
@@ -1303,8 +1304,24 @@ async function applyRangeEditor() {
   await loadActivity();
 }
 
+/// Forwarded requests are logged on the destination, not here; say so rather
+/// than let this machine's log look idle.
+function renderActivityForwarding() {
+  const el = $("activity-forwarding");
+  if (!el) return;
+  const target = ui.snap?.forwarding;
+  const html = target
+    ? `<div class="block-head"><span class="block-title">Forwarding to ${esc(target.name)}</span><span class="block-aside"><button class="text-link" data-action="page" data-page="devices">View in Devices</button></span></div>
+      <div class="placeholder">New requests are handled and logged on ${esc(target.name)}. This page shows this machine's history.</div>`
+    : "";
+  el.hidden = !target;
+  // Refreshes must not replace the link while it is focused or hovered.
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
 function activityShell() {
   return `<div class="page">
+    <section class="block" id="activity-forwarding" hidden></section>
     <section class="block" id="activity-traffic"></section>
     <section class="block log-block">
       <div class="block-head"><span class="block-title">Log</span><span class="block-aside" id="activity-range"></span></div>
