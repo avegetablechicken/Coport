@@ -468,6 +468,25 @@ test('Merged Traffic is exactly the sum of the device views', () => {
   assert.equal(context.sumTrafficViews([local, peer]), total);
   assert.notEqual(context.sumTrafficViews([local]), total);
 });
+test('Merged Traffic lines up parts read at different times by time, not index', () => {
+  const context = setup('all');
+  loadSharedViews(context);
+  const minute = 60_000;
+  const part = (counts) => ({ requests: counts.reduce((a, b) => a + b, 0), errors: 0, bytes: 0, counts, errorCounts: counts.map(() => 0), tokenCounts: counts.map(() => 0),
+    credentials: [{ service: 'Codex', credential: 'shared', requests: 1, counts, errorCounts: counts.map(() => 0), tokenCounts: counts.map(() => 0) }] });
+  // This device was read now; the peer at the last refresh, two minutes earlier.
+  const axis = { start: 10 * minute, end: 14 * minute, bucketMinutes: 1 };
+  const peerWindow = { windowStart: 8 * minute, windowEnd: 12 * minute, bucketMinutes: 1 };
+  const local = part([1, 1, 1, 1]);
+  const peer = part([10, 20, 30, 40]);
+  const total = context.sumTrafficViews([local, peer], [axis, peerWindow], axis);
+  // Peer minutes 10 and 11 land on the axis' first two bars; its older ones fall off,
+  // and the two recent minutes it has not reported yet stay as this device alone.
+  assert.deepEqual(plain(total.counts), [31, 41, 1, 1]);
+  assert.deepEqual(plain(total.credentials[0].counts), [31, 41, 1, 1]);
+  // Aligned windows add index by index, and a changed window is not served from cache.
+  assert.deepEqual(plain(context.sumTrafficViews([local, peer], [axis, axis], axis).counts), [11, 21, 31, 41]);
+});
 test('an unchanged view reuses its markup', () => {
   const context = setup('all');
   loadSharedViews(context);

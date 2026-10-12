@@ -574,15 +574,26 @@ function trafficSummary(view, scope, window = view) {
 
 const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "latencyTotalMs", "latencySamples"];
 const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
-function addTraffic(to, from) {
+function addTraffic(to, from, offset = 0, length = Infinity) {
   for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
   // Unreported usage stays unknown unless some part reported it.
   for (const key of REPORTED_TOKENS) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
   for (const key of ["counts", "errorCounts", "tokenCounts"]) {
     const values = from[key] ?? [];
     to[key] ||= Array(values.length).fill(0);
-    values.forEach((value, i) => { to[key][i] = (to[key][i] || 0) + value; });
+    values.forEach((value, i) => {
+      const slot = i + offset;
+      if (slot >= 0 && slot < length) to[key][slot] = (to[key][slot] || 0) + value;
+    });
   }
+}
+/// Where a part's first bucket lands on the axis. Parts read at different
+/// times cover different windows, so their bars line up by time, not index.
+function bucketOffset(window, axis) {
+  const start = (w) => w.start ?? w.windowStart;
+  if (!window || !axis || window === axis) return 0;
+  const offset = Math.round((start(window) - start(axis)) / (axis.bucketMinutes * 60_000));
+  return Number.isFinite(offset) ? offset : 0;
 }
 function finishTraffic(traffic) {
   for (const key of REPORTED_TOKENS) traffic[key] ??= null;
@@ -593,27 +604,33 @@ function finishTraffic(traffic) {
 let lastTrafficSum = null;
 /// Merged Traffic is exactly the sum of the views its device cards show: an
 /// account with the same name on several devices is one account, and each
-/// service's Unidentified traffic is one entry. Bars add bucket by bucket.
-function sumTrafficViews(views) {
-  if (lastTrafficSum?.views.length === views.length && lastTrafficSum.views.every((view, i) => view === views[i])) return lastTrafficSum.total;
+/// service's Unidentified traffic is one entry. Bars add bucket by bucket on
+/// the axis window; an older part's missing recent buckets stay empty.
+function sumTrafficViews(views, windows = [], axis = null) {
+  const offsets = views.map((_, i) => bucketOffset(windows[i], axis));
+  const end = axis && (axis.end ?? axis.windowEnd);
+  const length = axis ? Math.ceil((end - (axis.start ?? axis.windowStart)) / (axis.bucketMinutes * 60_000)) : NaN;
+  const buckets = Number.isFinite(length) ? length : Infinity;
+  if (lastTrafficSum?.views.length === views.length && lastTrafficSum.buckets === buckets
+      && lastTrafficSum.views.every((view, i) => view === views[i] && lastTrafficSum.offsets[i] === offsets[i])) return lastTrafficSum.total;
   const total = { counts: [], errorCounts: [], tokenCounts: [] };
   const accounts = new Map();
-  for (const view of views) {
-    addTraffic(total, view);
+  views.forEach((view, i) => {
+    addTraffic(total, view, offsets[i], buckets);
     for (const c of view.credentials ?? []) {
       const key = `${c.service}\0${c.credential}`;
       if (!accounts.has(key)) accounts.set(key, { service: c.service, credential: c.credential, sources: [], counts: [], errorCounts: [], tokenCounts: [] });
       const account = accounts.get(key);
-      addTraffic(account, c);
+      addTraffic(account, c, offsets[i], buckets);
       account.sources.push(...(c.sources ?? []));
     }
-  }
+  });
   // As each device orders them: known accounts by received bytes, Unidentified last.
   total.credentials = [...accounts.values()].map(finishTraffic)
     .sort((a, b) => (a.credential === "Unidentified") - (b.credential === "Unidentified") || b.bytes - a.bytes);
   total.targets = views.find((view) => view.targets?.length)?.targets ?? [];
   finishTraffic(total);
-  lastTrafficSum = { views: [...views], total };
+  lastTrafficSum = { views: [...views], offsets, buckets, total };
   return total;
 }
 
@@ -1594,7 +1611,7 @@ function mergedDataBlock() {
     // The newest part sets the time axis; older parts show their delay in the last bars.
     const end = (window) => window.end ?? window.windowEnd;
     const window = parts.reduce((latest, part) => end(part.window) > end(latest) ? part.window : latest, local);
-    body += deviceTrafficContent(sumTrafficViews(parts.map((part) => part.view)), scope, "merged", window);
+    body += deviceTrafficContent(sumTrafficViews(parts.map((part) => part.view), parts.map((part) => part.window), window), scope, "merged", window);
   }
   if (data) {
     for (const source of data.sources) {
@@ -1723,9 +1740,11 @@ function setDeviceForwarders(forwarders) {
 }
 async function refreshRecoveredDeviceTraffic() {
   if (!ui.deviceStartupRefreshDone || !ui.deviceTrafficRecoveryPending || ui.mergedDataLoading || ui.deviceRefresh) return;
+  // Peers are read only while Devices is open and no sooner than its cadence,
+  // so a light flipping between a failed read and a healthy tunnel cannot
+  // retry SSH. Elsewhere only the light follows; a due Devices visit refreshes.
+  if (ui.page !== "devices" || Date.now() - (ui.deviceRemoteAttemptAt || 0) < DEVICE_REFRESH_MS) return;
   ui.deviceTrafficRecoveryPending = false;
-  // Visiting Devices authorizes keeping its cached view in sync after recovery,
-  // including while the user is back in Settings or on Home.
   await loadMergedData(true, true);
 }
 function matchingDeviceCapability(device) {
@@ -1796,10 +1815,12 @@ function deviceCardViews() {
   const forwarded = ui.snap?.forwarding?.deviceId;
   const cards = new Map();
   for (const device of ui.devices) {
+    const source = data?.sources.find((source) => source.name === device.name);
+    // A device already counted via another entry gets no view, live or not.
+    if (source?.exclusion === "duplicate") continue;
     const live = device.id === forwarded && ui.forwardedTrafficViews?.[`${device.id}:${minutes}:${scope}`];
     if (live?.device === device.id) { cards.set(device.id, { view: live, window: live }); continue; }
-    const traffic = data?.sources.find((source) => source.name === device.name)?.traffic;
-    if (traffic) cards.set(device.id, { view: traffic, window: data });
+    if (source?.traffic) cards.set(device.id, { view: source.traffic, window: data });
   }
   return { local: ui.localTrafficViews?.[`${minutes}:${scope}`], cards, scope };
 }
