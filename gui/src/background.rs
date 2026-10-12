@@ -13,6 +13,9 @@ use std::{
 
 pub type Completion = tokio::sync::oneshot::Receiver<Result<(), String>>;
 const INITIALIZING: usize = 1 << (usize::BITS - 1);
+const JOB_CAPACITY: usize = 16;
+/// Diagnostics never take the slots an operation and Quit behind it need.
+const DIAGNOSTIC_SLOTS: usize = JOB_CAPACITY - 2;
 
 type Operation = Box<dyn FnOnce(&mut Controller) -> Result<(), String> + Send>;
 struct Pending {
@@ -24,6 +27,13 @@ impl Drop for Pending {
     fn drop(&mut self) {
         self.count.fetch_sub(self.amount, Ordering::AcqRel);
         (self.notify)();
+    }
+}
+/// A queued diagnostic's slot, released when it runs or is discarded.
+struct DiagnosticSlot(Arc<AtomicUsize>);
+impl Drop for DiagnosticSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 struct Job {
@@ -40,6 +50,7 @@ pub struct BackgroundController {
     status: Arc<Mutex<Option<daemon::Status>>>,
     error: Arc<Mutex<Option<String>>>,
     pending: Arc<AtomicUsize>,
+    diagnostics: Arc<AtomicUsize>,
     submission: Mutex<()>,
     closing: Arc<AtomicBool>,
     notify: Notify,
@@ -62,7 +73,7 @@ impl BackgroundController {
         )
     }
     fn with_daemon(notify: Notify, dir: PathBuf, binary: PathBuf) -> Self {
-        let (jobs, receiver) = mpsc::sync_channel::<Job>(16);
+        let (jobs, receiver) = mpsc::sync_channel::<Job>(JOB_CAPACITY);
         let shared = Arc::new(Mutex::new(Shared::default()));
         let status = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
@@ -74,6 +85,7 @@ impl BackgroundController {
             status: status.clone(),
             error: error.clone(),
             pending: pending.clone(),
+            diagnostics: Arc::new(AtomicUsize::new(0)),
             submission: Mutex::new(()),
             closing: closing.clone(),
             notify: notify.clone(),
@@ -260,8 +272,18 @@ impl BackgroundController {
             return;
         };
         if !self.closing.load(Ordering::Acquire) && !self.shared.is_poisoned() {
+            // Repeated tests while the worker is busy are dropped once the
+            // diagnostic slots are full, so Stop and Quit can still be queued.
+            if self.diagnostics.fetch_add(1, Ordering::AcqRel) >= DIAGNOSTIC_SLOTS {
+                self.diagnostics.fetch_sub(1, Ordering::AcqRel);
+                return;
+            }
+            let slot = DiagnosticSlot(self.diagnostics.clone());
             let _ = self.jobs.try_send(Job {
-                run,
+                run: Box::new(move |controller| {
+                    let _slot = slot;
+                    run(controller)
+                }),
                 reply: None,
                 pending: None,
                 exit: false,
@@ -381,6 +403,45 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn repeated_tests_while_busy_leave_room_for_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = BackgroundController::with_daemon(
+            Arc::new(|| {}),
+            dir.path().into(),
+            dir.path().join("missing-daemon"),
+        );
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let operation = controller
+            .operation(
+                Box::new(move |_| {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                }),
+                false,
+            )
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        for i in 0..JOB_CAPACITY * 2 {
+            controller.probe(&format!("proxy-{i}"), &endpoint);
+        }
+        assert_eq!(
+            controller.diagnostics.load(Ordering::Acquire),
+            DIAGNOSTIC_SLOTS
+        );
+        let exit = controller
+            .on_app_exit(true)
+            .expect("Quit must be queued behind repeated tests");
+        release.send(()).unwrap();
+        operation.blocking_recv().unwrap().unwrap();
+        exit.blocking_recv().unwrap().unwrap();
+        assert_eq!(controller.diagnostics.load(Ordering::Acquire), 0);
     }
 
     #[test]
