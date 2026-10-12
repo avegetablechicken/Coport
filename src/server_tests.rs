@@ -42,6 +42,7 @@ async fn read_request(io: &mut TestIo) -> std::io::Result<String> {
 async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
     let certified = rcgen::generate_simple_self_signed(vec![
         "upstream.invalid".into(),
+        "182.92.106.196".into(),
         "developers.openai.com".into(),
         "auth.openai.com".into(),
         "platform.claude.com".into(),
@@ -3398,4 +3399,252 @@ async fn a_decrypted_tunnel_closed_without_a_request_is_logged() {
     assert_eq!(row["client_connect"], "upstream.invalid");
     assert_eq!(row["status"], "400");
     assert_eq!(row["reason"], "Incomplete request headers.");
+}
+
+// Named providers/settings must behave identically through a base URL and an
+// HTTPS proxy. All outbound connections terminate at the local fixture.
+#[tokio::test]
+async fn named_upstreams_route_models_and_generation_through_both_entries() {
+    for claude in [false, true] {
+        for host in ["upstream.invalid", "182.92.106.196:6060"] {
+            let mut fixture = fixture("http", "oauth_json").await;
+            let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+            let home = tempfile::tempdir().unwrap();
+            let home_yaml = serde_json::to_string(home.path()).unwrap();
+            let service = if claude { "anthropic" } else { "codex" };
+            let config = if claude {
+                std::fs::write(
+                    home.path().join("custom.settings.json"),
+                    json!({"env": {
+                        "ANTHROPIC_BASE_URL":format!("https://{host}/v1"),
+                        "ANTHROPIC_AUTH_TOKEN":"fake-provider-secret"
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+                format!(
+                    "claude:\n  config_dirs: [{home_yaml}]\n  routing:\n    api_key: {{custom.settings.json: selected}}\n"
+                )
+            } else {
+                std::fs::write(home.path().join("config.toml"), format!(
+                    "[model_providers.ShareCoder]\nbase_url = 'https://{host}/v1'\nexperimental_bearer_token = 'fake-provider-secret'\n"
+                )).unwrap();
+                format!(
+                    "codex:\n  homes: [{home_yaml}]\n  routing:\n    api_key: {{ShareCoder: selected}}\n"
+                )
+            };
+            let running = running(&format!(
+                "connect_credential_routing: true\nproxies:\n  selected: {endpoint}\n{config}"
+            ))
+            .await;
+            trust(&running, &fixture, &endpoint);
+            let proxy = proxy_port_client(&running);
+            for entry in ["base", "explicit", "proxy"] {
+                let tunneled = entry == "proxy";
+                for path in ["models", if claude { "messages" } else { "responses" }] {
+                    let url = if entry == "base" {
+                        if claude {
+                            format!("{}/anthropic/{path}", running.url)
+                        } else {
+                            format!("{}/v1/{path}", running.url)
+                        }
+                    } else if tunneled {
+                        format!("https://{host}/v1/{path}")
+                    } else {
+                        format!("{}/{service}/https://{host}/v1/{path}", running.url)
+                    };
+                    let client = if tunneled { &proxy } else { &http() };
+                    let request = if path == "models" {
+                        client.get(&url)
+                    } else {
+                        client.post(&url).body("{}")
+                    };
+                    let response = request
+                        .bearer_auth("fake-provider-secret")
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        200,
+                        "{url}: {}",
+                        response.text().await.unwrap()
+                    );
+                    let connect = fixture.requests.recv().await.unwrap();
+                    let authority = if host.contains(':') {
+                        host.to_owned()
+                    } else {
+                        format!("{host}:443")
+                    };
+                    assert!(
+                        connect.starts_with(&format!("CONNECT {authority} ")),
+                        "{connect}"
+                    );
+                    let request = fixture.requests.recv().await.unwrap();
+                    assert!(request.contains(&format!(" /v1/{path} ")), "{request}");
+                    assert!(request.contains("authorization: Bearer fake-provider-secret"));
+                }
+            }
+            // Account-only usage is not opened to provider credentials.
+            let usage = if claude {
+                "/v1/api/oauth/usage"
+            } else {
+                "/backend-api/wham/usage"
+            };
+            let response = proxy
+                .get(format!("https://{host}{usage}"))
+                .bearer_auth("fake-provider-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403);
+            assert!(fixture.requests.try_recv().is_err());
+            // A discovered destination still requires a matching credential.
+            let response = proxy
+                .get(format!("https://{host}/v1/models"))
+                .bearer_auth("wrong-secret")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_client_error());
+            assert!(fixture.requests.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn named_provider_websocket_works_through_base_url_and_connect() {
+    let mut fixture = fixture("http", "websocket").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"),
+        "[model_providers.ShareCoder]\nbase_url = 'https://upstream.invalid/v1'\nexperimental_bearer_token = 'ws-secret'\n"
+    ).unwrap();
+    let running = running(&format!("connect_credential_routing: true\nproxies:\n  selected: {endpoint}\ncodex:\n  homes: [{}]\n  routing:\n    api_key: {{ShareCoder: selected}}\n", serde_json::to_string(home.path()).unwrap())).await;
+    trust(&running, &fixture, &endpoint);
+    let proxy = proxy_port_client(&running);
+    for tunneled in [false, true] {
+        let url = if tunneled {
+            "https://upstream.invalid/v1/socket".into()
+        } else {
+            format!("{}/codex/https://upstream.invalid/v1/socket", running.url)
+        };
+        let direct = http();
+        let client = if tunneled { &proxy } else { &direct };
+        let response = client
+            .get(url)
+            .bearer_auth("ws-secret")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-protocol", "test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 101);
+        let mut socket = response.upgrade().await.unwrap();
+        let mut early = [0; 4];
+        socket.read_exact(&mut early).await.unwrap();
+        assert_eq!(&early, b"\x81\x02hi");
+        socket
+            .write_all(b"\x81\x82\x01\x02\x03\x04ni")
+            .await
+            .unwrap();
+        let mut tail = Vec::new();
+        socket.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"\x81\x02ok\x88\x00");
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /v1/socket HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer ws-secret"));
+    }
+}
+
+// One public IP named by both a Codex provider and a Claude settings file stays
+// unprefixed, so each request resolves the same app through either entry.
+#[tokio::test]
+async fn a_named_host_shared_by_both_apps_routes_like_its_base_url() {
+    let mut fixture = fixture("http", "oauth_json").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    let host = "182.92.106.196:6060";
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[model_providers.myServer]\nbase_url = 'https://127.0.0.1:8787/https://{host}'\nexperimental_bearer_token = 'codex-secret'\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+    std::fs::write(
+        home.path().join("profiles").join("myServer.json"),
+        json!({"env": {
+            "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:8787/https://{host}"),
+            "ANTHROPIC_AUTH_TOKEN": "claude-secret"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let dir = serde_json::to_string(home.path()).unwrap();
+    let running = running(&format!(
+        "connect_credential_routing: true\nproxies:\n  selected: {endpoint}\ncodex:\n  homes: [{dir}]\n  routing:\n    api_key: {{myServer: selected}}\nclaude:\n  config_dirs: [{dir}]\n  routing:\n    api_key: {{myServer: selected}}\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let proxy = proxy_port_client(&running);
+    let base = http();
+    for tunneled in [false, true] {
+        let (client, origin) = if tunneled {
+            (&proxy, format!("https://{host}"))
+        } else {
+            (&base, format!("{}/https://{host}", running.url))
+        };
+        for (path, secret) in [
+            ("/responses", "codex-secret"),
+            ("/v1/messages", "claude-secret"),
+        ] {
+            let response = client
+                .post(format!("{origin}{path}"))
+                .bearer_auth(secret)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "{origin}{path}: {}",
+                response.text().await.unwrap()
+            );
+            let connect = fixture.requests.recv().await.unwrap();
+            assert!(
+                connect.starts_with(&format!("CONNECT {host} ")),
+                "{connect}"
+            );
+            let request = fixture.requests.recv().await.unwrap();
+            assert!(request.starts_with(&format!("POST {path} ")), "{request}");
+            assert!(request.contains(secret), "{request}");
+        }
+        // Each app accepts only its own credential, through either entry.
+        for (path, secret) in [
+            ("/responses", "claude-secret"),
+            ("/v1/messages", "codex-secret"),
+        ] {
+            let response = client
+                .post(format!("{origin}{path}"))
+                .bearer_auth(secret)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_client_error(), "{origin}{path}");
+            assert!(fixture.requests.try_recv().is_err());
+        }
+    }
 }

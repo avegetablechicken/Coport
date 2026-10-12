@@ -155,6 +155,32 @@ fn find(directories: &[String], name: &str) -> Result<Option<PathBuf>> {
     Ok(matches.into_iter().next())
 }
 
+/// Discover a configured destination without resolving a token, shell or keychain.
+pub(crate) fn upstream(directories: &[String], name: &str) -> Result<Option<String>> {
+    validate_name(name)?;
+    find(directories, name)?
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .map_err(|_| Error::config("Cannot read Claude settings file."))?;
+            let document: Value = serde_json::from_str(&text)
+                .map_err(|_| Error::config("Invalid Claude settings JSON."))?;
+            read_upstream(&document)
+        })
+        .transpose()
+}
+
+fn read_upstream(document: &Value) -> Result<String> {
+    let upstream = document
+        .get("env")
+        .and_then(|v| v.get("ANTHROPIC_BASE_URL"))
+        .or_else(|| document.get("ANTHROPIC_BASE_URL"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(Error::config("Claude settings require ANTHROPIC_BASE_URL."))?;
+    crate::config::unwrap_upstream(upstream)
+}
+
 fn read(path: &Path) -> Result<Profile> {
     let text = std::fs::read_to_string(path)
         .map_err(|_| Error::config("Cannot read Claude settings file."))?;
@@ -173,12 +199,7 @@ fn read(path: &Path) -> Result<Profile> {
         .ok_or(Error::config(
             "Claude settings require ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.",
         ))?;
-    let upstream = field("ANTHROPIC_BASE_URL")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or(Error::config("Claude settings require ANTHROPIC_BASE_URL."))?;
-    let upstream = crate::config::unwrap_upstream(upstream)?;
+    let upstream = read_upstream(&document)?;
     Ok(Profile {
         token: token.into(),
         upstream,

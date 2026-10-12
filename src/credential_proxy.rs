@@ -71,12 +71,11 @@ impl CredentialProxy {
 
 /// Request prefixes of each credential-routed API origin, keyed by host and
 /// port. Hosts routed by both services stay unprefixed, so the usual explicit
-/// URL rules decide (or report the conflict). IP upstreams keep base URLs.
+/// URL rules decide (or report the conflict).
 fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     let mut origins: BTreeMap<(String, u16), &str> = BTreeMap::new();
     let mut add = |url: &Url, prefix: &'static str| {
-        let (Some(url::Host::Domain(host)), Some(port)) = (url.host(), url.port_or_known_default())
-        else {
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
             return;
         };
         origins
@@ -99,7 +98,10 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     if !claude.account.is_empty()
         || claude.account_fallback.is_some()
         || claude.api_key_fallback.is_some()
-        || credential_selectors(&claude.api_key)
+        || claude
+            .api_key
+            .keys()
+            .any(|key| !crate::claude_settings::is_url(key))
     {
         add(&url(&config.claude.base_url)?, "/anthropic/");
         add(&url(crate::claude::TOKEN_REFRESH_UPSTREAM)?, "/anthropic/");
@@ -114,7 +116,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     for key in claude
         .api_key
         .keys()
-        .filter(|k| crate::url_routing::is_url_selector(k))
+        .filter(|k| crate::claude_settings::is_url(k))
     {
         add(&url(key)?, "/anthropic/");
     }
@@ -124,6 +126,28 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         .filter(|k| crate::url_routing::is_url_selector(k))
     {
         add(&url(key)?, "/codex/");
+    }
+    // Resolve configured provider definitions, not credentials or active profiles.
+    // One unavailable home must not hide routes from the other configured homes.
+    for provider in &config.codex.providers {
+        for upstream in provider
+            .upstreams(&config.codex.base_url.api_key, &config.codex)
+            .into_iter()
+            .flatten()
+        {
+            add(&url(&upstream)?, "/codex/");
+        }
+    }
+    for key in claude
+        .api_key
+        .keys()
+        .filter(|key| !crate::claude_settings::is_url(key))
+    {
+        if let Ok(Some(upstream)) =
+            crate::claude_settings::upstream(&config.claude.config_dirs, key)
+        {
+            add(&url(&upstream)?, "/anthropic/");
+        }
     }
     Ok(origins
         .into_iter()
@@ -143,10 +167,13 @@ mod tests {
     use super::*;
 
     fn config(extra: &str) -> Config {
-        Config::parse(&format!(
+        let mut parsed = Config::parse(&format!(
             "listen_port: 8787\nrequest_timeout_seconds: 3\nconnect_credential_routing: true\n{extra}"
         ))
-        .unwrap()
+        .unwrap();
+        parsed.codex.homes.clear();
+        parsed.claude.config_dirs.clear();
+        parsed
     }
 
     #[test]
@@ -173,9 +200,13 @@ mod tests {
             get("gateway.example.com", 8443),
             Some("/codex/https://gateway.example.com:8443")
         );
-        // No Codex API Key selector, and IP routes are not decrypted.
+        // No Codex API Key selector; public IP URL routes are decrypted too.
         assert_eq!(get("api.openai.com", 443), None);
-        assert_eq!(scopes.len(), 5);
+        assert_eq!(
+            get("182.92.106.196", 6060),
+            Some("/anthropic/https://182.92.106.196:6060")
+        );
+        assert_eq!(scopes.len(), 6);
     }
 
     #[test]
@@ -186,6 +217,48 @@ mod tests {
         assert_eq!(
             scopes(&config).unwrap()[&("shared.example.com".to_owned(), 443)],
             "/https://shared.example.com"
+        );
+    }
+
+    #[test]
+    fn provider_and_named_settings_destinations_use_configured_sources() {
+        let dirs = tempfile::tempdir().unwrap();
+        let a = dirs.path().join("a");
+        let b = dirs.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for (home, host) in [(&a, "gateway.invalid"), (&b, "182.92.106.196:6060")] {
+            // No token is needed for destination discovery.
+            std::fs::write(home.join("config.toml"), format!(
+                "[model_providers.ShareCoder]\nbase_url = 'https://{host}/v1'\nenv_key = 'FAKE_PROVIDER_KEY'\n"
+            )).unwrap();
+        }
+        std::fs::write(
+            a.join("custom.settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude-gateway.invalid/api"}}"#,
+        )
+        .unwrap();
+        let mut c = config(
+            "codex:\n  routing:\n    api_key: {ShareCoder: none}\nclaude:\n  routing:\n    api_key: {custom.settings.json: none}\n",
+        );
+        c.codex.homes = vec![a.to_string_lossy().into(), b.to_string_lossy().into()];
+        c.claude.config_dirs = vec![a.to_string_lossy().into()];
+        let routes = scopes(&c).unwrap();
+        for (host, port, prefix) in [
+            ("gateway.invalid", 443, "codex"),
+            ("182.92.106.196", 6060, "codex"),
+            ("claude-gateway.invalid", 443, "anthropic"),
+        ] {
+            assert!(routes[&(host.into(), port)].starts_with(&format!("/{prefix}/https://")));
+        }
+        assert!(!routes.contains_key(&("custom.settings.json".into(), 443)));
+        // env_key aliases use the same definition, and other homes survive an unreadable definition.
+        c.codex.providers[0].selector = "FAKE_PROVIDER_KEY".into();
+        std::fs::write(b.join("config.toml"), "invalid [").unwrap();
+        assert!(
+            scopes(&c)
+                .unwrap()
+                .contains_key(&("gateway.invalid".into(), 443))
         );
     }
 

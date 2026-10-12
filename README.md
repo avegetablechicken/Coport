@@ -616,22 +616,30 @@ connection. These hosts are decrypted:
 | Claude, with any account or non-URL API Key route or fallback | `claude.base_url` and `platform.claude.com` |
 | Codex, with account routes or `account_fallback` | `codex.base_url.account` and `auth.openai.com` |
 | Codex, with non-URL API Key routes or `api_key_fallback` | `codex.base_url.api_key` |
-| Either, for each hostname URL route | that route's host and port |
+| Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
+| Claude, for each named settings selector | the selected settings file's upstream host and port |
+| Either, for each URL route | that route's host and port, including public IPv4 addresses |
 
 A host routed by both services uses the unprefixed `/https://` form and its usual
-conflict rules. Public IP URL routes, Claude settings-file upstreams and Codex
-`config.toml` provider URLs are not decrypted; use base URLs for them, or list
-them under `connect` as opaque tunnels. All other destinations keep their
-`connect` routes or remain denied. Requests inside a decrypted tunnel must target
+conflict rules. Destination discovery reads local provider/settings definitions
+at startup without resolving credentials or contacting upstreams. Restart after changing those
+upstream addresses. Unavailable definitions contribute no destinations; valid
+definitions in other configured homes still apply. All other destinations keep
+their `connect` routes or remain denied. Requests inside a decrypted tunnel must target
 its destination (origin-form, or absolute-form naming that host), and the client
-must name the CONNECT host in SNI.
+must not name another host in SNI (IP clients normally omit SNI).
 
 The proxy CA is separate from the loopback CA and carries critical name
-constraints permitting only the decrypted hostnames, so trusting it does not
-cover loopback or any other site. If a later configuration decrypts a host the
-stored CA does not permit, the CA is replaced on start and must be trusted again;
-otherwise it is reused. Point clients at it rather than replacing their CA
-bundles:
+constraints permitting only the decrypted hostnames and exact IP addresses, so
+trusting it does not cover loopback or any other site. Constraints bind only the
+name types they list, so without a decrypted IP address every IP address is
+excluded, and without a decrypted hostname only the reserved `invalid` domain is
+permitted. If a later configuration decrypts a host the stored CA does not
+permit, or no longer needs a name type that CA permits, the CA is replaced on
+start and must be trusted again; otherwise it is reused. BoringSSL clients such
+as Claude Code reject IP certificates under IP constraints, so they cannot use
+the proxy port for an IP upstream; use its base URL instead. Point clients at
+the CA rather than replacing their CA bundles:
 
 ```sh
 export HTTPS_PROXY=http://127.0.0.1:8787

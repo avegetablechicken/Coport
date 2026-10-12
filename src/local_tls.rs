@@ -67,7 +67,7 @@ pub fn proxy_acceptors(
         Error::config("Cannot prepare the proxy port certificate.")
     }
     let ca_key = load_or_create(dir, &PROXY, &proxy_ca_params(hosts), &|cert| {
-        hosts.iter().all(|host| permits(cert, host))
+        covers(cert, hosts)
     })
     .map_err(failed)?;
     let issuer = Issuer::new(proxy_ca_params(hosts), &ca_key);
@@ -200,15 +200,75 @@ fn ca_params() -> CertificateParams {
     )
 }
 
+/// Permitted only for a CA without DNS hosts; reserved never to resolve (RFC 2606).
+const UNUSED_DNS_NAME: &str = "invalid";
+/// The excluded all-IPv4 and all-IPv6 subtrees: [7] OCTET STRING of a zero
+/// address and a zero mask.
+const ANY_IPV4: [u8; 10] = [0x87, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+const ANY_IPV6: [u8; 34] = {
+    let mut encoded = [0; 34];
+    encoded[0] = 0x87;
+    encoded[1] = 32;
+    encoded
+};
+
 fn proxy_ca_params(hosts: &BTreeSet<String>) -> CertificateParams {
-    ca_template(
-        "coport proxy CA",
-        hosts.iter().cloned().map(GeneralSubtree::DnsName).collect(),
-    )
+    let mut permitted: Vec<_> = hosts
+        .iter()
+        .map(|host| match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix(ip.octets(), 32))
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix(ip.octets(), 128))
+            }
+            Err(_) => GeneralSubtree::DnsName(host.clone()),
+        })
+        .collect();
+    // Constraints bind only the name types they list, so a type without a
+    // decrypted host is closed rather than left unconstrained.
+    if !permitted
+        .iter()
+        .any(|s| matches!(s, GeneralSubtree::DnsName(_)))
+    {
+        permitted.push(GeneralSubtree::DnsName(UNUSED_DNS_NAME.into()));
+    }
+    let no_ip_host = !permitted
+        .iter()
+        .any(|s| matches!(s, GeneralSubtree::IpAddress(_)));
+    let mut params = ca_template("coport proxy CA", permitted);
+    if no_ip_host {
+        // BoringSSL rejects only IP certificates under IP constraints; this CA issues none.
+        params.name_constraints.as_mut().unwrap().excluded_subtrees = vec![
+            GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0)),
+            GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0)),
+        ];
+    }
+    params
 }
 
-/// Whether the DER certificate `cert` lists `host` as a permitted dNSName.
+/// Whether a stored proxy CA can issue for every host and closes the name
+/// types `hosts` lacks, as `proxy_ca_params` would.
+fn covers(cert: &[u8], hosts: &BTreeSet<String>) -> bool {
+    let contains = |encoded: &[u8]| cert.windows(encoded.len()).any(|w| w == encoded);
+    let ip = |host: &String| host.parse::<std::net::IpAddr>().is_ok();
+    hosts.iter().all(|host| permits(cert, host))
+        && (hosts.iter().any(|h| !ip(h)) || permits(cert, UNUSED_DNS_NAME))
+        && (hosts.iter().any(ip) || (contains(&ANY_IPV4) && contains(&ANY_IPV6)))
+}
+
+/// Whether the DER certificate lists the DNS name or exact IP constraint.
 fn permits(cert: &[u8], host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let bytes = match ip {
+            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+            std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        let mut encoded = vec![0x87, (bytes.len() * 2) as u8];
+        encoded.extend(&bytes);
+        encoded.extend(vec![255; bytes.len()]);
+        return cert.windows(encoded.len()).any(|w| w == encoded);
+    }
     // A context-specific [2] IA5String: the tag, a DER length, then the name.
     let mut encoded = vec![0x82];
     match host.len() {
@@ -465,6 +525,111 @@ mod tests {
         assert!(!permits(der, "api.anthropic.com"));
         assert!(!permits(der, "anthropic.com"));
         assert!(!permits(der, &"a".repeat(129)));
+    }
+
+    #[test]
+    fn proxy_ca_tracks_exact_public_ip_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = hosts(&["gateway.invalid", "182.92.106.196"]);
+        proxy_acceptors(dir.path(), &initial).unwrap();
+        let pem = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        let der = CertificateDer::from_pem_slice(&pem).unwrap();
+        assert!(permits(&der, "182.92.106.196"));
+        assert!(!permits(&der, "182.92.106.197"));
+        assert!(!permits(&der, "127.0.0.1"));
+        proxy_acceptors(dir.path(), &initial).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), pem);
+        proxy_acceptors(
+            dir.path(),
+            &hosts(&["gateway.invalid", "182.92.106.196", "182.92.106.197"]),
+        )
+        .unwrap();
+        assert_ne!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), pem);
+    }
+
+    // Verified as a client would, since constraints only bind the name types
+    // they list: a CA with only DNS hosts must not vouch for any IP, and one
+    // with only IP hosts must not vouch for any site.
+    #[test]
+    fn proxy_ca_cannot_vouch_for_names_outside_its_hosts() {
+        use rustls::client::danger::ServerCertVerifier;
+        for (names, denied) in [
+            (
+                &["api.anthropic.com"][..],
+                &["www.example.com", "127.0.0.1", "182.92.106.196", "::1"][..],
+            ),
+            (
+                &["182.92.106.196"][..],
+                &["www.example.com", "localhost", "127.0.0.1", "::1"][..],
+            ),
+            (
+                &["api.anthropic.com", "182.92.106.196"][..],
+                &["www.example.com", "127.0.0.1", "182.92.106.197", "::1"][..],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let hosts = hosts(names);
+            proxy_acceptors(dir.path(), &hosts).unwrap();
+            let key = KeyPair::from_pem(
+                &std::fs::read_to_string(dir.path().join(PROXY_CA_KEY_FILE)).unwrap(),
+            )
+            .unwrap();
+            let issuer = Issuer::new(proxy_ca_params(&hosts), &key);
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap())
+                .unwrap();
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .unwrap();
+            let verifies = |name: &str| {
+                let leaf = leaf(name, "forged", &issuer).unwrap();
+                verifier
+                    .verify_server_cert(
+                        &leaf.cert[0],
+                        &[],
+                        &rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap(),
+                        &[],
+                        rustls::pki_types::UnixTime::now(),
+                    )
+                    .is_ok()
+            };
+            for name in names {
+                assert!(verifies(name), "{names:?} {name}");
+            }
+            for name in denied {
+                assert!(!verifies(name), "{names:?} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_proxy_ca_leaving_a_name_type_open_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let only_dns = hosts(&["api.anthropic.com"]);
+        // As created before unused name types were closed.
+        let key = KeyPair::generate().unwrap();
+        let open = ca_template(
+            "coport proxy CA",
+            vec![GeneralSubtree::DnsName("api.anthropic.com".into())],
+        )
+        .self_signed(&key)
+        .unwrap();
+        std::fs::write(dir.path().join(PROXY_CA_KEY_FILE), key.serialize_pem()).unwrap();
+        std::fs::write(dir.path().join(PROXY_CA_FILE), open.pem()).unwrap();
+        assert!(!covers(open.der(), &only_dns));
+        proxy_acceptors(dir.path(), &only_dns).unwrap();
+        let replaced = CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap();
+        assert_ne!(replaced.as_ref(), open.der().as_ref());
+        assert!(covers(&replaced, &only_dns));
+        // Gaining an IP host lifts the exclusion, so the CA is replaced again.
+        assert!(!covers(
+            &replaced,
+            &hosts(&["api.anthropic.com", "182.92.106.196"])
+        ));
     }
 
     #[tokio::test]
