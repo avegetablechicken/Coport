@@ -441,10 +441,14 @@ impl Server {
         if let Some(proxy) = &self.credential_proxy {
             self.logger.write(
                 "credential_proxy",
-                json!({"destinations": proxy.authorities()})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+                json!({
+                    "destinations": proxy.authorities(),
+                    "uncovered": proxy.uncovered(),
+                    "ca_unrestricted": proxy.ca_unrestricted(),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
             );
         }
         for (label, source) in &self.config.codex.account_sources() {
@@ -1069,7 +1073,20 @@ impl Server {
                 (crate::tunnel::authority(name).ok() == Some((host.clone(), port)))
                     .then_some(choice)
             })
-            .ok_or(Error::new(403, "CONNECT destination is not configured."))?;
+            .ok_or_else(|| {
+                let uncovered = self
+                    .credential_proxy
+                    .as_ref()
+                    .is_some_and(|proxy| proxy.is_uncovered(&host, port));
+                Error::new(
+                    403,
+                    if uncovered {
+                        "The proxy CA does not cover this destination; use its base URL or replace the CA."
+                    } else {
+                        "CONNECT destination is not configured."
+                    },
+                )
+            })?;
         let authority = if host.contains(':') {
             format!("[{host}]:{port}")
         } else {

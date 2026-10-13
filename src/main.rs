@@ -24,6 +24,11 @@ struct Args {
     check: bool,
     #[arg(long, hide = true)]
     print_listen_port: bool,
+    /// Replace the proxy-port CA with one covering every credential-routed
+    /// host, keeping the old pair in tls/backup/, then exit. Clients must
+    /// trust the new CA.
+    #[arg(long)]
+    replace_proxy_ca: bool,
     /// Override a YAML setting using a dotted path (repeatable; last value wins).
     #[arg(short = 'c', value_name = "PATH=VALUE")]
     overrides: Vec<String>,
@@ -73,6 +78,16 @@ async fn run(args: Args) -> Result<()> {
         );
         return Ok(());
     }
+    let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
+    if args.replace_proxy_ca {
+        coport::credential_proxy::CredentialProxy::replace_ca(&config, &tls_dir, |_| Ok(()))
+            .map_err(|_| Error::config("Cannot replace the proxy port certificate."))?;
+        println!(
+            "Replaced the proxy CA; trust {} and restart coport.",
+            tls_dir.join(coport::local_tls::PROXY_CA_FILE).display()
+        );
+        return Ok(());
+    }
     let log_path = args.log_file.map(|s| expand(&s)).unwrap_or_else(|| {
         path.parent()
             .unwrap_or(std::path::Path::new("."))
@@ -92,7 +107,6 @@ async fn run(args: Args) -> Result<()> {
         "coport listening on http://{listen_address}:{}",
         config.listen_port
     );
-    let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
     let credential_proxy = coport::credential_proxy::CredentialProxy::prepare(&config, &tls_dir)?;
     let mut server = Server::new(config, logger.clone());
     if let Some(proxy) = credential_proxy {
@@ -101,6 +115,18 @@ async fn run(args: Args) -> Result<()> {
             proxy.authorities().join(", "),
             tls_dir.join(coport::local_tls::PROXY_CA_FILE).display()
         );
+        let uncovered = proxy.uncovered();
+        if !uncovered.is_empty() {
+            eprintln!(
+                "Warning: the trusted proxy CA does not cover {}. Proxy-port clients cannot reach them; base URLs and the other hosts still work. Run with --replace-proxy-ca to include them.",
+                uncovered.join(", ")
+            );
+        }
+        if proxy.ca_unrestricted() {
+            eprintln!(
+                "Warning: the proxy CA predates IP constraints and could vouch for any IP address. Run with --replace-proxy-ca to narrow it."
+            );
+        }
         server = server.with_credential_proxy(proxy);
     }
     match coport::local_tls::acceptor(&tls_dir) {

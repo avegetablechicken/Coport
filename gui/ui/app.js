@@ -487,12 +487,31 @@ function proxyBlock() {
   if (s.config.changedSinceStart) {
     messages += message("warn", "The configuration changed since the proxy started.", `<button class="btn" data-action="restart">Restart to Apply</button>`);
   }
+  if (s.proxyCa) messages += proxyCaMessage(s.proxyCa);
   const strip = `<div class="strip">
     ${stat("Address", `127.0.0.1:${s.phase.port}`)}
     ${stat("Uptime", state === "running" ? `<span id="uptime">${fmtUptime(uptime())}</span>` : "—")}
     ${stat("Config", s.config.error ? "Invalid" : s.config.exists ? "Valid" : "Missing", s.config.error ? "bad" : "")}
   </div>`;
   return block("Proxy", head, strip + messages);
+}
+
+/// Hosts the trusted proxy CA does not cover stay undecrypted until the user
+/// replaces it. States what still works; once kept, only a short note remains.
+function proxyCaMessage(ca) {
+  const hosts = ca.uncovered.map((a) => `<strong>${esc(a.replace(/:443$/, ""))}</strong>`).join(", ");
+  const replace = (label, kind) => `<button class="${kind}" data-action="proxy-ca-replace">${label}</button>`;
+  if (ca.kept) {
+    const text = ca.uncovered.length
+      ? `Proxy port skips ${hosts}; base URLs still work.`
+      : "The proxy CA isn't limited to its hosts.";
+    return message("info", text, replace("Replace CA…", "text-link"));
+  }
+  const others = ca.decrypted.length;
+  const text = ca.uncovered.length
+    ? `Proxy CA doesn't cover ${hosts}.<span class="message-note">Still working: base URLs${others ? ` and the proxy port for ${others} other host${others === 1 ? "" : "s"}` : ""}. Proxy-port clients can't reach ${ca.uncovered.length === 1 ? "this host" : "these hosts"}.${ca.unrestricted ? " The CA also isn't limited to its hosts." : ""}</span>`
+    : `<strong>Proxy CA isn't limited to its hosts.</strong><span class="message-note">Everything still works, but it could vouch for any IP address.</span>`;
+  return message("warn", text, `${replace("Replace &amp; Trust…", "btn")}<button class="btn" data-action="proxy-ca-keep">Keep Current CA</button>`);
 }
 
 /// Bars of a stats object's buckets: requests, or with Models reported input
@@ -2167,6 +2186,24 @@ async function act(action, el) {
       try {
         await invoke("restart_proxy");
         toast("Proxy restarted");
+      } catch (e) {
+        toast(String(e));
+      }
+      await refresh();
+      break;
+    case "proxy-ca-replace":
+      try {
+        const trusted = await invoke("replace_proxy_ca");
+        if (trusted === true) toast("Proxy CA replaced and trusted");
+        else if (trusted === false) toast("Proxy CA replaced. Add it to your trust store");
+      } catch (e) {
+        toast(String(e));
+      }
+      await refresh();
+      break;
+    case "proxy-ca-keep":
+      try {
+        await invoke("keep_proxy_ca");
       } catch (e) {
         toast(String(e));
       }

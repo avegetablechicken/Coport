@@ -272,6 +272,71 @@ pub async fn clear_traffic_compatibility(app: AppHandle) -> Result<bool> {
     }
 }
 
+/// Keeps the current proxy CA: the hosts it does not cover stay undecrypted.
+#[tauri::command]
+pub fn keep_proxy_ca(state: State<AppState>) {
+    state.core.lock().unwrap().keep_proxy_ca();
+}
+
+/// Replaces the proxy CA after confirmation: the new CA is trusted first, so
+/// a refused trust prompt changes nothing, and a running proxy restarts to use
+/// it. Returns false when cancelled, otherwise whether trust was automatic.
+#[tauri::command]
+pub async fn replace_proxy_ca(app: AppHandle) -> Result<Option<bool>> {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let confirmed = panel::with_modal(&app, || {
+        app.dialog()
+            .message(if cfg!(any(target_os = "macos", target_os = "windows")) {
+                "A new proxy CA covering every configured host is added to your trust store; the system asks you to confirm. The proxy then restarts.\n\nApps that loaded the current CA may need a restart. The current CA is kept in tls/backup."
+            } else {
+                "A new proxy CA covering every configured host replaces the current one, and the proxy restarts. Add it to your trust store afterwards.\n\nThe current CA is kept in tls/backup."
+            })
+            .title("Replace the Proxy CA?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Replace".into(),
+                "Cancel".into(),
+            ))
+            .blocking_show()
+    });
+    if !confirmed {
+        return Ok(None);
+    }
+    let config_path = app.state::<AppState>().core.lock().unwrap().config_path();
+    // Not under the core lock: the trust prompt waits for the user.
+    let trusted = tauri::async_runtime::spawn_blocking(move || {
+        let config =
+            coport::config::Config::read(&config_path).map_err(|e| e.message.to_owned())?;
+        let mut trusted = false;
+        coport::credential_proxy::CredentialProxy::replace_ca(
+            &config,
+            &coport::local_tls::dir_for(&config_path),
+            |path| {
+                trusted = platform::trust_certificate(path)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("The proxy CA was not replaced: {e}"))?;
+        Ok::<_, String>(trusted)
+    })
+    .await
+    .map_err(|_| "The proxy CA was not replaced.".to_owned())??;
+    let completion = {
+        let state = app.state::<AppState>();
+        let mut core = state.core.lock().unwrap();
+        core.settings.kept_proxy_ca.clear();
+        core.settings.save();
+        core.is_running().then(|| core.start()).transpose()?
+    };
+    if let Some(completion) = completion {
+        completion
+            .await
+            .map_err(|_| "The proxy control worker stopped.".to_owned())??;
+    }
+    tray::sync(&app);
+    Ok(Some(trusted))
+}
+
 #[tauri::command]
 pub async fn set_running(app: AppHandle, state: State<'_, AppState>, running: bool) -> Result {
     let completion = {

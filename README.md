@@ -634,12 +634,20 @@ constraints permitting only the decrypted hostnames and exact IP addresses, so
 trusting it does not cover loopback or any other site. Constraints bind only the
 name types they list, so without a decrypted IP address every IP address is
 excluded, and without a decrypted hostname only the reserved `invalid` domain is
-permitted. If a later configuration decrypts a host the stored CA does not
-permit, or no longer needs a name type that CA permits, the CA is replaced on
-start and must be trusted again; otherwise it is reused. A replaced certificate
-and its key are moved to `tls/backup/` (for example
-`proxy-ca.<millis>-<id>.pem` with `proxy-ca-key.<millis>-<id>.pem`), never
-overwritten; the loopback CA is kept the same way. BoringSSL clients such
+permitted. A stored CA is never replaced automatically, since clients trust it.
+Hosts a later configuration adds outside its constraints are not decrypted:
+their CONNECT is refused with that reason, while base URLs and the hosts the CA
+covers keep working. The GUI warns on the Proxy card and offers **Replace &
+Trust**, which adds a new CA covering every host to your trust store (macOS asks
+for your login password, Windows shows a security warning; on Linux trust it
+yourself) before installing it, then restarts the proxy; **Keep Current CA**
+reduces the warning to a note until the uncovered hosts change. The CLI prints
+the same warning, and `coport --config <path> --replace-proxy-ca` replaces the
+CA. A CA created before IP constraints is kept the same way and reported as not
+limited to its hosts. A replaced certificate and its key are moved to
+`tls/backup/` (for example `proxy-ca.<millis>-<id>.pem` with
+`proxy-ca-key.<millis>-<id>.pem`), never overwritten; the loopback CA is kept
+the same way. BoringSSL clients such
 as Claude Code reject IP certificates under IP constraints, so they cannot use
 the proxy port for an IP upstream; use its base URL instead. Point clients at
 the CA rather than replacing their CA bundles:

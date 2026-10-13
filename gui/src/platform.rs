@@ -48,6 +48,46 @@ pub fn edit(path: &Path) {
     let _ = Command::new("xdg-open").arg(path).spawn();
 }
 
+/// Adds a CA certificate to the user's trust store once the system confirms
+/// it (macOS asks for the login password, Windows shows a security warning).
+/// Returns false where no user trust store is managed: the user trusts it.
+pub fn trust_certificate(path: &Path) -> std::io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        // User trust settings in the default (login) keychain; no admin rights.
+        let mut command = Command::new("/usr/bin/security");
+        command.args(["add-trusted-cert", "-r", "trustRoot"]);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("certutil");
+        command.args(["-user", "-addstore", "Root"]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let output = command.arg(path).output()?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let reason = String::from_utf8_lossy(&output.stderr);
+        let reason = reason
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        Err(std::io::Error::other(match reason.trim() {
+            "" => "The certificate was not trusted.".to_owned(),
+            reason => reason.to_owned(),
+        }))
+    }
+}
+
 trait TextClipboard: Send {
     fn set_text(&mut self, text: String) -> Result<(), arboard::Error>;
 }

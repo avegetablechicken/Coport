@@ -57,9 +57,22 @@ pub struct Status {
     #[serde(default)]
     pub data_port: Option<u16>,
     pub uptime_ms: u64,
+    /// The proxy-port CA as loaded at start, while credential routing is on.
+    #[serde(default)]
+    pub proxy_ca: Option<ProxyCa>,
     pub config_path: PathBuf,
     pub log_path: PathBuf,
     pub config_modified: Option<SystemTime>,
+}
+
+/// Credential-routed origins the stored proxy CA does not cover, which stay
+/// undecrypted until the user replaces it, and whether it leaves a name type
+/// unconstrained.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProxyCa {
+    pub decrypted: Vec<String>,
+    pub uncovered: Vec<String>,
+    pub unrestricted: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -688,6 +701,11 @@ async fn serve_until(
     // Enabled in Settings; without its CA, proxy-port clients could not be routed.
     let credential_proxy = coport::credential_proxy::CredentialProxy::prepare(&config, &tls_dir)
         .map_err(|e| io::Error::other(e.message))?;
+    let proxy_ca = credential_proxy.as_ref().map(|proxy| ProxyCa {
+        decrypted: proxy.authorities(),
+        uncovered: proxy.uncovered(),
+        unrestricted: proxy.ca_unrestricted(),
+    });
     let mut server = Server::new(config, logger.clone());
     if let Some(proxy) = credential_proxy {
         server = server.with_credential_proxy(proxy);
@@ -744,6 +762,7 @@ async fn serve_until(
         credential_checks_supported: true,
         port,
         uptime_ms: 0,
+        proxy_ca,
         allow_external_access,
         data_port,
         config_path,
@@ -970,6 +989,7 @@ pub(crate) mod tests {
                     credential_checks_supported: false,
                     port,
                     uptime_ms: 0,
+                    proxy_ca: None,
                     allow_external_access: false,
                     data_port: None,
                     config_path: dir.join("config.yaml"),
@@ -1059,6 +1079,55 @@ pub(crate) mod tests {
         assert!(Client::discover(dir.path()).is_none());
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, status.port)).unwrap();
         drop(idle);
+    }
+
+    // The GUI warns from this status; the daemon must keep the trusted CA
+    // rather than replace it when the configuration gains hosts.
+    #[test]
+    fn status_reports_hosts_outside_the_trusted_proxy_ca() {
+        let _guard = spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        coport::local_tls::proxy_acceptors(
+            &tls,
+            &["upstream.invalid", "platform.claude.com"]
+                .map(String::from)
+                .into(),
+        )
+        .unwrap();
+        let trusted = std::fs::read(tls.join(coport::local_tls::PROXY_CA_FILE)).unwrap();
+        // Continues the `claude` section the helper writes, then enables routing.
+        let (_signal, daemon) = serve_with_proxies(
+            dir.path(),
+            "  base_url: https://upstream.invalid\n  routing:\n    account_fallback: none\n    api_key:\n      'https://182.92.106.196:6060': none\nconnect_credential_routing: true\n",
+        );
+        let (client, status) = wait_for_daemon(dir.path());
+        assert_eq!(
+            status.proxy_ca,
+            Some(ProxyCa {
+                decrypted: vec![
+                    "platform.claude.com:443".into(),
+                    "upstream.invalid:443".into()
+                ],
+                uncovered: vec!["182.92.106.196:6060".into()],
+                unrestricted: false,
+            })
+        );
+        client.stop().unwrap();
+        daemon.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(tls.join(coport::local_tls::PROXY_CA_FILE)).unwrap(),
+            trusted
+        );
+        // Statuses from daemons predating the field still parse.
+        let mut older = serde_json::to_value(&status).unwrap();
+        older.as_object_mut().unwrap().remove("proxy_ca");
+        assert!(
+            serde_json::from_value::<Status>(older)
+                .unwrap()
+                .proxy_ca
+                .is_none()
+        );
     }
 
     #[test]

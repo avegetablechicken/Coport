@@ -109,6 +109,8 @@ fn main() {
             commands::clear_traffic_compatibility,
             commands::set_running,
             commands::restart_proxy,
+            commands::keep_proxy_ca,
+            commands::replace_proxy_ca,
             commands::probe_proxy,
             commands::update_settings,
             commands::set_launch_at_login,

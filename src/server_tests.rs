@@ -184,7 +184,12 @@ impl Drop for Running {
     }
 }
 async fn running(config: &str) -> Running {
+    running_with_tls(config, |_| {}).await
+}
+/// `running`, after `seed` prepares the TLS directory, e.g. with a stored CA.
+async fn running_with_tls(config: &str, seed: impl FnOnce(&std::path::Path)) -> Running {
     let temp = tempfile::tempdir().unwrap();
+    seed(&temp.path().join("tls"));
     let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));
     let mut config = Config::parse(&format!(
         "listen_port: 7889\nrequest_timeout_seconds: 3\n{config}"
@@ -3338,6 +3343,63 @@ async fn clients_that_do_not_trust_the_proxy_ca_are_logged_as_such() {
         .unwrap();
         assert_eq!(reason, "client_rejected_proxy_ca");
     }
+}
+
+// Hosts added after the proxy CA was trusted are not decrypted with a new CA;
+// their CONNECT is refused with the reason, and nothing is forwarded.
+#[tokio::test]
+async fn connect_to_a_host_outside_the_stored_proxy_ca_explains_the_refusal() {
+    let running = running_with_tls(
+        "connect_credential_routing: true\nclaude:\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: none\n    api_key:\n      'https://182.92.106.196:6060': none\n",
+        |tls| {
+            crate::local_tls::proxy_acceptors(
+                tls,
+                &std::collections::BTreeSet::from([
+                    "upstream.invalid".to_owned(),
+                    "platform.claude.com".to_owned(),
+                ]),
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    for (authority, expected) in [
+        ("182.92.106.196:6060", "HTTP/1.1 403"),
+        ("upstream.invalid:443", "HTTP/1.1 200"),
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with(expected), "{authority}: {head}");
+    }
+    let row = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            running.server.logger.flush().unwrap();
+            let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+            if let Some(row) = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|row| row["event"] == "request_rejected" && row["method"] == "CONNECT")
+            {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(row["destination"], "182.92.106.196:6060");
+    assert_eq!(
+        row["reason"],
+        "The proxy CA does not cover this destination; use its base URL or replace the CA."
+    );
 }
 
 #[tokio::test]

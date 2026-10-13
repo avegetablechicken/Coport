@@ -24,6 +24,9 @@ pub struct Settings {
     data_sources: Vec<crate::data_client::Source>,
     pub start_proxy_on_launch: bool,
     pub keep_proxy_running_on_quit: bool,
+    /// The proxy CA notice the user chose to keep the current CA for; the
+    /// warning returns when the notice changes.
+    pub kept_proxy_ca: Vec<String>,
 }
 
 impl Default for Settings {
@@ -35,6 +38,7 @@ impl Default for Settings {
             data_sources: Vec::new(),
             start_proxy_on_launch: true,
             keep_proxy_running_on_quit: false,
+            kept_proxy_ca: Vec::new(),
         }
     }
 }

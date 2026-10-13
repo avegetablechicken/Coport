@@ -5,6 +5,7 @@
 //!
 //! Proxy-port credential routing uses a second CA, constrained to the API
 //! hosts it decrypts, so trusting it never covers loopback or other sites.
+//! A trusted CA is replaced only on request, and a replaced pair is kept.
 use crate::{Error, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
@@ -58,33 +59,117 @@ pub fn acceptor(dir: &Path) -> Result<TlsAcceptor> {
     server_acceptor(certs).map_err(failed)
 }
 
-/// Load (or create) the proxy-port CA in `dir`, valid for every name in
-/// `hosts`, and build one acceptor per host. A stored CA whose constraints
-/// omit a host is replaced, and must then be trusted again.
-pub fn proxy_acceptors(
-    dir: &Path,
-    hosts: &BTreeSet<String>,
-) -> Result<HashMap<String, TlsAcceptor>> {
+/// The proxy-port CA in use.
+pub struct ProxyCa {
+    /// One acceptor per host the CA permits.
+    pub acceptors: HashMap<String, TlsAcceptor>,
+    /// Hosts the stored CA does not permit; they are not decrypted until the
+    /// user replaces the CA (`replace_proxy_ca`).
+    pub uncovered: BTreeSet<String>,
+    /// The stored CA leaves a name type unconstrained, as CAs made before
+    /// IP constraints did, so it could vouch for any IP address or site.
+    pub unrestricted: bool,
+}
+
+/// Load the proxy-port CA in `dir` and build an acceptor for each host it
+/// permits. A CA is created for `hosts` only when no usable one is stored:
+/// clients trust the stored CA, so it is never replaced here.
+pub fn proxy_acceptors(dir: &Path, hosts: &BTreeSet<String>) -> Result<ProxyCa> {
     fn failed<E>(_: E) -> Error {
         Error::config("Cannot prepare the proxy port certificate.")
     }
-    let ca_key = load_or_create(dir, &PROXY, &proxy_ca_params(hosts), &|cert| {
-        covers(cert, hosts)
-    })
-    .map_err(failed)?;
+    let ca_key = load_or_create(dir, &PROXY, &proxy_ca_params(hosts), &|_| true).map_err(failed)?;
+    let ca = CertificateDer::from_pem_file(dir.join(PROXY_CA_FILE)).map_err(failed)?;
     let issuer = Issuer::new(proxy_ca_params(hosts), &ca_key);
-    hosts
-        .iter()
+    let (covered, uncovered): (BTreeSet<_>, _) =
+        hosts.iter().cloned().partition(|host| permits(&ca, host));
+    let acceptors = covered
+        .into_iter()
         .map(|host| {
-            let cert = leaf(host, "coport proxy", &issuer).map_err(failed)?;
+            let cert = leaf(&host, "coport proxy", &issuer).map_err(failed)?;
             let acceptor = server_acceptor(Arc::new(SingleName {
                 name: host.clone(),
                 cert,
             }))
             .map_err(failed)?;
-            Ok((host.clone(), acceptor))
+            Ok((host, acceptor))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    let unrestricted = UNRESTRICTED_PROBES
+        .iter()
+        .any(|name| vouches_for(&ca, &issuer, name));
+    Ok(ProxyCa {
+        acceptors,
+        uncovered,
+        unrestricted,
+    })
+}
+
+/// Create a proxy CA for `hosts` and install it once `trust` accepts its
+/// staged certificate file; the replaced pair is moved to `BACKUP_DIR`. If
+/// `trust` fails, the current CA stays in place and in use.
+pub fn replace_proxy_ca(
+    dir: &Path,
+    hosts: &BTreeSet<String>,
+    trust: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let key = KeyPair::generate().map_err(std::io::Error::other)?;
+    let cert = proxy_ca_params(hosts)
+        .self_signed(&key)
+        .map_err(std::io::Error::other)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix("proxy-ca.pending.")
+        .suffix(".pem")
+        .tempfile_in(dir)?;
+    staged.write_all(cert.pem().as_bytes())?;
+    staged.as_file().sync_all()?;
+    // Not locked meanwhile: the user may take long to answer a trust prompt.
+    trust(staged.path())?;
+    let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE), Duration::from_secs(30))?;
+    back_up(dir, &PROXY)?;
+    persist(
+        dir,
+        &dir.join(PROXY_CA_KEY_FILE),
+        key.serialize_pem().as_bytes(),
+    )?;
+    staged
+        .persist(dir.join(PROXY_CA_FILE))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Names outside any configured upstream (RFC 5737, 3849 and 2606) that a
+/// constrained proxy CA must refuse.
+const UNRESTRICTED_PROBES: [&str; 3] = ["192.0.2.1", "2001:db8::1", "coport-probe.example"];
+
+/// Whether a client trusting `ca` accepts a certificate `issuer` makes for `name`.
+fn vouches_for(ca: &CertificateDer<'_>, issuer: &Issuer<'_, &KeyPair>, name: &str) -> bool {
+    use rustls::client::danger::ServerCertVerifier;
+    let mut roots = rustls::RootCertStore::empty();
+    if roots.add(ca.clone().into_owned()).is_err() {
+        return false;
+    }
+    let (Ok(verifier), Ok(leaf), Ok(server_name)) = (
+        rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build(),
+        leaf(name, "coport probe", issuer),
+        rustls::pki_types::ServerName::try_from(name.to_owned()),
+    ) else {
+        return false;
+    };
+    verifier
+        .verify_server_cert(
+            &leaf.cert[0],
+            &[],
+            &server_name,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .is_ok()
 }
 
 fn server_acceptor(certs: Arc<dyn ResolvesServerCert>) -> Result<TlsAcceptor> {
@@ -204,16 +289,6 @@ fn ca_params() -> CertificateParams {
 
 /// Permitted only for a CA without DNS hosts; reserved never to resolve (RFC 2606).
 const UNUSED_DNS_NAME: &str = "invalid";
-/// The excluded all-IPv4 and all-IPv6 subtrees: [7] OCTET STRING of a zero
-/// address and a zero mask.
-const ANY_IPV4: [u8; 10] = [0x87, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-const ANY_IPV6: [u8; 34] = {
-    let mut encoded = [0; 34];
-    encoded[0] = 0x87;
-    encoded[1] = 32;
-    encoded
-};
-
 fn proxy_ca_params(hosts: &BTreeSet<String>) -> CertificateParams {
     let mut permitted: Vec<_> = hosts
         .iter()
@@ -247,16 +322,6 @@ fn proxy_ca_params(hosts: &BTreeSet<String>) -> CertificateParams {
         ];
     }
     params
-}
-
-/// Whether a stored proxy CA can issue for every host and closes the name
-/// types `hosts` lacks, as `proxy_ca_params` would.
-fn covers(cert: &[u8], hosts: &BTreeSet<String>) -> bool {
-    let contains = |encoded: &[u8]| cert.windows(encoded.len()).any(|w| w == encoded);
-    let ip = |host: &String| host.parse::<std::net::IpAddr>().is_ok();
-    hosts.iter().all(|host| permits(cert, host))
-        && (hosts.iter().any(|h| !ip(h)) || permits(cert, UNUSED_DNS_NAME))
-        && (hosts.iter().any(ip) || (contains(&ANY_IPV4) && contains(&ANY_IPV6)))
 }
 
 /// Whether the DER certificate lists the DNS name or exact IP constraint.
@@ -528,25 +593,26 @@ mod tests {
     }
 
     #[test]
-    fn proxy_ca_is_reused_while_it_covers_every_host() {
+    fn a_stored_proxy_ca_is_kept_when_hosts_change() {
         let dir = tempfile::tempdir().unwrap();
         let both = hosts(&["api.anthropic.com", "chatgpt.com"]);
-        let acceptors = proxy_acceptors(dir.path(), &both).unwrap();
-        assert_eq!(acceptors.len(), 2);
+        let ca = proxy_acceptors(dir.path(), &both).unwrap();
+        assert_eq!(ca.acceptors.len(), 2);
+        assert!(ca.uncovered.is_empty() && !ca.unrestricted);
         let first = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
         // The loopback CA is separate and untouched.
         assert!(!dir.path().join(CA_FILE).exists());
-        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com"])).unwrap();
+        let ca = proxy_acceptors(dir.path(), &hosts(&["chatgpt.com"])).unwrap();
+        assert_eq!(ca.acceptors.keys().collect::<Vec<_>>(), ["chatgpt.com"]);
+        // A host the stored CA does not permit is reported, not covered by a new CA.
+        let ca = proxy_acceptors(dir.path(), &hosts(&["chatgpt.com", "api.openai.com"])).unwrap();
+        assert_eq!(ca.acceptors.keys().collect::<Vec<_>>(), ["chatgpt.com"]);
+        assert_eq!(ca.uncovered, hosts(&["api.openai.com"]));
         assert_eq!(
             first,
             std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap()
         );
-        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com", "api.openai.com"])).unwrap();
-        let replaced = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
-        assert_ne!(first, replaced);
-        let cert = CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap();
-        assert!(permits(&cert, "api.openai.com"));
-        assert!(!permits(&cert, "api.anthropic.com"));
+        assert!(!dir.path().join(BACKUP_DIR).exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -555,6 +621,51 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o077, 0);
+        }
+    }
+
+    /// Whether a client trusting only `ca_pem` completes a handshake with
+    /// `acceptor` for `name`.
+    async fn handshake(acceptor: &TlsAcceptor, ca_pem: &[u8], name: &str) -> bool {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca_pem).unwrap())
+            .unwrap();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        ));
+        let (near, far) = tokio::io::duplex(65536);
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move { acceptor.accept(far).await.is_ok() });
+        let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap();
+        // Kept open until the server finishes writing its session tickets.
+        let connected = client.connect(server_name, near).await;
+        server.await.unwrap() && connected.is_ok()
+    }
+
+    // A configuration gaining upstreams once replaced the trusted CA, and every
+    // client still trusting it failed for the hosts it had always covered.
+    #[tokio::test]
+    async fn clients_trusting_the_stored_ca_keep_working_after_hosts_are_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = ["api.anthropic.com", "chatgpt.com", "platform.claude.com"];
+        proxy_acceptors(dir.path(), &hosts(&api)).unwrap();
+        let trusted = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        let mut grown = hosts(&api);
+        grown.extend(hosts(&["sharecoder.cc", "182.92.106.196"]));
+        let ca = proxy_acceptors(dir.path(), &grown).unwrap();
+        assert_eq!(ca.uncovered, hosts(&["sharecoder.cc", "182.92.106.196"]));
+        for name in api {
+            assert!(
+                handshake(&ca.acceptors[name], &trusted, name).await,
+                "{name}"
+            );
         }
     }
 
@@ -572,17 +683,51 @@ mod tests {
         files
     }
 
-    #[test]
-    fn a_replaced_proxy_ca_is_kept_with_its_key() {
+    /// Files directly in `dir`, by name.
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_proxy_ca_is_replaced_only_once_trusted_and_the_old_pair_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         acceptor(dir.path()).unwrap();
         let loopback = std::fs::read(dir.path().join(CA_FILE)).unwrap();
         proxy_acceptors(dir.path(), &hosts(&["chatgpt.com"])).unwrap();
         let cert = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
         let key = std::fs::read(dir.path().join(PROXY_CA_KEY_FILE)).unwrap();
-        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com", "api.openai.com"])).unwrap();
+        let before = files(dir.path());
+        let grown = hosts(&["chatgpt.com", "182.92.106.196"]);
+        // A refused trust prompt changes nothing and leaves no staged file.
+        let mut offered = Vec::new();
+        let refused = replace_proxy_ca(dir.path(), &grown, |path| {
+            offered = std::fs::read(path).unwrap();
+            Err(std::io::Error::other("cancelled"))
+        });
+        assert!(refused.is_err());
+        assert_ne!(offered, cert);
+        assert_eq!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), cert);
+        assert_eq!(files(dir.path()), before);
+        assert!(!dir.path().join(BACKUP_DIR).exists());
+        // Once trusted, the offered certificate is installed and covers every host.
+        replace_proxy_ca(dir.path(), &grown, |path| {
+            offered = std::fs::read(path).unwrap();
+            Ok(())
+        })
+        .unwrap();
         let second = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
-        assert_ne!(second, cert);
+        assert_eq!(second, offered);
+        assert_eq!(files(dir.path()), before);
+        let ca = proxy_acceptors(dir.path(), &grown).unwrap();
+        assert!(ca.uncovered.is_empty());
+        assert!(handshake(&ca.acceptors["182.92.106.196"], &second, "182.92.106.196").await);
         let kept = backups(dir.path());
         assert_eq!(kept.len(), 2);
         let find = |prefix: &str| kept.iter().find(|(n, _)| n.starts_with(prefix)).unwrap();
@@ -606,9 +751,10 @@ mod tests {
             let backup = dir.path().join(BACKUP_DIR);
             assert_eq!(mode(&backup) & 0o077, 0);
             assert_eq!(mode(&backup.join(kept_key)) & 0o077, 0);
+            assert_eq!(mode(&dir.path().join(PROXY_CA_KEY_FILE)) & 0o077, 0);
         }
         // A further replacement keeps both earlier pairs.
-        proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com"])).unwrap();
+        replace_proxy_ca(dir.path(), &hosts(&["api.anthropic.com"]), |_| Ok(())).unwrap();
         let kept = backups(dir.path());
         assert_eq!(kept.len(), 4);
         assert!(kept.iter().any(|(_, data)| *data == cert));
@@ -642,14 +788,13 @@ mod tests {
         assert!(permits(&der, "182.92.106.196"));
         assert!(!permits(&der, "182.92.106.197"));
         assert!(!permits(&der, "127.0.0.1"));
-        proxy_acceptors(dir.path(), &initial).unwrap();
-        assert_eq!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), pem);
-        proxy_acceptors(
+        let ca = proxy_acceptors(
             dir.path(),
             &hosts(&["gateway.invalid", "182.92.106.196", "182.92.106.197"]),
         )
         .unwrap();
-        assert_ne!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), pem);
+        assert_eq!(ca.uncovered, hosts(&["182.92.106.197"]));
+        assert_eq!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), pem);
     }
 
     // Verified as a client would, since constraints only bind the name types
@@ -712,9 +857,8 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_proxy_ca_leaving_a_name_type_open_is_replaced() {
+    fn a_stored_proxy_ca_leaving_a_name_type_open_is_kept_and_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let only_dns = hosts(&["api.anthropic.com"]);
         // As created before unused name types were closed.
         let key = KeyPair::generate().unwrap();
         let open = ca_template(
@@ -725,22 +869,39 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join(PROXY_CA_KEY_FILE), key.serialize_pem()).unwrap();
         std::fs::write(dir.path().join(PROXY_CA_FILE), open.pem()).unwrap();
-        assert!(!covers(open.der(), &only_dns));
-        proxy_acceptors(dir.path(), &only_dns).unwrap();
-        let replaced = CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap();
-        assert_ne!(replaced.as_ref(), open.der().as_ref());
-        assert!(covers(&replaced, &only_dns));
-        // Gaining an IP host lifts the exclusion, so the CA is replaced again.
-        assert!(!covers(
-            &replaced,
-            &hosts(&["api.anthropic.com", "182.92.106.196"])
-        ));
+        let ca =
+            proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com", "182.92.106.196"])).unwrap();
+        assert!(ca.unrestricted);
+        // Only explicitly permitted hosts are decrypted, even if an open type would allow more.
+        assert_eq!(
+            ca.acceptors.keys().collect::<Vec<_>>(),
+            ["api.anthropic.com"]
+        );
+        assert_eq!(ca.uncovered, hosts(&["182.92.106.196"]));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(PROXY_CA_FILE)).unwrap(),
+            open.pem()
+        );
+        for names in [
+            &["api.anthropic.com"][..],
+            &["182.92.106.196"][..],
+            &["api.anthropic.com", "182.92.106.196"][..],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(
+                !proxy_acceptors(dir.path(), &hosts(names))
+                    .unwrap()
+                    .unrestricted
+            );
+        }
     }
 
     #[tokio::test]
     async fn proxy_certificates_are_only_offered_for_their_destination() {
         let dir = tempfile::tempdir().unwrap();
-        let acceptors = proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com"])).unwrap();
+        let acceptors = proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com"]))
+            .unwrap()
+            .acceptors;
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from_pem_file(dir.path().join(PROXY_CA_FILE)).unwrap())

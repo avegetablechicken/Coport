@@ -21,36 +21,74 @@ pub(crate) struct Destination {
 
 pub struct CredentialProxy {
     destinations: HashMap<(String, u16), Arc<Destination>>,
+    /// Credential-routed origins the stored proxy CA does not permit.
+    uncovered: BTreeSet<(String, u16)>,
+    unrestricted: bool,
 }
 
 impl CredentialProxy {
     /// `None` unless `connect_credential_routing` is enabled. The proxy CA is
-    /// kept in `tls_dir` beside the loopback CA.
+    /// kept in `tls_dir` beside the loopback CA. Origins the stored CA does
+    /// not permit are left undecrypted (see `uncovered`).
     pub fn prepare(config: &Config, tls_dir: &Path) -> Result<Option<Self>> {
         if !config.connect_credential_routing {
             return Ok(None);
         }
         let scopes = scopes(config)?;
-        let hosts: BTreeSet<String> = scopes.keys().map(|(host, _)| host.clone()).collect();
-        if hosts.is_empty() {
-            return Err(Error::config(
-                "connect_credential_routing requires codex or claude routes.",
-            ));
+        let ca = crate::local_tls::proxy_acceptors(tls_dir, &hosts(&scopes)?)?;
+        let mut destinations = HashMap::new();
+        let mut uncovered = BTreeSet::new();
+        for ((host, port), scope) in scopes {
+            let Some(acceptor) = ca.acceptors.get(&host) else {
+                uncovered.insert((host, port));
+                continue;
+            };
+            let destination = Destination {
+                host: host.clone(),
+                port,
+                acceptor: acceptor.clone(),
+                scope: scope.into(),
+            };
+            destinations.insert((host, port), Arc::new(destination));
         }
-        let acceptors = crate::local_tls::proxy_acceptors(tls_dir, &hosts)?;
-        let destinations = scopes
-            .into_iter()
-            .map(|((host, port), scope)| {
-                let destination = Destination {
-                    host: host.clone(),
-                    port,
-                    acceptor: acceptors[&host].clone(),
-                    scope: scope.into(),
-                };
-                ((host, port), Arc::new(destination))
-            })
-            .collect();
-        Ok(Some(Self { destinations }))
+        Ok(Some(Self {
+            destinations,
+            uncovered,
+            unrestricted: ca.unrestricted,
+        }))
+    }
+
+    /// Replace the proxy CA with one for every origin `config` routes by
+    /// credential, once `trust` accepts its certificate file. Takes effect on
+    /// the next start.
+    pub fn replace_ca(
+        config: &Config,
+        tls_dir: &Path,
+        trust: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let hosts = scopes(config)
+            .and_then(|scopes| hosts(&scopes))
+            .map_err(|e| std::io::Error::other(e.message))?;
+        crate::local_tls::replace_proxy_ca(tls_dir, &hosts, trust)
+    }
+
+    /// Whether `host:port` is credential-routed but not decrypted, since the
+    /// stored proxy CA does not permit it.
+    pub(crate) fn is_uncovered(&self, host: &str, port: u16) -> bool {
+        self.uncovered.contains(&(host.to_owned(), port))
+    }
+
+    /// Credential-routed origins left undecrypted, as `host:port`.
+    pub fn uncovered(&self) -> Vec<String> {
+        self.uncovered
+            .iter()
+            .map(|(host, port)| format!("{host}:{port}"))
+            .collect()
+    }
+
+    /// Whether the stored proxy CA leaves a name type unconstrained.
+    pub fn ca_unrestricted(&self) -> bool {
+        self.unrestricted
     }
 
     pub(crate) fn destination(&self, host: &str, port: u16) -> Option<Arc<Destination>> {
@@ -67,6 +105,17 @@ impl CredentialProxy {
         names.sort();
         names
     }
+}
+
+/// Hosts the proxy CA must permit for `scopes`.
+fn hosts(scopes: &BTreeMap<(String, u16), String>) -> Result<BTreeSet<String>> {
+    let hosts: BTreeSet<String> = scopes.keys().map(|(host, _)| host.clone()).collect();
+    if hosts.is_empty() {
+        return Err(Error::config(
+            "connect_credential_routing requires codex or claude routes.",
+        ));
+    }
+    Ok(hosts)
 }
 
 /// Request prefixes of each credential-routed API origin, keyed by host and
@@ -260,6 +309,38 @@ mod tests {
                 .unwrap()
                 .contains_key(&("gateway.invalid".into(), 443))
         );
+    }
+
+    #[test]
+    fn hosts_outside_the_stored_ca_stay_undecrypted_until_it_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = "claude:\n  routing:\n    account: {default: none}\n";
+        CredentialProxy::prepare(&config(accounts), dir.path()).unwrap();
+        let grown = config(&format!(
+            "{accounts}    api_key:\n      'https://182.92.106.196:6060': none\n"
+        ));
+        let proxy = CredentialProxy::prepare(&grown, dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy.uncovered(), ["182.92.106.196:6060"]);
+        assert!(proxy.is_uncovered("182.92.106.196", 6060));
+        assert!(proxy.destination("182.92.106.196", 6060).is_none());
+        assert!(proxy.destination("api.anthropic.com", 443).is_some());
+        assert!(!proxy.ca_unrestricted());
+        let refused = CredentialProxy::replace_ca(&grown, dir.path(), |_| {
+            Err(std::io::Error::other("cancelled"))
+        });
+        assert!(refused.is_err());
+        let proxy = CredentialProxy::prepare(&grown, dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy.uncovered(), ["182.92.106.196:6060"]);
+        CredentialProxy::replace_ca(&grown, dir.path(), |_| Ok(())).unwrap();
+        let proxy = CredentialProxy::prepare(&grown, dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(proxy.uncovered().is_empty());
+        assert!(proxy.destination("182.92.106.196", 6060).is_some());
     }
 
     #[test]

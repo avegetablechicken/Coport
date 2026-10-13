@@ -502,6 +502,16 @@ select:focus-visible {
   user-select: text;
 }
 
+.message-body strong {
+  font-weight: 600;
+}
+
+.message-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--secondary);
+}
+
 .message-actions,
 .actions {
   display: flex;

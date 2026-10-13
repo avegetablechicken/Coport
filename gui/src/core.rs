@@ -303,6 +303,10 @@ impl Core {
         result
     }
 
+    pub fn is_running(&self) -> bool {
+        self.controller.is_running()
+    }
+
     pub fn start_if_stopped(&self) -> Result<Completion, String> {
         self.controller
             .start_if_stopped(&self.config_path(), crate::settings::log_path())
@@ -455,6 +459,30 @@ impl Core {
                 log_bytes: std::fs::metadata(self.logs.path()).ok().map(|m| m.len()),
                 traffic_compatibility: TrafficCompatibilityDto::read(),
             },
+            proxy_ca: self.proxy_ca().map(|ca| ProxyCaDto {
+                kept: self.settings.kept_proxy_ca == proxy_ca_notice(&ca),
+                decrypted: ca.decrypted,
+                uncovered: ca.uncovered,
+                unrestricted: ca.unrestricted,
+            }),
+        }
+    }
+
+    /// The running proxy's CA, while it leaves hosts undecrypted or a name
+    /// type unconstrained.
+    fn proxy_ca(&self) -> Option<coport_gui::daemon::ProxyCa> {
+        if !self.controller.is_running() {
+            return None;
+        }
+        let ca = self.controller.daemon_status()?.proxy_ca.clone()?;
+        (!ca.uncovered.is_empty() || ca.unrestricted).then_some(ca)
+    }
+
+    /// Keeps the current proxy CA for its present notice; a different notice warns again.
+    pub fn keep_proxy_ca(&mut self) {
+        if let Some(notice) = self.proxy_ca().as_ref().map(proxy_ca_notice) {
+            self.settings.kept_proxy_ca = notice;
+            self.settings.save();
         }
     }
 
@@ -704,6 +732,28 @@ pub struct Snapshot {
     urls: Urls,
     config: ConfigDto,
     settings: SettingsDto,
+    /// Set while the running proxy's CA leaves credential-routed hosts
+    /// undecrypted or a name type unconstrained.
+    proxy_ca: Option<ProxyCaDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyCaDto {
+    decrypted: Vec<String>,
+    uncovered: Vec<String>,
+    unrestricted: bool,
+    /// The user chose to keep the current CA for this notice.
+    kept: bool,
+}
+
+/// Identifies a proxy CA notice, so keeping the current CA silences only it.
+fn proxy_ca_notice(ca: &coport_gui::daemon::ProxyCa) -> Vec<String> {
+    let mut notice = ca.uncovered.clone();
+    if ca.unrestricted {
+        notice.push("unrestricted".into());
+    }
+    notice
 }
 
 pub(crate) type AccountStates = coport_gui::tasks::AccountStates;
@@ -924,8 +974,24 @@ impl From<Entry> for EntryDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{Urls, matches_search, parse_config, replace_config};
+    use super::{Urls, matches_search, parse_config, proxy_ca_notice, replace_config};
     use crate::logs::Entry;
+
+    #[test]
+    fn keeping_the_proxy_ca_silences_only_the_same_notice() {
+        let ca = |uncovered: &[&str], unrestricted| coport_gui::daemon::ProxyCa {
+            decrypted: vec!["chatgpt.com:443".into()],
+            uncovered: uncovered.iter().map(|s| s.to_string()).collect(),
+            unrestricted,
+        };
+        let kept = proxy_ca_notice(&ca(&["sharecoder.cc:443"], false));
+        assert_eq!(proxy_ca_notice(&ca(&["sharecoder.cc:443"], false)), kept);
+        assert_ne!(
+            proxy_ca_notice(&ca(&["sharecoder.cc:443", "182.92.106.196:6060"], false)),
+            kept
+        );
+        assert_ne!(proxy_ca_notice(&ca(&["sharecoder.cc:443"], true)), kept);
+    }
 
     #[test]
     fn lan_proxy_details_include_exit_address() {
