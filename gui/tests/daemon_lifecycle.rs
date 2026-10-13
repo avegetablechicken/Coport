@@ -34,15 +34,11 @@ fn free_port() -> u16 {
     panic!("no free loopback port");
 }
 
-/// With `tunnels`, CONNECT to upstream.invalid:443 opens a decrypted tunnel.
-fn fixture(dir: &Path, tunnels: bool) -> u16 {
+fn fixture(dir: &Path) -> u16 {
     let port = free_port();
-    let mut config = format!(
+    let config = format!(
         "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n"
     );
-    if tunnels {
-        config.push_str("  base_url: https://upstream.invalid\n  routing:\n    account_fallback: none\nconnect_credential_routing: true\n");
-    }
     std::fs::write(dir.join("config.yaml"), config).unwrap();
     port
 }
@@ -58,23 +54,16 @@ fn read_head(stream: &mut impl Read) -> Vec<u8> {
     head
 }
 
-type Tunnel<S> = rustls::StreamOwned<rustls::ClientConnection, S>;
+type Tls<S> = rustls::StreamOwned<rustls::ClientConnection, S>;
 
-/// Opens a decrypted tunnel and completes TLS inside it, trusting only the
-/// daemon's proxy CA: binary records cross the connection in both directions,
-/// and nothing contacts an upstream.
-fn tunnel<S: Read + Write>(dir: &Path, mut stream: S) -> Tunnel<S> {
+/// Completes TLS with the listener, trusting only the daemon's loopback CA:
+/// binary records cross the connection in both directions, and nothing
+/// contacts an upstream.
+fn tls<S: Read + Write>(dir: &Path, stream: S) -> Tls<S> {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
-    write!(
-        stream,
-        "CONNECT upstream.invalid:443 HTTP/1.1\r\nHost: upstream.invalid:443\r\n\r\n"
-    )
-    .unwrap();
-    stream.flush().unwrap();
-    assert!(read_head(&mut stream).starts_with(b"HTTP/1.1 200"));
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(CertificateDer::from_pem_file(dir.join("tls").join("proxy-ca.pem")).unwrap())
+        .add(CertificateDer::from_pem_file(dir.join("tls").join("ca.pem")).unwrap())
         .unwrap();
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -84,13 +73,12 @@ fn tunnel<S: Read + Write>(dir: &Path, mut stream: S) -> Tunnel<S> {
     .with_root_certificates(roots)
     .with_no_client_auth();
     let connection =
-        rustls::ClientConnection::new(Arc::new(config), "upstream.invalid".try_into().unwrap())
-            .unwrap();
-    let mut tunnel = rustls::StreamOwned::new(connection, stream);
-    while tunnel.conn.is_handshaking() {
-        tunnel.conn.complete_io(&mut tunnel.sock).unwrap();
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+    while tls.conn.is_handshaking() {
+        tls.conn.complete_io(&mut tls.sock).unwrap();
     }
-    tunnel
+    tls
 }
 
 /// The forwarding helper's stdio as one stream, recording the bytes it relays.
@@ -115,16 +103,13 @@ impl Write for Pipe {
     }
 }
 
-/// A request without credentials, which the daemon answers itself.
-fn unauthenticated_request<S: Read + Write>(tunnel: &mut Tunnel<S>) {
-    tunnel
-        .write_all(
-            b"GET /v1/models HTTP/1.1\r\nHost: upstream.invalid\r\nConnection: close\r\n\r\n",
-        )
+/// A request the daemon answers itself, closing the connection after it.
+fn health<S: Read + Write>(tls: &mut Tls<S>) {
+    tls.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
-    tunnel.flush().unwrap();
-    let head = String::from_utf8(read_head(tunnel)).unwrap();
-    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    tls.flush().unwrap();
+    let head = String::from_utf8(read_head(tls)).unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }
 
 fn wait_for(mut predicate: impl FnMut() -> bool) {
@@ -179,7 +164,7 @@ fn parent(dir: &Path, keep: bool) -> std::process::Child {
 fn surviving_exit(force: bool) {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), true);
+    let port = fixture(dir.path());
     let mut parent = parent(dir.path(), true);
     wait_for(|| dir.path().join("ready").exists());
     let (client, before) = daemon::Client::discover(dir.path()).unwrap();
@@ -188,8 +173,8 @@ fn surviving_exit(force: bool) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    // The tunnel's TLS session is established before the GUI exits.
-    let mut tunnel = tunnel(dir.path(), stream);
+    // The TLS session is established before the GUI exits.
+    let mut tls = tls(dir.path(), stream);
     if force {
         parent.kill().unwrap();
     } else {
@@ -200,7 +185,7 @@ fn surviving_exit(force: bool) {
         assert!(exit.success());
     }
     assert_eq!(client.status().unwrap().pid, before.pid);
-    unauthenticated_request(&mut tunnel);
+    health(&mut tls);
 
     // A fresh controller attaches without starting another listener or changing PID.
     let mut reopened = controller(dir.path());
@@ -209,7 +194,7 @@ fn surviving_exit(force: bool) {
     reopened.stop().unwrap();
     assert!(daemon::Client::discover(dir.path()).is_none());
     TcpListener::bind(("127.0.0.1", port)).unwrap();
-    drop(tunnel);
+    drop(tls);
 }
 
 #[test]
@@ -226,7 +211,7 @@ fn force_killing_gui_preserves_daemon_and_connections() {
 fn disabled_option_stops_daemon_on_gui_exit() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), false);
+    let port = fixture(dir.path());
     let mut parent = parent(dir.path(), false);
     wait_for(|| dir.path().join("ready").exists());
     assert!(daemon::Client::discover(dir.path()).is_some());
@@ -240,7 +225,7 @@ fn disabled_option_stops_daemon_on_gui_exit() {
 fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_stopping() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), false);
+    fixture(dir.path());
     let mut gui = controller(dir.path());
     gui.try_start(
         &dir.path().join("config.yaml"),
@@ -258,7 +243,7 @@ fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_st
     assert_eq!(gui.daemon_status().unwrap().pid, initial.pid);
     let new_dir = dir.path().join("new");
     std::fs::create_dir(&new_dir).unwrap();
-    let new_port = fixture(&new_dir, false);
+    let new_port = fixture(&new_dir);
     let config = new_dir.join("config.yaml").canonicalize().unwrap();
     let log = new_dir.canonicalize().unwrap().join("proxy.log");
     gui.try_start(&config, log.clone()).unwrap();
@@ -274,7 +259,7 @@ fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_st
 fn daemon_crash_is_reported_and_restart_recovers_stale_registration() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), false);
+    fixture(dir.path());
     let mut daemon = Command::new(helper())
         .arg(dir.path())
         .arg(dir.path().join("config.yaml"))
@@ -304,7 +289,7 @@ fn daemon_crash_is_reported_and_restart_recovers_stale_registration() {
 fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), false);
+    let port = fixture(dir.path());
     std::fs::write(dir.path().join("daemon.json"), b"stale invalid endpoint").unwrap();
     let mut gui = controller(dir.path());
     gui.start(
@@ -325,7 +310,7 @@ fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
 fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), false);
+    fixture(dir.path());
     let (client, status) = daemon::start(
         &helper(),
         dir.path(),
@@ -385,7 +370,7 @@ fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
     use coport_gui::proxy::Probe;
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().into());
-    fixture(dir.path(), false);
+    fixture(dir.path());
     let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
     let endpoint = format!("http://user:password@{}", proxy.local_addr().unwrap());
@@ -536,7 +521,7 @@ fn metadata_uses_daemon_then_local_only_after_daemon_stops() {
 fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), true);
+    fixture(dir.path());
     let mut gui = controller(dir.path());
     gui.start(
         &dir.path().join("config.yaml"),
@@ -572,11 +557,11 @@ fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
             relayed: relayed.clone(),
         };
         // TLS fails on any altered byte in either direction.
-        let mut tunnel = tunnel(&state, pipe);
-        unauthenticated_request(&mut tunnel);
+        let mut tls = tls(&state, pipe);
+        health(&mut tls);
         // Keep stdin open: a closed remote socket must still terminate the helper.
         let mut rest = Vec::new();
-        tunnel.sock.read_to_end(&mut rest).unwrap();
+        tls.sock.read_to_end(&mut rest).unwrap();
         let response = relayed.lock().unwrap().clone();
         sender.send(response).unwrap();
     });
@@ -586,7 +571,8 @@ fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
     }
     let response = response.unwrap();
     io.join().unwrap();
-    assert!(response.starts_with(b"HTTP/1.1 200"));
+    // The daemon's bytes start with its TLS handshake record.
+    assert_eq!(response.first(), Some(&0x16));
     assert!(!response.windows(7).any(|bytes| bytes == b"COPORT-"));
     wait_for(|| child.try_wait().unwrap().is_some());
     assert!(child.wait().unwrap().success());
@@ -603,7 +589,7 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), false);
+    let port = fixture(dir.path());
     let ssh = dir.path().join("ssh");
     let ssh_script = r#"#!/bin/sh
 for argument do command="$argument"; done
@@ -728,7 +714,7 @@ printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
 #[test]
 fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path(), false);
+    fixture(dir.path());
     std::fs::create_dir(dir.path().join("logs")).unwrap();
     std::fs::write(dir.path().join("logs/proxy.log"), "").unwrap();
     coport_gui::data_api::prepare_identity(dir.path()).unwrap();
@@ -777,7 +763,7 @@ fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
 fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), false);
+    let port = fixture(dir.path());
     let forbidden = TcpListener::bind("127.0.0.1:0").unwrap();
     forbidden.set_nonblocking(true).unwrap();
     let upstream = format!("http://{}", forbidden.local_addr().unwrap());
