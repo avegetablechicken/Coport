@@ -5,6 +5,7 @@
 //! lens turns half a circle when a model call reaches its upstream. The badge
 //! is set at dusk, a clay sky over a teal sea, after Claude and Codex.
 
+#[cfg(target_os = "macos")]
 use coport::routing::Service;
 use std::f32::consts::PI;
 
@@ -249,7 +250,9 @@ struct Lens {
 /// How one beam covers a point of the image.
 struct Hit {
     alpha: f32,
-    /// The flare of a beam seen end on, from 0 to 1.
+    /// The flare of a beam seen end on, from 0 to 1; the menu bar glyph
+    /// tints with it.
+    #[cfg(any(target_os = "macos", test))]
     glow: f32,
     /// Whether the beam passes in front of the tower here.
     front: bool,
@@ -284,6 +287,7 @@ impl Lens {
     }
 
     /// How directly a beam points at the viewer, from 0 (side on) to 1.
+    #[cfg(target_os = "macos")]
     fn facing(&self) -> f32 {
         self.axes.iter().map(|a| a[2]).fold(0.0, f32::max)
     }
@@ -298,6 +302,7 @@ impl Lens {
             let fade = 1.0 - 0.6 * t;
             Some(Hit {
                 alpha: fade + (1.0 - fade) * glow,
+                #[cfg(any(target_os = "macos", test))]
                 glow,
                 front: span.depth > 0.0,
             })
@@ -702,6 +707,7 @@ mod tests {
         assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
     }
 
+    #[cfg(target_os = "macos")]
     fn alpha(rgba: &[u8]) -> u64 {
         rgba.chunks(4).map(|px| px[3] as u64).sum()
     }
