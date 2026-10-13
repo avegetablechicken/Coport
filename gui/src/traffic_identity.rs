@@ -1,7 +1,7 @@
 //! Display identity for API configurations whose name or base URL changed.
 //! Logs keep what was used at the time; matching happens only when reading.
 use crate::logs::Entry;
-use coport::{config::Config, routing::Service};
+use coport::config::Config;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -116,8 +116,6 @@ pub struct Target {
 pub struct Identities {
     names: BTreeMap<(String, String), BTreeSet<String>>,
     assignments: BTreeMap<(String, String, Option<String>), Option<TrafficTarget>>,
-    /// The app each CONNECT destination is decrypted for, by host and port.
-    connect: BTreeMap<(String, u16), Service>,
 }
 
 // Match complete bases, including path and non-default port. Never keep URL
@@ -158,7 +156,6 @@ impl Identities {
         if config.claude.routing.api_key_fallback.is_some() {
             result.insert("Claude", &config.claude.base_url, "api_key_fallback");
         }
-        result.connect = coport::credential_proxy::connect_services(config).unwrap_or_default();
         result.assignments = assignments
             .iter()
             .map(|a| {
@@ -169,22 +166,6 @@ impl Identities {
             })
             .collect();
         result
-    }
-
-    /// The app of a record: as logged, or for a decrypted CONNECT logged before
-    /// the proxy named its app, the app this configuration decrypts its host for.
-    pub fn service(&self, entry: &Entry) -> Option<Service> {
-        entry.service().or_else(|| {
-            if entry.get("method") != Some("CONNECT") || entry.get("routing") != Some("credential")
-            {
-                return None;
-            }
-            let (host, port) = entry.get("path")?.rsplit_once(':')?;
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            self.connect
-                .get(&(host.to_ascii_lowercase(), port.parse().ok()?))
-                .copied()
-        })
     }
 
     fn insert(&mut self, service: &str, base: &str, name: &str) {

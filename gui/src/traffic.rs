@@ -23,11 +23,10 @@ pub enum TrafficScope {
     Model,
 }
 
-/// Traffic counts requests to an app. A CONNECT is kept even without one: an
-/// older record takes the app of its destination under the current
-/// configuration once traffic is read (see `Identities::service`).
+/// Traffic counts requests to an app. A CONNECT has one only as the
+/// configured client of its tunnel's first request; see the proxy's log.
 fn included_in_scope(entry: &Entry, scope: TrafficScope) -> bool {
-    if entry.service().is_none() && entry.get("method") != Some("CONNECT") {
+    if entry.service().is_none() {
         return false;
     }
     let model_event = entry.event.starts_with("model_call_");
@@ -61,7 +60,7 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
 }
 
 /// The fields traffic reads from log records; file summaries keep only these.
-const FIELDS: [&str; 20] = [
+const FIELDS: [&str; 19] = [
     "account_id",
     "credential_ref",
     "account_label",
@@ -81,7 +80,6 @@ const FIELDS: [&str; 20] = [
     "upstream_base_url",
     "proxy_endpoint",
     "proxy",
-    "routing",
 ];
 
 /// A request or model call merged from its lifecycle records. The most
@@ -720,7 +718,7 @@ fn read_at(
     let mut groups = BTreeMap::new();
     let mut labels = labels.clone();
     for entry in source.entries(start, end, scope, &mut labels)? {
-        let Some(service) = identities.service(&entry) else {
+        let Some(service) = entry.service() else {
             continue;
         };
         let resolved = identities.resolve(&entry, service.label(), &labels);
@@ -1157,7 +1155,7 @@ pub(crate) fn export_windows_limit(
             })
             .collect();
         for entry in entries {
-            let Some(group_service) = identities.service(&entry) else {
+            let Some(group_service) = entry.service() else {
                 continue;
             };
             let service = group_service.label();
@@ -1462,7 +1460,7 @@ mod tests {
         let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
         let mut groups = BTreeMap::new();
         for entry in entries {
-            let Some(group_service) = identities.service(&entry) else {
+            let Some(group_service) = entry.service() else {
                 continue;
             };
             let service = group_service.label();
@@ -2586,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connect_counts_once_for_its_tunnels_app_and_first_account() {
+    fn a_connect_counts_once_for_the_configured_client_of_its_tunnel() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
@@ -2600,17 +2598,18 @@ mod tests {
         };
         let usage = "/codex/https://chatgpt.com/backend-api/wham/usage";
         let records: Vec<serde_json::Value> = [
-            // Logged before the proxy named a CONNECT's app.
+            // Logged before a CONNECT could show whose it was.
             connect("old", "chatgpt.com:443", "request_finished", serde_json::json!({"service":"connect", "routing":"credential", "status":"200"})),
             connect("old-failed", "platform.claude.com:443", "request_failed", serde_json::json!({"routing":"credential", "reason":"client_tls_failed"})),
             connect("refused", "www.cloudflare.com:443", "request_rejected", serde_json::json!({"service":"connect", "status":"403"})),
-            // Named by the proxy: by the first request routed through it, or
-            // by its destination when TLS failed before any request.
+            // Without a configured first request: no app, whatever the host.
+            connect("failed", "api.anthropic.com:443", "request_failed", serde_json::json!({"routing":"credential", "reason":"client_tls_failed"})),
+            connect("fallback", "chatgpt.com:443", "request_finished", serde_json::json!({"routing":"credential", "status":"200"})),
+            // Named by its configured first request.
             connect("new", "chatgpt.com:443", "request_finished", serde_json::json!({"service":"codex", "routing":"credential", "account_id":"acct", "status":"200"})),
-            connect("new-failed", "api.anthropic.com:443", "request_failed", serde_json::json!({"service":"claude", "routing":"credential", "reason":"client_tls_failed"})),
             [
                 serde_json::json!({"event":"request_received", "request_id":"usage", "method":"GET", "path":usage, "service":"codex"}),
-                serde_json::json!({"event":"request_finished", "request_id":"usage", "method":"GET", "path":usage, "service":"codex", "account_id":"acct", "status":"200", "duration_ms":"100"}),
+                serde_json::json!({"event":"request_finished", "request_id":"usage", "method":"GET", "path":usage, "service":"codex", "credential_match":"configured", "account_id":"acct", "status":"200", "duration_ms":"100"}),
             ],
         ]
         .into_iter()
@@ -2628,34 +2627,29 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let config = coport::config::Config::parse(&format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: [{}]\n  routing:\n    account_fallback: none\nclaude:\n  config_dirs: []\n  routing:\n    account_fallback: none\n",
-            serde_json::to_string(dir.path()).unwrap()
-        ))
-        .unwrap();
-        let identities = Identities::from_config(&config, &[]);
         let labels = BTreeMap::from([(
             ("Codex".to_owned(), "acct".to_owned()),
             "acct@example.invalid".to_owned(),
         )]);
-        let all = super::read(&path, 30, &labels, TrafficScope::All, &identities).unwrap();
-        let group = |service: &str, credential: &str| {
-            all.credentials
-                .iter()
-                .find(|c| c.service == service && c.credential == credential)
-                .map(|c| (c.requests, c.errors, c.avg_ms))
-        };
-        // The new CONNECT and its first request share an account; a tunnel's
+        let all = read(&path, 30, &labels, TrafficScope::All).unwrap();
+        let groups: Vec<_> = all
+            .credentials
+            .iter()
+            .map(|c| {
+                (
+                    c.service.as_str(),
+                    c.credential.as_str(),
+                    c.requests,
+                    c.avg_ms,
+                )
+            })
+            .collect();
+        // The CONNECT and its first request share the account; a tunnel's
         // duration never enters the latency.
+        assert_eq!(groups, [("Codex", "acct@example.invalid", 2, Some(100))]);
+        assert_eq!(all.summary.requests, 2);
         assert_eq!(
-            group("Codex", "acct@example.invalid"),
-            Some((2, 0, Some(100)))
-        );
-        assert_eq!(group("Codex", UNIDENTIFIED), Some((1, 0, None)));
-        assert_eq!(group("Claude", UNIDENTIFIED), Some((2, 2, None)));
-        assert_eq!(all.summary.requests, 5, "A refused CONNECT has no app");
-        assert_eq!(
-            super::read(&path, 30, &labels, TrafficScope::Model, &identities)
+            read(&path, 30, &labels, TrafficScope::Model)
                 .unwrap()
                 .summary
                 .requests,
@@ -2672,8 +2666,8 @@ mod tests {
         let refresh = "/anthropic/https://platform.claude.com/v1/oauth/token";
         let gateway = "/https://gateway.invalid/v1/messages";
         let records = [
-            // Tunnels logged before the proxy named a CONNECT's app, one still
-            // open; without a configuration decrypting their hosts, no app.
+            // Tunnels logged before a CONNECT could show whose it was, one
+            // still open: no app.
             serde_json::json!({"event":"request_received", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443"}),
             serde_json::json!({"event":"request_finished", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443", "service":"connect", "routing":"credential", "status":"200"}),
             serde_json::json!({"event":"request_received", "request_id":"open-tunnel", "method":"CONNECT", "path":"api.anthropic.com:443"}),

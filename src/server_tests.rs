@@ -1280,6 +1280,21 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
     assert!(log.contains("remote-account"));
     assert!(!log.contains("first-secret"));
     assert!(!log.contains("second-secret"));
+    // A client's own token counts as configured once its account is mapped.
+    let routed: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|row| {
+            row["account_id"] == "remote-account" && row.get("credential_match").is_some()
+        })
+        .collect();
+    assert!(!routed.is_empty());
+    assert!(
+        routed
+            .iter()
+            .all(|row| row["credential_match"] == "configured"),
+        "{routed:?}"
+    );
 }
 
 #[tokio::test]
@@ -3167,6 +3182,68 @@ async fn a_decrypted_tunnel_serves_requests_one_after_another() {
     assert_eq!(connect["service"], "codex", "{connect}");
     assert_eq!(connect["provider"], "ShareCoder", "{connect}");
     assert_eq!(connect["proxy"], "selected", "{connect}");
+    assert!(rows.iter().any(|row| row["event"] == "request_finished"
+        && row["method"] == "GET"
+        && row["credential_match"] == "configured"));
+}
+
+// Any local program may open a tunnel; one whose first request only a
+// fallback carries is not taken as a configured client's.
+#[tokio::test]
+async fn a_tunnel_opened_for_a_fallback_request_has_no_app() {
+    let mut fixture = fixture("direct", "oauth_json").await;
+    let running = running(
+        "connect_credential_routing: true\ncodex:\n  homes: []\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+    )
+    .await;
+    trust(&running, &fixture, "none");
+    let response = proxy_port_client(&running)
+        .get("https://upstream.invalid/v1/models")
+        .bearer_auth("unknown-client-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /v1/models ")
+    );
+    let rows = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            running.server.logger.flush().unwrap();
+            let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            if rows
+                .iter()
+                .any(|row| row["event"] == "request_finished" && row["method"] == "CONNECT")
+            {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = rows
+        .iter()
+        .find(|row| row["event"] == "request_finished" && row["method"] == "GET")
+        .unwrap();
+    assert_eq!(request["service"], "codex", "{request}");
+    assert_eq!(request["credential_match"], "unmatched", "{request}");
+    let connect = rows
+        .iter()
+        .find(|row| row["event"] == "request_finished" && row["method"] == "CONNECT")
+        .unwrap();
+    assert!(connect.get("service").is_none(), "{connect}");
+    assert!(connect.get("provider").is_none(), "{connect}");
 }
 
 #[tokio::test]
@@ -3418,9 +3495,8 @@ async fn clients_that_do_not_trust_the_proxy_ca_are_logged_as_such() {
         .await
         .unwrap();
         assert_eq!(reason["reason"], "client_rejected_proxy_ca");
-        // The destination is decrypted for Claude, so the failed tunnel is
-        // Claude's although no request reached it.
-        assert_eq!(reason["service"], "claude");
+        // No request reached the tunnel, so nothing shows whose it was.
+        assert!(reason.get("service").is_none(), "{reason}");
     }
 }
 
@@ -3540,15 +3616,14 @@ async fn a_decrypted_tunnel_closed_without_a_request_is_logged() {
     assert_eq!(row["client_connect"], "upstream.invalid");
     assert_eq!(row["status"], "400");
     assert_eq!(row["reason"], "Incomplete request headers.");
-    // Without a routed request, the CONNECT has its destination's app but
-    // no account.
+    // Without a routed request, nothing shows whose the tunnel was.
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     let connect = raw
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|row| row["event"] == "request_finished" && row["method"] == "CONNECT")
         .unwrap();
-    assert_eq!(connect["service"], "claude", "{connect}");
+    assert!(connect.get("service").is_none(), "{connect}");
     assert!(connect.get("account_id").is_none(), "{connect}");
     assert!(connect.get("provider").is_none(), "{connect}");
 }
@@ -3660,8 +3735,7 @@ async fn named_upstreams_route_models_and_generation_through_both_entries() {
                 .unwrap();
             assert!(response.status().is_client_error());
             assert!(fixture.requests.try_recv().is_err());
-            // Every record of every request names its app, from the first
-            // one on; a CONNECT names it once a request in its tunnel is routed.
+            // Every record of every request names its app, from the first one on.
             let rows = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     running.server.logger.flush().unwrap();
@@ -3695,9 +3769,17 @@ async fn named_upstreams_route_models_and_generation_through_both_entries() {
                 rows.iter()
                     .any(|row| row["event"] == "request_received" && row["method"] != "CONNECT")
             );
+            assert!(rows.iter().any(|row| row["method"] == "CONNECT"
+                && row["event"] == "request_finished"
+                && row["service"] == if claude { "claude" } else { "codex" }));
             for row in &rows {
-                if row["method"] == "CONNECT" && row["event"] == "request_received" {
-                    assert!(row.get("service").is_none(), "{row}");
+                if row["method"] == "CONNECT" {
+                    // Named only by a configured first request in its tunnel.
+                    assert!(
+                        row.get("service").is_none()
+                            || row["service"] == if claude { "claude" } else { "codex" },
+                        "{row}"
+                    );
                 } else {
                     assert_eq!(
                         row["service"],

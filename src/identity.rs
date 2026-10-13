@@ -826,6 +826,12 @@ impl Config {
         labels
     }
 
+    /// Whether `routing.account` names this identity itself.
+    pub(crate) fn account_mapped(&self, identity: &Identity) -> bool {
+        let account = &self.codex.routing.account;
+        account.contains_key(&identity.account_id)
+            || identity.usernames.iter().any(|u| account.contains_key(u))
+    }
     pub fn account_choice(
         &self,
         identity: &Identity,

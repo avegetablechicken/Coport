@@ -31,13 +31,32 @@ type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 /// A decrypted tunnel's CONNECT record, written once a request inside it is routed.
 type TunnelLog = Arc<Mutex<Option<RequestLog>>>;
 
-/// A tunnel is one client's connection, so its CONNECT takes the app and
-/// account of the first request routed through it. A tunnel closed before
-/// that is recorded without them.
+/// Logged on every routed request: whether its credential is one the
+/// configuration holds or maps.
+fn credential_match(configured: bool) -> &'static str {
+    if configured {
+        "configured"
+    } else {
+        "unmatched"
+    }
+}
+
+/// Anything local may open a tunnel, so a CONNECT belongs to an app and
+/// account only as the configured client its first routed request shows.
+/// A tunnel whose first request is unmatched, or that closes before one,
+/// is recorded without them.
 fn record_tunnel(tunnel: &TunnelLog, request: &RequestLog) {
     let Some(mut connect) = tunnel.lock().ok().and_then(|mut slot| slot.take()) else {
         return;
     };
+    if request
+        .fields
+        .get("credential_match")
+        .and_then(serde_json::Value::as_str)
+        != Some("configured")
+    {
+        return;
+    }
     for key in [
         "service",
         "provider",
@@ -640,11 +659,6 @@ impl Server {
         if connect {
             return Ok(match self.connect(&incoming, &mut log) {
                 Ok(destination) => {
-                    // A destination is decrypted for an app, so the tunnel's
-                    // app is known before any request, even if TLS then fails.
-                    if let Some(service) = destination.service() {
-                        log.field("service", service.name());
-                    }
                     log.status = 200;
                     log.field("routing", "credential");
                     let upgraded = hyper::upgrade::on(&mut incoming);
@@ -952,6 +966,12 @@ impl Server {
                 log.field("provider", p);
             }
         }
+        let configured = claude_route
+            .as_ref()
+            .map(|r| r.configured)
+            .or(route.as_ref().map(|r| r.configured))
+            .unwrap_or(false);
+        log.field("credential_match", credential_match(configured));
         if path.starts_with("/mcp/") && !docs {
             return Err(Error::new(404, "Unknown MCP endpoint."));
         }
@@ -1223,6 +1243,8 @@ impl Server {
         } else {
             self.config.resolve_refresh(&token).await?
         };
+        // Only a saved refresh token names its account; a fallback has none.
+        log.field("credential_match", credential_match(account_id.is_some()));
         if let Some(id) = &account_id {
             log.field("account_id", id);
         }

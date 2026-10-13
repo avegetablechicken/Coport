@@ -1179,14 +1179,17 @@ reconciliation is read-only and never rewrites retained logs.
 
 Every record of a proxied request carries `service`, `codex` or `claude`: the app
 the proxy routes the request to, decided from its target before the first record.
-Token refreshes belong to their app. A decrypted CONNECT belongs to the app its
-destination is decrypted for, so even a tunnel whose TLS handshake fails is
-attributed; for a host both apps route, the first request inside decides. Its end
-record is written once the first request in the tunnel is routed, with that
-request's account, and counts as one request and, when it fails, one error, but
-never toward latency. A refused CONNECT has no app. CONNECT records logged before
-this take their app from the current configuration's decrypted destinations and
-have no account. Traffic statistics count requests of the two apps only.
+Token refreshes belong to their app. Routed requests also carry
+`credential_match`: `configured` when the credential is one the configuration
+holds or maps (a saved login, a named API Key, provider or settings, or an account
+`routing.account` names), and `unmatched` when only a fallback or an explicit URL
+route, which does not check it, carries the request. Any local program may open a
+CONNECT, so its end record is written once the first request in the tunnel is
+routed and takes that request's `service` and account only when it is
+`configured`. A CONNECT whose TLS handshake fails, that closes before a request,
+whose first request is unmatched, or that is refused has no `service`, whatever
+its host. A CONNECT with one counts as a request of that app, but never toward
+latency. Traffic statistics count requests of the two apps only.
 
 Request logs keep the proxy-generated `request_id` separate from the client's
 `client_request_id` and `session_id`. Session headers are checked in this order:

@@ -229,6 +229,9 @@ pub struct ClaudeRoute {
     pub upstream: String,
     pub oauth: bool,
     pub custom_upstream: bool,
+    /// The credential is one the configuration holds or maps, not one a
+    /// fallback or an unchecked URL route lets through.
+    pub configured: bool,
 }
 
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://platform.claude.com/v1/oauth/token";
@@ -541,15 +544,17 @@ impl Claude {
             ));
         }
         let needs_profile = local_needs_profile || (bearer && !matched_account && !matched_api);
-        let (label, proxy) = if let Some((label, proxy)) = matches.pop() {
-            (label.clone(), proxy.clone())
+        // A saved login or named key is configured; a profile lookup decides
+        // for an unknown token (see `apply_profile`); fallbacks are not.
+        let (label, proxy, configured) = if let Some((label, proxy)) = matches.pop() {
+            (label.clone(), proxy.clone(), true)
         } else if needs_profile {
             let proxy = self.routing.account_probe.as_ref()
                 .or(self.routing.account_fallback.as_ref())
                 .ok_or(Error::config(
                     "Claude profile lookup requires routing.account_probe or routing.account_fallback.",
                 ))?;
-            ("claude-profile".into(), proxy.clone())
+            ("claude-profile".into(), proxy.clone(), matched_account)
         } else if let Some(proxy) = if bearer {
             &self.routing.account_fallback
         } else {
@@ -563,6 +568,7 @@ impl Claude {
                 }
                 .into(),
                 proxy.clone(),
+                false,
             )
         } else if unavailable {
             return Err(Error::config(
@@ -585,6 +591,7 @@ impl Claude {
             custom_upstream: api_upstream.is_some(),
             upstream: api_upstream.unwrap_or_else(|| self.base_url.clone()),
             oauth: bearer && !matched_api,
+            configured,
         })
     }
 
@@ -639,6 +646,7 @@ impl Claude {
             upstream: crate::url_routing::validate_upstream(base)?.into(),
             oauth: false,
             custom_upstream: true,
+            configured: false,
         }))
     }
 
@@ -665,6 +673,13 @@ impl Claude {
         identity: ClaudeIdentity,
     ) -> Result<()> {
         route.proxy = self.account_choice(Some(&identity), None)?;
+        // A saved login stays configured; another token only if its
+        // identity is mapped, not carried by account_fallback.
+        route.configured |= self.routing.account.contains_key(&identity.account_id)
+            || identity
+                .usernames
+                .iter()
+                .any(|u| self.routing.account.contains_key(u));
         route.label = "claude-account".into();
         route.identity = Some(identity);
         route.needs_profile = false;

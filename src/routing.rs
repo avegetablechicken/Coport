@@ -13,6 +13,9 @@ pub struct Route {
     pub proxy: Choice,
     pub upstream: String,
     pub custom_upstream: bool,
+    /// The credential is one the configuration holds or maps, not one a
+    /// fallback or an unchecked URL route lets through.
+    pub configured: bool,
 }
 pub fn codex_target(target: &str) -> &str {
     target
@@ -120,6 +123,7 @@ impl Config {
             proxy: proxy.clone(),
             upstream: crate::url_routing::validate_upstream(base)?.into(),
             custom_upstream: true,
+            configured: false,
         }))
     }
 
@@ -171,6 +175,7 @@ impl Config {
                             proxy: p.proxy.clone(),
                             upstream: credential.upstream,
                             custom_upstream,
+                            configured: true,
                         });
                     }
                 }
@@ -185,6 +190,9 @@ impl Config {
         }
         if let Some((i, source)) = identities.pop() {
             let proxy = self.account_choice(&i, source)?;
+            // A saved login, or an identity the routing maps; otherwise
+            // account_fallback carries it.
+            let configured = source.is_some() || self.account_mapped(&i);
             let account_label = crate::identity::routing_account_label(
                 &self.codex.routing,
                 &i.account_id,
@@ -199,6 +207,7 @@ impl Config {
                 proxy,
                 upstream: self.codex.base_url.account.clone(),
                 custom_upstream: false,
+                configured,
             });
         }
         if let Some(r) = matches.pop() {
@@ -214,6 +223,7 @@ impl Config {
                     proxy: proxy.clone(),
                     upstream: self.codex.base_url.api_key.clone(),
                     custom_upstream: false,
+                    configured: false,
                 });
             }
         }
