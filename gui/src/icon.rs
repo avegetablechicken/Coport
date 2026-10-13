@@ -1,8 +1,12 @@
 //! Procedurally rasterized icons, so the app ships without binary assets.
 //!
 //! The glyph is a lighthouse above the water: a port that shows traffic the
-//! way out. Its beams shine while the proxy runs and go dark otherwise. The
-//! badge is set at dusk, a clay sky over a teal sea, after Claude and Codex.
+//! way out. Its beams shine while the proxy runs and go dark otherwise; the
+//! lens turns half a circle when a model call reaches its upstream. The badge
+//! is set at dusk, a clay sky over a teal sea, after Claude and Codex.
+
+use coport::routing::Service;
+use std::f32::consts::PI;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -49,34 +53,113 @@ const SWELL: Wave = Wave {
     phase: 1.4,
 };
 
+/// A moment of the half turn the lens makes when a model call reaches its
+/// upstream: the angle of the beams, and how strongly they take the app's color.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Turn {
+    angle: f32,
+    tint: f32,
+}
+
+impl Turn {
+    /// The beams across the tower, as the still icon shows them.
+    pub const REST: Self = Self {
+        angle: 0.0,
+        tint: 0.0,
+    };
+
+    /// The turn at `progress` from 0 to 1, easing out of and back into rest.
+    pub fn at(progress: f32) -> Self {
+        let p = progress.clamp(0.0, 1.0);
+        Self {
+            angle: PI * smoothstep(0.0, 1.0, p),
+            tint: smoothstep(0.0, 0.15, p) * (1.0 - smoothstep(0.85, 1.0, p)),
+        }
+    }
+}
+
 /// Monochrome glyph for the macOS menu bar; only alpha is significant.
 #[cfg(target_os = "macos")]
 pub fn template(size: u32, status: Status) -> Vec<u8> {
+    const INK: Rgba = [0.0, 0.0, 0.0, 1.0];
+    glyph(size, status, Turn::REST, INK, INK)
+}
+
+/// A frame of the turn for the macOS menu bar. A colored image cannot be a
+/// template, so it is drawn in the bar's own ink for its appearance.
+#[cfg(target_os = "macos")]
+pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
+    let (ink, accent) = if dark {
+        let accent = match service {
+            Service::Claude => [0.929, 0.553, 0.424, 1.0],
+            Service::Codex => [0.384, 0.792, 0.765, 1.0],
+        };
+        ([1.0, 1.0, 1.0, 1.0], accent)
+    } else {
+        let accent = match service {
+            Service::Claude => [0.851, 0.467, 0.341, 1.0],
+            Service::Codex => [0.200, 0.580, 0.565, 1.0],
+        };
+        ([0.0, 0.0, 0.0, 0.85], accent)
+    };
+    glyph(size, Status::Running, turn, ink, accent)
+}
+
+/// The menu bar lighthouse in `ink`, its light taking `accent` as the turn
+/// asks: the badge's clay sky for Claude, its teal sea for Codex.
+#[cfg(target_os = "macos")]
+fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<u8> {
     const SCALE: f32 = 0.88;
     // Center between the roof tip (including its stroke) and the tower base.
     const CENTER_Y: f32 = (0.13 - 0.012 + 0.84) * 0.5;
-    let lit = status == Status::Running;
-    let alpha = if lit { 1.0 } else { 0.6 };
+    let lens = Lens::new(turn.angle);
+    // Light becomes opaque as it takes the accent.
+    let tinted = |w: f32| {
+        let mut color = mix(ink, accent, w);
+        color[3] = ink[3] + (1.0 - ink[3]) * w;
+        color
+    };
     raster(size, |x, y| {
         let (gx, gy) = ((x - 0.5) / SCALE + 0.5, (y - 0.5) / SCALE + CENTER_Y);
-        let d = tower_sdf(gx, gy, lit);
-        let mut a = coverage(d);
-        if lit {
-            // Beams fade as they travel away from the lantern.
-            for side in [-1.0, 1.0] {
-                let (d, t) = beam(gx, gy, side);
-                a = a.max(coverage(d) * (1.0 - 0.6 * t));
-            }
+        let mut px = [0.0; 4];
+        if status != Status::Running {
+            over(&mut px, ink, coverage(tower_sdf(gx, gy, false)) * 0.6);
+            return px;
         }
-        [0.0, 0.0, 0.0, a * alpha]
+        // A glow around the lantern while a beam points at the viewer.
+        let glow = turn.tint * lens.facing().powi(3) * 0.6;
+        if glow > 0.0 {
+            let r = ((gx - LANTERN.0).powi(2) + ((gy - LANTERN.1) * 1.15).powi(2)).sqrt();
+            over(&mut px, accent, glow * (1.0 - smoothstep(0.04, 0.22, r)));
+        }
+        let beams = lens.hits(gx, gy);
+        let beam = |px: &mut Rgba, hit: &Hit| {
+            over(px, tinted(turn.tint * (0.6 + 0.4 * hit.glow)), hit.alpha);
+        };
+        // Beams behind the lantern pass under the tower, the rest over it.
+        for hit in beams.iter().flatten().filter(|h| !h.front) {
+            beam(&mut px, hit);
+        }
+        let tower = coverage(tower_sdf(gx, gy, true));
+        if tower > 0.0 {
+            let lantern = coverage(lantern_sdf(gx, gy));
+            let w = turn.tint * (0.35 + 0.65 * lens.facing().powi(2)) * lantern;
+            over(&mut px, tinted(w), tower);
+        }
+        for hit in beams.iter().flatten().filter(|h| h.front) {
+            beam(&mut px, hit);
+        }
+        px
     })
 }
 
-/// Colored badge for Windows and Linux trays and the window icon.
-pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
+/// Colored badge for Windows and Linux trays and the window icon. Its beams
+/// follow `turn` but stay white, since the badge's sky and sea are the colors.
+pub fn badge(size: u32, status: Option<Status>, turn: Turn) -> Vec<u8> {
     const OFFSET: f32 = 0.10;
     const SCALE: f32 = 0.80;
     let lit = status.is_none_or(|s| s == Status::Running);
+    let lens = Lens::new(turn.angle);
     raster(size, |x, y| {
         let mut px = [0.0; 4];
         // Rounded-square badge with a dusk gradient.
@@ -97,16 +180,17 @@ pub fn badge(size: u32, status: Option<Status>) -> Vec<u8> {
         // Soft shadow: the tower's distance field, offset downwards and faded.
         let shadow = (0.5 - tower_sdf(gx, gy - 0.025, lit) / 0.05).clamp(0.0, 1.0);
         over(&mut px, SHADOW, shadow * 0.22 * badge);
-        if lit {
-            // Beams fade as they travel away from the lantern.
-            for side in [-1.0, 1.0] {
-                let (d, t) = beam(gx, gy, side);
-                over(&mut px, WHITE, coverage(d) * (1.0 - 0.6 * t) * badge);
-            }
+        let beams = if lit { lens.hits(gx, gy) } else { [None, None] };
+        // Beams behind the lantern pass under the tower, the rest over it.
+        for hit in beams.iter().flatten().filter(|h| !h.front) {
+            over(&mut px, WHITE, hit.alpha * badge);
         }
         over(&mut px, WHITE, coverage(SWELL.sdf(gx, gy)) * 0.7 * badge);
         over(&mut px, WHITE, coverage(WAVE.sdf(gx, gy)) * badge);
         over(&mut px, WHITE, coverage(tower_sdf(gx, gy, lit)) * badge);
+        for hit in beams.iter().flatten().filter(|h| h.front) {
+            over(&mut px, WHITE, hit.alpha * badge);
+        }
         if let Some(status) = status {
             let color = match status {
                 Status::Running => GREEN,
@@ -134,7 +218,7 @@ fn tower_sdf(x: f32, y: f32, lit: bool) -> f32 {
     let tower = ((x - 0.5).abs() - half).max((y - 0.62).abs() - 0.22);
     let tower = tower.max(-((y - 0.58).abs() - 0.035));
     let gallery = rounded_rect_sdf(x, y, 0.5, 0.385, 0.14, 0.025, 0.02);
-    let lantern = rounded_rect_sdf(x, y, 0.5, 0.30, 0.075, 0.065, 0.02);
+    let lantern = lantern_sdf(x, y);
     let roof = triangle_sdf(x, y, [(0.39, 0.24), (0.61, 0.24), (0.5, 0.13)]) - 0.012;
     let d = tower.min(gallery).min(lantern).min(roof);
     if lit {
@@ -144,18 +228,167 @@ fn tower_sdf(x: f32, y: f32, lit: bool) -> f32 {
     }
 }
 
-/// Distance to the beam on `side` (-1 left, 1 right): a cone from the lantern
-/// with an arc at its far end. Also returns how far along the beam the point
-/// lies, from 0 at the lantern to 1 at the arc.
-fn beam(x: f32, y: f32, side: f32) -> (f32, f32) {
+fn lantern_sdf(x: f32, y: f32) -> f32 {
+    rounded_rect_sdf(x, y, LANTERN.0, LANTERN.1, 0.075, 0.065, 0.02)
+}
+
+/// The lantern's center in the unit square.
+const LANTERN: (f32, f32) = (0.5, 0.30);
+
+type Vec3 = [f32; 3];
+
+/// The lantern's two opposite beams: cones of light turned by an angle about
+/// the tower and seen from slightly above with perspective. Side on, they are
+/// the still icon's beams; a beam turning towards the viewer drops and grows
+/// until it flares at the lantern, while one turning away rises, shrinks and
+/// passes behind the tower.
+struct Lens {
+    axes: [Vec3; 2],
+}
+
+/// How one beam covers a point of the image.
+struct Hit {
+    alpha: f32,
+    /// The flare of a beam seen end on, from 0 to 1.
+    glow: f32,
+    /// Whether the beam passes in front of the tower here.
+    front: bool,
+}
+
+/// Where a ray runs through a beam.
+struct Span {
+    /// The nearest distance to the lantern along it.
+    near: f32,
+    /// Depth towards the viewer where it enters.
+    depth: f32,
+    /// The length of the ray inside the beam.
+    length: f32,
+}
+
+impl Lens {
+    /// Downward view angle, and the viewer's distance in lantern-to-tip units.
+    const TILT: f32 = 14.0 * PI / 180.0;
+    const EYE: f32 = 1.9;
+    /// A beam starts outside the lantern and fades towards its tip.
     const NEAR: f32 = 0.12;
     const FAR: f32 = 0.47;
-    const HALF_ANGLE: f32 = 13.0 * std::f32::consts::PI / 180.0;
-    let (dx, dy) = ((x - 0.5) * side, y - 0.30);
-    let r = (dx * dx + dy * dy).sqrt();
-    let edge = (dy.atan2(dx).abs() - HALF_ANGLE) * r;
-    let d = edge.max(r - FAR).max(NEAR - r) - 0.006;
-    (d, ((r - NEAR) / (FAR - NEAR)).clamp(0.0, 1.0))
+    const HALF_ANGLE: f32 = 13.0 * PI / 180.0;
+
+    /// At angle 0 the beams point left and right; positive angles turn the
+    /// right one towards the viewer.
+    fn new(angle: f32) -> Self {
+        let (s, c) = angle.sin_cos();
+        Self {
+            axes: [[c, 0.0, s], [-c, 0.0, -s]],
+        }
+    }
+
+    /// How directly a beam points at the viewer, from 0 (side on) to 1.
+    fn facing(&self) -> f32 {
+        self.axes.iter().map(|a| a[2]).fold(0.0, f32::max)
+    }
+
+    fn hits(&self, x: f32, y: f32) -> [Option<Hit>; 2] {
+        let (eye, ray) = Self::view(x, y);
+        self.axes.map(|axis| {
+            let span = Self::span(eye, ray, axis)?;
+            let t = ((span.near - Self::NEAR) / (Self::FAR - Self::NEAR)).clamp(0.0, 1.0);
+            // Seen end on, the light along the whole beam adds up into a flare.
+            let glow = smoothstep(0.10, 0.30, span.length) * smoothstep(0.2, 0.8, axis[2]);
+            let fade = 1.0 - 0.6 * t;
+            Some(Hit {
+                alpha: fade + (1.0 - fade) * glow,
+                glow,
+                front: span.depth > 0.0,
+            })
+        })
+    }
+
+    /// The eye and the unit ray through a point of the image, with the
+    /// lantern at the origin and the image plane through it at scale 1.
+    fn view(x: f32, y: f32) -> (Vec3, Vec3) {
+        let (s, c) = Self::TILT.sin_cos();
+        let eye = [0.0, Self::EYE * s, Self::EYE * c];
+        let (u, v) = (x - LANTERN.0, LANTERN.1 - y);
+        let ray = [u, v * c - eye[1], -v * s - eye[2]];
+        let n = dot(ray, ray).sqrt();
+        (eye, ray.map(|r| r / n))
+    }
+
+    /// Where `eye + s·ray` lies within `HALF_ANGLE` of `axis`, between
+    /// `NEAR` and `FAR` from the lantern. The spherical ends make a beam seen
+    /// side on a sector, like the still icon's.
+    fn span(eye: Vec3, ray: Vec3, axis: Vec3) -> Option<Span> {
+        let point = |s: f32| -> Vec3 { std::array::from_fn(|i| eye[i] + s * ray[i]) };
+        let cos = Self::HALF_ANGLE.cos();
+        let inside = |s: f32| {
+            let p = point(s);
+            let r = dot(p, p).sqrt();
+            r >= Self::NEAR && dot(p, axis) >= r * cos
+        };
+        // |point(s)|² = s² + 2·er·s + ee.
+        let (er, ee) = (dot(eye, ray), dot(eye, eye));
+        let [lo, hi] = roots(1.0, 2.0 * er, ee - Self::FAR * Self::FAR)?;
+        // Split the far sphere's chord where the ray crosses the near sphere,
+        // the cone or the plane through the lantern, then keep the inside pieces.
+        let (ea, ra) = (dot(eye, axis), dot(ray, axis));
+        let cos2 = cos * cos;
+        let mut cuts = [lo; 8];
+        let mut n = 1;
+        let crossings = [
+            roots(1.0, 2.0 * er, ee - Self::NEAR * Self::NEAR),
+            roots(
+                ra * ra - cos2,
+                2.0 * (ea * ra - cos2 * er),
+                ea * ea - cos2 * ee,
+            ),
+            (ra != 0.0).then(|| [-ea / ra; 2]),
+        ];
+        for s in crossings.into_iter().flatten().flatten() {
+            if s > lo && s < hi {
+                cuts[n] = s;
+                n += 1;
+            }
+        }
+        cuts[n] = hi;
+        let cuts = &mut cuts[..=n];
+        cuts.sort_by(f32::total_cmp);
+        let mut span: Option<Span> = None;
+        for piece in cuts.windows(2) {
+            let (a, b) = (piece[0], piece[1]);
+            if b <= a || !inside((a + b) * 0.5) {
+                continue;
+            }
+            // The ray is nearest the lantern at s = -er.
+            let p = point((-er).clamp(a, b));
+            let span = span.get_or_insert(Span {
+                near: f32::MAX,
+                depth: point(a)[2],
+                length: 0.0,
+            });
+            span.near = span.near.min(dot(p, p).sqrt());
+            span.length += b - a;
+        }
+        span
+    }
+}
+
+fn dot(a: Vec3, b: Vec3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Real roots of a·s² + b·s + c in ascending order; a linear equation's root twice.
+fn roots(a: f32, b: f32, c: f32) -> Option<[f32; 2]> {
+    if a.abs() < 1e-6 {
+        return (b.abs() > 1e-6).then(|| [-c / b; 2]);
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let q = disc.sqrt();
+    let (r0, r1) = ((-b - q) / (2.0 * a), (-b + q) / (2.0 * a));
+    Some([r0.min(r1), r0.max(r1)])
 }
 
 struct Wave {
@@ -348,4 +581,128 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Area and mean height of a beam's image over the unit square, sampled
+    /// on a grid; `None` when it covers nothing.
+    fn extent(lens: &Lens, beam: usize) -> Option<(f32, f32)> {
+        const N: usize = 200;
+        let (mut area, mut y_sum) = (0.0, 0.0);
+        for j in 0..N {
+            for i in 0..N {
+                let (x, y) = ((i as f32 + 0.5) / N as f32, (j as f32 + 0.5) / N as f32);
+                if let Some(hit) = &lens.hits(x, y)[beam] {
+                    area += hit.alpha;
+                    y_sum += hit.alpha * y;
+                }
+            }
+        }
+        (area > 0.0).then(|| (area / (N * N) as f32, y_sum / area))
+    }
+
+    #[test]
+    fn beams_at_rest_lie_level_across_the_tower() {
+        let lens = Lens::new(0.0);
+        let (right, left) = (extent(&lens, 0).unwrap(), extent(&lens, 1).unwrap());
+        assert!((right.0 - left.0).abs() < 1e-3);
+        assert!((right.1 - LANTERN.1).abs() < 0.01 && (left.1 - LANTERN.1).abs() < 0.01);
+        // Side on, each beam is a sector from just outside the lantern to its tip.
+        for (x, covered) in [
+            (0.5 + 0.30, true),
+            (0.5 - 0.30, true),
+            (0.5 + 0.08, false),
+            (0.5 + 0.55, false),
+        ] {
+            assert_eq!(
+                lens.hits(x, LANTERN.1).iter().any(Option::is_some),
+                covered,
+                "x = {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_beam_turning_towards_the_viewer_drops_and_grows() {
+        // A quarter of the way, the right beam swings towards the viewer and
+        // the left one away.
+        let lens = Lens::new(PI / 4.0);
+        let (near, far) = (extent(&lens, 0).unwrap(), extent(&lens, 1).unwrap());
+        assert!(near.0 > far.0 * 1.2, "near {near:?}, far {far:?}");
+        assert!(
+            near.1 > LANTERN.1 + 0.02 && far.1 < LANTERN.1 - 0.02,
+            "near {near:?}, far {far:?}"
+        );
+        // End on, it flares around the lantern and nothing reaches the sides.
+        let lens = Lens::new(PI / 2.0);
+        let [flare, _] = lens.hits(LANTERN.0, LANTERN.1 + 0.05);
+        let flare = flare.unwrap();
+        assert!(flare.front && flare.glow > 0.5);
+        assert!(lens.hits(0.5 + 0.40, LANTERN.1).iter().all(Option::is_none));
+        // The beam turning away passes behind the tower.
+        assert!(
+            lens.hits(LANTERN.0, LANTERN.1 - 0.05)[1]
+                .as_ref()
+                .is_none_or(|h| !h.front)
+        );
+    }
+
+    #[test]
+    fn a_turn_eases_from_rest_back_to_rest() {
+        assert_eq!(Turn::at(0.0), Turn::REST);
+        let end = Turn::at(1.0);
+        assert_eq!(end.tint, 0.0);
+        // Half a circle later the beams have traded places, which looks the same.
+        let same = |a: &[u8], b: &[u8]| a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1);
+        assert!(same(
+            &badge(64, Some(Status::Running), end),
+            &badge(64, Some(Status::Running), Turn::REST)
+        ));
+        assert!(!same(
+            &badge(64, Some(Status::Running), Turn::at(0.3)),
+            &badge(64, Some(Status::Running), Turn::REST)
+        ));
+        // A stopped lighthouse has no beams to turn.
+        assert_eq!(
+            badge(64, Some(Status::Stopped), Turn::at(0.3)),
+            badge(64, Some(Status::Stopped), Turn::REST)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_frames_start_from_the_template_and_take_the_app_color() {
+        // At rest a colored frame matches the template drawn in the light bar's
+        // ink, so swapping between them does not jump.
+        let template = template(44, Status::Running);
+        for service in [Service::Claude, Service::Codex] {
+            let rest = beacon(44, Turn::REST, service, false);
+            for (t, c) in template.chunks(4).zip(rest.chunks(4)) {
+                assert!((t[3] as f32 * 0.85 - c[3] as f32).abs() <= 1.0);
+            }
+        }
+        // Halfway the lantern flares in the app's color.
+        // The lantern sits at row 15 of the 44 px glyph.
+        let (x, y) = (22 * 4, 15 * 44 * 4);
+        let lantern = |service, dark| {
+            let px = beacon(44, Turn::at(0.5), service, dark);
+            [px[y + x], px[y + x + 1], px[y + x + 2]]
+        };
+        for dark in [false, true] {
+            let (claude, codex) = (
+                lantern(Service::Claude, dark),
+                lantern(Service::Codex, dark),
+            );
+            assert!(claude[0] > claude[2] + 40, "{claude:?}");
+            assert!(codex[2] > codex[0] + 40, "{codex:?}");
+        }
+        assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
+    }
+
+    fn alpha(rgba: &[u8]) -> u64 {
+        rgba.chunks(4).map(|px| px[3] as u64).sum()
+    }
 }

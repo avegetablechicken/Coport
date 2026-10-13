@@ -15,6 +15,8 @@ use std::{
 const CAPACITY: usize = 5000;
 /// How much existing history to load when a log file is first opened.
 const BACKFILL: u64 = 512 * 1024;
+/// How recent a model call must be to count as sent now rather than history.
+const LIVE: Duration = Duration::from_secs(10);
 
 /// A stable row key for a log line: the same line read by the tailer or by a
 /// traffic scan gets the same key. Kept within JavaScript's exact integers.
@@ -55,6 +57,17 @@ impl Entry {
                 | "model_call_cancelled"
                 | "model_call_unknown"
         )
+    }
+    /// Whether a model call has just reached its upstream: an HTTP call the
+    /// upstream answered without an error, or a call sent on an open WebSocket.
+    pub fn is_model_call_sent(&self) -> bool {
+        match self.event.as_str() {
+            "upstream_response" => {
+                self.get("model_call_id").is_some() && self.status().is_some_and(|s| s < 400)
+            }
+            "model_call_started" => self.get("model_transport") == Some("websocket"),
+            _ => false,
+        }
     }
     pub fn duration_ms(&self) -> Option<u64> {
         self.get("duration_ms")?.parse().ok()
@@ -114,6 +127,15 @@ struct Store {
     entries: VecDeque<Entry>,
     /// Bumped when the file changes identity so the tailer restarts.
     generation: u64,
+    /// Model calls seen reaching their upstream as they happened, and the
+    /// app of the latest; backfilled history is not counted.
+    sent: Sent,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Sent {
+    pub count: u64,
+    pub latest: Option<Service>,
 }
 
 #[derive(Clone)]
@@ -147,6 +169,11 @@ impl LogFeed {
 
     pub fn path(&self) -> PathBuf {
         self.store.lock().unwrap().path.clone()
+    }
+
+    /// Model calls seen reaching their upstream live.
+    pub fn sent(&self) -> Sent {
+        self.store.lock().unwrap().sent
     }
 
     /// Snapshot of entries matching `keep`, newest last.
@@ -292,6 +319,8 @@ impl LogFeed {
         let complete: Vec<u8> = pending.drain(..=last_newline).collect();
         let mut s = self.store.lock().unwrap();
         let mut added = false;
+        let now = Local::now();
+        let live = chrono::Duration::from_std(LIVE).unwrap_or_default();
         for line in complete.split(|&b| b == b'\n') {
             // A leading NUL marks the truncated first line of a backfill.
             if line.first() == Some(&b'\0') || line.is_empty() {
@@ -309,12 +338,20 @@ impl LogFeed {
                 .and_then(|t| t.as_str().map(str::to_owned))
                 .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                 .map(|t| t.with_timezone(&Local));
-            s.entries.push_back(Entry {
+            let entry = Entry {
                 seq: line_key(line),
                 time,
                 event,
                 fields,
-            });
+            };
+            if entry.is_model_call_sent()
+                && entry.time.is_some_and(|t| (now - t).abs() < live)
+                && let Some(service) = entry.service()
+            {
+                s.sent.count += 1;
+                s.sent.latest = Some(service);
+            }
+            s.entries.push_back(entry);
             if s.entries.len() > CAPACITY {
                 s.entries.pop_front();
             }
@@ -542,6 +579,72 @@ mod tests {
         assert_eq!(stats.requests, 1);
         assert_eq!(stats.errors, 0);
         assert_eq!(feed.entries(|_| true)[0].status(), None);
+    }
+
+    #[test]
+    fn counts_model_calls_sent_upstream_as_they_happen() {
+        use serde_json::json;
+        for newline in ["\n", "\r\n"] {
+            let feed = LogFeed {
+                store: Arc::new(Mutex::new(Store::default())),
+            };
+            let now = Local::now();
+            let old = now - chrono::Duration::minutes(5);
+            let lines = |events: &[(DateTime<Local>, serde_json::Value)]| {
+                events
+                    .iter()
+                    .map(|(time, e)| {
+                        let mut e = e.clone();
+                        e["timestamp"] = time.to_rfc3339().into();
+                        format!("{e}{newline}")
+                    })
+                    .collect::<String>()
+                    .into_bytes()
+            };
+            let claude = |event: &str, id: &str, status: &str| {
+                json!({"event":event, "service":"claude", "model_call_id":id,
+                    "model_transport":"http", "status":status})
+            };
+            let codex_ws = |id: &str| {
+                json!({"event":"model_call_started", "service":"codex", "model_call_id":id,
+                    "model_transport":"websocket"})
+            };
+            let events = [
+                // HTTP: the call is sent once the upstream answers without an error.
+                (now, claude("model_call_started", "a", "0")),
+                (now, claude("upstream_response", "a", "200")),
+                (now, claude("upstream_response", "b", "429")),
+                (
+                    now,
+                    json!({"event":"upstream_response", "service":"claude", "status":"200", "path":"/v1/models"}),
+                ),
+                // WebSocket: the upgrade is not a call; each response.create is.
+                (
+                    now,
+                    json!({"event":"upstream_response", "service":"codex", "status":"101", "model_transport":"websocket"}),
+                ),
+                (now, codex_ws("c")),
+                // History read when the log is first opened.
+                (old, claude("upstream_response", "d", "200")),
+                (old, codex_ws("e")),
+            ];
+            assert!(feed.ingest(&mut lines(&events)));
+            assert_eq!(feed.entries(|_| true).len(), events.len());
+            let sent = |count, latest| Sent {
+                count,
+                latest: Some(latest),
+            };
+            assert_eq!(feed.sent(), sent(2, Service::Codex));
+            let mut undated =
+                format!("{}{newline}", claude("upstream_response", "f", "200")).into_bytes();
+            feed.ingest(&mut undated);
+            assert_eq!(feed.sent(), sent(2, Service::Codex));
+            feed.ingest(&mut lines(&[(
+                now,
+                claude("upstream_response", "g", "200"),
+            )]));
+            assert_eq!(feed.sent(), sent(3, Service::Claude));
+        }
     }
 
     fn wait_for(cond: impl Fn() -> bool) {

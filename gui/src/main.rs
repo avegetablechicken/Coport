@@ -59,7 +59,7 @@ fn main() {
                     return usage_error();
                 };
                 let size = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
-                let png = icon::png(size, &icon::badge(size, None));
+                let png = icon::png(size, &icon::badge(size, None, icon::Turn::REST));
                 if let Err(e) = std::fs::write(&dest, png) {
                     eprintln!("Cannot write {dest}: {e}");
                     std::process::exit(1);

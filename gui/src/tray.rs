@@ -1,22 +1,35 @@
 //! Menu bar (macOS) / notification area (Windows) / StatusNotifierItem (Linux).
 //!
 //! A left click toggles the panel; the context menu (right click, or any
-//! click on GNOME) only offers the essentials.
+//! click on GNOME) only offers the essentials. The lighthouse's lens turns
+//! half a circle when a model call reaches its upstream, its light in the
+//! app's color on the macOS menu bar.
 
 use crate::{
     AppState,
-    icon::{self, Status},
+    icon::{self, Status, Turn},
     panel,
     placement::Rect,
     proxy::Phase,
 };
-use std::sync::Mutex;
+use coport::routing::Service;
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tauri::{
     AppHandle, Manager, Wry,
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
+
+/// How long the lens takes for its half turn, and how many frames it shows.
+const TURN: Duration = Duration::from_millis(2200);
+const FRAMES: u32 = 66;
 
 /// What the tray currently shows, so updates only touch what changed.
 #[derive(Clone, PartialEq)]
@@ -37,6 +50,16 @@ pub struct Tray {
     restart: MenuItem<Wry>,
     quit: MenuItem<Wry>,
     view: Mutex<Option<View>>,
+    /// Model calls sent upstream as of the last update.
+    sent: AtomicU64,
+    beacon: Mutex<Beacon>,
+}
+
+#[derive(Default)]
+struct Beacon {
+    playing: bool,
+    /// The app of a call sent while a turn played, which turns once more.
+    next: Option<Service>,
 }
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
@@ -127,6 +150,16 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         restart,
         quit,
         view: Mutex::new(None),
+        sent: AtomicU64::new(
+            app.state::<AppState>()
+                .core
+                .lock()
+                .unwrap()
+                .logs
+                .sent()
+                .count,
+        ),
+        beacon: Mutex::default(),
     });
     sync(app);
     Ok(())
@@ -160,7 +193,7 @@ fn sync_on_main_thread(app: &AppHandle) {
     let Some(tray) = app.try_state::<Tray>() else {
         return;
     };
-    let view = {
+    let (view, sent) = {
         let state = app.state::<AppState>();
         let core = state.core.lock().unwrap();
         let phase = core.controller.phase();
@@ -177,13 +210,14 @@ fn sync_on_main_thread(app: &AppHandle) {
         } else {
             "Not listening".to_owned()
         };
-        View {
+        let view = View {
             status,
             headline,
             stats,
             running: matches!(phase, Phase::Running { .. }),
             busy: core.controller.busy(),
-        }
+        };
+        (view, core.logs.sent())
     };
     let mut last = tray.view.lock().unwrap();
     let old = last.as_ref();
@@ -216,13 +250,135 @@ fn sync_on_main_thread(app: &AppHandle) {
         let _ = tray.restart.set_text("Restart Proxy");
         let _ = tray.quit.set_text("Quit Coport");
     }
+    let running = view.status == Status::Running;
     *last = Some(view);
+    drop(last);
+    if tray.sent.swap(sent.count, Ordering::Relaxed) < sent.count
+        && running
+        && let Some(service) = sent.latest
+    {
+        turn(app, &tray, service);
+    }
+}
+
+/// Plays the turn from a worker thread, which renders each frame and queues it
+/// on the main thread. Calls sent while it plays add one more turn, in the
+/// color of the latest.
+fn turn(app: &AppHandle, tray: &Tray, service: Service) {
+    {
+        let mut beacon = tray.beacon.lock().unwrap();
+        if beacon.playing {
+            beacon.next = Some(service);
+            return;
+        }
+        beacon.playing = true;
+    }
+    let worker = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tray-beacon".into())
+        .spawn(move || {
+            let mut service = service;
+            loop {
+                play(&worker, service);
+                let tray = worker.state::<Tray>();
+                let mut beacon = tray.beacon.lock().unwrap();
+                match beacon.next.take() {
+                    Some(next) => service = next,
+                    None => {
+                        let h = worker.clone();
+                        let _ = worker.run_on_main_thread(move || show_frame(&h, None));
+                        beacon.playing = false;
+                        return;
+                    }
+                }
+            }
+        });
+    if spawned.is_err() {
+        tray.beacon.lock().unwrap().playing = false;
+    }
+}
+
+/// One turn, paced by the clock so slow frames are not made up later.
+fn play(app: &AppHandle, service: Service) {
+    #[cfg(target_os = "macos")]
+    let dark = menu_bar_is_dark(app);
+    let start = Instant::now();
+    for i in 1..FRAMES {
+        let turn = Turn::at(i as f32 / FRAMES as f32);
+        #[cfg(target_os = "macos")]
+        let frame = Image::new_owned(icon::beacon(44, turn, service, dark), 44, 44);
+        #[cfg(not(target_os = "macos"))]
+        let frame = {
+            let _ = service;
+            Image::new_owned(icon::badge(64, Some(Status::Running), turn), 64, 64)
+        };
+        std::thread::sleep((start + TURN * i / FRAMES).saturating_duration_since(Instant::now()));
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || show_frame(&h, Some(frame)));
+    }
+    std::thread::sleep((start + TURN).saturating_duration_since(Instant::now()));
+}
+
+/// Whether the menu bar around the icon is dark, which can differ from the
+/// app's appearance. Asked on the main thread, without holding any lock.
+#[cfg(target_os = "macos")]
+fn menu_bar_is_dark(app: &AppHandle) -> bool {
+    use objc2_app_kit::{
+        NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let dark = h.try_state::<Tray>().is_some_and(|tray| {
+            tray.icon
+                .with_inner_tray_icon(|inner| {
+                    let mtm = objc2::MainThreadMarker::new()?;
+                    let button = inner.ns_status_item()?.button(mtm)?;
+                    // SAFETY: AppKit's appearance names are immutable statics.
+                    let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+                    let names = objc2_foundation::NSArray::from_slice(&[aqua, dark]);
+                    let best = button
+                        .effectiveAppearance()
+                        .bestMatchFromAppearancesWithNames(&names)?;
+                    Some(&*best == dark)
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        });
+        let _ = tx.send(dark);
+    });
+    rx.recv_timeout(Duration::from_secs(1)).unwrap_or(false)
+}
+
+/// Shows a frame of the turn while the proxy still runs, or with `None` the
+/// icon for the current status. A status update during a turn has already set
+/// its own icon, which later frames leave alone.
+fn show_frame(app: &AppHandle, frame: Option<Image<'static>>) {
+    let Some(tray) = app.try_state::<Tray>() else {
+        return;
+    };
+    let view = tray.view.lock().unwrap();
+    let Some(status) = view.as_ref().map(|v| v.status) else {
+        return;
+    };
+    match frame {
+        Some(frame) if status == Status::Running => {
+            let _ = tray.icon.set_icon_with_as_template(Some(frame), false);
+        }
+        Some(_) => {}
+        None => {
+            let _ = tray
+                .icon
+                .set_icon_with_as_template(Some(image(status)), cfg!(target_os = "macos"));
+        }
+    }
 }
 
 fn image(status: Status) -> Image<'static> {
     #[cfg(target_os = "macos")]
     let (size, rgba) = (44, icon::template(44, status));
     #[cfg(not(target_os = "macos"))]
-    let (size, rgba) = (64, icon::badge(64, Some(status)));
+    let (size, rgba) = (64, icon::badge(64, Some(status), Turn::REST));
     Image::new_owned(rgba, size, size)
 }
