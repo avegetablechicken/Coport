@@ -581,6 +581,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lf_and_crlf_discovery_scripts_execute_the_registered_helper() {
+        let _guard = crate::daemon::spawn_guard();
         let (home, _, _) = discovery_fixture();
         let lf = DISCOVERY_SCRIPT.replace("\r\n", "\n");
         for script in [lf.clone(), lf.replace('\n', "\r\n")] {
@@ -638,8 +639,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn ssh_check_reports_failure_and_times_out_without_network_access() {
+    #[test]
+    fn ssh_check_reports_failure_and_times_out_without_network_access() {
+        // `check_command` spawns the child; the guard is held around the
+        // whole check rather than across an await.
+        let _guard = crate::daemon::spawn_guard();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         for (mode, expected) in [
             ("success", None),
             ("failure", Some("SSH connection failed")),
@@ -654,7 +662,7 @@ mod tests {
             } else {
                 std::time::Duration::from_secs(10)
             };
-            let result = check_command(command, timeout).await;
+            let result = runtime.block_on(check_command(command, timeout));
             if let Some(expected) = expected {
                 assert!(result.unwrap_err().contains(expected));
             } else {
@@ -713,6 +721,7 @@ mod tests {
 
     #[cfg(unix)]
     fn run_discovery(home: &Path, binary: &str) -> std::process::Output {
+        let _guard = crate::daemon::spawn_guard();
         std::process::Command::new("/bin/sh")
             .args(["-c", &summary_command(binary)])
             .env("HOME", home)
@@ -750,6 +759,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discovery_falls_back_to_path_only_when_registration_is_absent() {
+        let _guard = crate::daemon::spawn_guard();
         let (home, dir, binary) = discovery_fixture();
         std::fs::remove_file(dir.join("summary-executable")).unwrap();
         let output = std::process::Command::new("/bin/sh")

@@ -643,12 +643,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relay_closes_child_stdin_after_client_half_close() {
-        let mut child = tokio::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let mut child = {
+            let _guard = crate::daemon::spawn_guard();
+            tokio::process::Command::new("cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let (mut client, local) = tokio::io::duplex(64);

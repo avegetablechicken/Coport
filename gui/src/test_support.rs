@@ -13,12 +13,19 @@ pub fn data_key_in_subprocess(test: &str) -> bool {
         assert_eq!(std::env::var(DATA_KEY_ENV).unwrap(), DATA_KEY);
         return false;
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
-        .env(CASE_ENV, test)
-        .env(DATA_KEY_ENV, DATA_KEY)
-        .output()
-        .unwrap();
+    // A child shares this process's open lock handles until it execs.
+    let child = {
+        let _guard = crate::daemon::spawn_guard();
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CASE_ENV, test)
+            .env(DATA_KEY_ENV, DATA_KEY)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{test}:\n{stdout}\n{stderr}");

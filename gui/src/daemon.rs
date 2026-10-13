@@ -832,9 +832,10 @@ async fn serve_until(
     result.and(stopped)
 }
 
-/// A child forked by `start` shares every open file until it execs, including
-/// lock handles a parallel test has just dropped. Tests that spawn a daemon or
-/// expect a released lock to be free at once hold this guard.
+/// A child forked by `start`, or by any test, shares every open file until it
+/// execs, including lock handles a parallel test has just dropped. Tests that
+/// spawn a child process or expect a released lock to be free at once hold
+/// this guard.
 #[cfg(test)]
 pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
