@@ -60,16 +60,34 @@ mod websocket_relay;
 use transport::*;
 
 type AccountCheck = (Instant, Result<Option<String>>);
+/// Claude OAuth identities by access token, with last use for bounded LRU
+/// eviction. An identity does not depend on routing, so one process can share
+/// the cache across servers rebuilt for configuration changes.
+pub type ClaudeProfiles = Arc<Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>>;
+/// Background identity discovery does not retry a failed probe sooner than
+/// this; successes are kept in `ClaudeProfiles` instead.
+const FAILED_PROBE_RETRY: Duration = Duration::from_secs(600);
+
+fn retain_account_checks(checks: &mut HashMap<String, AccountCheck>, failed: Duration) {
+    checks.retain(|_, (at, result)| {
+        at.elapsed()
+            < if result.is_ok() {
+                Duration::from_secs(30)
+            } else {
+                failed
+            }
+    });
+}
 
 pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
-    // Timestamps track last use for bounded LRU eviction, not expiry.
-    claude_profiles: Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>,
-    // UI checks are serialized and cached briefly, including failures. The key
-    // is the credential, so switching a saved login forces a new check.
+    claude_profiles: ClaudeProfiles,
+    // UI checks are serialized and cached briefly, including failures, which
+    // background discovery holds for longer. The key is the credential, so
+    // switching a saved login forces a new check.
     account_checks: tokio::sync::Mutex<HashMap<String, AccountCheck>>,
     credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -84,7 +102,7 @@ impl Server {
             logger,
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
-            claude_profiles: Mutex::new(HashMap::new()),
+            claude_profiles: Default::default(),
             account_checks: tokio::sync::Mutex::new(HashMap::new()),
             credential_checks: Default::default(),
             tls: None,
@@ -95,6 +113,11 @@ impl Server {
     /// Also accept TLS on the listening port; plain HTTP keeps working.
     pub fn with_tls(mut self, tls: tokio_rustls::TlsAcceptor) -> Self {
         self.tls = Some(tls);
+        self
+    }
+    /// Reuse identities already looked up by another server in this process.
+    pub fn with_claude_profiles(mut self, profiles: ClaudeProfiles) -> Self {
+        self.claude_profiles = profiles;
         self
     }
     /// Decrypt CONNECT tunnels to credential-routed API hosts.
@@ -117,7 +140,7 @@ impl Server {
             return states;
         }
         let mut checks = self.account_checks.lock().await;
-        checks.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+        retain_account_checks(&mut checks, Duration::from_secs(30));
         let mut confirmed = Vec::new();
         let mut failed = false;
         for (source, account) in self.config.claude.account_sources() {
@@ -250,7 +273,7 @@ impl Server {
                 continue;
             };
             let mut checks = self.account_checks.lock().await;
-            checks.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+            retain_account_checks(&mut checks, FAILED_PROBE_RETRY);
             if checks
                 .get(&token)
                 .is_some_and(|(_, result)| result.is_err())

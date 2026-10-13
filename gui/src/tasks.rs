@@ -1,6 +1,10 @@
 //! GUI operations prefer the daemon and fall back only after proving absence.
 use crate::daemon;
-use coport::{config::Config, logger::Logger, server::Server};
+use coport::{
+    config::Config,
+    logger::Logger,
+    server::{ClaudeProfiles, Server},
+};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 pub type AccountStates = [BTreeMap<String, String>; 2];
@@ -11,6 +15,7 @@ pub struct Tasks {
     config_path: PathBuf,
     config: Config,
     local: tokio::sync::Mutex<Option<Arc<Server>>>,
+    claude_profiles: ClaudeProfiles,
 }
 
 impl Tasks {
@@ -20,7 +25,15 @@ impl Tasks {
             config_path,
             config,
             local: Default::default(),
+            claude_profiles: Default::default(),
         }
+    }
+
+    /// Keep Claude identities found by earlier configurations, so a reload does
+    /// not repeat their profile lookups.
+    pub fn with_claude_profiles(mut self, profiles: ClaudeProfiles) -> Self {
+        self.claude_profiles = profiles;
+        self
     }
 
     async fn backend(&self) -> Result<Option<daemon::Client>, String> {
@@ -78,12 +91,15 @@ impl Tasks {
             let mut local = self.local.lock().await;
             local
                 .get_or_insert_with(|| {
-                    Arc::new(Server::new(
-                        self.config.clone(),
-                        Arc::new(Logger::new(
-                            self.directory.join("logs/account-probes.jsonl"),
-                        )),
-                    ))
+                    Arc::new(
+                        Server::new(
+                            self.config.clone(),
+                            Arc::new(Logger::new(
+                                self.directory.join("logs/account-probes.jsonl"),
+                            )),
+                        )
+                        .with_claude_profiles(self.claude_profiles.clone()),
+                    )
                 })
                 .clone()
         }
@@ -133,6 +149,69 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert!(reports.iter().all(|report| report.ok));
         assert!(tasks.local.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rebuilt_tasks_reuse_claude_identities_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::write(
+            claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        // Counts connections to the probe route and closes them at once.
+        let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = trap.local_addr().unwrap().port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for stream in trap.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let config = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  trap: http://127.0.0.1:{port}\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: trap\n",
+            serde_json::to_string(&claude).unwrap()
+        ))
+        .unwrap();
+        let profiles = ClaudeProfiles::default();
+        profiles.lock().unwrap().insert(
+            "saved-secret".into(),
+            (
+                std::time::Instant::now(),
+                coport::claude::ClaudeIdentity {
+                    account_id: "remote-account".into(),
+                    usernames: vec!["remote@example.invalid".into()],
+                },
+            ),
+        );
+        let identity = ("Claude".to_owned(), "remote-account".to_owned());
+        // Each configuration reload builds new tasks around the same cache.
+        for _ in 0..3 {
+            let tasks = Tasks::new(
+                dir.path().into(),
+                dir.path().join("config.yaml"),
+                config.clone(),
+            )
+            .with_claude_profiles(profiles.clone());
+            tasks.credential_reports().await.unwrap();
+            assert_eq!(
+                tasks
+                    .cached_credential_labels()
+                    .await
+                    .get(&identity)
+                    .map(String::as_str),
+                Some("remote@example.invalid")
+            );
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Without the shared cache the same check does probe.
+        let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
+        tasks.credential_reports().await.unwrap();
+        assert!(connections.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 
     #[test]

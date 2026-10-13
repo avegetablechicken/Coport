@@ -817,10 +817,20 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
         lookup.requests.try_recv().is_err(),
         "Neither cached reports nor display reads retry a failed probe"
     );
-    // Expire both periodic and failed-probe caches, without waiting a minute.
+    // The next periodic check, a minute later, still holds the failure.
     *running.server.credential_checks.lock().await = None;
     for (at, _) in running.server.account_checks.lock().await.values_mut() {
         *at = Instant::now() - Duration::from_secs(61);
+    }
+    running.server.credential_reports().await;
+    assert!(
+        lookup.requests.try_recv().is_err(),
+        "A failed probe is not retried on every periodic check"
+    );
+    // Expire both periodic and failed-probe caches, without waiting.
+    *running.server.credential_checks.lock().await = None;
+    for (at, _) in running.server.account_checks.lock().await.values_mut() {
+        *at = Instant::now() - FAILED_PROBE_RETRY - Duration::from_secs(1);
     }
     running.server.credential_reports().await;
     assert!(
@@ -880,6 +890,63 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
     assert!(
         !dir.path().join(".claude.json").exists(),
         "Probes must not rewrite Claude metadata"
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_servers_reuse_shared_claude_identities() {
+    let mut lookup = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &lookup, &endpoint);
+    let identity = ("Claude".into(), "remote-account".into());
+    assert!(
+        running
+            .server
+            .traffic_credential_labels()
+            .await
+            .contains_key(&identity)
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    // A configuration reload starts a server without account checks.
+    let rebuilt = Server::new(running.server.config.clone(), running.server.logger.clone())
+        .with_claude_profiles(running.server.claude_profiles.clone());
+    for _ in 0..3 {
+        assert_eq!(
+            rebuilt
+                .traffic_credential_labels()
+                .await
+                .get(&identity)
+                .map(String::as_str),
+            Some("remote@example.invalid")
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), lookup.requests.recv())
+            .await
+            .is_err(),
+        "A shared identity is not looked up again"
     );
 }
 

@@ -23,6 +23,8 @@ pub struct Core {
     pub launch_at_login: bool,
     config: ConfigCache,
     account_probe: Option<std::sync::Arc<coport_gui::tasks::Tasks>>,
+    /// Outlives `account_probe`, which is rebuilt for each configuration.
+    claude_profiles: coport::server::ClaudeProfiles,
     /// Last account activation; kept across config changes until replaced.
     account_states: Option<AccountStates>,
     account_states_error: Option<String>,
@@ -120,6 +122,7 @@ impl Core {
             settings,
             config: ConfigCache::default(),
             account_probe: None,
+            claude_profiles: Default::default(),
             account_states: None,
             account_states_error: None,
             account_states_pending: false,
@@ -274,11 +277,14 @@ impl Core {
 
     pub(crate) fn account_tasks(&mut self) -> Option<std::sync::Arc<coport_gui::tasks::Tasks>> {
         if self.account_probe.is_none() {
-            self.account_probe = Some(std::sync::Arc::new(coport_gui::tasks::Tasks::new(
-                crate::settings::app_dir(),
-                self.config_path(),
-                self.loaded_config()?.clone(),
-            )));
+            self.account_probe = Some(std::sync::Arc::new(
+                coport_gui::tasks::Tasks::new(
+                    crate::settings::app_dir(),
+                    self.config_path(),
+                    self.loaded_config()?.clone(),
+                )
+                .with_claude_profiles(self.claude_profiles.clone()),
+            ));
         }
         self.account_probe.clone()
     }
