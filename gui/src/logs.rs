@@ -2,6 +2,7 @@
 
 use crate::proxy::Notify;
 use chrono::{DateTime, Local};
+use coport::routing::Service;
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -91,24 +92,18 @@ impl Entry {
         }
         Some(path)
     }
-    /// Which client the request belongs to, inferred from its path.
-    pub fn service(&self) -> Option<&'static str> {
-        if let Some(service) = self.get("service") {
-            return match service {
-                "claude" => Some("Claude"),
-                "codex" => Some("Codex"),
-                _ => None,
-            };
-        }
-        let path = self.get("path")?;
-        if path.starts_with("/anthropic")
-            || path.starts_with("/claude")
-            || path.starts_with("/v1/messages")
-            || path.starts_with("/api/oauth")
-        {
-            Some("Claude")
-        } else {
-            Some("Codex")
+    /// The app the proxy routed this request to; `None` for CONNECT tunnels,
+    /// whose requests are logged on their own.
+    pub fn service(&self) -> Option<Service> {
+        match self.get("service") {
+            // Token refreshes were once logged as `*_auth`.
+            Some("codex" | "codex_auth") => Some(Service::Codex),
+            Some("claude" | "claude_auth") => Some(Service::Claude),
+            // "connect": tunnels, before they stopped naming a service.
+            Some(_) => None,
+            None if self.get("method") == Some("CONNECT") => None,
+            // Records from before the proxy logged the app on each of them.
+            None => self.get("path").map(coport::routing::logged_service),
         }
     }
 }
@@ -485,7 +480,7 @@ mod tests {
         assert_eq!(stats.avg_latency_ms, Some(20));
         assert_eq!(
             feed.entries(|e| e.is_request_end())[0].service(),
-            Some("Claude")
+            Some(Service::Claude)
         );
 
         // Rotation: the logger renames to `.1` and starts a fresh file. A line

@@ -40,11 +40,11 @@ test('folds credentials beyond the shades into Others per service', () => {
   assert.deepEqual(four.map((s) => s.color), ['--claude-1', '--claude-2', '--claude-3', '--claude-4']);
   assert.deepEqual(shareGroups(named.slice(0, 5), requests)[0].slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (2)']);
 });
-test('services other than Codex and Claude follow them in a neutral hue', () => {
+test('Codex comes before Claude whatever the order or size', () => {
   const { shareGroups } = setup();
-  const groups = shareGroups([credential('x', 500, 'Gemini'), credential('b', 1, 'Claude'), credential('a', 1)], requests);
-  assert.deepEqual(plain(groups.map((g) => g.service)), ['Codex', 'Claude', 'Gemini']);
-  assert.equal(groups[2].slices[0].color, '--other-1');
+  const groups = shareGroups([credential('b', 500, 'Claude'), credential('a', 1)], requests);
+  assert.deepEqual(plain(groups.map((g) => g.service)), ['Codex', 'Claude']);
+  assert.deepEqual(plain(shareGroups([credential('b', 5, 'Claude')], requests).map((g) => g.service)), ['Claude']);
 });
 test('All shows request counts without percentages', () => {
   const { trafficShare } = setup();

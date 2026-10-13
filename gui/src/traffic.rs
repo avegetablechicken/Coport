@@ -2,6 +2,7 @@
 use crate::logs::Entry;
 use crate::traffic_identity::{Identities, Reason, Resolution, Source, Target, UNIDENTIFIED};
 use chrono::{DateTime, Local};
+use coport::routing::Service;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -22,7 +23,12 @@ pub enum TrafficScope {
     Model,
 }
 
+/// Traffic counts requests to an app; a CONNECT tunnel's requests are logged
+/// and counted on their own.
 fn included_in_scope(entry: &Entry, scope: TrafficScope) -> bool {
+    if entry.service().is_none() {
+        return false;
+    }
     let model_event = entry.event.starts_with("model_call_");
     match scope {
         TrafficScope::All => !model_event,
@@ -202,12 +208,9 @@ impl FileTraffic {
         if let (Some(id), Some(label)) = (entry.get("account_id"), entry.get("account_label"))
             && !id.is_empty()
             && !label.is_empty()
+            && let Some(service) = entry.service()
         {
-            let service = entry
-                .service()
-                .or_else(|| entry.get("service"))
-                .unwrap_or("Unknown");
-            let evidence = (service.to_owned(), id.to_owned(), label.to_owned());
+            let evidence = (service.label().to_owned(), id.to_owned(), label.to_owned());
             if sighted.insert(evidence.clone()) {
                 self.evidence.push(evidence);
             }
@@ -715,7 +718,10 @@ fn read_at(
     let mut groups = BTreeMap::new();
     let mut labels = labels.clone();
     for entry in source.entries(start, end, scope, &mut labels)? {
-        let resolved = identities.resolve(&entry, entry.service().unwrap_or("Unknown"), &labels);
+        let Some(service) = entry.service() else {
+            continue;
+        };
+        let resolved = identities.resolve(&entry, service.label(), &labels);
         aggregate(
             &mut groups,
             &entry,
@@ -810,7 +816,7 @@ fn credential_name(
 }
 
 fn aggregate(
-    groups: &mut BTreeMap<(String, String), CredentialTraffic>,
+    groups: &mut BTreeMap<(Service, String), CredentialTraffic>,
     e: &Entry,
     start: i64,
     end: i64,
@@ -827,19 +833,17 @@ fn aggregate(
     if time < start || time >= end {
         return;
     }
-    let service = e
-        .service()
-        .or_else(|| e.get("service"))
-        .unwrap_or("Unknown")
-        .to_owned();
-    let credential = credential_name(e, &service, labels, resolved.as_ref());
+    let Some(service) = e.service() else {
+        return;
+    };
+    let credential = credential_name(e, service.label(), labels, resolved.as_ref());
     let source = resolved.and_then(|r| r.source);
     let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
-    let claude = service == "Claude";
+    let claude = service == Service::Claude;
     let group = groups
-        .entry((service.clone(), credential.clone()))
+        .entry((service, credential.clone()))
         .or_insert_with(|| CredentialTraffic {
-            service,
+            service: service.label().to_owned(),
             credential,
             counts: vec![0; bucket_count],
             error_counts: vec![0; bucket_count],
@@ -1135,15 +1139,12 @@ pub(crate) fn export_windows_limit(
             })
             .collect();
         for entry in entries {
-            let service = entry.service().unwrap_or("Unknown").to_owned();
-            // Group keys must match `aggregate`, which keeps raw services such as CONNECT.
-            let group_service = entry
-                .service()
-                .or_else(|| entry.get("service"))
-                .unwrap_or("Unknown")
-                .to_owned();
-            let resolved = identities.resolve(&entry, &service, &labels);
-            let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
+            let Some(group_service) = entry.service() else {
+                continue;
+            };
+            let service = group_service.label();
+            let resolved = identities.resolve(&entry, service, &labels);
+            let credential = credential_name(&entry, service, &labels, resolved.as_ref());
             let proxy = entry
                 .get("proxy_endpoint")
                 .map(str::to_owned)
@@ -1168,10 +1169,10 @@ pub(crate) fn export_windows_limit(
             let upstream_ref =
                 references_cache.reference("upstream", &format!("{service}\0{credential}"));
             let account_ref = identities
-                .provider_reference(&service, &credential, references)
+                .provider_reference(service, &credential, references)
                 .or_else(|| {
                     coport_gui::data_api::account_reference(
-                        &service,
+                        service,
                         entry.get("account_id").unwrap_or(""),
                     )
                 })
@@ -1204,7 +1205,7 @@ pub(crate) fn export_windows_limit(
                 let mut account_ref = account_ref.clone();
                 let label = format!("{proxy_ref}/{upstream_ref}");
                 if window.groups.len() >= limit
-                    && !window.groups.contains_key(&(group_service.clone(), label))
+                    && !window.groups.contains_key(&(group_service, label))
                 {
                     proxy_ref = references_cache.reference("proxy", "overflow");
                     upstream_ref = references_cache.reference("upstream", "overflow");
@@ -1213,7 +1214,7 @@ pub(crate) fn export_windows_limit(
                 let label = format!("{proxy_ref}/{upstream_ref}");
                 window
                     .account_refs
-                    .entry((group_service.clone(), label.clone()))
+                    .entry((group_service, label.clone()))
                     .or_default()
                     .insert(account_ref);
                 aggregate(
@@ -1263,8 +1264,8 @@ impl ExportReferences<'_> {
 }
 struct ExportWindow {
     options: ExportOptions,
-    groups: BTreeMap<(String, String), CredentialTraffic>,
-    account_refs: BTreeMap<(String, String), BTreeSet<Option<String>>>,
+    groups: BTreeMap<(Service, String), CredentialTraffic>,
+    account_refs: BTreeMap<(Service, String), BTreeSet<Option<String>>>,
 }
 fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
     let ExportWindow {
@@ -1273,19 +1274,15 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
         ..
     } = window;
     groups
-        .into_values()
-        .map(|g| {
+        .into_iter()
+        .map(|((service, _), g)| {
             let (proxy_ref, upstream_ref) = g.credential.split_once('/').unwrap();
             coport_gui::data_api::Group {
-                service: match g.service.as_str() {
-                    "Codex" => coport_gui::data_api::Service::Codex,
-                    "Claude" => coport_gui::data_api::Service::Claude,
-                    _ => coport_gui::data_api::Service::Other,
-                },
+                service,
                 proxy_ref: proxy_ref.into(),
                 upstream_ref: upstream_ref.into(),
                 account_ref: account_refs
-                    .remove(&(g.service.clone(), g.credential.clone()))
+                    .remove(&(service, g.credential.clone()))
                     .filter(|refs| refs.len() == 1)
                     .and_then(|refs| refs.into_iter().next().flatten()),
                 stats: coport_gui::data_api::Stats {
@@ -1444,14 +1441,12 @@ mod tests {
         let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
         let mut groups = BTreeMap::new();
         for entry in entries {
-            let service = entry.service().unwrap_or("Unknown").to_owned();
-            let group_service = entry
-                .service()
-                .or_else(|| entry.get("service"))
-                .unwrap_or("Unknown")
-                .to_owned();
-            let resolved = identities.resolve(&entry, &service, &labels);
-            let credential = credential_name(&entry, &service, &labels, resolved.as_ref());
+            let Some(group_service) = entry.service() else {
+                continue;
+            };
+            let service = group_service.label();
+            let resolved = identities.resolve(&entry, service, &labels);
+            let credential = credential_name(&entry, service, &labels, resolved.as_ref());
             let proxy = entry
                 .get("proxy_endpoint")
                 .map(str::to_owned)
@@ -1474,10 +1469,10 @@ mod tests {
             // create extra upstream accounts in the exported result.
             let mut upstream_ref = key.reference("upstream", &format!("{service}\0{credential}"));
             let mut account_ref = identities
-                .provider_reference(&service, &credential, references)
+                .provider_reference(service, &credential, references)
                 .or_else(|| {
                     coport_gui::data_api::account_reference(
-                        &service,
+                        service,
                         entry.get("account_id").unwrap_or(""),
                     )
                 })
@@ -1491,7 +1486,7 @@ mod tests {
                         .map(str::to_owned)
                 });
             let label = format!("{proxy_ref}/{upstream_ref}");
-            if groups.len() >= limit && !groups.contains_key(&(group_service.clone(), label)) {
+            if groups.len() >= limit && !groups.contains_key(&(group_service, label)) {
                 proxy_ref = key.reference("proxy", "overflow");
                 upstream_ref = key.reference("upstream", "overflow");
                 account_ref = None;
@@ -1515,19 +1510,15 @@ mod tests {
             );
         }
         Ok(groups
-            .into_values()
-            .map(|g| {
+            .into_iter()
+            .map(|((service, _), g)| {
                 let (proxy_ref, upstream_ref) = g.credential.split_once('/').unwrap();
                 coport_gui::data_api::Group {
-                    service: match g.service.as_str() {
-                        "Codex" => coport_gui::data_api::Service::Codex,
-                        "Claude" => coport_gui::data_api::Service::Claude,
-                        _ => coport_gui::data_api::Service::Other,
-                    },
+                    service,
                     proxy_ref: proxy_ref.into(),
                     upstream_ref: upstream_ref.into(),
                     account_ref: account_refs
-                        .remove(&(g.service.clone(), g.credential.clone()))
+                        .remove(&(service, g.credential.clone()))
                         .filter(|refs| refs.len() == 1)
                         .and_then(|refs| refs.into_iter().next().flatten()),
                     stats: coport_gui::data_api::Stats {
@@ -2502,15 +2493,38 @@ mod tests {
     }
 
     #[test]
-    fn export_limit_keeps_existing_connect_groups_out_of_overflow() {
+    fn export_limit_keeps_existing_groups_out_of_overflow_and_tunnels_out_of_traffic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         let timestamp = chrono::DateTime::from_timestamp_millis(end - 60_000)
             .unwrap()
             .to_rfc3339();
-        let row = |id: &str| serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":id, "method":"CONNECT", "path":"example.com:443", "service":"connect", "proxy":"none", "status":"200"});
-        std::fs::write(&path, format!("{}\n{}\n", row("first"), row("second"))).unwrap();
+        let row = |id: &str| serde_json::json!({"event":"request_finished", "timestamp":timestamp, "request_id":id, "method":"POST", "path":"/v1/responses", "service":"codex", "proxy":"none", "status":"200"});
+        // Tunnels as logged before and after they stopped naming a service;
+        // the requests inside them are logged on their own.
+        let tunnel = |id: &str, event: &str, service: Option<&str>| {
+            let mut row = serde_json::json!({"event":event, "timestamp":timestamp, "request_id":id, "method":"CONNECT", "path":"chatgpt.com:443", "proxy":"none", "status":"200"});
+            if let Some(service) = service {
+                row["service"] = service.into();
+            }
+            row
+        };
+        let rows = [
+            tunnel("old-tunnel", "request_received", None),
+            tunnel("old-tunnel", "request_finished", Some("connect")),
+            tunnel("tunnel", "request_received", None),
+            tunnel("tunnel", "request_finished", None),
+            row("first"),
+            row("second"),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
         let config = coport::config::Config::parse(
             "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n",
         )
@@ -2539,10 +2553,69 @@ mod tests {
             1,
             "The full group must not split into overflow"
         );
+        assert_eq!(exported[0].service, Service::Codex);
         assert_eq!(exported[0].stats.requests, 2);
         assert_ne!(
             exported[0].upstream_ref,
             key.reference("upstream", "overflow")
+        );
+    }
+
+    #[test]
+    fn traffic_counts_requests_of_the_two_apps_and_never_their_tunnels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let usage = "/codex/https://chatgpt.com/backend-api/wham/usage";
+        let refresh = "/anthropic/https://platform.claude.com/v1/oauth/token";
+        let gateway = "/https://gateway.invalid/v1/messages";
+        let records = [
+            // Decrypted tunnels, one of them still open; their requests are
+            // logged on their own.
+            serde_json::json!({"event":"request_received", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443"}),
+            serde_json::json!({"event":"request_finished", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443", "service":"connect", "routing":"credential", "status":"200"}),
+            serde_json::json!({"event":"request_received", "request_id":"open-tunnel", "method":"CONNECT", "path":"api.anthropic.com:443"}),
+            // From before Codex records named their app.
+            serde_json::json!({"event":"request_received", "request_id":"usage", "method":"GET", "path":usage}),
+            serde_json::json!({"event":"request_finished", "request_id":"usage", "method":"GET", "path":usage, "account_id":"acct", "status":"200"}),
+            // A token refresh under its former service name.
+            serde_json::json!({"event":"request_received", "request_id":"refresh", "method":"POST", "path":refresh}),
+            serde_json::json!({"event":"request_finished", "request_id":"refresh", "method":"POST", "path":refresh, "service":"claude_auth", "status":"200"}),
+            // A Claude call that failed before any record named its app.
+            serde_json::json!({"event":"request_received", "request_id":"gateway", "model_call_id":"gateway-call", "method":"POST", "path":gateway}),
+            serde_json::json!({"event":"request_failed", "request_id":"gateway", "model_call_id":"gateway-call", "method":"POST", "path":gateway, "status":"502"}),
+            serde_json::json!({"event":"model_call_failed", "request_id":"gateway", "model_call_id":"gateway-call", "method":"POST", "path":gateway, "status":"502"}),
+            // In progress, named from its first record on.
+            serde_json::json!({"event":"request_received", "request_id":"current", "method":"GET", "path":"/backend-api/wham/usage", "service":"codex"}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    r["timestamp"] = timestamp.clone().into();
+                    format!("{r}\n")
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+        let by_service = |scope| {
+            let traffic = read(&path, 30, &BTreeMap::new(), scope).unwrap();
+            let mut services = BTreeMap::new();
+            for credential in &traffic.credentials {
+                *services.entry(credential.service.clone()).or_insert(0) += credential.requests;
+            }
+            assert_eq!(traffic.summary.requests, services.values().sum::<u64>());
+            services
+        };
+        assert_eq!(
+            by_service(TrafficScope::All),
+            BTreeMap::from([("Claude".to_owned(), 2), ("Codex".to_owned(), 2)])
+        );
+        assert_eq!(
+            by_service(TrafficScope::Model),
+            BTreeMap::from([("Claude".to_owned(), 1)])
         );
     }
 
@@ -3157,9 +3230,9 @@ mod tests {
             let e = Entry { seq: 0, time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)), event: "request_finished".into(), fields: serde_json::from_value(serde_json::json!({"service": service, "account_id": account, "provider": provider})).unwrap() };
             aggregate(&mut groups, &e, 0, 1_800_000, 1, &labels, None);
         }
-        assert!(groups.contains_key(&("Codex".into(), "default".into())));
-        assert!(groups.contains_key(&("Codex".into(), "MY_API_KEY".into())));
-        assert!(groups.contains_key(&("Claude".into(), "user@example.test".into())));
+        assert!(groups.contains_key(&(Service::Codex, "default".into())));
+        assert!(groups.contains_key(&(Service::Codex, "MY_API_KEY".into())));
+        assert!(groups.contains_key(&(Service::Claude, "user@example.test".into())));
     }
 
     #[test]
@@ -3244,7 +3317,7 @@ mod tests {
             aggregate(&mut groups, &e, 0, 1_800_000, 1, &BTreeMap::new(), None);
         }
         assert_eq!(groups.len(), 2);
-        let codex = &groups[&("Codex".into(), "Unidentified".into())];
+        let codex = &groups[&(Service::Codex, "Unidentified".into())];
         assert_eq!(codex.counts[0], 2);
         assert_eq!(codex.counts[29], 1);
         assert_eq!(codex.errors, 3);

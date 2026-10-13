@@ -14,11 +14,17 @@ use tokio::{
     sync::{RwLock, Semaphore},
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Service {
-    Codex,
-    Claude,
-    Other,
+/// Every group belongs to the app the proxy routed its requests to.
+pub use coport::routing::Service;
+/// Peers from before each logged request named its app also sent `Other`
+/// groups: CONNECT tunnels, whose requests they also counted on their own,
+/// and token refreshes. Neither is traffic of an app, so they are dropped.
+fn app_groups<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Group>, D::Error> {
+    Vec::<serde_json::Value>::deserialize(deserializer)?
+        .into_iter()
+        .filter(|group| group["service"] != "Other")
+        .map(|group| serde_json::from_value(group).map_err(serde::de::Error::custom))
+        .collect()
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -61,6 +67,7 @@ pub struct Summary {
     pub window_start: i64,
     pub window_end: i64,
     pub bucket_minutes: u8,
+    #[serde(deserialize_with = "app_groups")]
     pub groups: Vec<Group>,
     #[serde(default)]
     pub windows: Vec<Window>,
@@ -75,6 +82,7 @@ pub struct Window {
     pub window_start: i64,
     pub window_end: i64,
     pub bucket_minutes: u64,
+    #[serde(deserialize_with = "app_groups")]
     pub groups: Vec<Group>,
 }
 pub const RANGES: [u64; 6] = [30, 360, 720, 1440, 10080, 43200];
@@ -1055,6 +1063,27 @@ mod tests {
         assert_eq!(summary.groups[0].stats.requests, 1);
         assert_eq!(summary.groups[0].stats.input_tokens, Some(7));
         assert_eq!(summary.groups[0].stats.output_tokens, Some(3));
+    }
+    #[test]
+    fn groups_of_no_app_from_older_peers_are_dropped() {
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let mut counts = vec![0; 30];
+        counts[29] = 1;
+        let group = |service: &str, upstream: &str| {
+            json!({"service":service, "proxyRef":"a".repeat(64), "upstreamRef":upstream.repeat(64),
+                "stats":Stats { requests: 1, counts: counts.clone(), error_counts: vec![0; 30], token_counts: vec![0; 30], ..Default::default() }})
+        };
+        let value = json!({"schemaVersion":1, "nodeId":uuid::Uuid::new_v4().to_string(), "windowStart":end-30*60_000,
+            "windowEnd":end, "bucketMinutes":1, "groups":[group("Codex", "b"), group("Other", "c"), group("Claude", "d")]});
+        let summary: Summary = serde_json::from_value(value).unwrap();
+        summary.validate().unwrap();
+        assert_eq!(
+            summary.groups.iter().map(|g| g.service).collect::<Vec<_>>(),
+            [Service::Codex, Service::Claude]
+        );
+        let unknown = json!({"schemaVersion":1, "nodeId":uuid::Uuid::new_v4().to_string(), "windowStart":end-30*60_000,
+            "windowEnd":end, "bucketMinutes":1, "groups":[group("Unknown", "b")]});
+        assert!(serde_json::from_value::<Summary>(unknown).is_err());
     }
     #[test]
     fn summary_parser_rejects_unexpected_sensitive_fields_and_stale_windows() {

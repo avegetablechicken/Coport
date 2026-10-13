@@ -416,7 +416,24 @@ async fn claude_token_refresh_uses_saved_account_proxy_without_injecting_credent
     assert!(fixture.requests.try_recv().is_err());
     running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
-    assert!(log.contains("claude_auth"));
+    let refreshes: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| {
+            record["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/oauth/token"))
+        })
+        .collect();
+    assert!(
+        refreshes
+            .iter()
+            .any(|record| record["event"] == "request_received")
+    );
+    assert!(
+        refreshes.iter().all(|record| record["service"] == "claude"),
+        "Every record of a token refresh names its app"
+    );
     assert!(!log.contains("refresh-secret"));
 }
 
@@ -3637,6 +3654,52 @@ async fn named_upstreams_route_models_and_generation_through_both_entries() {
                 .unwrap();
             assert!(response.status().is_client_error());
             assert!(fixture.requests.try_recv().is_err());
+            // Every record of every request names its app, from the first
+            // one on; tunnels belong to no app, as their requests are logged.
+            let rows = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    running.server.logger.flush().unwrap();
+                    let raw =
+                        std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+                    let rows: Vec<serde_json::Value> = raw
+                        .lines()
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .filter(|row: &serde_json::Value| row["method"].is_string())
+                        .collect();
+                    let count = |end: bool| {
+                        rows.iter()
+                            .filter(|row| {
+                                row["event"].as_str().is_some_and(|event| {
+                                    (event == "request_received") != end
+                                        && event.starts_with("request_")
+                                })
+                            })
+                            .count()
+                    };
+                    if count(false) == count(true) {
+                        return rows;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(rows.iter().any(|row| row["method"] == "CONNECT"));
+            assert!(
+                rows.iter()
+                    .any(|row| row["event"] == "request_received" && row["method"] != "CONNECT")
+            );
+            for row in &rows {
+                if row["method"] == "CONNECT" {
+                    assert!(row.get("service").is_none(), "{row}");
+                } else {
+                    assert_eq!(
+                        row["service"],
+                        if claude { "claude" } else { "codex" },
+                        "{row}"
+                    );
+                }
+            }
         }
     }
 }

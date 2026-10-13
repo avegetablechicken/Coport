@@ -1151,21 +1151,18 @@ function modelTokenStats(stats, scope) {
 const SHARE_SERVICES = ["Codex", "Claude"];
 const SHARE_SHADES = 4;
 
-/// Credentials grouped by service, each group in one hue. `measure` gives a
-/// credential's amount, or null when it is unknown. Each credential takes a shade
-/// while they fit; beyond that the largest keep theirs and at least two others
-/// fold into "Others". Unidentified requests come last; Others and unidentified
-/// are drawn without a hue.
+/// Credentials grouped by app, Codex then Claude, each group in its hue; traffic
+/// has no other service. `measure` gives a credential's amount, or null when it
+/// is unknown. Each credential takes a shade while they fit; beyond that the
+/// largest keep theirs and at least two others fold into "Others". Unidentified
+/// requests come last; Others and unidentified are drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
   const used = credentials.filter((c) => c.requests > 0);
-  const services = [...new Set(used.map((c) => c.service))];
-  const rank = (service) => (SHARE_SERVICES.includes(service) ? SHARE_SERVICES.indexOf(service) : SHARE_SERVICES.length);
-  services.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
-  return services.map((service) => {
+  return SHARE_SERVICES.filter((service) => used.some((c) => c.service === service)).map((service) => {
     const own = used.filter((c) => c.service === service);
     const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
-    const hue = SHARE_SERVICES.includes(service) ? service.toLowerCase() : "other";
+    const hue = service.toLowerCase();
     const shown = named.length > SHARE_SHADES ? SHARE_SHADES - 1 : named.length;
     const slices = named.slice(0, shown).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
     const rest = named.slice(shown);

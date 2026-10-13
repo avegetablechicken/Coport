@@ -588,6 +588,14 @@ impl Claude {
         })
     }
 
+    /// Whether `explicit_api_route` applies to this target, before headers.
+    pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
+        let Some(explicit) = crate::claude_api::explicit_target(target) else {
+            return Ok(false);
+        };
+        Ok(crate::url_routing::match_route(&self.url_routes(), explicit)?.is_some())
+    }
+
     pub(crate) fn explicit_api_route(
         &self,
         headers: &HeaderMap,

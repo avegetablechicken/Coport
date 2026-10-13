@@ -268,7 +268,7 @@ mod tests {
             .unwrap()
             .groups
             .push(Group {
-                service: Service::Other,
+                service: Service::Claude,
                 proxy_ref: "a".repeat(64),
                 upstream_ref: "b".repeat(64),
                 account_ref: None,

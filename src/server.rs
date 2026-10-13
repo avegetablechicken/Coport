@@ -3,8 +3,8 @@ use crate::{
     config::{Choice, Config, redacted_endpoint},
     logger::{Logger, RequestLog},
     routing::{
-        MCP_PATH, MCP_UPSTREAM, TOKEN_REFRESH_UPSTREAM, account_query, query_url, refresh_token,
-        token_refresh, upstream_url,
+        MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query, query_url,
+        refresh_token, token_refresh, upstream_url,
     },
 };
 use bytes::{Buf, Bytes};
@@ -593,6 +593,13 @@ impl Server {
                 destination.scope.rsplit("://").next().unwrap_or(""),
             );
         }
+        // The app is decided once, before any record: routing follows it and
+        // every record logs it. CONNECT tunnels and requests this listener
+        // does not serve belong to no app.
+        let service = (valid && !connect).then(|| self.config.request_service(&target));
+        if let Some(Ok(service)) = &service {
+            log.field("service", service.name());
+        }
         log.event("request_received");
         if !valid {
             return Ok(reject(
@@ -609,8 +616,7 @@ impl Server {
                 ),
             ));
         }
-        if incoming.method() == "CONNECT" {
-            log.field("service", "connect");
+        if connect {
             let upstream = self.connect(&incoming, &mut log).await;
             return Ok(match upstream {
                 Ok(Tunnel::Decrypt(destination)) => {
@@ -634,12 +640,17 @@ impl Server {
                 Err(error) => reject(&mut log, error),
             });
         }
+        let service = match service {
+            Some(Ok(service)) => service,
+            Some(Err(error)) => return Ok(reject(&mut log, error)),
+            None => unreachable!("valid requests other than CONNECT have an app"),
+        };
         let ws_key = incoming.headers().get("sec-websocket-key").cloned();
         let upgrade = incoming
             .headers()
             .contains_key("upgrade")
             .then(|| hyper::upgrade::on(&mut incoming));
-        match self.forward(incoming, &target, &mut log).await {
+        match self.forward(incoming, &target, service, &mut log).await {
             Ok(upstream) => {
                 if upstream.status() == 101 {
                     let Some((upgrade, key)) = upgrade.zip(ws_key) else {
@@ -770,6 +781,7 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         target: &str,
+        service: Service,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         if incoming.headers().keys().any(|name| {
@@ -794,33 +806,27 @@ impl Server {
         if incoming.method() == "CONNECT" {
             return Err(Error::new(400, "Invalid CONNECT request."));
         }
-        let codex_scoped = target.starts_with("/codex/https://");
-        let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
+        // `service` was decided from this target by `Config::request_service`.
+        let claude = service == Service::Claude;
         let target = crate::routing::codex_target(target);
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
-        if !codex_scoped && crate::claude::token_refresh(target) {
+        if claude && crate::claude::token_refresh(target) {
             return self.forward_token_refresh(incoming, log, true).await;
         }
-        if !claude_scoped && token_refresh(target) {
+        if !claude && token_refresh(target) {
             return self.forward_token_refresh(incoming, log, false).await;
         }
-        let explicit_api_route = if codex_scoped {
-            None
-        } else {
+        let explicit_api_route = if claude {
             self.config
                 .claude
                 .explicit_api_route(incoming.headers(), target)?
+        } else {
+            None
         };
-        let codex_url_match = !claude_scoped
+        let codex_url_match = !claude
             && crate::url_routing::match_route(&self.config.codex.routing.api_key, target)?
                 .is_some();
-        if codex_url_match && explicit_api_route.is_some() {
-            return Err(Error::new(
-                409,
-                "API upstream is configured for both apps; use /codex/https:// or /anthropic/https://.",
-            ));
-        }
         let explicit_codex_route = if codex_url_match {
             self.config.resolve_url(
                 incoming
@@ -832,10 +838,14 @@ impl Server {
         } else {
             None
         };
-        let claude_target = if codex_scoped || explicit_codex_route.is_some() {
-            None
+        let claude_target = if claude {
+            Some(
+                crate::claude::target(target)
+                    .or_else(|| explicit_api_route.as_ref().map(|_| target))
+                    .ok_or(Error::config("Unroutable Claude request target."))?,
+            )
         } else {
-            crate::claude::target(target).or_else(|| explicit_api_route.as_ref().map(|_| target))
+            None
         };
         let claude_route = if claude_target.is_some() {
             Some(if let Some(route) = explicit_api_route {
@@ -857,7 +867,6 @@ impl Server {
             .get("chatgpt-account-id")
             .and_then(|h| h.to_str().ok());
         let (route, choice) = if let Some(r) = &claude_route {
-            log.field("service", "claude");
             log.field("provider", &r.label);
             log.field("upstream_base_url", &r.upstream);
             if r.identity.is_none() {
@@ -897,7 +906,6 @@ impl Server {
             }
         } else {
             let r = if let Some(route) = explicit_codex_route {
-                log.field("service", "codex");
                 route
             } else {
                 self.config.resolve(auth, true).await?
@@ -960,7 +968,6 @@ impl Server {
             if target.contains('#') {
                 return Err(Error::config("Invalid MCP request target."));
             }
-            log.field("service", "codex");
             log.field(
                 "routing",
                 if route.is_some() {
@@ -1214,7 +1221,6 @@ impl Server {
         log: &mut RequestLog,
         claude: bool,
     ) -> Result<reqwest::Response> {
-        log.field("service", if claude { "claude_auth" } else { "codex_auth" });
         if incoming.method() != "POST" {
             return Err(Error::new(405, "Token refresh supports POST only."));
         }

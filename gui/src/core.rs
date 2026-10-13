@@ -966,7 +966,10 @@ impl From<Entry> for EntryDto {
             status: e.status(),
             method: e.get("method").map(str::to_owned),
             path: e.path().map(str::to_owned),
-            service: e.get("path").and(e.service()),
+            service: e
+                .get("path")
+                .and(e.service())
+                .map(coport::routing::Service::label),
             proxy: e.get("proxy").map(str::to_owned),
             duration_ms: e.duration_ms(),
             bytes: (e.is_request_end() || e.is_model_call_end()).then(|| e.bytes()),

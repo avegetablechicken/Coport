@@ -1183,7 +1183,7 @@ reconciliation is read-only and never rewrites retained logs.
 | --- | --- |
 | `current_route` | Account ID and proxy configured at startup; not a connectivity test. |
 | `route_unavailable` | Startup credentials or mapping could not be read; later requests retry credential loading using the startup configuration. |
-| `request_received` | Request method, path without query, and unique request ID. |
+| `request_received` | Request method, path without query, unique request ID, and `service`. |
 | `route_selected` | Account and proxy actually selected for this request. |
 | `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
 | `route_health` | Effective route eligibility, consecutive failures and feedback source (`probe`, `request` or `connect`). |
@@ -1195,6 +1195,12 @@ reconciliation is read-only and never rewrites retained logs.
 | `model_call_finished` / `model_call_failed` / `model_call_cancelled` | Per-call outcome, model, response ID, duration, and reported input/output/cache token usage when available. WebSocket success requires a model terminal event delivered to the client. |
 | `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |
 | `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
+
+Every record of a proxied request carries `service`, `codex` or `claude`: the app
+the proxy routes the request to, decided from its target before the first record.
+Token refreshes belong to their app. A CONNECT tunnel belongs to no app and carries
+no `service`; the requests inside a decrypted tunnel are logged on their own.
+Traffic statistics count requests of the two apps only.
 
 Request logs keep the proxy-generated `request_id` separate from the client's
 `client_request_id` and `session_id`. Session headers are checked in this order:

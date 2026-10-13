@@ -20,7 +20,88 @@ pub fn codex_target(target: &str) -> &str {
         .filter(|rest| rest.starts_with("/https://"))
         .unwrap_or(target)
 }
+
+/// The app a proxied request belongs to. The proxy decides it once from the
+/// request target, routes by it and logs it as `service` on every record.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
+pub enum Service {
+    Codex,
+    Claude,
+}
+impl Service {
+    /// The logged `service` value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+    /// The name statistics show.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
+}
+
+/// Scoped targets and token refreshes decide the app first, then URL routes,
+/// then Claude's own paths; anything else is Codex. `url_route` matches the
+/// unscoped target against configured URL routes, given whether it was
+/// scoped to Claude.
+fn service_of<E>(
+    target: &str,
+    url_route: impl FnOnce(&str, bool) -> std::result::Result<Option<Service>, E>,
+) -> std::result::Result<Service, E> {
+    let codex_scoped = target.starts_with("/codex/https://");
+    let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
+    let target = codex_target(target);
+    if !codex_scoped && crate::claude::token_refresh(target) {
+        return Ok(Service::Claude);
+    }
+    if codex_scoped || (!claude_scoped && token_refresh(target)) {
+        return Ok(Service::Codex);
+    }
+    if let Some(service) = url_route(target, claude_scoped)? {
+        return Ok(service);
+    }
+    Ok(if crate::claude::target(target).is_some() {
+        Service::Claude
+    } else {
+        Service::Codex
+    })
+}
+
+/// The app of a logged request path, for records written before the proxy
+/// logged `service` on each of them. The configuration in force then is
+/// unknown, so URL routes do not apply; the proxy logged those requests' app
+/// on their later records.
+pub fn logged_service(path: &str) -> Service {
+    let Ok(service) = service_of::<std::convert::Infallible>(path, |_, _| Ok(None));
+    service
+}
+
 impl Config {
+    /// The app of a request target; see [`Service`].
+    pub fn request_service(&self, target: &str) -> Result<Service> {
+        service_of(target, |target, claude_scoped| {
+            let claude = self.claude.url_route_matches(target)?;
+            let codex = !claude_scoped
+                && crate::url_routing::match_route(&self.codex.routing.api_key, target)?.is_some();
+            match (claude, codex) {
+                (true, true) => Err(Error::new(
+                    409,
+                    "API upstream is configured for both apps; use /codex/https:// or /anthropic/https://.",
+                )),
+                (true, false) => Ok(Some(Service::Claude)),
+                (false, true) => Ok(Some(Service::Codex)),
+                (false, false) => Ok(None),
+            }
+        })
+    }
+
     pub fn resolve_url(&self, authorization: Option<&str>, target: &str) -> Result<Option<Route>> {
         let Some((base, proxy)) =
             crate::url_routing::match_route(&self.codex.routing.api_key, codex_target(target))?
@@ -379,6 +460,76 @@ mod tests {
             "/responses#secret",
         ] {
             assert!(upstream_url(b, t, true).is_err(), "{t}");
+        }
+    }
+
+    #[test]
+    fn every_request_target_belongs_to_one_app() {
+        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\n").unwrap();
+        let cases = [
+            ("/v1/responses", Service::Codex),
+            ("/backend-api/wham/usage", Service::Codex),
+            ("/mcp/openaiDeveloperDocs", Service::Codex),
+            ("/oauth/token", Service::Codex),
+            ("/https://auth.openai.com/oauth/token", Service::Codex),
+            (
+                "/codex/https://chatgpt.com/backend-api/wham/usage",
+                Service::Codex,
+            ),
+            ("/codex/https://gateway.invalid/v1/messages", Service::Codex),
+            ("/https://sharecoder.invalid/responses", Service::Codex),
+            ("/v1/messages", Service::Claude),
+            ("/api/oauth/usage", Service::Claude),
+            ("/v1/oauth/token", Service::Claude),
+            (
+                "/https://platform.claude.com/v1/oauth/token",
+                Service::Claude,
+            ),
+            (
+                "/anthropic/https://platform.claude.com/v1/oauth/token",
+                Service::Claude,
+            ),
+            (
+                "/anthropic/https://api.anthropic.com/v1/models",
+                Service::Claude,
+            ),
+            ("/claude/v1/models", Service::Claude),
+            ("/https://other.invalid/v1/messages", Service::Claude),
+        ];
+        for (target, service) in cases {
+            assert_eq!(config.request_service(target).unwrap(), service, "{target}");
+            assert_eq!(logged_service(target), service, "{target}");
+        }
+        // Only the configuration decides unscoped URL routes; records logged
+        // without it fall back to the proxy's default for those.
+        assert_eq!(
+            config
+                .request_service("/https://gateway.invalid/v1/models")
+                .unwrap(),
+            Service::Claude
+        );
+        assert_eq!(
+            logged_service("/https://gateway.invalid/v1/models"),
+            Service::Codex
+        );
+        assert_eq!(
+            config
+                .request_service("/https://codex.invalid/v1/messages")
+                .unwrap(),
+            Service::Codex
+        );
+        assert_eq!(
+            config
+                .request_service("/https://both.invalid/v1/models")
+                .unwrap_err()
+                .status,
+            409
+        );
+        for (target, service) in [
+            ("/codex/https://both.invalid/v1/models", Service::Codex),
+            ("/anthropic/https://both.invalid/v1/models", Service::Claude),
+        ] {
+            assert_eq!(config.request_service(target).unwrap(), service, "{target}");
         }
     }
 
