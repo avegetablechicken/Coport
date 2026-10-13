@@ -23,10 +23,11 @@ pub enum TrafficScope {
     Model,
 }
 
-/// Traffic counts requests to an app; a CONNECT tunnel's requests are logged
-/// and counted on their own.
+/// Traffic counts requests to an app. A CONNECT is kept even without one: an
+/// older record takes the app of its destination under the current
+/// configuration once traffic is read (see `Identities::service`).
 fn included_in_scope(entry: &Entry, scope: TrafficScope) -> bool {
-    if entry.service().is_none() {
+    if entry.service().is_none() && entry.get("method") != Some("CONNECT") {
         return false;
     }
     let model_event = entry.event.starts_with("model_call_");
@@ -60,7 +61,7 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
 }
 
 /// The fields traffic reads from log records; file summaries keep only these.
-const FIELDS: [&str; 19] = [
+const FIELDS: [&str; 20] = [
     "account_id",
     "credential_ref",
     "account_label",
@@ -80,6 +81,7 @@ const FIELDS: [&str; 19] = [
     "upstream_base_url",
     "proxy_endpoint",
     "proxy",
+    "routing",
 ];
 
 /// A request or model call merged from its lifecycle records. The most
@@ -718,16 +720,19 @@ fn read_at(
     let mut groups = BTreeMap::new();
     let mut labels = labels.clone();
     for entry in source.entries(start, end, scope, &mut labels)? {
-        let Some(service) = entry.service() else {
+        let Some(service) = identities.service(&entry) else {
             continue;
         };
         let resolved = identities.resolve(&entry, service.label(), &labels);
         aggregate(
             &mut groups,
             &entry,
-            start,
-            end,
-            bucket_minutes,
+            service,
+            Span {
+                start,
+                end,
+                bucket_minutes,
+            },
             &labels,
             resolved,
         );
@@ -815,15 +820,27 @@ fn credential_name(
     })
 }
 
-fn aggregate(
-    groups: &mut BTreeMap<(Service, String), CredentialTraffic>,
-    e: &Entry,
+/// A traffic window's bounds in milliseconds and its bucket width.
+#[derive(Clone, Copy)]
+struct Span {
     start: i64,
     end: i64,
     bucket_minutes: u64,
+}
+
+fn aggregate(
+    groups: &mut BTreeMap<(Service, String), CredentialTraffic>,
+    e: &Entry,
+    service: Service,
+    span: Span,
     labels: &BTreeMap<(String, String), String>,
     resolved: Option<Resolution>,
 ) {
+    let Span {
+        start,
+        end,
+        bucket_minutes,
+    } = span;
     if lifecycle_rank(e) == 0 {
         return;
     }
@@ -833,9 +850,6 @@ fn aggregate(
     if time < start || time >= end {
         return;
     }
-    let Some(service) = e.service() else {
-        return;
-    };
     let credential = credential_name(e, service.label(), labels, resolved.as_ref());
     let source = resolved.and_then(|r| r.source);
     let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
@@ -896,7 +910,11 @@ fn aggregate(
         group.cache_read = group.cache_read.saturating_add(cached);
         group.cache_prompt = group.cache_prompt.saturating_add(input);
     }
-    if let Some(ms) = e.duration_ms() {
+    // A CONNECT's duration measures its tunnel, not a response.
+    if let Some(ms) = e
+        .duration_ms()
+        .filter(|_| e.get("method") != Some("CONNECT"))
+    {
         group.latency_total += ms;
         group.latency_count += 1;
         group.avg_ms = Some(group.latency_total / group.latency_count);
@@ -1139,7 +1157,7 @@ pub(crate) fn export_windows_limit(
             })
             .collect();
         for entry in entries {
-            let Some(group_service) = entry.service() else {
+            let Some(group_service) = identities.service(&entry) else {
                 continue;
             };
             let service = group_service.label();
@@ -1220,9 +1238,12 @@ pub(crate) fn export_windows_limit(
                 aggregate(
                     &mut window.groups,
                     &entry,
-                    start,
-                    end,
-                    crate::data_api::bucket_minutes(minutes).unwrap(),
+                    group_service,
+                    Span {
+                        start,
+                        end,
+                        bucket_minutes: crate::data_api::bucket_minutes(minutes).unwrap(),
+                    },
                     &labels,
                     Some(Resolution {
                         label,
@@ -1441,7 +1462,7 @@ mod tests {
         let mut account_refs = BTreeMap::<_, BTreeSet<Option<String>>>::new();
         let mut groups = BTreeMap::new();
         for entry in entries {
-            let Some(group_service) = entry.service() else {
+            let Some(group_service) = identities.service(&entry) else {
                 continue;
             };
             let service = group_service.label();
@@ -1499,9 +1520,12 @@ mod tests {
             aggregate(
                 &mut groups,
                 &entry,
-                start,
-                end,
-                bucket,
+                group_service,
+                Span {
+                    start,
+                    end,
+                    bucket_minutes: bucket,
+                },
                 &labels,
                 Some(Resolution {
                     label,
@@ -2562,7 +2586,85 @@ mod tests {
     }
 
     #[test]
-    fn traffic_counts_requests_of_the_two_apps_and_never_their_tunnels() {
+    fn a_connect_counts_once_for_its_tunnels_app_and_first_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let connect = |id: &str, host: &str, end: &str, extra: serde_json::Value| {
+            let received = serde_json::json!({"event":"request_received", "request_id":id, "method":"CONNECT", "path":host});
+            let mut ended = serde_json::json!({"event":end, "request_id":id, "method":"CONNECT", "path":host, "duration_ms":"9000"});
+            for (key, value) in extra.as_object().unwrap() {
+                ended[key] = value.clone();
+            }
+            [received, ended]
+        };
+        let usage = "/codex/https://chatgpt.com/backend-api/wham/usage";
+        let records: Vec<serde_json::Value> = [
+            // Logged before the proxy named a CONNECT's app.
+            connect("old", "chatgpt.com:443", "request_finished", serde_json::json!({"service":"connect", "routing":"credential", "status":"200"})),
+            connect("old-failed", "platform.claude.com:443", "request_failed", serde_json::json!({"routing":"credential", "reason":"client_tls_failed"})),
+            connect("refused", "www.cloudflare.com:443", "request_rejected", serde_json::json!({"service":"connect", "status":"403"})),
+            // Named by the proxy: by the first request routed through it, or
+            // by its destination when TLS failed before any request.
+            connect("new", "chatgpt.com:443", "request_finished", serde_json::json!({"service":"codex", "routing":"credential", "account_id":"acct", "status":"200"})),
+            connect("new-failed", "api.anthropic.com:443", "request_failed", serde_json::json!({"service":"claude", "routing":"credential", "reason":"client_tls_failed"})),
+            [
+                serde_json::json!({"event":"request_received", "request_id":"usage", "method":"GET", "path":usage, "service":"codex"}),
+                serde_json::json!({"event":"request_finished", "request_id":"usage", "method":"GET", "path":usage, "service":"codex", "account_id":"acct", "status":"200", "duration_ms":"100"}),
+            ],
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    r["timestamp"] = timestamp.clone().into();
+                    format!("{r}\n")
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+        let config = coport::config::Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: [{}]\n  routing:\n    account_fallback: none\nclaude:\n  config_dirs: []\n  routing:\n    account_fallback: none\n",
+            serde_json::to_string(dir.path()).unwrap()
+        ))
+        .unwrap();
+        let identities = Identities::from_config(&config, &[]);
+        let labels = BTreeMap::from([(
+            ("Codex".to_owned(), "acct".to_owned()),
+            "acct@example.invalid".to_owned(),
+        )]);
+        let all = super::read(&path, 30, &labels, TrafficScope::All, &identities).unwrap();
+        let group = |service: &str, credential: &str| {
+            all.credentials
+                .iter()
+                .find(|c| c.service == service && c.credential == credential)
+                .map(|c| (c.requests, c.errors, c.avg_ms))
+        };
+        // The new CONNECT and its first request share an account; a tunnel's
+        // duration never enters the latency.
+        assert_eq!(
+            group("Codex", "acct@example.invalid"),
+            Some((2, 0, Some(100)))
+        );
+        assert_eq!(group("Codex", UNIDENTIFIED), Some((1, 0, None)));
+        assert_eq!(group("Claude", UNIDENTIFIED), Some((2, 2, None)));
+        assert_eq!(all.summary.requests, 5, "A refused CONNECT has no app");
+        assert_eq!(
+            super::read(&path, 30, &labels, TrafficScope::Model, &identities)
+                .unwrap()
+                .summary
+                .requests,
+            0
+        );
+    }
+
+    #[test]
+    fn traffic_counts_requests_of_the_two_apps_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
         let timestamp = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
@@ -2570,8 +2672,8 @@ mod tests {
         let refresh = "/anthropic/https://platform.claude.com/v1/oauth/token";
         let gateway = "/https://gateway.invalid/v1/messages";
         let records = [
-            // Decrypted tunnels, one of them still open; their requests are
-            // logged on their own.
+            // Tunnels logged before the proxy named a CONNECT's app, one still
+            // open; without a configuration decrypting their hosts, no app.
             serde_json::json!({"event":"request_received", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443"}),
             serde_json::json!({"event":"request_finished", "request_id":"tunnel", "method":"CONNECT", "path":"chatgpt.com:443", "service":"connect", "routing":"credential", "status":"200"}),
             serde_json::json!({"event":"request_received", "request_id":"open-tunnel", "method":"CONNECT", "path":"api.anthropic.com:443"}),
@@ -3228,7 +3330,18 @@ mod tests {
             ("codex", "opaque-id", "MY_API_KEY"),
         ] {
             let e = Entry { seq: 0, time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)), event: "request_finished".into(), fields: serde_json::from_value(serde_json::json!({"service": service, "account_id": account, "provider": provider})).unwrap() };
-            aggregate(&mut groups, &e, 0, 1_800_000, 1, &labels, None);
+            aggregate(
+                &mut groups,
+                &e,
+                e.service().unwrap(),
+                Span {
+                    start: 0,
+                    end: 1_800_000,
+                    bucket_minutes: 1,
+                },
+                &labels,
+                None,
+            );
         }
         assert!(groups.contains_key(&(Service::Codex, "default".into())));
         assert!(groups.contains_key(&(Service::Codex, "MY_API_KEY".into())));
@@ -3314,7 +3427,18 @@ mod tests {
                 )
                 .unwrap(),
             };
-            aggregate(&mut groups, &e, 0, 1_800_000, 1, &BTreeMap::new(), None);
+            aggregate(
+                &mut groups,
+                &e,
+                e.service().unwrap(),
+                Span {
+                    start: 0,
+                    end: 1_800_000,
+                    bucket_minutes: 1,
+                },
+                &BTreeMap::new(),
+                None,
+            );
         }
         assert_eq!(groups.len(), 2);
         let codex = &groups[&(Service::Codex, "Unidentified".into())];

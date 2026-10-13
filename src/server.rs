@@ -28,6 +28,31 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use url::Url;
 
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+/// A decrypted tunnel's CONNECT record, written once a request inside it is routed.
+type TunnelLog = Arc<Mutex<Option<RequestLog>>>;
+
+/// A tunnel is one client's connection, so its CONNECT takes the app and
+/// account of the first request routed through it. A tunnel closed before
+/// that is recorded without them.
+fn record_tunnel(tunnel: &TunnelLog, request: &RequestLog) {
+    let Some(mut connect) = tunnel.lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    for key in [
+        "service",
+        "provider",
+        "account_id",
+        "account_label",
+        "credential_ref",
+        "upstream_base_url",
+        "proxy",
+        "proxy_endpoint",
+    ] {
+        if let Some(value) = request.fields.get(key) {
+            connect.fields.insert(key.into(), value.clone());
+        }
+    }
+}
 
 /// A decrypted client connection; routing happens after local TLS termination.
 pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -538,6 +563,7 @@ impl Server {
         mut incoming: Request<Incoming>,
         relay: tokio::sync::mpsc::UnboundedSender<Relay>,
         destination: Option<Arc<crate::credential_proxy::Destination>>,
+        tunnel: Option<TunnelLog>,
     ) -> std::result::Result<Response<Body>, Infallible> {
         let mut target = incoming
             .uri()
@@ -589,8 +615,8 @@ impl Server {
             );
         }
         // The app is decided once, before any record: routing follows it and
-        // every record logs it. CONNECT tunnels and requests this listener
-        // does not serve belong to no app.
+        // every record logs it. A CONNECT takes the app of the first request
+        // in its tunnel; requests this listener does not serve have none.
         let service = (valid && !connect).then(|| self.config.request_service(&target));
         if let Some(Ok(service)) = &service {
             log.field("service", service.name());
@@ -614,6 +640,11 @@ impl Server {
         if connect {
             return Ok(match self.connect(&incoming, &mut log) {
                 Ok(destination) => {
+                    // A destination is decrypted for an app, so the tunnel's
+                    // app is known before any request, even if TLS then fails.
+                    if let Some(service) = destination.service() {
+                        log.field("service", service.name());
+                    }
                     log.status = 200;
                     log.field("routing", "credential");
                     let upgraded = hyper::upgrade::on(&mut incoming);
@@ -633,7 +664,11 @@ impl Server {
             .headers()
             .contains_key("upgrade")
             .then(|| hyper::upgrade::on(&mut incoming));
-        match self.forward(incoming, &target, service, &mut log).await {
+        let forwarded = self.forward(incoming, &target, service, &mut log).await;
+        if let Some(tunnel) = &tunnel {
+            record_tunnel(tunnel, &log);
+        }
+        match forwarded {
             Ok(upstream) => {
                 if upstream.status() == 101 {
                     let Some((upgrade, key)) = upgrade.zip(ws_key) else {
@@ -1156,8 +1191,7 @@ impl Server {
             match tokio::time::timeout(Duration::from_secs(30), handshake).await {
                 Ok(Ok(tls)) => {
                     log.outcome = "request_finished";
-                    drop(log);
-                    self.serve_http(tls, Some(destination)).await;
+                    self.serve_http(tls, Some(destination), Some(log)).await;
                 }
                 Ok(Err(reason)) => {
                     log.outcome = "request_failed";
@@ -1293,7 +1327,7 @@ impl Server {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_http(socket, None).await
+        self.serve_http(socket, None, None).await
     }
 
     /// Boxed, since a decrypted CONNECT serves its own connection from a relay.
@@ -1301,10 +1335,13 @@ impl Server {
         self: Arc<Self>,
         mut socket: S,
         destination: Option<Arc<crate::credential_proxy::Destination>>,
+        tunnel: Option<RequestLog>,
     ) -> Relay
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // Dropping the last reference writes a CONNECT no request claimed.
+        let tunnel: Option<TunnelLog> = tunnel.map(|log| Arc::new(Mutex::new(Some(log))));
         Box::pin(async move {
             let prefix = match tokio::time::timeout(Duration::from_secs(30), read_head(&mut socket))
                 .await
@@ -1348,8 +1385,12 @@ impl Server {
                 .serve_connection(
                     TokioIo::new(PrefixedSocket { prefix, socket }),
                     service_fn(move |r| {
-                        self.clone()
-                            .handle(r, relay_tx.clone(), destination.clone())
+                        self.clone().handle(
+                            r,
+                            relay_tx.clone(),
+                            destination.clone(),
+                            tunnel.clone(),
+                        )
                     }),
                 )
                 .with_upgrades();

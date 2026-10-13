@@ -3160,6 +3160,13 @@ async fn a_decrypted_tunnel_serves_requests_one_after_another() {
         1,
         "Both requests share one tunnel"
     );
+    let connect = rows
+        .iter()
+        .find(|row| row["event"] == "request_finished" && row["method"] == "CONNECT")
+        .unwrap();
+    assert_eq!(connect["service"], "codex", "{connect}");
+    assert_eq!(connect["provider"], "ShareCoder", "{connect}");
+    assert_eq!(connect["proxy"], "selected", "{connect}");
 }
 
 #[tokio::test]
@@ -3403,14 +3410,17 @@ async fn clients_that_do_not_trust_the_proxy_ca_are_logged_as_such() {
                     .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
                     .find(|row| row["event"] == "request_failed" && row["method"] == "CONNECT")
                 {
-                    return row["reason"].clone();
+                    return row;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(reason, "client_rejected_proxy_ca");
+        assert_eq!(reason["reason"], "client_rejected_proxy_ca");
+        // The destination is decrypted for Claude, so the failed tunnel is
+        // Claude's although no request reached it.
+        assert_eq!(reason["service"], "claude");
     }
 }
 
@@ -3530,6 +3540,17 @@ async fn a_decrypted_tunnel_closed_without_a_request_is_logged() {
     assert_eq!(row["client_connect"], "upstream.invalid");
     assert_eq!(row["status"], "400");
     assert_eq!(row["reason"], "Incomplete request headers.");
+    // Without a routed request, the CONNECT has its destination's app but
+    // no account.
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let connect = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|row| row["event"] == "request_finished" && row["method"] == "CONNECT")
+        .unwrap();
+    assert_eq!(connect["service"], "claude", "{connect}");
+    assert!(connect.get("account_id").is_none(), "{connect}");
+    assert!(connect.get("provider").is_none(), "{connect}");
 }
 
 // Named providers/settings must behave identically through a base URL and an
@@ -3640,7 +3661,7 @@ async fn named_upstreams_route_models_and_generation_through_both_entries() {
             assert!(response.status().is_client_error());
             assert!(fixture.requests.try_recv().is_err());
             // Every record of every request names its app, from the first
-            // one on; tunnels belong to no app, as their requests are logged.
+            // one on; a CONNECT names it once a request in its tunnel is routed.
             let rows = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     running.server.logger.flush().unwrap();
@@ -3675,7 +3696,7 @@ async fn named_upstreams_route_models_and_generation_through_both_entries() {
                     .any(|row| row["event"] == "request_received" && row["method"] != "CONNECT")
             );
             for row in &rows {
-                if row["method"] == "CONNECT" {
+                if row["method"] == "CONNECT" && row["event"] == "request_received" {
                     assert!(row.get("service").is_none(), "{row}");
                 } else {
                     assert_eq!(

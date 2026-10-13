@@ -2,7 +2,7 @@
 //! the codex or claude section routes by credential is decrypted with the
 //! proxy CA; each request inside then takes the explicit upstream URL form,
 //! so it is matched and forwarded exactly like a base URL request.
-use crate::{Error, Result, config::Config};
+use crate::{Error, Result, config::Config, routing::Service};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -17,6 +17,33 @@ pub(crate) struct Destination {
     pub acceptor: TlsAcceptor,
     /// Prepended to each request target, e.g. `/anthropic/https://api.anthropic.com`.
     pub scope: Arc<str>,
+}
+impl Destination {
+    /// The app this destination is decrypted for; `None` for a host both
+    /// apps route, whose requests name their app themselves.
+    pub(crate) fn service(&self) -> Option<Service> {
+        scope_service(&self.scope)
+    }
+}
+
+fn scope_service(scope: &str) -> Option<Service> {
+    if scope.starts_with("/codex/") {
+        Some(Service::Codex)
+    } else if scope.starts_with("/anthropic/") {
+        Some(Service::Claude)
+    } else {
+        None
+    }
+}
+
+/// The app each CONNECT destination is decrypted for under `config`, whether
+/// or not credential routing is on; hosts both apps route are absent. Reads
+/// CONNECT records logged before the proxy named their app.
+pub fn connect_services(config: &Config) -> Result<BTreeMap<(String, u16), Service>> {
+    Ok(scopes(config)?
+        .into_iter()
+        .filter_map(|(origin, scope)| scope_service(&scope).map(|service| (origin, service)))
+        .collect())
 }
 
 pub struct CredentialProxy {
@@ -267,6 +294,25 @@ mod tests {
             scopes(&config).unwrap()[&("shared.example.com".to_owned(), 443)],
             "/https://shared.example.com"
         );
+    }
+
+    #[test]
+    fn connect_destinations_name_their_app_except_shared_hosts() {
+        let config = config(
+            "codex:\n  routing:\n    account: {default: none}\n    api_key:\n      'shared.example.com/openai': none\nclaude:\n  routing:\n    account_fallback: none\n    api_key:\n      'shared.example.com/anthropic': none\n",
+        );
+        let services = connect_services(&config).unwrap();
+        let get = |host: &str| services.get(&(host.to_owned(), 443)).copied();
+        assert_eq!(get("chatgpt.com"), Some(Service::Codex));
+        assert_eq!(get("auth.openai.com"), Some(Service::Codex));
+        assert_eq!(get("api.anthropic.com"), Some(Service::Claude));
+        assert_eq!(get("platform.claude.com"), Some(Service::Claude));
+        assert_eq!(get("shared.example.com"), None);
+        assert_eq!(get("www.cloudflare.com"), None);
+        // Records read after credential routing is switched off keep their app.
+        let mut off = config.clone();
+        off.connect_credential_routing = false;
+        assert_eq!(connect_services(&off).unwrap(), services);
     }
 
     #[test]
