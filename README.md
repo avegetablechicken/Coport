@@ -649,9 +649,12 @@ restart the app. A client that does not trust it, or still trusts a replaced
 proxy CA, refuses the handshake; the CONNECT is then logged with reason
 `client_rejected_proxy_ca` and nothing is forwarded. A decrypted tunnel that
 closes or times out without a valid request is logged as `request_rejected`
-with its `client_connect` host. Each decrypted connection carries one request,
-like base URL connections. Request logs include `client_connect` with the
-decrypted host.
+with its `client_connect` host. Like base URL connections, a decrypted
+connection serves further requests after a forwarded response, so a client
+reuses its tunnel instead of opening a CONNECT per request; it closes after 30
+seconds without a new request, after a locally generated error response, or when
+a response stream fails midway, so a truncated body is never taken as complete.
+Request logs include `client_connect` with the decrypted host.
 
 Outbound HTTP and HTTPS proxies support Basic proxy authentication; SOCKS5
 supports optional username/password authentication and resolves destination

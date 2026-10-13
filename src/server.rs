@@ -719,10 +719,6 @@ impl Server {
                     log.fields["method"] == "HEAD" || matches!(status.as_u16(), 204 | 304);
                 let mut response = Response::builder().status(status);
                 *response.headers_mut().unwrap() = headers;
-                response
-                    .headers_mut()
-                    .unwrap()
-                    .insert("connection", "close".parse().unwrap());
                 if no_body {
                     log.outcome = "request_finished";
                     return Ok(response.body(empty()).unwrap());
@@ -1341,9 +1337,10 @@ impl Server {
                 }
             };
             let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
-            // Keep Hyper's upgrade handshake intact. Disabling keep-alive
-            // overwrites Connection: Upgrade with Connection: close.
-            // Ordinary HTTP responses explicitly send Connection: close.
+            // Forwarded responses keep the connection for further requests,
+            // which the header read timeout closes once idle; local error
+            // responses close it. A stream failing midway aborts the
+            // connection, so the client never takes a truncated body as whole.
             let mut connection = http1::Builder::new()
                 .max_buf_size(65536)
                 .timer(TokioTimer::new())

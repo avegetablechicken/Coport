@@ -1522,9 +1522,9 @@ async fn request_limits_duplicates_and_chunked_upload() {
         .await
         .unwrap();
     socket.write_all(b"POST /responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").await.unwrap();
-    let mut output = String::new();
-    socket.read_to_string(&mut output).await.unwrap();
-    assert!(output.starts_with("HTTP/1.1 302"));
+    // A forwarded response keeps the connection open for further requests.
+    let output = read_response_head(&mut socket).await;
+    assert!(output.starts_with("HTTP/1.1 302"), "{output}");
     assert!(fixture.requests.recv().await.unwrap().ends_with("abcde"));
 }
 
@@ -2788,6 +2788,82 @@ async fn rejected_requests_with_unread_bodies_receive_a_complete_response() {
 }
 
 #[tokio::test]
+async fn a_connection_serves_requests_one_after_another() {
+    let mut fixture = fixture("direct", "oauth_json").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        socket
+            .write_all(b"GET /models HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "{head}"
+        );
+        // The chunked body's terminator ends the response, not the connection.
+        let mut body = Vec::new();
+        while !body.ends_with(b"\r\n0\r\n\r\n") {
+            body.push(socket.read_u8().await.unwrap());
+        }
+        assert!(String::from_utf8_lossy(&body).contains("five_hour"));
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /v1/models ")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stream_failing_midway_closes_the_connection_without_completing_the_body() {
+    let mut fixture = fixture("direct", "sse").await;
+    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    trust(&running, &fixture, "none");
+    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"POST /responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nContent-Length: 2\r\n\r\n{}")
+        .await
+        .unwrap();
+    let head = read_response_head(&mut socket).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut body = Vec::new();
+    while !String::from_utf8_lossy(&body).contains("data: first") {
+        body.push(socket.read_u8().await.unwrap());
+    }
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/responses")
+    );
+    // The upstream goes away midway: the client must see the connection end
+    // before the body does, rather than a complete response on a live one.
+    fixture.task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut body))
+        .await
+        .expect("the connection closes");
+    assert!(
+        !body.ends_with(b"0\r\n\r\n"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("data: last"));
+}
+
+#[tokio::test]
 async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_rejected() {
     let mut fixture = fixture("direct", "redirect").await;
     let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
@@ -2796,9 +2872,8 @@ async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_reject
         .await
         .unwrap();
     socket.write_all(b"GET /models HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nAccept: application/json\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\nConnection: x-test-hop\r\nx-test-hop: remove-me\r\n\r\n").await.unwrap();
-    let mut response = String::new();
-    socket.read_to_string(&mut response).await.unwrap();
-    assert!(response.starts_with("HTTP/1.1 302"));
+    let response = read_response_head(&mut socket).await;
+    assert!(response.starts_with("HTTP/1.1 302"), "{response}");
     let forwarded = fixture.requests.recv().await.unwrap().to_lowercase();
     assert!(forwarded.contains("accept: application/json"));
     assert!(forwarded.contains("accept: text/event-stream"));
@@ -3010,6 +3085,81 @@ async fn proxy_port_requests_are_routed_by_credential() {
     assert_eq!(denied["destination"], "other.invalid:443");
     // Activity shows a CONNECT's target, not `/`.
     assert_eq!(denied["path"], "other.invalid:443");
+}
+
+// A client keeps its tunnel for the next request, as with any HTTP proxy.
+#[tokio::test]
+async fn a_decrypted_tunnel_serves_requests_one_after_another() {
+    let mut fixture = fixture("http", "oauth_json").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[model_providers.ShareCoder]\nbase_url = 'https://upstream.invalid/v1'\nexperimental_bearer_token = 'fake-provider-secret'\n",
+    )
+    .unwrap();
+    let running = running(&format!(
+        "connect_credential_routing: true\nproxies:\n  selected: {endpoint}\ncodex:\n  homes: [{}]\n  routing:\n    api_key: {{ShareCoder: selected}}\n",
+        serde_json::to_string(home.path()).unwrap()
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let proxy = proxy_port_client(&running);
+    for _ in 0..2 {
+        let response = proxy
+            .get("https://upstream.invalid/v1/models")
+            .bearer_auth("fake-provider-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.text().await.unwrap();
+        // Outbound, each request still takes its own route.
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .contains(" /v1/models ")
+        );
+    }
+    let rows = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            running.server.logger.flush().unwrap();
+            let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            if rows
+                .iter()
+                .filter(|row| row["event"] == "request_finished" && row["method"] == "GET")
+                .count()
+                == 2
+            {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "request_received" && row["method"] == "CONNECT")
+            .count(),
+        1,
+        "Both requests share one tunnel"
+    );
 }
 
 #[tokio::test]
