@@ -3,7 +3,8 @@
 A cross-platform Rust loopback reverse proxy for Codex, Claude Code, ChatGPT account APIs and
 OpenAI documentation MCP. It selects an outbound proxy by matching account or
 API Key credentials. HTTP/SSE and WebSocket data are passed through without model
-or protocol conversion. Explicit destination routes also support HTTP CONNECT tunnels.
+or protocol conversion. Clients that use it as an HTTP proxy are decrypted and routed
+by credential in the same way.
 
 ## Configuration
 
@@ -569,28 +570,10 @@ the handshake over HTTPS and, after a valid `101` response, relays frames in bot
 directions, including binary data, ping/pong, close frames, negotiated subprotocols
 and extensions. Upstream handshake errors keep their HTTP status and body.
 
-To use the listener as an HTTP CONNECT proxy, configure exact destinations at
-the top level:
-
-```yaml
-connect:
-  "api.anthropic.com:443": claude_official
-  "platform.claude.com:443": claude_official
-  "chatgpt.com:443": [us, jp]
-```
-
-Values refer to names in `proxies`; `none` explicitly selects direct TCP.
-Unlisted destinations return 403. Hostnames are case-insensitive; ports must
-match. IPv6 literals use `[address]:port`. Configure any additional destinations
-needed by the client.
-
-Clients that support an HTTP proxy can then use
-`HTTPS_PROXY=http://127.0.0.1:8787` with their original HTTPS URLs. This also carries
-secure WebSocket connections through CONNECT. TLS stays between client and
-server, so the proxy cannot inspect the API path or token, apply per-account
-routing, or change headers inside the tunnel. CONNECT routes use the destination
-alone and are independent of `codex.routing` and `claude.routing`, unless
-credential routing (below) decrypts that destination.
+The listener answers CONNECT only for the API hosts it decrypts with proxy port
+credential routing (below), and routes each request inside by credential. It never
+tunnels a destination without reading its requests: every other CONNECT returns
+403, and a top-level `connect` section is rejected as configuration.
 
 ### Credential routing on the proxy port
 
@@ -624,8 +607,8 @@ A host routed by both services uses the unprefixed `/https://` form and its usua
 conflict rules. Destination discovery reads local provider/settings definitions
 at startup without resolving credentials or contacting upstreams. Restart after changing those
 upstream addresses. Unavailable definitions contribute no destinations; valid
-definitions in other configured homes still apply. All other destinations keep
-their `connect` routes or remain denied. Requests inside a decrypted tunnel must target
+definitions in other configured homes still apply. All other destinations are
+denied. Requests inside a decrypted tunnel must target
 its destination (origin-form, or absolute-form naming that host), and the client
 must not name another host in SNI (IP clients normally omit SNI).
 
@@ -673,12 +656,7 @@ decrypted host.
 Outbound HTTP and HTTPS proxies support Basic proxy authentication; SOCKS5
 supports optional username/password authentication and resolves destination
 hostnames remotely. HTTPS proxy certificates are verified using native system
-trust. Ordered route lists attempt tunnel establishment in order and retain the
-first successful connection; payloads are never replayed after establishment.
-All CONNECT candidates share one establishment timeout budget. Candidate lists
-use the same health state machine and background recovery schedule as HTTP; a
-real connection attempt serves as the initial check, so successful sockets are
-reused rather than opened twice.
+trust.
 
 CONNECT and upgraded WebSocket connections count toward the 128-connection
 limit, close on service shutdown, and expire after `request_timeout_seconds`
@@ -759,8 +737,8 @@ still identifies unmatched access tokens via the profile API before routing.
 The unprefixed `/v1/oauth/token` and explicit
 `/https://platform.claude.com/v1/oauth/token` paths are also supported, including
 `/anthropic` and `/claude` prefixes. Use the local URL as an OAuth base URL,
-or configure the separate CONNECT destination routes before using the listener
-as an HTTP proxy.
+or enable proxy port credential routing before using the listener as an HTTP
+proxy.
 
 Implementation references: Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
 and [Claude header definitions](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/pkg/claude/constants.go).
@@ -1186,7 +1164,7 @@ reconciliation is read-only and never rewrites retained logs.
 | `request_received` | Request method, path without query, unique request ID, and `service`. |
 | `route_selected` | Account and proxy actually selected for this request. |
 | `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
-| `route_health` | Effective route eligibility, consecutive failures and feedback source (`probe`, `request` or `connect`). |
+| `route_health` | Effective route eligibility, consecutive failures and feedback source (`probe` or `request`). |
 | `upstream_retry` | A bodyless GET transport failure before response headers; includes `upstream_attempts`, redacted `transport_error` category, and `retry_delay_ms`. |
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
 | `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
@@ -1257,7 +1235,7 @@ close with code 1000; first-message/output/read timeouts use 1001 and write fail
 use 1011. Close frames are sent where the transport permits, never inside a partial
 data frame. Connection logs record the stage, direction, close code, frame size and
 whether downstream bytes were written. An unfinished call remains failed even when
-the upstream closes normally. CONNECT and other opaque tunnels retain the shared
+the upstream closes normally. Other upgraded connections retain the shared
 byte-activity timeout from `request_timeout_seconds`.
 
 The WebSocket observer handles masking, fragmentation and negotiated
@@ -1285,7 +1263,7 @@ Logs contain **full account IDs and proxy endpoints**. They do not record tokens
 - Repeated list-valued `Accept`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Connection`, `Pragma`, and `Via` headers are supported. Duplicate authentication, routing, Host, framing, and other unknown headers are rejected.
 - `Expect: 100-continue` returns HTTP 417. Only WebSocket version 13 GET upgrades are supported; other Upgrade requests return HTTP 426.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
-- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. CONNECT candidates likewise share one establishment deadline; the relay idle timeout starts separately after connection establishment. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
+- Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures the HTTP request timeout and the idle timeout for established WebSocket/CONNECT tunnels. Tunnel activity in either direction resets the idle timer; active tunnels have no total lifetime limit. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.

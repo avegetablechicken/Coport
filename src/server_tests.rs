@@ -122,6 +122,12 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     }
                     let _ = io.read_u8().await;
                 }
+                else if response_mode=="websocket_hold" {
+                    io.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n").await.unwrap();
+                    let mut byte = [0];
+                    while matches!(io.read(&mut byte).await, Ok(1..)) {}
+                    let _ = tx.send("CLOSED".into());
+                }
                 else if response_mode=="websocket" || response_mode=="websocket_bad" {
                     let accept = if response_mode=="websocket_bad" { "invalid" } else { "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" };
                     io.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: test\r\n\r\n").as_bytes()).await.unwrap();
@@ -1752,82 +1758,15 @@ async fn websocket_invalid_accept_is_rejected() {
 }
 
 #[tokio::test]
-async fn inbound_connect_direct_preserves_early_bytes_and_half_close() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let destination = listener.local_addr().unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut payload = Vec::new();
-        socket.read_to_end(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"early-later");
-        socket.write_all(b"reply-after-half-close").await.unwrap();
-    });
-    let running = running(&format!("connect:\n  '{destination}': none\n")).await;
-    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
-        .await
-        .unwrap();
-    socket
-        .write_all(
-            format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\nearly-")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let head = read_response_head(&mut socket).await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    socket.write_all(b"later").await.unwrap();
-    socket.shutdown().await.unwrap();
-    let mut payload = Vec::new();
-    socket.read_to_end(&mut payload).await.unwrap();
-    assert_eq!(&payload, b"reply-after-half-close");
-    peer.await.unwrap();
-}
-
-#[tokio::test]
-async fn inbound_connect_uses_http_proxy_without_forwarding_client_credentials() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let head = read_response_head(&mut socket).await;
-        assert!(head.starts_with("CONNECT api.anthropic.com:443 HTTP/1.1"));
-        assert!(head.contains("Proxy-Authorization: Basic dTpw"));
-        assert!(!head.contains("private"));
-        socket
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nearly-reply")
-            .await
-            .unwrap();
-        let mut payload = Vec::new();
-        socket.read_to_end(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"tunnel-data");
-    });
-    let running = running(&format!(
-        "proxies:\n  selected: http://u:p@{endpoint}\nconnect:\n  api.anthropic.com:443: selected\n"
-    ))
-    .await;
-    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
-        .await
-        .unwrap();
-    socket.write_all(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nAuthorization: Bearer private-token\r\nCookie: private-cookie\r\nProxy-Authorization: Basic private\r\n\r\n").await.unwrap();
-    assert!(
-        read_response_head(&mut socket)
-            .await
-            .starts_with("HTTP/1.1 200")
-    );
-    socket.write_all(b"tunnel-data").await.unwrap();
-    socket.shutdown().await.unwrap();
-    let mut data = Vec::new();
-    socket.read_to_end(&mut data).await.unwrap();
-    assert_eq!(&data, b"early-reply");
-    peer.await.unwrap();
-}
-
-#[tokio::test]
-async fn inbound_connect_rejects_unconfigured_destinations_and_bodies() {
-    let running = running("connect:\n  api.anthropic.com:443: none\n").await;
+async fn inbound_connect_without_credential_routing_is_refused() {
+    // Without credential routing no destination is served, and none is
+    // contacted; malformed requests are refused as such.
+    let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = destination.local_addr().unwrap().to_string();
+    let running = running("").await;
     for (destination, extra, status) in [
-        ("other.invalid:443", "", 403),
-        ("api.anthropic.com:444", "", 403),
+        (address.as_str(), "", 403),
+        ("api.anthropic.com:443", "", 403),
         ("api.anthropic.com:443", "Content-Length: 1\r\n", 400),
         (
             "api.anthropic.com:443",
@@ -1848,14 +1787,23 @@ async fn inbound_connect_rejects_unconfigured_destinations_and_bodies() {
         let head = read_response_head(&mut socket).await;
         assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{head}");
     }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), destination.accept())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
-async fn connect_relays_close_on_timeout_disconnect_and_shutdown() {
+async fn upgraded_relays_close_on_timeout_disconnect_and_shutdown() {
     for mode in ["timeout", "disconnect", "shutdown"] {
-        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = destination.local_addr().unwrap();
-        let running = running(&format!("connect:\n  '{address}': none\n")).await;
+        let mut fixture = fixture("http", "websocket_hold").await;
+        let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+        let running = running(&format!(
+            "proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key:\n      upstream.invalid: selected\n"
+        ))
+        .await;
+        trust(&running, &fixture, &endpoint);
         running.task.abort();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = listener.local_addr().unwrap();
@@ -1864,16 +1812,26 @@ async fn connect_relays_close_on_timeout_disconnect_and_shutdown() {
             let _ = stop.await;
         }));
         let mut socket = tokio::net::TcpStream::connect(local).await.unwrap();
-        socket
-            .write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        // Not a model endpoint, so the upgraded connection is an opaque relay.
+        socket.write_all(b"GET /codex/https://upstream.invalid/v1/socket HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        let head = read_response_head(&mut socket).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
         assert!(
-            read_response_head(&mut socket)
+            fixture
+                .requests
+                .recv()
                 .await
-                .starts_with("HTTP/1.1 200")
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
         );
-        let (mut peer, _) = destination.accept().await.unwrap();
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /v1/socket ")
+        );
         let mut socket = Some(socket);
         let mut shutdown = Some(shutdown);
         if mode == "disconnect" {
@@ -1882,17 +1840,18 @@ async fn connect_relays_close_on_timeout_disconnect_and_shutdown() {
         if mode == "shutdown" {
             shutdown.take().unwrap().send(()).unwrap();
         }
-        let mut bytes = [0];
+        // The upstream sees its side closed: by the idle timeout, the client
+        // leaving, or service shutdown.
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), peer.read(&mut bytes))
+            tokio::time::timeout(Duration::from_secs(5), fixture.requests.recv())
                 .await
                 .unwrap()
                 .unwrap(),
-            0,
+            "CLOSED",
             "{mode}"
         );
-        drop(peer);
         if let Some(mut socket) = socket {
+            let mut bytes = [0];
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), socket.read(&mut bytes))
                     .await
@@ -1904,57 +1863,6 @@ async fn connect_relays_close_on_timeout_disconnect_and_shutdown() {
         }
         drop(shutdown);
         serve.await.unwrap().unwrap();
-    }
-}
-
-#[tokio::test]
-async fn connect_only_falls_back_to_explicit_candidates_before_establishment() {
-    for allow_direct in [true, false] {
-        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = destination.local_addr().unwrap();
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_address = proxy.local_addr().unwrap();
-        let reject = tokio::spawn(async move {
-            let (mut socket, _) = proxy.accept().await.unwrap();
-            let _ = read_response_head(&mut socket).await;
-            socket
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        });
-        let candidates = if allow_direct {
-            "[rejected, none]"
-        } else {
-            "[rejected]"
-        };
-        let running = running(&format!(
-            "proxies:\n  rejected: http://{proxy_address}\nconnect:\n  '{address}': {candidates}\n"
-        ))
-        .await;
-        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
-            .await
-            .unwrap();
-        socket
-            .write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
-        let head = read_response_head(&mut socket).await;
-        if allow_direct {
-            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-            let (mut peer, _) = destination.accept().await.unwrap();
-            socket.write_all(b"x").await.unwrap();
-            assert_eq!(peer.read_u8().await.unwrap(), b'x');
-        } else {
-            assert!(head.starts_with("HTTP/1.1 502"), "{head}");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), destination.accept())
-                    .await
-                    .is_err()
-            );
-        }
-        reject.await.unwrap();
     }
 }
 
@@ -2323,7 +2231,6 @@ async fn api_response_clears_only_its_own_exit_failures() {
         endpoint: "none".into(),
         origin: "https://upstream.invalid/".into(),
         native_tls: false,
-        tunnel: false,
     };
     let mut suspect = ProbeHealth::default();
     suspect.observe(ProbeResult::Transient);
@@ -2380,7 +2287,6 @@ async fn homepage_failure_does_not_disable_a_working_tunnel() {
                 endpoint,
                 origin: "http://example.invalid/".into(),
                 native_tls: false,
-                tunnel: false,
             })
             .await;
         assert_eq!(result, ProbeResult::Healthy);
@@ -2417,7 +2323,6 @@ async fn stale_failed_probe_cannot_override_a_successful_request() {
             endpoint: endpoint.clone(),
             origin: "http://example.invalid/".into(),
             native_tls: false,
-            tunnel: false,
         },
         state.clone(),
     );
@@ -2532,78 +2437,6 @@ async fn refresh_failure_is_not_replayed_and_counts_once() {
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(!log.contains("upstream_retry"));
     assert!(!log.contains("refresh-secret"));
-}
-
-#[tokio::test]
-async fn connect_candidates_share_one_deadline_and_recover_from_cached_failure() {
-    let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", slow.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        let (mut socket, _) = slow.accept().await.unwrap();
-        let _ = read_response_head(&mut socket).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    });
-    let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = Url::parse(&format!("https://{}/", destination.local_addr().unwrap())).unwrap();
-    let running = running(&format!("proxies:\n  slow: {endpoint}\n")).await;
-    let mut log = RequestLog {
-        logger: running.server.logger.clone(),
-        fields: Default::default(),
-        started: Instant::now(),
-        status: 502,
-        bytes: 0,
-        outcome: "test_finished",
-    };
-    let result = running
-        .server
-        .connect_via(
-            &Choice::List(vec!["slow".into(), "none".into()]),
-            &url,
-            Deadline::new(0.05),
-            &mut log,
-        )
-        .await;
-    assert!(result.is_err());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), destination.accept())
-            .await
-            .is_err(),
-        "second candidate must not receive a fresh timeout budget"
-    );
-    task.abort();
-
-    let key = ProbeKey::tunnel("none", &url);
-    let mut cached = ProbeHealth::default();
-    cached.observe(ProbeResult::HardFailure);
-    cached.monitored = true;
-    cached.next_check = Some(Instant::now());
-    let state = Arc::new(tokio::sync::Mutex::new(cached));
-    running
-        .server
-        .probes
-        .lock()
-        .unwrap()
-        .insert(key.clone(), state.clone());
-    running.server.refresh_probes().await;
-    assert!(!state.lock().await.unavailable);
-    let _ = destination.accept().await.unwrap(); // Background probe connection.
-    let socket = running
-        .server
-        .connect_via(
-            &Choice::List(vec!["none".into()]),
-            &url,
-            Deadline::new(1.0),
-            &mut log,
-        )
-        .await
-        .unwrap();
-    let _ = destination.accept().await.unwrap();
-    assert_eq!(state.lock().await.failures, 0);
-    assert!(
-        key != ProbeKey::http("none", &url, false),
-        "CONNECT cannot prove HTTP/TLS handshake health"
-    );
-    drop(socket);
 }
 
 #[tokio::test]
@@ -3087,7 +2920,7 @@ async fn proxy_port_requests_are_routed_by_credential() {
     let opaque = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let opaque_port = opaque.local_addr().unwrap().port();
     let running = running(&format!(
-        "connect_credential_routing: true\nproxies:\n  pa: http://a:x@127.0.0.1:{port}\n  pb: http://b:y@127.0.0.1:{port}\nconnect:\n  127.0.0.1:{opaque_port}: none\nclaude:\n  config_dirs: [{}, {}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      a@example.invalid: pa\n      b@example.invalid: pb\n",
+        "connect_credential_routing: true\nproxies:\n  pa: http://a:x@127.0.0.1:{port}\n  pb: http://b:y@127.0.0.1:{port}\nclaude:\n  config_dirs: [{}, {}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      a@example.invalid: pa\n      b@example.invalid: pb\n",
         dir("a"),
         dir("b")
     ))
@@ -3136,12 +2969,9 @@ async fn proxy_port_requests_are_routed_by_credential() {
         .await
         .unwrap();
     assert!(response.status().is_client_error(), "{}", response.status());
-    // Other destinations keep their opaque CONNECT routes or remain denied.
+    // Other destinations are denied without being contacted.
     let opaque_destination = format!("127.0.0.1:{opaque_port}");
-    for (destination, status) in [
-        (opaque_destination.as_str(), "HTTP/1.1 200"),
-        ("other.invalid:443", "HTTP/1.1 403"),
-    ] {
+    for destination in ["other.invalid:443", opaque_destination.as_str()] {
         let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
             .await
             .unwrap();
@@ -3152,9 +2982,14 @@ async fn proxy_port_requests_are_routed_by_credential() {
             .await
             .unwrap();
         let head = read_response_head(&mut socket).await;
-        assert!(head.starts_with(status), "{destination}: {head}");
+        assert!(head.starts_with("HTTP/1.1 403"), "{destination}: {head}");
     }
     assert!(fixture.requests.try_recv().is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), opaque.accept())
+            .await
+            .is_err()
+    );
     // A denied destination is logged with the host the client asked for.
     let denied = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

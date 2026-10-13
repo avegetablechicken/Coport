@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio_rustls::rustls;
 
 fn helper() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coportd"))
@@ -33,16 +34,97 @@ fn free_port() -> u16 {
     panic!("no free loopback port");
 }
 
-fn fixture(dir: &Path, upstream: Option<u16>) -> u16 {
+/// With `tunnels`, CONNECT to upstream.invalid:443 opens a decrypted tunnel.
+fn fixture(dir: &Path, tunnels: bool) -> u16 {
     let port = free_port();
     let mut config = format!(
         "listen_port: {port}\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n"
     );
-    if let Some(upstream) = upstream {
-        config.push_str(&format!("connect:\n  \"127.0.0.1:{upstream}\": none\n"));
+    if tunnels {
+        config.push_str("  base_url: https://upstream.invalid\n  routing:\n    account_fallback: none\nconnect_credential_routing: true\n");
     }
     std::fs::write(dir.join("config.yaml"), config).unwrap();
     port
+}
+
+fn read_head(stream: &mut impl Read) -> Vec<u8> {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+        assert!(head.len() < 4096);
+    }
+    head
+}
+
+type Tunnel<S> = rustls::StreamOwned<rustls::ClientConnection, S>;
+
+/// Opens a decrypted tunnel and completes TLS inside it, trusting only the
+/// daemon's proxy CA: binary records cross the connection in both directions,
+/// and nothing contacts an upstream.
+fn tunnel<S: Read + Write>(dir: &Path, mut stream: S) -> Tunnel<S> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    write!(
+        stream,
+        "CONNECT upstream.invalid:443 HTTP/1.1\r\nHost: upstream.invalid:443\r\n\r\n"
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    assert!(read_head(&mut stream).starts_with(b"HTTP/1.1 200"));
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_file(dir.join("tls").join("proxy-ca.pem")).unwrap())
+        .unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), "upstream.invalid".try_into().unwrap())
+            .unwrap();
+    let mut tunnel = rustls::StreamOwned::new(connection, stream);
+    while tunnel.conn.is_handshaking() {
+        tunnel.conn.complete_io(&mut tunnel.sock).unwrap();
+    }
+    tunnel
+}
+
+/// The forwarding helper's stdio as one stream, recording the bytes it relays.
+struct Pipe {
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    relayed: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+impl Read for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.output.read(buf)?;
+        self.relayed.lock().unwrap().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+impl Write for Pipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.input.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.input.flush()
+    }
+}
+
+/// A request without credentials, which the daemon answers itself.
+fn unauthenticated_request<S: Read + Write>(tunnel: &mut Tunnel<S>) {
+    tunnel
+        .write_all(
+            b"GET /v1/models HTTP/1.1\r\nHost: upstream.invalid\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    tunnel.flush().unwrap();
+    let head = String::from_utf8(read_head(tunnel)).unwrap();
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
 }
 
 fn wait_for(mut predicate: impl FnMut() -> bool) {
@@ -94,56 +176,20 @@ fn parent(dir: &Path, keep: bool) -> std::process::Child {
         .unwrap()
 }
 
-fn exchange(stream: &mut TcpStream, bytes: &[u8]) {
-    stream.write_all(bytes).unwrap();
-    let mut echo = vec![0; bytes.len()];
-    stream.read_exact(&mut echo).unwrap();
-    assert_eq!(echo, bytes);
-}
-
 fn surviving_exit(force: bool) {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
-    let upstream_port = upstream.local_addr().unwrap().port();
-    let port = fixture(dir.path(), Some(upstream_port));
-    let echo = std::thread::spawn(move || {
-        let (mut stream, _) = upstream.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut bytes = [0; 128];
-        while let Ok(n) = stream.read(&mut bytes) {
-            if n == 0 {
-                break;
-            }
-            if stream.write_all(&bytes[..n]).is_err() {
-                break;
-            }
-        }
-    });
+    let port = fixture(dir.path(), true);
     let mut parent = parent(dir.path(), true);
     wait_for(|| dir.path().join("ready").exists());
     let (client, before) = daemon::Client::discover(dir.path()).unwrap();
     assert_ne!(before.pid, parent.id());
-    let mut tunnel = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    tunnel
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    write!(
-        tunnel,
-        "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
-    )
-    .unwrap();
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        tunnel.read_exact(&mut byte).unwrap();
-        head.push(byte[0]);
-        assert!(head.len() < 4096);
-    }
-    assert!(String::from_utf8(head).unwrap().starts_with("HTTP/1.1 200"));
-    exchange(&mut tunnel, b"before GUI exit");
+    // The tunnel's TLS session is established before the GUI exits.
+    let mut tunnel = tunnel(dir.path(), stream);
     if force {
         parent.kill().unwrap();
     } else {
@@ -154,7 +200,7 @@ fn surviving_exit(force: bool) {
         assert!(exit.success());
     }
     assert_eq!(client.status().unwrap().pid, before.pid);
-    exchange(&mut tunnel, b"after GUI process ended");
+    unauthenticated_request(&mut tunnel);
 
     // A fresh controller attaches without starting another listener or changing PID.
     let mut reopened = controller(dir.path());
@@ -164,7 +210,6 @@ fn surviving_exit(force: bool) {
     assert!(daemon::Client::discover(dir.path()).is_none());
     TcpListener::bind(("127.0.0.1", port)).unwrap();
     drop(tunnel);
-    echo.join().unwrap();
 }
 
 #[test]
@@ -181,7 +226,7 @@ fn force_killing_gui_preserves_daemon_and_connections() {
 fn disabled_option_stops_daemon_on_gui_exit() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), None);
+    let port = fixture(dir.path(), false);
     let mut parent = parent(dir.path(), false);
     wait_for(|| dir.path().join("ready").exists());
     assert!(daemon::Client::discover(dir.path()).is_some());
@@ -195,7 +240,7 @@ fn disabled_option_stops_daemon_on_gui_exit() {
 fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_stopping() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), None);
+    fixture(dir.path(), false);
     let mut gui = controller(dir.path());
     gui.try_start(
         &dir.path().join("config.yaml"),
@@ -213,7 +258,7 @@ fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_st
     assert_eq!(gui.daemon_status().unwrap().pid, initial.pid);
     let new_dir = dir.path().join("new");
     std::fs::create_dir(&new_dir).unwrap();
-    let new_port = fixture(&new_dir, None);
+    let new_port = fixture(&new_dir, false);
     let config = new_dir.join("config.yaml").canonicalize().unwrap();
     let log = new_dir.canonicalize().unwrap().join("proxy.log");
     gui.try_start(&config, log.clone()).unwrap();
@@ -229,7 +274,7 @@ fn switching_configuration_changes_live_paths_and_rejects_invalid_yaml_before_st
 fn daemon_crash_is_reported_and_restart_recovers_stale_registration() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), None);
+    fixture(dir.path(), false);
     let mut daemon = Command::new(helper())
         .arg(dir.path())
         .arg(dir.path().join("config.yaml"))
@@ -259,7 +304,7 @@ fn daemon_crash_is_reported_and_restart_recovers_stale_registration() {
 fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), None);
+    let port = fixture(dir.path(), false);
     std::fs::write(dir.path().join("daemon.json"), b"stale invalid endpoint").unwrap();
     let mut gui = controller(dir.path());
     gui.start(
@@ -280,7 +325,7 @@ fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
 fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    fixture(dir.path(), None);
+    fixture(dir.path(), false);
     let (client, status) = daemon::start(
         &helper(),
         dir.path(),
@@ -340,7 +385,7 @@ fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
     use coport_gui::proxy::Probe;
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().into());
-    fixture(dir.path(), None);
+    fixture(dir.path(), false);
     let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
     let endpoint = format!("http://user:password@{}", proxy.local_addr().unwrap());
@@ -491,19 +536,7 @@ fn metadata_uses_daemon_then_local_only_after_daemon_stops() {
 fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let upstream_port = upstream.local_addr().unwrap().port();
-    fixture(dir.path(), Some(upstream_port));
-    let upstream_task = std::thread::spawn(move || {
-        let (mut socket, _) = upstream.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut request = [0; 6];
-        socket.read_exact(&mut request).unwrap();
-        assert_eq!(&request, b"hello\0");
-        socket.write_all(b"remote-response\0\xff").unwrap();
-    });
+    fixture(dir.path(), true);
     let mut gui = controller(dir.path());
     gui.start(
         &dir.path().join("config.yaml"),
@@ -524,31 +557,27 @@ fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
     let input = child.stdin.take().unwrap();
     let output = child.stdout.take().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
+    let state = dir.path().to_owned();
     let io = std::thread::spawn(move || {
-        let mut input = input;
         let mut output = output;
         let mut ready = [0; b"COPORT-FORWARD/1\n".len()];
         // Read the protocol marker separately from HTTP bytes.
         let marker = b"COPORT-FORWARD/1\n";
         output.read_exact(&mut ready[..marker.len()]).unwrap();
         assert_eq!(&ready[..marker.len()], marker);
-        write!(
+        let relayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipe = Pipe {
             input,
-            "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
-        )
-        .unwrap();
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            output.read_exact(&mut byte).unwrap();
-            head.push(byte[0]);
-            assert!(head.len() < 4096);
-        }
-        assert!(head.starts_with(b"HTTP/1.1 200"));
-        input.write_all(b"hello\0").unwrap();
-        let mut response = Vec::new();
+            output,
+            relayed: relayed.clone(),
+        };
+        // TLS fails on any altered byte in either direction.
+        let mut tunnel = tunnel(&state, pipe);
+        unauthenticated_request(&mut tunnel);
         // Keep stdin open: a closed remote socket must still terminate the helper.
-        output.read_to_end(&mut response).unwrap();
+        let mut rest = Vec::new();
+        tunnel.sock.read_to_end(&mut rest).unwrap();
+        let response = relayed.lock().unwrap().clone();
         sender.send(response).unwrap();
     });
     let response = receiver.recv_timeout(Duration::from_secs(10));
@@ -557,8 +586,7 @@ fn stdio_forwarding_uses_the_running_daemon_and_preserves_response_bytes() {
     }
     let response = response.unwrap();
     io.join().unwrap();
-    assert_eq!(response, b"remote-response\0\xff");
-    upstream_task.join().unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
     assert!(!response.windows(7).any(|bytes| bytes == b"COPORT-"));
     wait_for(|| child.try_wait().unwrap().is_some());
     assert!(child.wait().unwrap().success());
@@ -575,7 +603,7 @@ fn unified_forwarding_keeps_port_and_tls_and_never_falls_back_on_ssh_failure() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), None);
+    let port = fixture(dir.path(), false);
     let ssh = dir.path().join("ssh");
     let ssh_script = r#"#!/bin/sh
 for argument do command="$argument"; done
@@ -700,7 +728,7 @@ printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
 #[test]
 fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path(), None);
+    fixture(dir.path(), false);
     std::fs::create_dir(dir.path().join("logs")).unwrap();
     std::fs::write(dir.path().join("logs/proxy.log"), "").unwrap();
     coport_gui::data_api::prepare_identity(dir.path()).unwrap();
@@ -749,7 +777,7 @@ fn summary_stream_helper_respects_platform_support_without_starting_daemon() {
 fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
-    let port = fixture(dir.path(), None);
+    let port = fixture(dir.path(), false);
     let forbidden = TcpListener::bind("127.0.0.1:0").unwrap();
     forbidden.set_nonblocking(true).unwrap();
     let upstream = format!("http://{}", forbidden.local_addr().unwrap());

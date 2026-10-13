@@ -264,9 +264,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connect_config_validates() {
-        let config = crate::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nconnect:\n  'api.anthropic.com:443': none\n  '[::1]:8443': none\n").unwrap();
-        assert_eq!(config.connect.len(), 2);
+    fn connect_authorities_validate_and_destination_routes_are_refused() {
+        // Destinations are not routed by name; CONNECT is decrypted and routed
+        // by credential or refused.
+        let Err(error) = crate::config::Config::parse(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nconnect:\n  'api.anthropic.com:443': none\n",
+        ) else {
+            panic!("CONNECT destination routes were accepted");
+        };
+        assert!(
+            error.message.contains("connect_credential_routing"),
+            "{}",
+            error.message
+        );
         for value in [
             "api.anthropic.com",
             "api.anthropic.com:0",
@@ -277,8 +287,10 @@ mod tests {
             assert!(authority(value).is_err(), "{value}");
         }
         assert_eq!(authority("[::1]:8443").unwrap(), ("::1".into(), 8443));
-        assert!(crate::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nconnect:\n  'API.ANTHROPIC.COM:443': none\n  'api.anthropic.com:443': none\n").is_err());
-        assert!(crate::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nconnect:\n  'api.anthropic.com:443': missing\n").is_err());
+        assert_eq!(
+            authority("API.Anthropic.com:443").unwrap(),
+            ("api.anthropic.com".into(), 443)
+        );
         assert_eq!(
             websocket_accept(b"dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="

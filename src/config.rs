@@ -135,8 +135,6 @@ struct Raw {
     #[serde(default)]
     proxies: BTreeMap<String, String>,
     #[serde(default)]
-    connect: BTreeMap<String, Choice>,
-    #[serde(default)]
     connect_credential_routing: bool,
 }
 
@@ -206,7 +204,6 @@ pub struct Config {
     pub request_timeout_seconds: f64,
     pub websocket: WebSocketTimeouts,
     pub proxies: BTreeMap<String, String>,
-    pub connect: BTreeMap<String, Choice>,
     /// Decrypt CONNECT tunnels to credential-routed API hosts and route their
     /// requests by credential, as for base URL clients.
     pub connect_credential_routing: bool,
@@ -232,6 +229,11 @@ impl Config {
         if RETIRED_TOP_LEVEL.iter().any(|key| root.get(*key).is_some()) {
             return Err(Error::config(
                 "Top-level Codex settings are not supported; place them under codex.",
+            ));
+        }
+        if root.get("connect").is_some() {
+            return Err(Error::config(
+                "CONNECT destination routes are not supported; proxy-port clients are routed by credential with connect_credential_routing.",
             ));
         }
         if let Some(codex) = root.get_mut("codex") {
@@ -262,7 +264,6 @@ impl Config {
             request_timeout_seconds: raw.request_timeout_seconds,
             websocket: raw.websocket,
             proxies: raw.proxies,
-            connect: raw.connect,
             connect_credential_routing: raw.connect_credential_routing,
         };
         c.validate()?;
@@ -300,14 +301,6 @@ impl Config {
         }
 
         self.claude.validate(self)?;
-        let mut authorities = std::collections::HashSet::new();
-        for (authority, choice) in &self.connect {
-            let (host, port) = crate::tunnel::authority(authority)?;
-            if !authorities.insert((host, port)) {
-                return Err(Error::config("Duplicate CONNECT destination."));
-            }
-            self.validate_choice(choice)?;
-        }
         validate_directories(&self.codex.homes)?;
         if self.codex.routing.account_probe.is_some() {
             return Err(Error::config(

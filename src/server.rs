@@ -29,11 +29,6 @@ use url::Url;
 
 type Relay = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-enum Tunnel {
-    Open(crate::tunnel::Socket),
-    Decrypt(Arc<crate::credential_proxy::Destination>),
-}
-
 /// A decrypted client connection; routing happens after local TLS termination.
 pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientStream for T {}
@@ -617,24 +612,12 @@ impl Server {
             ));
         }
         if connect {
-            let upstream = self.connect(&incoming, &mut log).await;
-            return Ok(match upstream {
-                Ok(Tunnel::Decrypt(destination)) => {
+            return Ok(match self.connect(&incoming, &mut log) {
+                Ok(destination) => {
                     log.status = 200;
                     log.field("routing", "credential");
                     let upgraded = hyper::upgrade::on(&mut incoming);
                     let _ = relay.send(self.clone().decrypt(upgraded, destination, log));
-                    Response::builder().status(200).body(empty()).unwrap()
-                }
-                Ok(Tunnel::Open(upstream)) => {
-                    log.status = 200;
-                    let upgraded = hyper::upgrade::on(&mut incoming);
-                    let _ = relay.send(relay_stream(
-                        upgraded,
-                        upstream,
-                        log,
-                        self.config.request_timeout_seconds,
-                    ));
                     Response::builder().status(200).body(empty()).unwrap()
                 }
                 Err(error) => reject(&mut log, error),
@@ -1069,7 +1052,12 @@ impl Server {
         .await
     }
 
-    async fn connect(&self, incoming: &Request<Incoming>, log: &mut RequestLog) -> Result<Tunnel> {
+    /// CONNECT is served only for destinations decrypted and routed by credential.
+    fn connect(
+        &self,
+        incoming: &Request<Incoming>,
+        log: &mut RequestLog,
+    ) -> Result<Arc<crate::credential_proxy::Destination>> {
         if incoming.uri().scheme().is_some()
             || incoming.uri().path_and_query().is_some()
             || incoming.headers().contains_key("transfer-encoding")
@@ -1088,50 +1076,22 @@ impl Server {
         let (host, port) = crate::tunnel::authority(authority.as_str())?;
         // Logged before routing, so a denied destination is visible too.
         log.field("destination", format!("{host}:{port}"));
-        if let Some(destination) = self
-            .credential_proxy
-            .as_ref()
-            .and_then(|proxy| proxy.destination(&host, port))
-        {
-            return Ok(Tunnel::Decrypt(destination));
-        }
-        let choice = self
-            .config
-            .connect
-            .iter()
-            .find_map(|(name, choice)| {
-                (crate::tunnel::authority(name).ok() == Some((host.clone(), port)))
-                    .then_some(choice)
-            })
-            .ok_or_else(|| {
-                let uncovered = self
-                    .credential_proxy
-                    .as_ref()
-                    .is_some_and(|proxy| proxy.is_uncovered(&host, port));
-                Error::new(
-                    403,
-                    if uncovered {
-                        "The proxy CA does not cover this destination; use its base URL or replace the CA."
-                    } else {
-                        "CONNECT destination is not configured."
-                    },
-                )
-            })?;
-        let authority = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
+        let Some(proxy) = &self.credential_proxy else {
+            return Err(Error::new(
+                403,
+                "CONNECT requires proxy port credential routing.",
+            ));
         };
-        let destination = Url::parse(&format!("https://{authority}/"))
-            .map_err(|_| Error::new(400, "Invalid CONNECT destination."))?;
-        self.connect_via(
-            choice,
-            &destination,
-            Deadline::new(self.config.request_timeout_seconds),
-            log,
-        )
-        .await
-        .map(Tunnel::Open)
+        proxy.destination(&host, port).ok_or_else(|| {
+            Error::new(
+                403,
+                if proxy.is_uncovered(&host, port) {
+                    "The proxy CA does not cover this destination; use its base URL or replace the CA."
+                } else {
+                    "CONNECT is served only for API hosts routed by credential."
+                },
+            )
+        })
     }
 
     /// Whether an absolute-form target names this listener on a loopback

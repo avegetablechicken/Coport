@@ -1105,7 +1105,7 @@ function trafficRangeSelect(id, selected, label) {
 
 function trafficControls(prefix, minutes, label) {
   return `<span class="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], ui.trafficScope,
-    "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls. CONNECT contents cannot be classified."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
+    "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
 async function loadTraffic() {

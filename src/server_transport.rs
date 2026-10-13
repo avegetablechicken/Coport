@@ -7,7 +7,6 @@ pub(super) struct ProbeKey {
     pub(super) endpoint: String,
     pub(super) origin: String,
     pub(super) native_tls: bool,
-    pub(super) tunnel: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum ProbeResult {
@@ -68,13 +67,6 @@ impl ProbeKey {
             endpoint: endpoint.into(),
             origin: origin.to_string(),
             native_tls,
-            tunnel: false,
-        }
-    }
-    pub(super) fn tunnel(endpoint: &str, url: &Url) -> Self {
-        Self {
-            tunnel: true,
-            ..Self::http(endpoint, url, false)
         }
     }
 }
@@ -286,17 +278,6 @@ impl Server {
     }
     pub(super) async fn probe(&self, key: &ProbeKey) -> ProbeResult {
         let deadline = Deadline::new(self.config.request_timeout_seconds.min(7.0));
-        if key.tunnel {
-            let (result, reason) = match self.open_tunnel(key, deadline.cap(5.0)).await {
-                Ok(_) => (ProbeResult::Healthy, "tunnel_connected"),
-                Err(error) => {
-                    let failure = Failure::tunnel(&error);
-                    (failure.health, failure.reason)
-                }
-            };
-            self.log_probe(key, result, reason, None);
-            return result;
-        }
         let mut reason = "http_response";
         let mut status = None;
         let result = match self.client_transport(&key.endpoint, key.native_tls) {
@@ -358,7 +339,7 @@ impl Server {
             json!({
                 "proxy_endpoint": redacted_endpoint(&key.endpoint),
                 "origin": key.origin,
-                "transport": if key.tunnel { "connect" } else { "http" },
+                "transport": "http",
                 "probe_success": (result == ProbeResult::Healthy).to_string(),
                 "probe_result": format!("{result:?}"),
                 "reason": reason,
@@ -411,7 +392,7 @@ impl Server {
     fn log_health(&self, key: &ProbeKey, health: &ProbeHealth, source: &str) {
         self.logger.write("route_health", json!({
             "proxy_endpoint": redacted_endpoint(&key.endpoint), "origin": key.origin,
-            "transport": if key.tunnel { "connect" } else { "http" }, "source": source,
+            "transport": "http", "source": source,
             "available": (!health.unavailable).to_string(),
             "health": if health.unavailable { "unavailable" } else if health.failures > 0 { "suspect" } else { "healthy" },
             "consecutive_failures": health.failures.to_string(),
@@ -573,48 +554,6 @@ impl Server {
                 &key.endpoint,
             ))
             .await?
-    }
-
-    /// Connecting a candidate is the probe itself; never open a second tunnel
-    /// just to test a socket which has already been established successfully.
-    pub(super) async fn connect_via(
-        &self,
-        choice: &Choice,
-        destination: &Url,
-        deadline: Deadline,
-        log: &mut RequestLog,
-    ) -> Result<crate::tunnel::Socket> {
-        for name in choice.names() {
-            deadline.remaining()?;
-            let endpoint = self.config.endpoint(name);
-            let key = ProbeKey::tunnel(endpoint, destination);
-            let state = self.health_state(&key);
-            {
-                let mut cached = state.lock().await;
-                cached.monitored |= matches!(choice, Choice::List(_));
-                if matches!(choice, Choice::List(_)) && cached.unavailable {
-                    continue;
-                }
-            }
-            log.field("proxy", name);
-            log.field("proxy_endpoint", redacted_endpoint(endpoint));
-            match self.open_tunnel(&key, deadline).await {
-                Ok(socket) => {
-                    self.record_health(&key, ProbeResult::Healthy, "connect")
-                        .await;
-                    log.event("route_selected");
-                    return Ok(socket);
-                }
-                Err(error) => {
-                    let failure = Failure::tunnel(&error);
-                    log.field("transport_error", failure.reason);
-                    self.record_health(&key, failure.health, "connect").await;
-                }
-            }
-        }
-        Err(Error::config(
-            "No configured CONNECT route could establish a tunnel.",
-        ))
     }
 }
 
