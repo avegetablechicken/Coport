@@ -34,6 +34,8 @@ pub const PROXY_CA_FILE: &str = "proxy-ca.pem";
 const PROXY_CA_KEY_FILE: &str = "proxy-ca-key.pem";
 /// Held while a CA is created, so concurrent first starts write one pair.
 const CA_LOCK_FILE: &str = "ca.lock";
+/// Replaced pairs are moved here, since clients may still trust them.
+pub const BACKUP_DIR: &str = "backup";
 
 /// Directory holding the CA for the configuration at `config`.
 pub fn dir_for(config: &Path) -> PathBuf {
@@ -303,6 +305,7 @@ fn load_or_create(
     }
     let key = KeyPair::generate().map_err(std::io::Error::other)?;
     let cert = params.self_signed(&key).map_err(std::io::Error::other)?;
+    back_up(dir, authority)?;
     // NamedTempFile is created owner-only; the key keeps that mode.
     persist(
         dir,
@@ -311,6 +314,41 @@ fn load_or_create(
     )?;
     persist(dir, &dir.join(authority.cert), cert.pem().as_bytes())?;
     Ok(key)
+}
+
+/// Move the stored files of `authority` into `BACKUP_DIR` under one
+/// replacement stamp. A pair that cannot be kept is not overwritten.
+fn back_up(dir: &Path, authority: &Authority) -> std::io::Result<()> {
+    let stored: Vec<_> = [authority.cert, authority.key]
+        .into_iter()
+        .filter(|name| dir.join(name).exists())
+        .collect();
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let backup = dir.join(BACKUP_DIR);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&backup)?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let stamp = format!(
+        "{millis}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    for name in stored {
+        let stem = name.strip_suffix(".pem").unwrap_or(name);
+        // A rename keeps the key's owner-only mode.
+        std::fs::rename(dir.join(name), backup.join(format!("{stem}.{stamp}.pem")))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,6 +442,7 @@ mod tests {
         let first = std::fs::read(dir.path().join(CA_FILE)).unwrap();
         acceptor(dir.path()).unwrap();
         assert_eq!(first, std::fs::read(dir.path().join(CA_FILE)).unwrap());
+        assert!(!dir.path().join(BACKUP_DIR).exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -426,6 +465,12 @@ mod tests {
         assert!(load_ca(dir.path()).is_none());
         let key = load_or_create_ca(dir.path()).unwrap();
         assert_ne!(std::fs::read(dir.path().join(CA_FILE)).unwrap(), mismatched);
+        let kept = backups(dir.path());
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept.iter()
+                .any(|(name, data)| name.starts_with("ca.") && *data == mismatched)
+        );
         assert_eq!(
             load_ca(dir.path()).unwrap().public_key_raw(),
             key.public_key_raw()
@@ -511,6 +556,66 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    /// Names and contents of the files in the backup directory, by name.
+    fn backups(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir.join(BACKUP_DIR))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(path).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_replaced_proxy_ca_is_kept_with_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        acceptor(dir.path()).unwrap();
+        let loopback = std::fs::read(dir.path().join(CA_FILE)).unwrap();
+        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com"])).unwrap();
+        let cert = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        let key = std::fs::read(dir.path().join(PROXY_CA_KEY_FILE)).unwrap();
+        proxy_acceptors(dir.path(), &hosts(&["chatgpt.com", "api.openai.com"])).unwrap();
+        let second = std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap();
+        assert_ne!(second, cert);
+        let kept = backups(dir.path());
+        assert_eq!(kept.len(), 2);
+        let find = |prefix: &str| kept.iter().find(|(n, _)| n.starts_with(prefix)).unwrap();
+        let (kept_cert, kept_cert_data) = find("proxy-ca.");
+        let (kept_key, kept_key_data) = find("proxy-ca-key.");
+        assert_eq!((kept_cert_data, kept_key_data), (&cert, &key));
+        // Certificate and key share one replacement stamp.
+        assert_eq!(
+            &kept_cert["proxy-ca".len()..],
+            &kept_key["proxy-ca-key".len()..]
+        );
+        // The kept pair still verifies as a pair.
+        let restored = tempfile::tempdir().unwrap();
+        std::fs::write(restored.path().join(PROXY_CA_FILE), &cert).unwrap();
+        std::fs::write(restored.path().join(PROXY_CA_KEY_FILE), &key).unwrap();
+        assert!(load(restored.path(), &PROXY, &|_| true).is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode();
+            let backup = dir.path().join(BACKUP_DIR);
+            assert_eq!(mode(&backup) & 0o077, 0);
+            assert_eq!(mode(&backup.join(kept_key)) & 0o077, 0);
+        }
+        // A further replacement keeps both earlier pairs.
+        proxy_acceptors(dir.path(), &hosts(&["api.anthropic.com"])).unwrap();
+        let kept = backups(dir.path());
+        assert_eq!(kept.len(), 4);
+        assert!(kept.iter().any(|(_, data)| *data == cert));
+        assert!(kept.iter().any(|(_, data)| *data == second));
+        // Replacing the proxy CA leaves the loopback CA in place.
+        assert!(kept.iter().all(|(name, _)| name.starts_with("proxy-ca")));
+        assert_eq!(std::fs::read(dir.path().join(CA_FILE)).unwrap(), loopback);
     }
 
     #[test]

@@ -636,7 +636,10 @@ name types they list, so without a decrypted IP address every IP address is
 excluded, and without a decrypted hostname only the reserved `invalid` domain is
 permitted. If a later configuration decrypts a host the stored CA does not
 permit, or no longer needs a name type that CA permits, the CA is replaced on
-start and must be trusted again; otherwise it is reused. BoringSSL clients such
+start and must be trusted again; otherwise it is reused. A replaced certificate
+and its key are moved to `tls/backup/` (for example
+`proxy-ca.<millis>-<id>.pem` with `proxy-ca-key.<millis>-<id>.pem`), never
+overwritten; the loopback CA is kept the same way. BoringSSL clients such
 as Claude Code reject IP certificates under IP constraints, so they cannot use
 the proxy port for an IP upstream; use its base URL instead. Point clients at
 the CA rather than replacing their CA bundles:
