@@ -362,6 +362,8 @@ const BACK_KEYS = IS_MAC ? "Meta+[" : "Alt+ArrowLeft";
 function render() {
   if (!ui.snap) return;
   if (openSelect) { selectRenderPending = true; return; }
+  // The shown page stays until the next one has its data (act "page").
+  if (ui.pageChange) return;
   renderTop();
   renderPage();
   queueFit();
@@ -372,8 +374,8 @@ function renderTop() {
     $("top").innerHTML = `
       <span class="app-name">Coport</span><span class="version">v${esc(ui.snap.version)}</span>
       <nav class="links">
-        <button class="text-link" data-action="page" data-page="activity">Activity</button>
-        ${(ui.devicesLoaded ? ui.devices.length : ui.snap.settings?.deviceCount || 0) > 0 ? `<button class="text-link" data-action="page" data-page="devices">Devices</button>` : ""}
+        <button class="text-link" data-action="page" data-page="activity" data-morph="title:activity">Activity</button>
+        ${(ui.devicesLoaded ? ui.devices.length : ui.snap.settings?.deviceCount || 0) > 0 ? `<button class="text-link" data-action="page" data-page="devices" data-morph="title:devices">Devices</button>` : ""}
         <button class="text-link" data-action="page" data-page="settings">Settings</button>
         <button class="text-link" data-action="quit">Quit</button>
       </nav>`;
@@ -387,8 +389,8 @@ function renderTop() {
         </nav>`
       : ui.page === "devices" ? `<nav class="links"><button class="icon-btn" data-action="page" data-page="settings" data-tip="Configure devices" aria-label="Configure devices in Settings">${ICON.settings}</button></nav>` : "";
   $("top").innerHTML = `
-    <button class="text-link back" data-action="page" data-page="main" aria-keyshortcuts="${BACK_KEYS}">${ICON.back}Back</button>
-    <span class="page-title">${title}</span>${tools}`;
+    <button class="text-link back" data-action="page" data-page="main" aria-keyshortcuts="${BACK_KEYS}" data-morph="back">${ICON.back}Back</button>
+    <span class="page-title" data-morph="title:${ui.page}">${title}</span>${tools}`;
 }
 
 function renderPage() {
@@ -423,9 +425,10 @@ function renderPage() {
   ui.rendering = false;
 }
 
-/// A block: titled box with an optional right-aligned headline.
-function block(title, aside, body) {
-  return `<section class="block">
+/// A block: titled box with an optional right-aligned headline. `morph` names
+/// what it shows, so another page's block of that name turns into it.
+function block(title, aside, body, morph = "") {
+  return `<section class="block"${morph ? ` data-morph="${esc(morph)}"` : ""}>
     <div class="block-head"><span class="block-title">${title}</span>${aside ? `<span class="block-aside">${aside}</span>` : ""}</div>
     ${body}</section>`;
 }
@@ -455,7 +458,7 @@ function remoteForwardingBlock() {
   else if (health.recoveredAt && Date.now() - health.recoveredAt < 120000) body += message("info", `Connection restored at ${esc(stamp(health.recoveredAt))}.`);
   const traffic = target.traffic || {};
   body += `<div class="block-head"><span class="block-title">This forwarding session</span></div><div class="row"><span class="row-label">Connections / active / failed</span><span class="row-value">${traffic.connections || 0} / ${traffic.active || 0} / ${traffic.failures || 0}</span></div><div class="row"><span class="row-label">Upload / download</span><span class="row-value">${fmtBytes(traffic.uploadBytes || 0)} / ${fmtBytes(traffic.downloadBytes || 0)}</span></div><div class="row"><span class="row-label">Upload / download speed</span><span class="row-value">${fmtBytes(traffic.uploadBytesPerSecond || 0)}/s / ${fmtBytes(traffic.downloadBytesPerSecond || 0)}/s</span></div>`;
-  return block("SSH forwarding", "", body);
+  return block("SSH forwarding", "", body, `device/${target.deviceId}`);
 }
 
 function message(kind, text, actions = "") {
@@ -468,7 +471,7 @@ function proxyBlock() {
   const s = ui.snap;
   const state = s.phase.state;
   const label = s.phase.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Failed to start" }[state];
-  const head = `<span class="state"><span class="dot ${state}"></span>${label}</span>
+  const head = `<span class="state" data-morph="proxy-state"><span class="dot ${state}"></span>${label}</span>
     <button class="switch" role="switch" aria-checked="${state === "running"}" data-action="power" ${s.phase.busy ? "disabled" : ""} aria-label="Start or stop the proxy"></button>`;
   let messages = "";
   if (!s.config.exists) {
@@ -488,11 +491,11 @@ function proxyBlock() {
   }
   if (s.proxyCa) messages += proxyCaMessage(s.proxyCa);
   const strip = `<div class="strip">
-    ${stat("Address", `127.0.0.1:${s.phase.port}`)}
+    ${stat("Address", `<span data-morph="address">127.0.0.1:${s.phase.port}</span>`)}
     ${stat("Uptime", state === "running" ? `<span id="uptime">${fmtUptime(uptime())}</span>` : "—")}
     ${stat("Config", s.config.error ? "Invalid" : s.config.exists ? "Valid" : "Missing", s.config.error ? "bad" : "")}
   </div>`;
-  return block("Proxy", head, strip + messages);
+  return block("Proxy", head, strip + messages, "this-device");
 }
 
 /// Hosts the trusted proxy CA does not cover stay undecrypted until the user
@@ -567,9 +570,11 @@ function chart(stats, scope, showPeak = false, window = stats) {
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
 /// card and Merged Traffic show it. An unchanged view reuses its markup.
+/// `source` names whose traffic it is ("local", "merged" or "device/<id>"), so
+/// a page change carries it over to the same traffic on the next page.
 const trafficMarkup = new WeakMap();
-function trafficSummary(view, scope, window = view) {
-  const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}`;
+function trafficSummary(view, scope, window = view, source = "") {
+  const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}|${source}`;
   const cached = trafficMarkup.get(view);
   if (cached?.key === key) return cached.html;
   let rate = "—";
@@ -579,13 +584,13 @@ function trafficSummary(view, scope, window = view) {
     rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
     rateClass = r >= 10 ? "bad" : "";
   }
-  const html = `${trafficShare(view.credentials ?? [], scope)}${chart(view, scope, false, window)}
+  const html = `<div${source ? ` data-morph="summary:${esc(source)}"` : ""}>${trafficShare(view.credentials ?? [], scope, source)}${chart(view, scope, false, window)}
      <div class="strip">
        ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(view.avgMs))}
        ${stat("Received", fmtBytes(view.bytes))}
-     </div>${modelTokenStats(view, scope)}`;
+     </div>${modelTokenStats(view, scope)}</div>`;
   trafficMarkup.set(view, { key, html });
   return html;
 }
@@ -706,6 +711,13 @@ function loadForwardedTraffic(device, minutes, scope) {
   });
 }
 
+/// The last read of the traffic Home or Activity shows for the shared range, so
+/// either page opens with the other's ring instead of waiting for a read.
+function cachedTraffic(device) {
+  const key = `${ui.trafficMinutes}:${ui.trafficScope}`;
+  return (device ? ui.forwardedTrafficViews?.[`${device}:${key}`] : ui.localTrafficViews?.[key]) ?? null;
+}
+
 /// Home shows the forwarded device's traffic while SSH forwarding is on, else this machine's.
 function homeTrafficDevice() {
   return ui.snap?.forwarding?.deviceId ?? null;
@@ -739,14 +751,15 @@ function trafficBlock() {
   const st = ui.homeTraffic && (ui.homeTraffic.device ?? null) === homeTrafficDevice() ? ui.homeTraffic : null;
   const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
   const error = ui.homeTrafficError === "TRAFFIC_UPDATING" ? "" : ui.homeTrafficError || st?.remoteError || "";
-  if (!st) return block("Traffic", range, `<div class="placeholder">${esc(error || "Loading traffic…")}</div>`);
+  if (!st) return block("Traffic", range, `<div class="placeholder">${esc(error || "Loading traffic…")}</div>`, "traffic");
   return block(
     "Traffic",
     range,
     `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
      ${error ? `<span class="traffic-update-error" title="${esc(error)}">Update failed</span>` : ""}
-     ${trafficSummary(st, st.scope)}
-     ${st.device ? `<div class="placeholder">Includes other clients on ${esc(st.deviceName)}. Updated ${esc(new Date(st.fetchedAt).toLocaleTimeString())}${Date.now() - st.fetchedAt > 90000 || st.remoteError ? " · stale" : ""}.</div>` : ""}</div>`
+     ${trafficSummary(st, st.scope, st, st.device ? `device/${st.device}` : "local")}
+     ${st.device ? `<div class="placeholder">Includes other clients on ${esc(st.deviceName)}. Updated ${esc(new Date(st.fetchedAt).toLocaleTimeString())}${Date.now() - st.fetchedAt > 90000 || st.remoteError ? " · stale" : ""}.</div>` : ""}</div>`,
+    "traffic"
   );
 }
 
@@ -782,7 +795,7 @@ function recentBlock() {
   const body = rows.length
     ? rows.map((e) => requestRow(e, false)).join("")
     : `<div class="placeholder">${ui.snap.phase.state === "running" ? "Waiting for the first request…" : "Start the proxy to see requests."}</div>`;
-  return block("Recent Requests", aside, body);
+  return block("Recent Requests", aside, body, "log");
 }
 
 function proxiesBlock() {
@@ -1103,7 +1116,7 @@ function trafficRangeSelect(id, selected, label) {
 }
 
 function trafficControls(prefix, minutes, label) {
-  return `<span class="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], ui.trafficScope,
+  return `<span class="traffic-controls" data-morph="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], ui.trafficScope,
     "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
@@ -1226,8 +1239,8 @@ function shareMeasure(scope) {
 }
 
 /// Each credential's part of the traffic in the range, as a ring and a legend
-/// grouped by service.
-function trafficShare(credentials, scope) {
+/// grouped by service. Rings of the same `source` are one ring across pages.
+function trafficShare(credentials, scope, source = "") {
   const { unit, measure, format } = shareMeasure(scope);
   // Unidentified model calls were rejected before reaching an upstream, so they
   // report no tokens; Models leaves them out, with any service left empty.
@@ -1258,7 +1271,7 @@ function trafficShare(credentials, scope) {
     ${g.slices.map((s) => `<div class="share-item${s.muted ? " muted" : ""}" title="${esc(label({ ...s, service: g.service }))}">
       <i style="--slice:${color(s)}"></i><span>${esc(s.name)}</span><span>${value(s.value)}</span></div>`).join("")}</div>`).join("");
   return `<div class="traffic-share">
-    <div class="share-ring" title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
+    <div class="share-ring"${source ? ` data-morph="ring:${esc(source)}"` : ""} title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
       <div class="share-total"><strong>${format(total)}</strong><span>${unit}</span></div></div>
     <div class="share-legend">${legend}</div></div>`;
 }
@@ -1350,7 +1363,7 @@ function renderActivityTraffic() {
     ${reviews ? `<button type="button" class="traffic-review-all" data-action="traffic-review" title="Requests from ${reviews} renamed, changed or unknown ${reviews === 1 ? "configuration need" : "configurations need"} review">${ICON.warning}Review</button>` : ""}
     ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
     ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
-    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope) + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
+    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope, "local") + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
   if (ui.pinLog) scrollToLog();
   else if (keepLog) $("content").scrollTop += logOffset() - logBefore;
   queueFit();
@@ -1441,6 +1454,7 @@ function renderActivityForwarding() {
       <div class="placeholder">New requests are handled and logged on ${esc(target.name)}. This page shows this machine's history.</div>`
     : "";
   el.hidden = !target;
+  el.dataset.morph = target ? `device/${target.deviceId}` : "";
   // Refreshes must not replace the link while it is focused or hovered.
   if (el.innerHTML !== html) el.innerHTML = html;
 }
@@ -1448,8 +1462,8 @@ function renderActivityForwarding() {
 function activityShell() {
   return `<div class="page">
     <section class="block" id="activity-forwarding" hidden></section>
-    <section class="block" id="activity-traffic"></section>
-    <section class="block log-block">
+    <section class="block" id="activity-traffic" data-morph="traffic"></section>
+    <section class="block log-block" data-morph="log">
       <div class="block-head"><span class="block-title">Log</span><span class="block-aside" id="activity-range"></span></div>
       <div class="range-editor" id="range-editor" role="dialog" aria-label="Custom log range" hidden>
         <label class="range-row"><span class="range-label">From</span>
@@ -1510,7 +1524,7 @@ function requestRow(e, expandable) {
     .join(" · ");
   const tag = expandable ? "button" : "div";
   const attrs = expandable ? `data-action="expand" data-seq="${e.seq}" aria-expanded="${ui.expanded.has(e.seq)}"` : "";
-  return `<${tag} class="req" ${attrs}>
+  return `<${tag} class="req" ${attrs} data-morph="req:${esc(e.time)}:${esc(e.seq)}">
     <span class="status ${cancelled || unknown ? "cancelled" : e.error ? "s5" : deviceQuery ? "s2" : modelCall ? (incomplete ? "s4" : e.event === "model_call_finished" ? "s2" : "s3") : statusClass(e.status)}"${tip ? ` title="${esc(tip)}" aria-label="${esc(tip)}"` : ""}>${esc(code)}</span>
     <span class="req-main">
       <span class="req-path">${e.method ? `<span class="method">${esc(e.method)}</span>` : ""}${esc(deviceQuery ? queryLabel : e.path ?? e.event)}</span>
@@ -1599,7 +1613,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
   }
 }
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
-  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window)}</div>`;
+  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window, detailsKey)}</div>`;
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
@@ -1635,7 +1649,7 @@ function mergedDataBlock() {
       else if (source.exclusion === "duplicate") body += `<div class="placeholder">${esc(source.name)}: Already counted via another entry.</div>`;
     }
   }
-  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading && ui.mergedDataRemote ? "disabled" : ""}>Refresh</button>`, body);
+  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading && ui.mergedDataRemote ? "disabled" : ""}>Refresh</button>`, body, "traffic");
 }
 function deviceConnectionKey(devices) {
   return JSON.stringify(devices.map(d => {
@@ -1844,9 +1858,9 @@ function devicesPage() {
   const data = ui.mergedData;
   const { local: localTraffic, cards: views, scope } = deviceCardViews();
   let cards = block("This Device", "",
-    `<div class="row"><span class="row-label">127.0.0.1:${local.port}</span><span class="state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
+    `<div class="row"><span class="row-label" data-morph="address">127.0.0.1:${local.port}</span><span class="state" data-morph="proxy-state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
     (local.error ? message("warn", esc(local.error)) : "") +
-    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : `<div class="placeholder">Loading traffic…</div>`));
+    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : `<div class="placeholder">Loading traffic…</div>`), "this-device");
   for (const device of ui.devices) {
     const source = (data || ui.mergedDataLatest)?.sources.find(source => source.name === device.name);
     const card = views.get(device.id);
@@ -1856,7 +1870,7 @@ function devicesPage() {
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
-      (card ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(card.view, scope, `device/${device.id}`, card.window)}<div class="placeholder">Data through ${esc(new Date(card.window.end ?? card.window.windowEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</div>` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`));
+      (card ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(card.view, scope, `device/${device.id}`, card.window)}<div class="placeholder">Data through ${esc(new Date(card.window.end ?? card.window.windowEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</div>` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`), `device/${device.id}`);
   }
   return mergedDataBlock() + cards;
 }
@@ -2061,20 +2075,29 @@ async function setConfigValue(key, value) {
 
 let fitQueued = false;
 let lastHeight = 0;
+/// The page change in motion (changePage), if any.
+let pageMotion = null;
+function panelHeight(page) {
+  const style = getComputedStyle($("content"));
+  const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  return Math.ceil($("top").offsetHeight + page.offsetHeight + padding);
+}
+function fitPanel(height) {
+  if (Math.abs(height - lastHeight) <= 1) return;
+  lastHeight = height;
+  invoke("fit_panel", { height });
+}
 function queueFit() {
+  // A page change resizes the window only before or after its motion.
+  if (pageMotion) { pageMotion.fit = true; return; }
   if (fitQueued) return;
   fitQueued = true;
   requestAnimationFrame(() => {
     fitQueued = false;
     const page = $("content").firstElementChild;
     if (!page) return;
-    const style = getComputedStyle($("content"));
-    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
-    const height = Math.ceil($("top").offsetHeight + page.offsetHeight + padding);
-    if (Math.abs(height - lastHeight) > 1) {
-      lastHeight = height;
-      invoke("fit_panel", { height });
-    }
+    if (pageMotion) pageMotion.fit = true;
+    else fitPanel(panelHeight(page));
   });
 }
 
@@ -2092,30 +2115,251 @@ new MutationObserver(() => {
   observedPage = page;
 }).observe($("content"), { childList: true, subtree: true });
 
+// ---------------------------------------------------------------- page changes
+
+// Settings turns in like the next page and turns back out. Between the other
+// pages, what both show keeps its identity: an element with the same
+// `data-morph` name on both moves to its new place (a block also reshapes),
+// and the rest crossfades. A layer over the panel draws both pages meanwhile;
+// the live page underneath is already the new one, hidden until the end.
+const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
+const TURN_MS = 340;
+const MORPH_MS = 420;
+const MOTION_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
+// Inherited text styles a moving element loses outside its page.
+const MORPH_TEXT = ["color", "font-family", "font-size", "font-weight", "line-height", "letter-spacing", "white-space", "font-variant-numeric"];
+
+function endPageMotion() {
+  const motion = pageMotion;
+  if (!motion) return;
+  pageMotion = null;
+  motion.layer.remove();
+  $("top").style.visibility = $("content").style.visibility = "";
+  if (motion.fit) queueFit();
+}
+
+/// The named elements in view or beside it, with their place on screen.
+function morphTargets(region, view) {
+  const found = new Map();
+  for (const el of region.querySelectorAll("[data-morph]")) {
+    const rect = el.getBoundingClientRect();
+    if (!el.dataset.morph || !rect.width || !rect.height) continue;
+    // A closed disclosure still lays out its content in WebKit, unseen.
+    if (el.closest("details:not([open])") && !el.closest("summary")) continue;
+    const near = rect.bottom > view.top - view.height && rect.top < view.bottom + view.height;
+    if (!near) continue;
+    const block = el.classList.contains("block");
+    let text = null;
+    let size = 1;
+    if (!block) {
+      const style = getComputedStyle(el);
+      text = MORPH_TEXT.map((name) => [name, style.getPropertyValue(name)]);
+      size = parseFloat(style.fontSize) || 1;
+    }
+    found.set(el.dataset.morph, { el, rect, block, text, size });
+  }
+  return found;
+}
+
+function motionLayer(className, rect, origin) {
+  const el = document.createElement("div");
+  el.className = className;
+  if (rect) place(el, rect, origin);
+  return el;
+}
+
+function place(el, rect, origin, height = false) {
+  Object.assign(el.style, {
+    position: "absolute", margin: "0",
+    left: `${rect.left - origin.left}px`, top: `${rect.top - origin.top}px`, width: `${rect.width}px`,
+    ...(height ? { height: `${rect.height}px` } : {}),
+  });
+}
+
+/// A copy of a named element to move, without its name; named elements inside
+/// it move on their own.
+function morphCopy(target) {
+  const copy = target.el.cloneNode(true);
+  copy.removeAttribute("data-morph");
+  copy.removeAttribute("data-morph-paired");
+  return copy;
+}
+
+/// Shows `update`'s page change in motion. `update` renders the next page
+/// and scrolls it; what it shows afterwards is where everything lands.
+function changePage(update) {
+  endPageMotion();
+  const top = $("top");
+  const content = $("content");
+  const from = ui.builtPage;
+  const oldPage = content.firstElementChild;
+  if (!oldPage || REDUCED_MOTION.matches || document.hidden) return update();
+  const topRect = top.getBoundingClientRect();
+  const contentRect = content.getBoundingClientRect();
+  const oldHead = [...top.childNodes];
+  const oldPageRect = oldPage.getBoundingClientRect();
+  const before = { head: morphTargets(top, topRect), body: morphTargets(content, contentRect) };
+  update();
+  const page = content.firstElementChild;
+  // A render held back (an open menu) changed nothing.
+  if (!page || page === oldPage || ui.builtPage === from) return;
+  const turn = from === "settings" || ui.builtPage === "settings";
+  const panelRect = $("panel").getBoundingClientRect();
+  const after = { head: morphTargets(top, topRect), body: morphTargets(content, contentRect) };
+
+  const layer = motionLayer("page-motion");
+  const head = motionLayer("page-motion-head", { left: panelRect.left, top: topRect.top, width: panelRect.width }, panelRect);
+  head.style.height = `${topRect.height}px`;
+  const body = motionLayer("page-motion-body", { left: panelRect.left, top: contentRect.top, width: panelRect.width }, panelRect);
+  layer.append(head, body);
+
+  // Elements named on both pages, at least one of them in view, move; their
+  // places in the page copies stay empty.
+  const pairs = [];
+  if (!turn) {
+    for (const [region, origin, into] of [["head", topRect, head], ["body", contentRect, body]]) {
+      const inView = (rect) => rect.bottom > origin.top && rect.top < origin.bottom;
+      for (const [name, next] of after[region]) {
+        const prev = before[region].get(name);
+        if (!prev || !(inView(prev.rect) || inView(next.rect))) continue;
+        prev.el.setAttribute("data-morph-paired", "");
+        next.el.setAttribute("data-morph-paired", "");
+        pairs.push({ prev, next, origin: { left: panelRect.left, top: origin.top }, into });
+      }
+    }
+  }
+
+  const oldTop = motionLayer("top page-motion-page");
+  oldTop.append(...oldHead);
+  const newTop = top.cloneNode(true);
+  newTop.removeAttribute("id");
+  newTop.className = "top page-motion-page";
+  const newPage = page.cloneNode(true);
+  newPage.classList.add("page-motion-page");
+  oldPage.classList.add("page-motion-page");
+  for (const [el, rect] of [[oldTop, topRect], [newTop, topRect]]) place(el, rect, { left: panelRect.left, top: topRect.top }, true);
+  place(oldPage, oldPageRect, { left: panelRect.left, top: contentRect.top });
+  place(newPage, page.getBoundingClientRect(), { left: panelRect.left, top: contentRect.top });
+  head.append(oldTop, newTop);
+  body.append(oldPage, newPage);
+
+  const duration = turn ? TURN_MS : MORPH_MS;
+  const timing = { duration, easing: MOTION_EASE, fill: "both" };
+  const animations = [];
+  const animate = (el, frames, options = timing) => animations.push(el.animate(frames, options));
+  if (turn) {
+    // Into Settings the next page comes from the right; back out it leaves there.
+    const shift = (ui.builtPage === "settings" ? 1 : -1) * panelRect.width;
+    for (const el of [oldTop, oldPage]) animate(el, [{ transform: "none", opacity: 1 }, { transform: `translateX(${-shift}px)`, opacity: 0.4 }]);
+    for (const el of [newTop, newPage]) animate(el, [{ transform: `translateX(${shift}px)` }, { transform: "none" }]);
+  } else {
+    for (const el of [oldTop, oldPage]) animate(el, [{ opacity: 1 }, { opacity: 0 }], { ...timing, duration: duration * 0.6 });
+    for (const el of [newTop, newPage]) animate(el, [{ opacity: 0 }, { opacity: 1 }], { ...timing, delay: duration * 0.2, duration: duration * 0.8 });
+    // Blocks first, so a moving ring or row is never covered by a block passing it.
+    pairs.sort((a, b) => b.next.block - a.next.block
+      || (a.next.el.compareDocumentPosition(b.next.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+    for (const pair of pairs) morph(pair, animate, timing);
+  }
+  for (const { next } of pairs) next.el.removeAttribute("data-morph-paired");
+
+  top.style.visibility = content.style.visibility = "hidden";
+  $("panel").append(layer);
+  const motion = { layer, fit: true };
+  pageMotion = motion;
+  // A taller page gets its room before moving in; a shorter one gives it back after.
+  const height = panelHeight(page);
+  if (height > lastHeight) fitPanel(height);
+  Promise.all(animations.map((a) => a.finished)).then(() => {
+    if (pageMotion === motion) endPageMotion();
+  }, () => {});
+}
+
+/// Moves one named element from its old place to its new one. The same
+/// markup moves as one piece; otherwise the old copy fades into the new one
+/// on the way. A block's box reshapes around both.
+function morph({ prev, next, origin, into }, animate, timing) {
+  const a = morphCopy(prev);
+  const b = morphCopy(next);
+  const same = a.outerHTML === b.outerHTML;
+  const fade = motionLayer("morph-fade");
+  if (prev.block) {
+    const box = motionLayer("morph-box", prev.rect, origin);
+    box.style.height = `${prev.rect.height}px`;
+    const frame = (rect) => ({ left: `${rect.left - origin.left}px`, top: `${rect.top - origin.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
+    animate(box, [frame(prev.rect), frame(next.rect)]);
+    a.style.width = `${prev.rect.width}px`;
+    b.style.width = `${next.rect.width}px`;
+    box.append(fade);
+    into.append(box);
+  } else {
+    // Text keeps its page's look; the copy is placed and sized like the original.
+    for (const [copy, target] of [[a, prev], [b, next]]) {
+      for (const [name, value] of target.text) copy.style.setProperty(name, value);
+      place(copy, target.rect, origin, true);
+      // Fractional widths must not wrap the text.
+      copy.style.width = `${Math.ceil(target.rect.width)}px`;
+    }
+    const dx = next.rect.left - prev.rect.left;
+    const dy = next.rect.top - prev.rect.top;
+    // Text grows or shrinks to the next page's size; boxes may differ in width.
+    const scale = next.size / prev.size;
+    animate(a, [{ transform: "none" }, { transform: `translate(${dx}px, ${dy}px) scale(${scale})` }]);
+    animate(b, [{ transform: `translate(${-dx}px, ${-dy}px) scale(${1 / scale})` }, { transform: "none" }]);
+    into.append(fade);
+  }
+  a.classList.add("morph-copy");
+  b.classList.add("morph-copy");
+  if (same) {
+    fade.append(b);
+    return;
+  }
+  // Fading with the motion's easing settles with the place.
+  fade.append(a, b);
+  animate(a, [{ opacity: 1 }, { opacity: 0 }]);
+  animate(b, [{ opacity: 0 }, { opacity: 1 }]);
+}
+
 // ---------------------------------------------------------------- actions
 
 async function act(action, el) {
   const s = ui.snap;
   switch (action) {
-    case "page":
+    case "page": {
       ui.page = el.dataset.page;
-      if (ui.page === "activity") {
-        if (s.settings?.deviceCount > 0) {
-          try { await loadDeviceDefinitions(); } catch (error) { toast(String(error)); }
+      // The shown page stays while the next one reads what it shows first, so
+      // the change happens in one motion. A later change supersedes this one.
+      const change = ui.pageChange = (ui.pageChanges || 0) + 1;
+      ui.pageChanges = change;
+      try {
+        if (ui.page === "activity") {
+          if (s.settings?.deviceCount > 0) {
+            try { await loadDeviceDefinitions(); } catch (error) { toast(String(error)); }
+          }
+          // Home's ring, already read, opens Activity unchanged.
+          ui.traffic = cachedTraffic(null) ?? ui.traffic;
+          loadTraffic();
+          // Presets follow the clock; a custom range stays as chosen.
+          resolveActivityRange();
+          await loadActivity();
         }
-        loadTraffic();
-        // Presets follow the clock; a custom range stays as chosen.
-        resolveActivityRange();
-        await loadActivity();
+        if (ui.page === "main") {
+          ui.homeTraffic = cachedTraffic(homeTrafficDevice()) ?? ui.homeTraffic;
+          loadHomeTraffic();
+        }
+        if (ui.page === "devices") loadDevices();
+        if (ui.page === "settings") await loadDevices();
+      } finally {
+        if (ui.pageChange === change) ui.pageChange = null;
       }
-      if (ui.page === "main") loadHomeTraffic();
-      if (ui.page === "devices") loadDevices();
-      if (ui.page === "settings") await loadDevices();
+      if (ui.pageChanges !== change) break;
       ui.pinLog = ui.page === "activity" && el.dataset.target === "log";
-      render();
-      $("content").scrollTop = 0;
-      if (ui.pinLog) scrollToLog();
+      changePage(() => {
+        render();
+        $("content").scrollTop = 0;
+        if (ui.pinLog) scrollToLog();
+      });
       break;
+    }
     case "forwarding-restore": {
       if (ui.forwardingRestoreBusy) break;
       const enabled = !ui.snap.forwardingRestore;
@@ -2379,8 +2623,9 @@ document.addEventListener("change", async (event) => {
     return;
   }
 
+  // Home and Activity share the range, so their rings show the same traffic.
   if (event.target.id === "home-traffic-range") {
-    ui.homeTrafficMinutes = Number(event.target.value);
+    ui.homeTrafficMinutes = ui.trafficMinutes = Number(event.target.value);
     ui.homeTrafficError = "";
     // Launch immediately so concurrent refreshes cannot start an older range.
     const loading = loadHomeTraffic(true);
@@ -2389,7 +2634,7 @@ document.addEventListener("change", async (event) => {
     return;
   }
   if (event.target.id === "traffic-range") {
-    ui.trafficMinutes = Number(event.target.value);
+    ui.trafficMinutes = ui.homeTrafficMinutes = Number(event.target.value);
     ui.trafficError = "";
     renderActivityTraffic();
     await loadTraffic();

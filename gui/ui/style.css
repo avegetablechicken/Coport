@@ -1495,3 +1495,58 @@ html.frosted .select-menu {
 .device-setting-row .device-setting-name { flex-direction: row; grid-column: 1; grid-row: 1; align-self: center; }
 .device-setting-row .device-setting-actions { max-width: none; grid-column: 2; grid-row: 1; align-self: center; }
 .device-setting-transport { color: var(--tertiary); font-size: 10px; font-weight: 400; flex: none; }
+
+/* ------------------------------------------------------------ page changes */
+
+/* While a page change moves (app.js changePage), copies of both pages are
+   drawn over the hidden live panel. The two copies of a moving element add
+   up (plus-lighter), so what both pages show does not dim mid-crossfade. */
+.panel {
+  position: relative;
+}
+
+.page-motion {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.page-motion-body {
+  bottom: 0;
+  overflow: hidden;
+}
+
+.page-motion [data-morph-paired] {
+  visibility: hidden;
+}
+
+.morph-fade {
+  position: absolute;
+  inset: 0;
+  isolation: isolate;
+}
+
+.morph-copy {
+  transform-origin: 0 0;
+  mix-blend-mode: plus-lighter;
+}
+
+/* A moving block's box; the copies inside fade without their own. */
+.morph-box {
+  position: absolute;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--block);
+  box-shadow: 0 0 0 0.5px var(--block-border), var(--block-shadow);
+}
+
+.morph-box .morph-copy {
+  position: absolute;
+  margin: 0;
+  left: 0;
+  top: 0;
+  background: transparent;
+  box-shadow: none;
+}

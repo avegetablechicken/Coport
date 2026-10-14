@@ -99,3 +99,79 @@ test("SSH availability is checked once at app startup, not on every panel reopen
   }
   assert.deepEqual(p.sshChecks, ['startup']);
 });
+
+// Page changes: the shown page stays while the next one reads its first data,
+// then one motion (changePage) shows it.
+function navigation(page = "main") {
+  const views = { "30:model": { scope: "model", credentials: [] } };
+  const ui = { page, snap: { settings: {} }, trafficMinutes: 30, homeTrafficMinutes: 30, trafficScope: "model", localTrafficViews: views };
+  const rendered = [];
+  const changes = [];
+  const loads = [];
+  const context = {
+    ui, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
+    changePage: (update) => { changes.push({ page: ui.page, traffic: ui.traffic, homeTraffic: ui.homeTraffic }); update(); },
+    loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, homeTrafficDevice: () => null,
+    loadActivity: () => new Promise((resolve) => loads.push(resolve)),
+    $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function render()"), source.indexOf("\nfunction renderTop()")), context);
+  vm.runInContext(source.slice(source.indexOf("function cachedTraffic("), source.indexOf("/// Home shows the forwarded device")), context);
+  vm.runInContext(source.slice(source.indexOf("async function act("), source.indexOf("// Any scroll or input")), context);
+  const go = (target) => context.act("page", { dataset: { page: target } });
+  return { ui, views, rendered, changes, loads, render: context.render, go };
+}
+
+test("the shown page stays while the next one loads, then changes once", async () => {
+  const p = navigation();
+  const going = p.go("activity");
+  await Promise.resolve();
+  p.render();
+  assert.deepEqual(p.rendered, []);
+  p.loads[0]();
+  await going;
+  assert.deepEqual(p.changes.map((c) => c.page), ["activity"]);
+  assert.deepEqual(p.rendered, ["activity"]);
+  p.render();
+  assert.deepEqual(p.rendered, ["activity", "activity"]);
+});
+
+test("a later page change supersedes one still loading", async () => {
+  const p = navigation();
+  const activity = p.go("activity");
+  await Promise.resolve();
+  await p.go("main");
+  p.loads[0]();
+  await activity;
+  assert.equal(p.ui.page, "main");
+  assert.deepEqual(p.changes.map((c) => c.page), ["main"]);
+});
+
+test("Home and Activity open with the ring the other already read", async () => {
+  const p = navigation();
+  const going = p.go("activity");
+  p.loads[0]();
+  await going;
+  assert.equal(p.changes[0].traffic, p.views["30:model"]);
+  const other = { scope: "model", credentials: [] };
+  p.views["360:model"] = other;
+  p.ui.trafficMinutes = p.ui.homeTrafficMinutes = 360;
+  await p.go("main");
+  assert.equal(p.changes[1].homeTraffic, other);
+});
+
+test("page changes move only what is shown, not content of a closed disclosure", () => {
+  const context = { MORPH_TEXT: ["color"], getComputedStyle: () => ({ getPropertyValue: () => "", fontSize: "11px" }) };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function morphTargets("), source.indexOf("\nfunction motionLayer(")), context);
+  // WebKit lays out a closed disclosure's content, so it has a place but is not seen.
+  const element = (morph, { closed = false, summary = false } = {}) => ({
+    dataset: { morph }, classList: { contains: () => false },
+    getBoundingClientRect: () => ({ top: 100, bottom: 120, width: 300, height: 20 }),
+    closest: (selector) => (selector === "summary" ? summary : selector === "details:not([open])" && closed) || null,
+  });
+  const region = { querySelectorAll: () => [element("log", { closed: true }), element("title:inactive", { closed: true, summary: true }), element("traffic")] };
+  const found = context.morphTargets(region, { top: 0, bottom: 600, height: 600 });
+  assert.deepEqual([...found.keys()], ["title:inactive", "traffic"]);
+});
