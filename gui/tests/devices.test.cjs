@@ -19,6 +19,7 @@ function harness(invoke) {
     fields['device-transport'] = { value: ui.deviceDraft.transport, id: 'device-transport' };
   };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function panelSelect("), source.indexOf("let openSelect = null;")), context);
   const relabelStart = source.indexOf("function relabelDeviceViews(");
   const relabelEnd = source.indexOf("async function loadDeviceDefinitions",relabelStart);
   vm.runInContext(source.slice(relabelStart,relabelEnd),context);

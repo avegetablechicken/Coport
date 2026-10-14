@@ -13,7 +13,13 @@ use gdk::{
     prelude::*,
 };
 use serde::Serialize;
-use std::{sync::Mutex, time::SystemTime};
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
+};
 use tauri::{Emitter, Monitor, WebviewWindow};
 
 /// The backdrop has this fraction of the logical resolution; the blur hides
@@ -76,6 +82,8 @@ struct Payload {
     width: f64,
     height: f64,
     image: Option<String>,
+    /// WebKit composites the page, so `backdrop-filter` blurs within it.
+    composited: bool,
 }
 
 struct Cache {
@@ -83,6 +91,12 @@ struct Cache {
     area: Area,
     /// Set while the backdrop shows the wallpaper rendered from this source.
     wallpaper: Option<Option<Source>>,
+}
+
+static COMPOSITED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_composited(composited: bool) {
+    COMPOSITED.store(composited, Ordering::Relaxed);
 }
 
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
@@ -152,6 +166,7 @@ fn emit(w: &WebviewWindow, area: &Area, x: f64, y: f64, png: Option<Vec<u8>>) {
             width: area.w / area.scale,
             height: area.h / area.scale,
             image,
+            composited: COMPOSITED.load(Ordering::Relaxed),
         },
     );
 }

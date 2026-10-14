@@ -99,6 +99,10 @@ On Linux, the panel uses Copool's frosted backdrop: a blurred snapshot of the
 screen taken before opening on X11, with the GNOME wallpaper as a fallback on
 Wayland. The backdrop stays fixed while the panel is open; if neither source is
 available, the panel keeps its opaque background.
+In-panel menus blur the page behind them when WebKitGTK compositing is enabled,
+otherwise they reuse the frosted background. NVIDIA systems automatically use
+Copool's shared-memory rendering workaround unless renderer environment variables
+were explicitly configured.
 
 ## Background service
 

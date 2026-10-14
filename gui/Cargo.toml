@@ -49,6 +49,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSA
 [target.'cfg(target_os = "linux")'.dependencies]
 base64 = "0.22"
 gdk = "0.18"
+webkit2gtk = "=2.0.2"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 [dev-dependencies]

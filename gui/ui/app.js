@@ -1910,7 +1910,7 @@ function deviceSettings() {
     return `<div class="row device-setting-row"><span class="device-setting-name row-label"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>` + deviceCapabilities(device);
   }).join("");
   const form = ui.deviceFormOpen ? `<div class="device-form">
-    <label>Connection<select class="field" id="device-transport"><option value="ssh" ${d.transport === "ssh" ? "selected" : ""}>SSH</option><option value="http" ${d.transport !== "ssh" ? "selected" : ""}>HTTP / HTTPS</option></select></label>
+    <label>Connection${panelSelect("device-transport", [["ssh", "SSH"], ["http", "HTTP / HTTPS"]], d.transport, "Connection", "field")}</label>
     <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" placeholder="Defaults to the SSH config name or HTTP origin"></label>
     ${d.transport === "ssh" ? `
       <label>SSH config name or host<input class="field" id="device-host" value="${esc(d.host || "")}" maxlength="255" placeholder="mbp16"></label>
@@ -2736,6 +2736,7 @@ const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 window.__TAURI__.event
   .listen("panel-backdrop", ({ payload }) => {
     const root = document.documentElement;
+    root.classList.toggle("composited", payload.composited);
     root.style.setProperty("--backdrop-size", `${payload.width}px ${payload.height}px`);
     root.style.setProperty("--backdrop-position", `${-payload.x}px ${-payload.y}px`);
     if (payload.image === null) return;

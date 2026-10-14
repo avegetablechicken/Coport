@@ -5,6 +5,8 @@
 
 mod activity;
 #[cfg(target_os = "linux")]
+mod appearance;
+#[cfg(target_os = "linux")]
 mod backdrop;
 mod commands;
 mod config_edit;
@@ -49,6 +51,8 @@ Usage: coport-gui [--background]
 const LAUNCH_OPEN_DELAY: Duration = Duration::from_millis(400);
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    appearance::enable_compositing();
     // Opening the app by hand shows the panel; login items start quietly.
     let mut open = true;
     let mut args = std::env::args().skip(1);
@@ -126,6 +130,8 @@ fn main() {
             commands::quit_app,
         ])
         .setup(move |app| {
+            #[cfg(target_os = "linux")]
+            appearance::configure(app)?;
             // Menu bar app: no Dock icon and no app menu.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
