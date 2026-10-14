@@ -54,6 +54,7 @@ pub fn request(
     method: &str,
 ) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_nodelay(true).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(8)))
         .unwrap();
@@ -71,7 +72,14 @@ pub fn request(
     if let Some(account) = account {
         head.push_str(&format!("ChatGPT-Account-Id: {account}\r\n"));
     }
-    write!(stream, "{head}\r\n{body}").unwrap();
+    // write_fmt may send the head, separator and body as separate writes. An
+    // early response (notably /health during startup) can close the connection
+    // while the last fragment is still delayed, causing a reset on macOS.
+    // Send the complete fixture together; delayed/unread bodies are exercised
+    // explicitly by the server tests rather than by incidental packet timing.
+    head.push_str("\r\n");
+    head.push_str(body);
+    stream.write_all(head.as_bytes()).unwrap();
     let head = read_head(&mut stream);
     let status = String::from_utf8_lossy(&head)
         .split_whitespace()
