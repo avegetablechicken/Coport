@@ -319,7 +319,9 @@ fn frost((mut rgb, w, h): (Vec<f32>, usize, usize)) -> Option<Vec<u8>> {
         box_pass(&scratch, &mut rgb, w, h, false);
     }
     let bytes: Vec<u8> = rgb
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|p| {
             let luma = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
             p.iter()
