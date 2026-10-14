@@ -5,7 +5,6 @@ const { listen } = window.__TAURI__.event;
 
 const IS_MAC = navigator.userAgent.includes("Mac");
 const REVEAL_LABEL = IS_MAC ? "Show in Finder" : navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in Folder";
-if (IS_MAC) document.documentElement.classList.add("macos");
 
 // ---------------------------------------------------------------- icons
 
@@ -2485,6 +2484,20 @@ setInterval(() => {
 
 // Check configured proxies once at startup; reopening the panel does not repeat it.
 const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
+
+// Linux has no system material behind the panel: the backend sends the screen
+// under it, blurred, and where the window lies on it. `image` is null when
+// unchanged and empty without a backdrop.
+window.__TAURI__.event
+  .listen("panel-backdrop", ({ payload }) => {
+    const root = document.documentElement;
+    root.style.setProperty("--backdrop-size", `${payload.width}px ${payload.height}px`);
+    root.style.setProperty("--backdrop-position", `${-payload.x}px ${-payload.y}px`);
+    if (payload.image === null) return;
+    root.style.setProperty("--backdrop-image", payload.image ? `url("${payload.image}")` : "none");
+    root.classList.toggle("frosted", Boolean(payload.image));
+  })
+  .catch((error) => toast(error));
 
 listen("state-changed", scheduleRefresh);
 const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;

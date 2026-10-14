@@ -47,6 +47,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppe
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSString"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+base64 = "0.22"
+gdk = "0.18"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 [dev-dependencies]

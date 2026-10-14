@@ -95,6 +95,11 @@ target/release/coport-gui
 ./scripts/bundle_macos.sh                   # macOS: target/Coport.app
 ```
 
+On Linux, the panel uses Copool's frosted backdrop: a blurred snapshot of the
+screen taken before opening on X11, with the GNOME wallpaper as a fallback on
+Wayland. The backdrop stays fixed while the panel is open; if neither source is
+available, the panel keeps its opaque background.
+
 ## Background service
 
 ```sh

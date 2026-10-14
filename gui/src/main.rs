@@ -4,6 +4,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod activity;
+#[cfg(target_os = "linux")]
+mod backdrop;
 mod commands;
 mod config_edit;
 mod core;

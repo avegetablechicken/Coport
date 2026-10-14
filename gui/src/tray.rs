@@ -93,6 +93,17 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
                 let anchor = app.state::<Tray>().rect();
+                // Let GNOME's tray menu fade out before capturing the screen.
+                #[cfg(target_os = "linux")]
+                {
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let app = handle.clone();
+                        let _ = handle.run_on_main_thread(move || panel::show(&app, anchor));
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
                 panel::show(app, anchor);
             }
             "toggle" => {

@@ -795,9 +795,11 @@ name = "coport-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "chrono",
  "coport",
  "dirs",
+ "gdk",
  "httparse",
  "libc",
  "objc2",

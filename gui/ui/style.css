@@ -162,6 +162,31 @@ select:focus-visible {
   background: var(--window);
 }
 
+/* The window is transparent on Linux too; its panel is rounded from the
+   first paint (platform.js). */
+.linux .panel {
+  border-radius: 12px;
+}
+
+/* On Linux the screen under the panel, blurred by the backend (backdrop.rs),
+   behind a tint like that of the macOS popover material. */
+.frosted .panel {
+  --glass-tint: rgba(236, 236, 236, 0.62);
+  --glass-rim: rgba(255, 255, 255, 0.45);
+  background:
+    linear-gradient(var(--glass-tint), var(--glass-tint)),
+    var(--backdrop-image) var(--backdrop-position) / var(--backdrop-size) no-repeat,
+    var(--window);
+  box-shadow: inset 0 0 0 0.5px var(--glass-rim);
+}
+
+@media (prefers-color-scheme: dark) {
+  .frosted .panel {
+    --glass-tint: rgba(36, 36, 38, 0.64);
+    --glass-rim: rgba(255, 255, 255, 0.16);
+  }
+}
+
 /* The system popover material is the background on macOS. */
 .macos .panel {
   background: transparent;
@@ -1388,6 +1413,25 @@ details.disclosure[open] summary svg {
   background: var(--window);
   box-shadow: 0 0 0 1px var(--control-border), 0 4px 16px rgba(0, 0, 0, 0.25);
 }
+/* With the panel's frosted backdrop (Linux), the menu shows the same blurred
+   screen, fixed to the window, under a denser tint. */
+html.frosted .select-menu {
+  --menu-sheen: rgba(255, 255, 255, 0.5);
+  --menu-tint: rgba(246, 246, 246, 0.78);
+  background:
+    linear-gradient(to bottom, var(--menu-sheen), transparent 45%),
+    linear-gradient(var(--menu-tint), var(--menu-tint)),
+    var(--backdrop-image) var(--backdrop-position) / var(--backdrop-size) no-repeat fixed,
+    var(--window);
+}
+
+@media (prefers-color-scheme: dark) {
+  html.frosted .select-menu {
+    --menu-sheen: rgba(255, 255, 255, 0.1);
+    --menu-tint: rgba(44, 44, 48, 0.8);
+  }
+}
+
 .select-menu button {
   display: block;
   width: 100%;
