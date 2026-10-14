@@ -1120,6 +1120,16 @@ function trafficControls(prefix, minutes, label) {
     "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
+/// Home, Activity and Devices show traffic for one range, so changing pages
+/// keeps it. Reads started for the previous range must not land afterwards.
+function setTrafficMinutes(minutes) {
+  ui.trafficMinutes = ui.homeTrafficMinutes = ui.deviceTrafficMinutes = minutes;
+  ++ui.trafficRequest; ++ui.homeTrafficRequest;
+  ui.trafficLoading = ui.homeTrafficLoading = false;
+  ui.trafficError = ui.homeTrafficError = "";
+  ui.homeTrafficFetchedAt = 0;
+}
+
 async function loadTraffic() {
   // Long ranges can take longer to read than the refresh interval; a read of
   // the same range and category that is still current is not started twice.
@@ -2399,7 +2409,11 @@ async function act(action, el) {
           ui.homeTraffic = cachedTraffic(homeTrafficDevice()) ?? ui.homeTraffic;
           loadHomeTraffic();
         }
-        if (ui.page === "devices") loadDevices();
+        if (ui.page === "devices") {
+          // Peers' views for the shared range, from the last refresh, open with the page.
+          selectDeviceTraffic();
+          loadDevices();
+        }
         if (ui.page === "settings") await loadDevices();
       } finally {
         if (ui.pageChange === change) ui.pageChange = null;
@@ -2646,7 +2660,7 @@ document.addEventListener("change", async (event) => {
       ui.trafficScope = event.target.value;
       ++ui.trafficRequest; ++ui.homeTrafficRequest;
       ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
-    } else { ui.deviceTrafficMinutes = Number(event.target.value); }
+    } else { setTrafficMinutes(Number(event.target.value)); }
     const cards = loadDeviceCards();
     if (selectDeviceTraffic()) { render(); await cards; return; }
     // A remote refresh delivers every range when it completes. A cache read now
@@ -2676,10 +2690,8 @@ document.addEventListener("change", async (event) => {
     return;
   }
 
-  // Home and Activity share the range, so their rings show the same traffic.
   if (event.target.id === "home-traffic-range") {
-    ui.homeTrafficMinutes = ui.trafficMinutes = Number(event.target.value);
-    ui.homeTrafficError = "";
+    setTrafficMinutes(Number(event.target.value));
     // Launch immediately so concurrent refreshes cannot start an older range.
     const loading = loadHomeTraffic(true);
     render();
@@ -2687,8 +2699,7 @@ document.addEventListener("change", async (event) => {
     return;
   }
   if (event.target.id === "traffic-range") {
-    ui.trafficMinutes = ui.homeTrafficMinutes = Number(event.target.value);
-    ui.trafficError = "";
+    setTrafficMinutes(Number(event.target.value));
     renderActivityTraffic();
     await loadTraffic();
     return;

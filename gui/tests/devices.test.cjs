@@ -25,6 +25,8 @@ function harness(invoke) {
   vm.runInContext(source.slice(relabelStart,relabelEnd),context);
   // Shared traffic views, markup and merging, as every page uses them.
   vm.runInContext(source.slice(source.indexOf('const trafficMarkup = new WeakMap();'), source.indexOf('/// Home shows the forwarded device')), context);
+  // One range for Home, Activity and Devices.
+  vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   vm.runInContext(code, context);
   context.fields = fields; context.listeners = listeners;
   context.action = async (name, el = context.el || { dataset: {} }) => {

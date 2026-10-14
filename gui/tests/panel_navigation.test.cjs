@@ -110,7 +110,7 @@ function navigation(page = "main") {
   const loads = [];
   const context = {
     ui, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
-    changePage: (update) => { changes.push({ page: ui.page, traffic: ui.traffic, homeTraffic: ui.homeTraffic }); update(); },
+    changePage: (update) => { changes.push({ page: ui.page, traffic: ui.traffic, homeTraffic: ui.homeTraffic, mergedData: ui.mergedData }); update(); },
     loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, homeTrafficDevice: () => null,
     loadActivity: () => new Promise((resolve) => loads.push(resolve)),
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
@@ -120,7 +120,7 @@ function navigation(page = "main") {
   vm.runInContext(source.slice(source.indexOf("function cachedTraffic("), source.indexOf("/// Home shows the forwarded device")), context);
   vm.runInContext(source.slice(source.indexOf("async function act("), source.indexOf("// Any scroll or input")), context);
   const go = (target) => context.act("page", { dataset: { page: target } });
-  return { ui, views, rendered, changes, loads, render: context.render, go };
+  return { ui, views, rendered, changes, loads, render: context.render, go, context };
 }
 
 test("the shown page stays while the next one loads, then changes once", async () => {
@@ -159,6 +159,36 @@ test("Home and Activity open with the ring the other already read", async () => 
   p.ui.trafficMinutes = p.ui.homeTrafficMinutes = 360;
   await p.go("main");
   assert.equal(p.changes[1].homeTraffic, other);
+});
+
+test("Devices opens with the merged traffic of the range Home shows", async () => {
+  const p = navigation();
+  const context = { ui: p.ui };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function selectDeviceTraffic("), source.indexOf("async function loadMergedData(")), context);
+  const day = { minutes: 1440, scope: "model", sources: [] };
+  p.ui.mergedData = { minutes: 30, scope: "model", sources: [] };
+  p.ui.deviceTrafficViews = { "30:model": p.ui.mergedData, "1440:model": day };
+  p.ui.trafficMinutes = p.ui.homeTrafficMinutes = p.ui.deviceTrafficMinutes = 1440;
+  p.context.selectDeviceTraffic = context.selectDeviceTraffic;
+  await p.go("devices");
+  assert.equal(p.changes[0].mergedData, day);
+});
+
+test("a range chosen on any traffic page applies to Home, Activity and Devices", () => {
+  const ui = { trafficMinutes: 30, homeTrafficMinutes: 30, deviceTrafficMinutes: 30, trafficRequest: 4, homeTrafficRequest: 7,
+    trafficLoading: true, homeTrafficLoading: true, trafficError: "old", homeTrafficError: "old", homeTrafficFetchedAt: 5 };
+  const context = { ui };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function setTrafficMinutes("), source.indexOf("\nasync function loadTraffic(")), context);
+  context.setTrafficMinutes(360);
+  assert.deepEqual([ui.trafficMinutes, ui.homeTrafficMinutes, ui.deviceTrafficMinutes], [360, 360, 360]);
+  // Reads still running for the previous range are superseded.
+  assert.deepEqual([ui.trafficRequest, ui.homeTrafficRequest], [5, 8]);
+  assert.deepEqual([ui.trafficLoading, ui.homeTrafficLoading, ui.trafficError, ui.homeTrafficError, ui.homeTrafficFetchedAt], [false, false, "", "", 0]);
+  // Every range control on the three pages calls it.
+  const handlers = source.slice(source.indexOf('document.addEventListener("change"'));
+  for (const id of ["devices-traffic-range", "home-traffic-range", "traffic-range"]) assert.match(handlers, new RegExp(`"${id}"[^]*?setTrafficMinutes\\(`));
 });
 
 test("page changes move only what is shown, not content of a closed disclosure", () => {
