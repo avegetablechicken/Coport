@@ -1,13 +1,13 @@
 // Records the README demos: the real panel UI (gui/ui) with the synthetic
 // data in mock.js, light and dark side by side.
 //
-//   node scripts/readme_demo/record.mjs [--scene home|tour] [--chrome PATH] [--out FILE]
+//   node scripts/readme_demo/record.mjs [--scene home|tour] [--fps N] [--chrome PATH] [--out FILE]
 //     [--still [--at MS,MS...]]
 //
 // `home` (assets/coport-demo.gif) stays on Home while calls arrive; `tour`
 // (assets/coport-pages.gif) clicks through Home, Activity and Devices.
 //
-// Needs Google Chrome (or Chromium) and ffmpeg. Nothing is contacted besides
+// Needs Google Chrome (or Chromium), ffmpeg and gifsicle. Nothing is contacted besides
 // a loopback file server; the browser runs with a temporary profile.
 import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
@@ -28,7 +28,8 @@ const option = (name, fallback) => {
 const CHROME = option("--chrome", process.platform === "darwin"
   ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
   : "google-chrome");
-const SCENES = { home: { file: "coport-demo.gif", seconds: 10 }, tour: { file: "coport-pages.gif", seconds: 14 } };
+// The tour's page changes last under half a second; more frames keep them fluid.
+const SCENES = { home: { file: "coport-demo.gif", seconds: 10, fps: 12 }, tour: { file: "coport-pages.gif", seconds: 14, fps: Number(option("--fps", 20)) } };
 const SCENE = option("--scene", "home");
 if (!SCENES[SCENE]) throw new Error(`Unknown scene ${SCENE}; use ${Object.keys(SCENES).join(" or ")}`);
 const OUT = resolve(option("--out", join(ROOT, "assets", SCENES[SCENE].file)));
@@ -38,7 +39,7 @@ const WIDTH = 360; // The panel's window width (gui/tauri.conf.json).
 // From the header through Outbound Proxies.
 const HEIGHT = Number(option("--height", 898));
 const SCALE = 2;
-const FPS = 12;
+const FPS = SCENES[SCENE].fps;
 const SECONDS = SCENES[SCENE].seconds;
 const THEMES = ["light", "dark"];
 
@@ -160,6 +161,9 @@ try {
       "[0][1]hstack,split[a][b];[a]palettegen=max_colors=128:stats_mode=full[p];[b][p]paletteuse=dither=none:diff_mode=rectangle",
       "-loop", "0", OUT,
     ]);
+    // Page changes redraw whole frames; slight lossiness keeps the GIF small
+    // without visible noise on text.
+    execFileSync("gifsicle", ["-O3", "--lossy=80", "--batch", OUT]);
   }
   console.log(OUT);
 } catch (error) {

@@ -268,6 +268,8 @@
   // every pixel in each frame and multiply the GIF's size.
   const LOG_AT = 4500;
   const clicked = new Set();
+  // When the last page change began; its motion follows the recording's clock.
+  let changedAt = null;
 
   // Clicks happen in order, even when a preview jumps past some of them.
   async function tour(elapsed) {
@@ -275,6 +277,7 @@
       if (step.at > elapsed || clicked.has(i)) continue;
       clicked.add(i);
       const el = document.querySelector(step.click);
+      changedAt = step.at;
       if (el) await act("page", el);
     }
   }
@@ -303,6 +306,16 @@
       } else {
         await refresh();
         await loadHomeTraffic(true);
+      }
+      // A page change in motion shows where it is at this time, or ends.
+      for (const animation of document.getAnimations()) {
+        if (changedAt == null || !animation.effect?.target?.closest?.(".page-motion")) continue;
+        const { delay, duration } = animation.effect.getTiming();
+        if (elapsed - changedAt >= delay + duration) animation.finish();
+        else {
+          animation.pause();
+          animation.currentTime = elapsed - changedAt;
+        }
       }
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     },

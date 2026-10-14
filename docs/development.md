@@ -52,8 +52,8 @@ Development, service management, and macOS packaging require no Python installat
 
 `assets/coport-demo.gif` (Home while calls arrive) and `assets/coport-pages.gif`
 (Home, Activity and Devices) show the real panel UI rendered with synthetic
-data. After changing these pages, record them again (requires Google Chrome and
-ffmpeg):
+data. After changing these pages, record them again (requires Google Chrome,
+ffmpeg and gifsicle):
 
 ```sh
 node scripts/readme_demo/record.mjs                 # assets/coport-demo.gif
@@ -64,6 +64,8 @@ node scripts/readme_demo/record.mjs --scene tour    # assets/coport-pages.gif
 proxies, devices and traffic; the recorder serves `gui/ui` on a loopback port,
 captures light and dark frames in headless Chrome with a temporary profile, and
 joins them with ffmpeg.
+The tour records 20 frames per second so page changes stay fluid (`--fps`
+overrides it), and its motion is stepped on the recording's clock.
 `--still --at 3000,9000 --out frame.png` renders single frames at those
 milliseconds for a quick check. It never starts the proxy or reads
 configuration, credentials or logs.
