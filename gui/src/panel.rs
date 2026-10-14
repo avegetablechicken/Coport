@@ -159,6 +159,20 @@ fn layout(w: &WebviewWindow, panel: &PanelState, appearing: bool) {
         .unwrap()
         .unwrap_or(560.0)
         .clamp(MIN_HEIGHT, max_height);
+    // WebKitGTK's shared-memory compositor briefly exposes an unpainted strip
+    // when a visible transparent window shrinks. Keep the viewport stable while
+    // the panel is open. content_height still stores the desired height, so the
+    // next show lays it out at that height before making the window visible.
+    #[cfg(target_os = "linux")]
+    let height = if w.is_visible().unwrap_or(false) {
+        w.inner_size().ok().map_or(height, |size| {
+            height
+                .max(size.height as f64 / m.scale_factor())
+                .min(max_height)
+        })
+    } else {
+        height
+    };
     let _ = w.set_size(tauri::LogicalSize::new(WIDTH, height));
     let (x, y) = placement::place(anchor, (WIDTH * unit, height * unit), screen, unit);
     let _ = if IN_POINTS {
