@@ -93,7 +93,8 @@ struct Channel {
 impl Channel {
     async fn open(device: &Device, executable: &Path) -> Result<Self, String> {
         device.validate()?;
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args([
                 "-T",
                 "-a",
@@ -122,9 +123,17 @@ impl Channel {
             .stdout(std::process::Stdio::piped())
             // Diagnostics are bounded and never enter the request stream.
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("Cannot start SSH: {e}"))?;
+            .kill_on_drop(true);
+        let mut child = {
+            // A test's SSH fork can inherit another test's daemon lock until
+            // exec. Serialize that short interval with lock-release assertions,
+            // including calls made by background forwarding/health tasks.
+            #[cfg(test)]
+            let _guard = crate::daemon::spawn_guard();
+            command
+                .spawn()
+                .map_err(|e| format!("Cannot start SSH: {e}"))?
+        };
         let mut stderr = child.stderr.take().unwrap();
         let mut diagnostics = Diagnostics(tokio::spawn(async move {
             let mut saved = Vec::new();
