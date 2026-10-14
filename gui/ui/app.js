@@ -2176,9 +2176,49 @@ function place(el, rect, origin, height = false) {
   });
 }
 
+// Snapshot row geometry while the original page is laid out.
+function motionRows(region, view) {
+  // The native window may grow during the transition. Keep enough rows for a
+  // full monitor, even when the old page used a short viewport.
+  const extent = Math.max(view.height, globalThis.screen?.height || 0);
+  return [...region.querySelectorAll(".req")].map(el => {
+    const rect = el.getBoundingClientRect();
+    return { height: rect.height, keep: rect.bottom > view.top - extent && rect.top < view.top + extent * 2 };
+  });
+}
+
+// Activity can contain 500 log rows. The animation copies need their geometry,
+// but not the thousands of text nodes outside the moving viewport. Only trim
+// copies (or the detached old page); the live page keeps every row and control.
+function trimMotionRows(copy, rows) {
+  let spacer = null;
+  let height = 0;
+  [...copy.querySelectorAll(".req")].forEach((el, i) => {
+    const row = rows[i];
+    if (!row || row.keep || !row.height || el.parentElement.id !== "activity-list") {
+      spacer = null;
+      return;
+    }
+    // The log list is normal block flow without row margins. Adjacent omitted
+    // rows can share one exact-height spacer; expanded details break the run.
+    if (spacer && spacer.nextSibling === el) {
+      height += row.height;
+      spacer.style.height = `${height}px`;
+      el.remove();
+    } else {
+      spacer = document.createElement("div");
+      height = row.height;
+      spacer.style.height = `${height}px`;
+      el.replaceWith(spacer);
+    }
+  });
+}
+
 /// A copy of a named element to move, without its name; named elements inside
 /// it move on their own.
 function morphCopy(target) {
+  // Shared elements can travel vertically across the viewport; keep their
+  // complete contents. Only the fixed-height page copies are trimmed below.
   const copy = target.el.cloneNode(true);
   copy.removeAttribute("data-morph");
   copy.removeAttribute("data-morph-paired");
@@ -2198,6 +2238,7 @@ function changePage(update) {
   const contentRect = content.getBoundingClientRect();
   const oldHead = [...top.childNodes];
   const oldPageRect = oldPage.getBoundingClientRect();
+  const oldRows = motionRows(oldPage, contentRect);
   const before = { head: morphTargets(top, topRect), body: morphTargets(content, contentRect) };
   update();
   const page = content.firstElementChild;
@@ -2206,6 +2247,12 @@ function changePage(update) {
   const turn = from === "settings" || ui.builtPage === "settings";
   const panelRect = $("panel").getBoundingClientRect();
   const after = { head: morphTargets(top, topRect), body: morphTargets(content, contentRect) };
+  // Measure the live page while layout is already current. Reading its height
+  // after mounting the animated copies forces WebKitGTK to lay them all out
+  // synchronously, blocking the first animation frame on long Activity pages.
+  const newRows = motionRows(page, contentRect);
+  const pageRect = page.getBoundingClientRect();
+  const height = panelHeight(page);
 
   const layer = motionLayer("page-motion");
   const head = motionLayer("page-motion-head", { left: panelRect.left, top: topRect.top, width: panelRect.width }, panelRect);
@@ -2239,14 +2286,14 @@ function changePage(update) {
   oldPage.classList.add("page-motion-page");
   for (const [el, rect] of [[oldTop, topRect], [newTop, topRect]]) place(el, rect, { left: panelRect.left, top: topRect.top }, true);
   place(oldPage, oldPageRect, { left: panelRect.left, top: contentRect.top });
-  place(newPage, page.getBoundingClientRect(), { left: panelRect.left, top: contentRect.top });
+  place(newPage, pageRect, { left: panelRect.left, top: contentRect.top });
   head.append(oldTop, newTop);
   body.append(oldPage, newPage);
 
   const duration = turn ? TURN_MS : MORPH_MS;
   const timing = { duration, easing: MOTION_EASE, fill: "both" };
-  const animations = [];
-  const animate = (el, frames, options = timing) => animations.push(el.animate(frames, options));
+  const pending = [];
+  const animate = (el, frames, options = timing) => pending.push({ el, frames, options });
   if (turn) {
     // Into Settings the next page comes from the right; back out it leaves there.
     const shift = (ui.builtPage === "settings" ? 1 : -1) * panelRect.width;
@@ -2261,14 +2308,18 @@ function changePage(update) {
     for (const pair of pairs) morph(pair, animate, timing);
   }
   for (const { next } of pairs) next.el.removeAttribute("data-morph-paired");
+  trimMotionRows(oldPage, oldRows);
+  trimMotionRows(newPage, newRows);
 
   top.style.visibility = content.style.visibility = "hidden";
   $("panel").append(layer);
   const motion = { layer, fit: true };
   pageMotion = motion;
   // A taller page gets its room before moving in; a shorter one gives it back after.
-  const height = panelHeight(page);
   if (height > lastHeight) fitPanel(height);
+  // Mount every copy before starting animations, so WebKit starts the effects
+  // together on the next rendering update rather than on detached elements.
+  const animations = pending.map(({ el, frames, options }) => el.animate(frames, options));
   Promise.all(animations.map((a) => a.finished)).then(() => {
     if (pageMotion === motion) endPageMotion();
   }, () => {});
@@ -2280,7 +2331,7 @@ function changePage(update) {
 function morph({ prev, next, origin, into }, animate, timing) {
   const a = morphCopy(prev);
   const b = morphCopy(next);
-  const same = a.outerHTML === b.outerHTML;
+  const same = a.isEqualNode(b);
   const fade = motionLayer("morph-fade");
   if (prev.block) {
     const box = motionLayer("morph-box", prev.rect, origin);
