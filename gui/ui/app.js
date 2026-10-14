@@ -2123,8 +2123,10 @@ new MutationObserver(() => {
 // and the rest crossfades. A layer over the panel draws both pages meanwhile;
 // the live page underneath is already the new one, hidden until the end.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
-const TURN_MS = 340;
-const MORPH_MS = 420;
+// Keep the Linux panel responsive to direct clicks; its full-width turns and
+// shared-element morphs use a shorter cadence than the macOS presentation.
+const TURN_MS = navigator.userAgent.includes("Linux") ? 170 : 340;
+const MORPH_MS = navigator.userAgent.includes("Linux") ? 210 : 420;
 const MOTION_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
 // Inherited text styles a moving element loses outside its page.
 const MORPH_TEXT = ["color", "font-family", "font-size", "font-weight", "line-height", "letter-spacing", "white-space", "font-variant-numeric"];
