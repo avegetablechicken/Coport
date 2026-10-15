@@ -1408,7 +1408,8 @@ details.disclosure[open] summary svg {
    and saturated material that shows the panel through it, a sheen fading
    from the top edge, a bright hairline rim and a soft shadow. Position, size
    and type are those of Coport's menu. */
-.select-menu {
+.select-menu,
+.tooltip {
   --menu-tint: rgba(255, 255, 255, 0.42);
   --menu-sheen: rgba(255, 255, 255, 0.55);
   --menu-rim: rgba(255, 255, 255, 0.7);
@@ -1432,7 +1433,8 @@ details.disclosure[open] summary svg {
 }
 
 @media (prefers-color-scheme: dark) {
-  .select-menu {
+  .select-menu,
+  .tooltip {
     --menu-tint: rgba(36, 36, 40, 0.42);
     --menu-sheen: rgba(255, 255, 255, 0.12);
     --menu-rim: rgba(255, 255, 255, 0.28);
@@ -1446,7 +1448,8 @@ details.disclosure[open] summary svg {
 /* Without the native material (WebKitGTK, WebView2), backdrop-filter may not
    blur, which leaves the panel showing through: an opaque menu instead, as
    those desktops draw theirs. */
-html:not(.macos) .select-menu {
+html:not(.macos) .select-menu,
+html:not(.macos) .tooltip {
   --menu-sheen: transparent;
   --menu-tint: #ffffff;
   -webkit-backdrop-filter: none;
@@ -1454,7 +1457,8 @@ html:not(.macos) .select-menu {
 }
 
 @media (prefers-color-scheme: dark) {
-  html:not(.macos) .select-menu {
+  html:not(.macos) .select-menu,
+  html:not(.macos) .tooltip {
     --menu-tint: #353538;
   }
 }
@@ -1462,7 +1466,8 @@ html:not(.macos) .select-menu {
 /* With the panel's frosted backdrop (Linux), the menu shows the same blurred
    screen, fixed to the window, under a denser tint. */
 html.frosted .select-menu,
-html.frosted .range-editor {
+html.frosted .range-editor,
+html.frosted .tooltip {
   --menu-sheen: rgba(255, 255, 255, 0.5);
   --menu-tint: rgba(246, 246, 246, 0.78);
   background:
@@ -1474,7 +1479,8 @@ html.frosted .range-editor {
 
 @media (prefers-color-scheme: dark) {
   html.frosted .select-menu,
-  html.frosted .range-editor {
+  html.frosted .range-editor,
+  html.frosted .tooltip {
     --menu-sheen: rgba(255, 255, 255, 0.1);
     --menu-tint: rgba(44, 44, 48, 0.8);
   }
@@ -1484,7 +1490,8 @@ html.frosted .range-editor {
    panel with its content, as on macOS. It drops the whole backdrop filter
    when that includes brightness(). */
 html.linux.composited .select-menu,
-html.linux.composited .range-editor {
+html.linux.composited .range-editor,
+html.linux.composited .tooltip {
   --menu-sheen: rgba(255, 255, 255, 0.55);
   --menu-tint: rgba(255, 255, 255, 0.42);
   background:
@@ -1496,10 +1503,36 @@ html.linux.composited .range-editor {
 
 @media (prefers-color-scheme: dark) {
   html.linux.composited .select-menu,
-  html.linux.composited .range-editor {
+  html.linux.composited .range-editor,
+  html.linux.composited .tooltip {
     --menu-sheen: rgba(255, 255, 255, 0.12);
     --menu-tint: rgba(36, 36, 40, 0.42);
   }
+}
+
+/* The in-panel tooltip that replaces the desktop's own for a `title` off
+   macOS (app.js), in the menus' material above, at the panel's type size. */
+.tooltip {
+  --menu-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 4px 12px rgba(0, 0, 0, 0.18);
+  z-index: 200;
+  overflow: hidden;
+  max-width: 240px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  color: var(--label);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease-out, visibility 0s linear 0.12s;
+}
+.tooltip.shown {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.12s ease-out;
 }
 
 .select-menu button {

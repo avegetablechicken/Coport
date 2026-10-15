@@ -1111,6 +1111,64 @@ document.addEventListener("scroll", (event) => {
 }, true);
 window.addEventListener("resize", () => closeSelect());
 
+// WebKitGTK and WebView2 draw a `title` as the desktop's own tooltip, in its
+// theme rather than the panel's: an in-panel one in the menus' look replaces
+// it there. The owner's title moves to `data-tooltip` while the pointer is on
+// it, so that the native one never shows, and comes back as it leaves.
+if (!document.documentElement.classList.contains("macos")) {
+  const tip = document.createElement("div");
+  tip.className = "tooltip";
+  tip.setAttribute("aria-hidden", "true");
+  document.body.append(tip);
+  let owner = null;
+  let timer;
+  const claim = (node) => {
+    const text = node.getAttribute("title");
+    if (text === null) return;
+    node.dataset.tooltip = text;
+    node.removeAttribute("title");
+  };
+  // A title set while the pointer is on its owner, as a route name's is.
+  new MutationObserver(() => {
+    if (owner?.hasAttribute("title")) claim(owner);
+  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["title"] });
+  const hide = () => {
+    clearTimeout(timer);
+    tip.classList.remove("shown");
+    if (!owner) return;
+    if (!owner.hasAttribute("title")) owner.setAttribute("title", owner.dataset.tooltip);
+    delete owner.dataset.tooltip;
+    owner = null;
+  };
+  // Below its owner, or above it near the panel's bottom; kept inside.
+  const show = () => {
+    if (!owner?.isConnected || !owner.dataset.tooltip) return hide();
+    tip.textContent = owner.dataset.tooltip;
+    tip.classList.add("shown");
+    const bounds = owner.getBoundingClientRect();
+    const panel = $("panel").getBoundingClientRect();
+    const center = bounds.left + bounds.width / 2 - tip.offsetWidth / 2;
+    const left = Math.min(center, panel.right - tip.offsetWidth - 6);
+    const below = bounds.bottom + 4;
+    const top = below + tip.offsetHeight <= panel.bottom - 6 ? below : bounds.top - tip.offsetHeight - 4;
+    tip.style.left = `${Math.max(panel.left + 6, left)}px`;
+    tip.style.top = `${Math.max(panel.top + 6, top)}px`;
+  };
+  document.addEventListener("pointerover", (event) => {
+    const node = event.target.closest?.("[title], [data-tooltip]");
+    if (node === owner) return;
+    hide();
+    if (!node || !node.getAttribute("title")) return;
+    owner = node;
+    claim(node);
+    timer = setTimeout(show, 600);
+  });
+  document.addEventListener("pointerout", (event) => {
+    if (!event.relatedTarget) hide();
+  });
+  for (const type of ["pointerdown", "keydown", "wheel", "blur"]) window.addEventListener(type, hide, true);
+}
+
 function trafficRangeSelect(id, selected, label) {
   return panelSelect(id, TRAFFIC_RANGES.map(([minutes, text]) => [minutes, `Last ${text}`]), selected, label, "traffic-range");
 }
