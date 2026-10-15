@@ -358,7 +358,7 @@ target/release/coport --config config.yaml
 ```
 
 `--check` validates configuration and enabled credential sources, not network
-reachability. Stop with Ctrl-C or SIGTERM.
+reachability. Stop with Ctrl-C, SIGTERM or, on Windows, Ctrl-Break.
 
 ## Command-line configuration overrides
 

@@ -15,6 +15,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+}
+#[cfg(windows)]
+const CTRL_BREAK_EVENT: u32 = 1;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+
 pub fn binary() -> PathBuf {
     std::env::var_os("COPORT_BINARY")
         .map(PathBuf::from)
@@ -145,6 +157,9 @@ impl App {
             .envs(&self.env)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Its own process group, so that Ctrl+Break stops it alone.
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         cmd
     }
     pub fn restart(&mut self) {
@@ -171,7 +186,13 @@ impl App {
                 unsafe {
                     libc::kill(child.id() as i32, libc::SIGTERM);
                 }
-                #[cfg(not(unix))]
+                // Stopped gracefully, as SIGTERM does, so that it drains the
+                // records its log worker has accepted; a kill would lose them.
+                #[cfg(windows)]
+                if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) } == 0 {
+                    child.kill().unwrap();
+                }
+                #[cfg(not(any(unix, windows)))]
                 child.kill().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while child.try_wait().unwrap().is_none() {
