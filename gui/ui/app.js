@@ -1113,20 +1113,34 @@ window.addEventListener("resize", () => closeSelect());
 
 // WebKitGTK and WebView2 draw a `title` as the desktop's own tooltip, in its
 // theme rather than the panel's: an in-panel one in the menus' look replaces
-// it there. The owner's title moves to `data-tooltip` while the pointer is on
-// it, so that the native one never shows, and comes back as it leaves.
+// it there. The owner's title, or an SVG shape's <title>, moves to
+// `data-tooltip` while the pointer is on it, so that the native one never
+// shows, and comes back as it leaves.
 if (!document.documentElement.classList.contains("macos")) {
   const tip = document.createElement("div");
   tip.className = "tooltip";
   tip.setAttribute("aria-hidden", "true");
   document.body.append(tip);
   let owner = null;
+  let shape = null;
   let timer;
+  const shapeTitle = (node) => node instanceof SVGElement && node.querySelector(":scope > title");
+  const titled = (node) => {
+    for (; node instanceof Element; node = node.parentElement)
+      if (node.hasAttribute("title") || node.dataset.tooltip !== undefined || shapeTitle(node)) return node;
+    return null;
+  };
   const claim = (node) => {
     const text = node.getAttribute("title");
-    if (text === null) return;
-    node.dataset.tooltip = text;
-    node.removeAttribute("title");
+    if (text !== null) {
+      node.dataset.tooltip = text;
+      node.removeAttribute("title");
+      return;
+    }
+    shape = shapeTitle(node);
+    if (!shape) return;
+    node.dataset.tooltip = shape.textContent;
+    shape.remove();
   };
   // A title set while the pointer is on its owner, as a route name's is.
   new MutationObserver(() => {
@@ -1136,9 +1150,11 @@ if (!document.documentElement.classList.contains("macos")) {
     clearTimeout(timer);
     tip.classList.remove("shown");
     if (!owner) return;
-    if (!owner.hasAttribute("title")) owner.setAttribute("title", owner.dataset.tooltip);
+    if (shape) owner.prepend(shape);
+    else if (!owner.hasAttribute("title")) owner.setAttribute("title", owner.dataset.tooltip);
     delete owner.dataset.tooltip;
     owner = null;
+    shape = null;
   };
   // Below its owner, or above it near the panel's bottom; kept inside.
   const show = () => {
@@ -1155,10 +1171,10 @@ if (!document.documentElement.classList.contains("macos")) {
     tip.style.top = `${Math.max(panel.top + 6, top)}px`;
   };
   document.addEventListener("pointerover", (event) => {
-    const node = event.target.closest?.("[title], [data-tooltip]");
+    const node = titled(event.target);
     if (node === owner) return;
     hide();
-    if (!node || !node.getAttribute("title")) return;
+    if (!node || !(node.getAttribute("title") || shapeTitle(node)?.textContent)) return;
     owner = node;
     claim(node);
     timer = setTimeout(show, 600);

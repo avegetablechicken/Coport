@@ -1359,23 +1359,13 @@ details.disclosure[open] summary svg {
 .route-warning svg { width: 100%; height: 100%; }
 .route-warning[data-tip]::after, .credential-warning[data-tip]::after { content: none; }
 .credential-warning { cursor: help; }
-/* Outside the scrolling panel; JS keeps all edges inside the viewport. */
+/* Outside the scrolling panel; JS keeps all edges inside the viewport. Its
+   look is the in-panel tooltip's, with the menus' material (below). */
 .route-tooltip {
-  position: fixed;
-  z-index: 100;
   width: max-content;
   max-width: min(240px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
-  overflow-y: auto;
-  padding: 4px 7px;
-  border-radius: 3px;
-  background: var(--window);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16), 0 0 0 0.5px var(--separator);
-  color: var(--secondary);
-  font-size: 10px;
-  line-height: 1.45;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 .route-destination { flex: 0 1 auto; min-width: 0; max-width: 55%; text-align: right; }
 .route-destination .chain { display: flex; flex-wrap: wrap; gap: 3px; padding: 3px 0; }
@@ -1409,7 +1399,8 @@ details.disclosure[open] summary svg {
    from the top edge, a bright hairline rim and a soft shadow. Position, size
    and type are those of Coport's menu. */
 .select-menu,
-.tooltip {
+.tooltip,
+.route-tooltip {
   --menu-tint: rgba(255, 255, 255, 0.42);
   --menu-sheen: rgba(255, 255, 255, 0.55);
   --menu-rim: rgba(255, 255, 255, 0.7);
@@ -1434,7 +1425,8 @@ details.disclosure[open] summary svg {
 
 @media (prefers-color-scheme: dark) {
   .select-menu,
-  .tooltip {
+  .tooltip,
+  .route-tooltip {
     --menu-tint: rgba(36, 36, 40, 0.42);
     --menu-sheen: rgba(255, 255, 255, 0.12);
     --menu-rim: rgba(255, 255, 255, 0.28);
@@ -1449,7 +1441,8 @@ details.disclosure[open] summary svg {
    blur, which leaves the panel showing through: an opaque menu instead, as
    those desktops draw theirs. */
 html:not(.macos) .select-menu,
-html:not(.macos) .tooltip {
+html:not(.macos) .tooltip,
+html:not(.macos) .route-tooltip {
   --menu-sheen: transparent;
   --menu-tint: #ffffff;
   -webkit-backdrop-filter: none;
@@ -1458,7 +1451,8 @@ html:not(.macos) .tooltip {
 
 @media (prefers-color-scheme: dark) {
   html:not(.macos) .select-menu,
-  html:not(.macos) .tooltip {
+  html:not(.macos) .tooltip,
+  html:not(.macos) .route-tooltip {
     --menu-tint: #353538;
   }
 }
@@ -1467,7 +1461,8 @@ html:not(.macos) .tooltip {
    screen, fixed to the window, under a denser tint. */
 html.frosted .select-menu,
 html.frosted .range-editor,
-html.frosted .tooltip {
+html.frosted .tooltip,
+html.frosted .route-tooltip {
   --menu-sheen: rgba(255, 255, 255, 0.5);
   --menu-tint: rgba(246, 246, 246, 0.78);
   background:
@@ -1480,7 +1475,8 @@ html.frosted .tooltip {
 @media (prefers-color-scheme: dark) {
   html.frosted .select-menu,
   html.frosted .range-editor,
-  html.frosted .tooltip {
+  html.frosted .tooltip,
+  html.frosted .route-tooltip {
     --menu-sheen: rgba(255, 255, 255, 0.1);
     --menu-tint: rgba(44, 44, 48, 0.8);
   }
@@ -1491,7 +1487,8 @@ html.frosted .tooltip {
    when that includes brightness(). */
 html.linux.composited .select-menu,
 html.linux.composited .range-editor,
-html.linux.composited .tooltip {
+html.linux.composited .tooltip,
+html.linux.composited .route-tooltip {
   --menu-sheen: rgba(255, 255, 255, 0.55);
   --menu-tint: rgba(255, 255, 255, 0.42);
   background:
@@ -1504,26 +1501,31 @@ html.linux.composited .tooltip {
 @media (prefers-color-scheme: dark) {
   html.linux.composited .select-menu,
   html.linux.composited .range-editor,
-  html.linux.composited .tooltip {
+  html.linux.composited .tooltip,
+  html.linux.composited .route-tooltip {
     --menu-sheen: rgba(255, 255, 255, 0.12);
     --menu-tint: rgba(36, 36, 40, 0.42);
   }
 }
 
 /* The in-panel tooltip that replaces the desktop's own for a `title` off
-   macOS (app.js), in the menus' material above, at the panel's type size. */
-.tooltip {
+   macOS (app.js), and the charts' and routes' tooltip, in the menus'
+   material above, at the panel's type size. */
+.tooltip,
+.route-tooltip {
   --menu-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 4px 12px rgba(0, 0, 0, 0.18);
-  z-index: 200;
-  overflow: hidden;
-  max-width: 240px;
   padding: 3px 7px;
   border-radius: 6px;
   color: var(--label);
   font-size: 11px;
   line-height: 1.35;
-  white-space: pre-line;
   overflow-wrap: anywhere;
+}
+.tooltip {
+  z-index: 200;
+  overflow: hidden;
+  max-width: 240px;
+  white-space: pre-line;
   pointer-events: none;
   opacity: 0;
   visibility: hidden;
