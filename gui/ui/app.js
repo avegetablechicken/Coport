@@ -910,8 +910,9 @@ document.addEventListener("pointerover", (event) => {
   }
 });
 
-// Render account warnings and bar details outside the scrolling panel,
-// keeping tooltips inside the viewport.
+// Render every `data-tip` (controls, notes, account warnings and bar details)
+// outside the scrolling panel, keeping tooltips inside the viewport. Keyboard
+// focus shows one as well; a click does not.
 let routeTooltipTimer;
 let routeTooltipOwner;
 
@@ -950,15 +951,16 @@ function showRouteTooltip(owner) {
 
 for (const type of ["pointerover", "focusin"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning, .credential-warning, .chart-bar");
+    const owner = event.target.closest?.(".chart-bar, [data-tip]");
+    if (type === "focusin" && !owner?.matches(":focus-visible")) return;
     if (owner) showRouteTooltip(owner);
   });
 }
 for (const type of ["pointerout", "focusout"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".route-warning, .credential-warning, .chart-bar");
+    const owner = event.target.closest?.(".chart-bar, [data-tip]");
     if (!owner || owner.contains(event.relatedTarget)) return;
-    if (type === "pointerout" && document.activeElement === owner) return;
+    if (type === "pointerout" && owner.matches(":focus-visible")) return;
     if (type === "focusout" && owner.matches(":hover")) return;
     hideRouteTooltip();
   });
@@ -967,6 +969,7 @@ document.addEventListener("scroll", (event) => {
   if (event.target !== $("route-tooltip")) hideRouteTooltip();
 }, true);
 window.addEventListener("resize", hideRouteTooltip);
+window.addEventListener("pointerdown", hideRouteTooltip, true);
 
 function routingBlock() {
   const s = ui.snap;
@@ -1113,9 +1116,10 @@ window.addEventListener("resize", () => closeSelect());
 
 // WebKitGTK and WebView2 draw a `title` as the desktop's own tooltip, in its
 // theme rather than the panel's: an in-panel one in the menus' look replaces
-// it there. The owner's title, or an SVG shape's <title>, moves to
-// `data-tooltip` while the pointer is on it, so that the native one never
-// shows, and comes back as it leaves.
+// it there. While the pointer is on an element, its title and every
+// ancestor's move to `data-tooltip`, and an SVG shape's <title> is detached,
+// so that no native one shows, not even an ancestor's in their place; they
+// come back as it leaves. A `data-tip` shows the route tooltip instead.
 if (!document.documentElement.classList.contains("macos")) {
   const tip = document.createElement("div");
   tip.className = "tooltip";
@@ -1123,61 +1127,68 @@ if (!document.documentElement.classList.contains("macos")) {
   document.body.append(tip);
   let owner = null;
   let shape = null;
+  let held = [];
   let timer;
   const shapeTitle = (node) => node instanceof SVGElement && node.querySelector(":scope > title");
+  const routed = (node) => node.matches(".chart-bar, [data-tip]");
   const titled = (node) => {
     for (; node instanceof Element; node = node.parentElement)
-      if (node.hasAttribute("title") || node.dataset.tooltip !== undefined || shapeTitle(node)) return node;
+      if (routed(node) || node.hasAttribute("title") || node.dataset.tooltip !== undefined || shapeTitle(node)) return node;
     return null;
   };
-  const claim = (node) => {
-    const text = node.getAttribute("title");
-    if (text !== null) {
+  const hold = (node) => {
+    for (; node instanceof Element; node = node.parentElement) {
+      const text = node.getAttribute("title");
+      if (text === null) continue;
       node.dataset.tooltip = text;
       node.removeAttribute("title");
-      return;
+      if (!held.includes(node)) held.push(node);
     }
-    shape = shapeTitle(node);
-    if (!shape) return;
-    node.dataset.tooltip = shape.textContent;
-    shape.remove();
   };
   // A title set while the pointer is on its owner, as a route name's is.
   new MutationObserver(() => {
-    if (owner?.hasAttribute("title")) claim(owner);
+    if (owner) hold(owner);
   }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["title"] });
   const hide = () => {
     clearTimeout(timer);
     tip.classList.remove("shown");
-    if (!owner) return;
-    if (shape) owner.prepend(shape);
-    else if (!owner.hasAttribute("title")) owner.setAttribute("title", owner.dataset.tooltip);
-    delete owner.dataset.tooltip;
-    owner = null;
-    shape = null;
+    if (shape) {
+      owner.prepend(shape);
+      delete owner.dataset.tooltip;
+    }
+    for (const node of held) {
+      if (!node.hasAttribute("title")) node.setAttribute("title", node.dataset.tooltip);
+      delete node.dataset.tooltip;
+    }
+    owner = shape = null;
+    held = [];
   };
-  // Below its owner, or above it near the panel's bottom; kept inside.
+  // Placed as the route tooltip is, which shows every `data-tip`.
   const show = () => {
     if (!owner?.isConnected || !owner.dataset.tooltip) return hide();
     tip.textContent = owner.dataset.tooltip;
     tip.classList.add("shown");
-    const bounds = owner.getBoundingClientRect();
-    const panel = $("panel").getBoundingClientRect();
-    const center = bounds.left + bounds.width / 2 - tip.offsetWidth / 2;
-    const left = Math.min(center, panel.right - tip.offsetWidth - 6);
-    const below = bounds.bottom + 4;
-    const top = below + tip.offsetHeight <= panel.bottom - 6 ? below : bounds.top - tip.offsetHeight - 4;
-    tip.style.left = `${Math.max(panel.left + 6, left)}px`;
-    tip.style.top = `${Math.max(panel.top + 6, top)}px`;
+    const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
   };
   document.addEventListener("pointerover", (event) => {
     const node = titled(event.target);
     if (node === owner) return;
     hide();
-    if (!node || !(node.getAttribute("title") || shapeTitle(node)?.textContent)) return;
+    if (!node) return;
     owner = node;
-    claim(node);
-    timer = setTimeout(show, 600);
+    if (!routed(node) && !node.hasAttribute("title")) {
+      shape = shapeTitle(node) || null;
+      if (shape) {
+        node.dataset.tooltip = shape.textContent;
+        shape.remove();
+      }
+    }
+    hold(node);
+    if (routed(node) || !node.dataset.tooltip) return;
+    // A ring's slices answer as quickly as a chart's bars.
+    timer = setTimeout(show, shape ? 100 : 500);
   });
   document.addEventListener("pointerout", (event) => {
     if (!event.relatedTarget) hide();

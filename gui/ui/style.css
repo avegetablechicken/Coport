@@ -399,8 +399,6 @@ select:focus-visible {
   pointer-events: all;
 }
 
-.chart-bar[data-tip]::after { content: none; }
-
 /* ------------------------------------------------------------------- rows */
 
 .row {
@@ -1079,49 +1077,6 @@ details.disclosure[open] summary svg {
   transform: translate(-50%, 0);
 }
 
-/* Tooltips, as in eul: small secondary text on a control-colored box. */
-[data-tip] {
-  position: relative;
-}
-
-[data-tip]:hover::after {
-  content: attr(data-tip);
-  position: absolute;
-  z-index: 10;
-  bottom: calc(100% + 4px);
-  right: 0;
-  padding: 2px 6px;
-  border-radius: 3px;
-  background: var(--window);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16), 0 0 0 0.5px var(--separator);
-  color: var(--secondary);
-  font-size: 10.5px;
-  font-weight: 400;
-  white-space: nowrap;
-  pointer-events: none;
-  animation: tip-in 1ms linear 500ms both;
-}
-
-/* Multi-line configuration details, anchored to the label's leading edge. */
-.tip-wide[data-tip]:hover::after {
-  left: 0;
-  right: auto;
-  width: max-content;
-  max-width: 300px;
-  padding: 4px 7px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 10px;
-  line-height: 1.45;
-}
-
-@keyframes tip-in {
-  from {
-    opacity: 0;
-  }
-}
-
 /* ------------------------------------------------------------- proxy tags */
 
 /* Each proxy's color label, used wherever the proxy is named. */
@@ -1247,15 +1202,6 @@ details.disclosure[open] summary svg {
   color: var(--secondary);
 }
 
-.row.proxy .dot[data-tip]:hover::after {
-  left: 0;
-  right: auto;
-  width: max-content;
-  max-width: 280px;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-
 /* Per-credential activity history. */
 .traffic-range { margin-left: auto; width: auto; max-width: 145px; font-size: 11px; }
 .credential-traffic { border-top: 1px solid var(--separator); padding-top: 9px; margin-top: 9px; }
@@ -1297,23 +1243,12 @@ details.disclosure[open] summary svg {
 .share-item.muted i { box-shadow: inset 0 0 0 1px var(--tertiary); }
 .share-service span, .share-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .share-item span:last-child { color: var(--secondary); }
-/* Explanatory notes kept out of the layout; opens downward so the first block is not clipped. */
+/* Explanatory notes kept out of the layout. */
 .info-tip { display: inline-grid; place-items: center; width: 16px; height: 16px; margin-left: -4px; color: var(--tertiary); cursor: default; }
 .info-tip:hover { color: var(--secondary); }
 .info-tip svg { width: 12px; height: 12px; }
 .stat-tip { width: 12px; height: 12px; margin-left: 2px; vertical-align: -2px; }
 .stat-tip svg { width: 11px; height: 11px; }
-.stat-tip[data-tip]:hover::after { left: -60px; width: max-content; max-width: 220px; }
-.info-tip[data-tip]:hover::after {
-  top: calc(100% + 4px);
-  bottom: auto;
-  left: -40px;
-  right: auto;
-  width: 250px;
-  padding: 5px 8px;
-  white-space: pre-line;
-  line-height: 1.45;
-}
 .traffic-axis { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; color: var(--secondary); font-size: 10px; margin-top: 8px; }
 .traffic-axis > :nth-child(2) { text-align: center; white-space: nowrap; }
 .traffic-axis > :last-child { text-align: right; }
@@ -1357,7 +1292,6 @@ details.disclosure[open] summary svg {
 .route-activation { flex: none; font-size: 10px; }
 .route-warning { display: inline-flex; width: 14px; height: 14px; color: var(--tertiary); cursor: help; }
 .route-warning svg { width: 100%; height: 100%; }
-.route-warning[data-tip]::after, .credential-warning[data-tip]::after { content: none; }
 .credential-warning { cursor: help; }
 /* Outside the scrolling panel; JS keeps all edges inside the viewport. Its
    look is the in-panel tooltip's, with the menus' material (below). */
