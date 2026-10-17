@@ -24,6 +24,8 @@ pub struct Settings {
     data_sources: Vec<crate::data_client::Source>,
     pub start_proxy_on_launch: bool,
     pub keep_proxy_running_on_quit: bool,
+    /// Show only part of an account email or ID in traffic and routing.
+    pub mask_account_names: bool,
     /// The proxy CA notice the user chose to keep the current CA for; the
     /// warning returns when the notice changes.
     pub kept_proxy_ca: Vec<String>,
@@ -38,6 +40,7 @@ impl Default for Settings {
             data_sources: Vec::new(),
             start_proxy_on_launch: true,
             keep_proxy_running_on_quit: false,
+            mask_account_names: true,
             kept_proxy_ca: Vec::new(),
         }
     }
@@ -197,6 +200,19 @@ mod tests {
         assert!(settings.appearance == Appearance::Dark);
         let saved = serde_json::to_value(&settings).unwrap();
         assert!(saved.get("config_path").is_none() && saved.get("log_path").is_none());
+    }
+
+    #[test]
+    fn account_names_are_masked_by_default_and_can_be_shown_in_full() {
+        let settings: Settings = serde_json::from_str(r#"{"appearance":"Dark"}"#).unwrap();
+        assert!(settings.mask_account_names);
+        let shown = Settings {
+            mask_account_names: false,
+            ..settings
+        };
+        let restored: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&shown).unwrap()).unwrap();
+        assert!(!restored.mask_account_names);
     }
 
     #[test]

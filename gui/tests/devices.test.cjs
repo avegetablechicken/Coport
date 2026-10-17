@@ -114,11 +114,13 @@ test('configuration lives in Settings and Settings loading makes no remote reque
 test('Settings places forwarding immediately after SSH device configuration', () => {
   const code = source.slice(source.indexOf('function settings()'), source.indexOf('/// The fixed configuration'));
   const rendered = vm.runInNewContext(code + '\nsettings()', {
-    ui: { snap: { settings: {} } }, ICON: {}, panelSelect: () => '',
-    block: title => `[${title}]`, configSettings: () => '[Network]', filesBlock: () => '[Files]', forwardingSettings: () => '[Request forwarding]', deviceSettings: () => '[Devices]',
+    ui: { snap: { settings: { maskAccountNames: false } } }, ICON: {}, panelSelect: () => '',
+    block: (title, aside, body) => (title === 'General' ? body : `[${title}]`), configSettings: () => '[Network]', filesBlock: () => '[Files]', forwardingSettings: () => '[Request forwarding]', deviceSettings: () => '[Devices]',
   });
   assert.ok(rendered.includes('[Files]\n    [Devices]\n    [Request forwarding]'));
   assert.ok(rendered.trim().endsWith('[Request forwarding]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
+  assert.match(rendered, /Mask account names/);
+  assert.match(rendered, /aria-checked="false" data-action="mask-account-names"/);
 });
 
 test('each device renders full Traffic metrics and an offline peer leaves other devices visible', () => {

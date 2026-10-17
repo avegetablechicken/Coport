@@ -37,6 +37,23 @@ test('Account emails and IDs are shortened for display', () => {
   // Configuration names and aliases stay readable.
   for (const name of ['work', 'default', 'Unidentified']) assert.equal(maskAccountName(name), name);
 });
+test('turning the setting off shows full account names', () => {
+  const context = setup('all');
+  context.ui.snap = { settings: { maskAccountNames: false } };
+  assert.equal(context.maskAccountName('suzhi2333@gmail.com'), 'suzhi2333@gmail.com');
+  assert.match(context.trafficShare([credential('suzhi2333@gmail.com', 1)], 'all', 'local'), /suzhi2333@gmail\.com/);
+});
+test('changing the setting redraws cached traffic markup', () => {
+  const context = setup('all');
+  loadSharedViews(context);
+  Object.assign(context, { chart: () => '<chart>', stat: () => '', fmtMs: String, fmtBytes: String, modelTokenStats: () => '' });
+  const view = { requests: 1, errors: 0, credentials: [credential('suzhi2333@gmail.com', 1)], start: 0, end: 60000, bucketMinutes: 1 };
+  context.ui.snap = { settings: { maskAccountNames: true } };
+  assert.match(context.trafficSummary(view, 'all'), /su\*\*\*3@gmail\.com/);
+  context.ui.snap.settings.maskAccountNames = false;
+  assert.match(context.trafficSummary(view, 'all'), /suzhi2333@gmail\.com/);
+  assert.doesNotMatch(context.trafficSummary(view, 'all'), /su\*\*\*3/);
+});
 test('Traffic rings shorten account emails on every page', () => {
   const { trafficShare } = setup();
   const credentials = [credential('suzhi2333@gmail.com', 3), credential('work', 2)];

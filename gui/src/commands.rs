@@ -379,6 +379,7 @@ pub struct SettingsPatch {
     appearance: Option<Appearance>,
     start_proxy_on_launch: Option<bool>,
     keep_proxy_running_on_quit: Option<bool>,
+    mask_account_names: Option<bool>,
 }
 
 #[tauri::command]
@@ -394,6 +395,9 @@ pub fn update_settings(app: AppHandle, state: State<AppState>, patch: SettingsPa
         }
         if let Some(keep_running) = patch.keep_proxy_running_on_quit {
             core.settings.keep_proxy_running_on_quit = keep_running;
+        }
+        if let Some(mask) = patch.mask_account_names {
+            core.settings.mask_account_names = mask;
         }
         core.settings.save();
     }

@@ -461,6 +461,7 @@ impl Core {
                 appearance: self.settings.appearance,
                 start_proxy_on_launch: self.settings.start_proxy_on_launch,
                 keep_proxy_running_on_quit: self.settings.keep_proxy_running_on_quit,
+                mask_account_names: self.settings.mask_account_names,
                 launch_at_login: self.launch_at_login,
                 log_bytes: std::fs::metadata(self.logs.path()).ok().map(|m| m.len()),
                 traffic_compatibility: TrafficCompatibilityDto::read(),
@@ -896,6 +897,7 @@ struct SettingsDto {
     appearance: crate::settings::Appearance,
     start_proxy_on_launch: bool,
     keep_proxy_running_on_quit: bool,
+    mask_account_names: bool,
     launch_at_login: bool,
     /// Size of the request log in use, if it exists yet.
     log_bytes: Option<u64>,

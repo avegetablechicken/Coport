@@ -574,7 +574,7 @@ function chart(stats, scope, showPeak = false, window = stats) {
 /// a page change carries it over to the same traffic on the next page.
 const trafficMarkup = new WeakMap();
 function trafficSummary(view, scope, window = view, source = "") {
-  const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}|${source}`;
+  const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}|${source}|${accountNamesMasked()}`;
   const cached = trafficMarkup.get(view);
   if (cached?.key === key) return cached.html;
   let rate = "—";
@@ -1258,9 +1258,15 @@ function modelTokenStats(stats, scope) {
 const SHARE_SERVICES = ["Codex", "Claude"];
 const SHARE_SHADES = 4;
 
+/// Settings may show account names in full; masking is the default.
+function accountNamesMasked() {
+  return ui.snap?.settings?.maskAccountNames !== false;
+}
+
 /// Traffic views hide part of an account name. An email keeps its domain, and
 /// an account ID keeps its ends; configuration names stay readable.
 function maskAccountName(name) {
+  if (!accountNamesMasked()) return name;
   const at = name.indexOf("@");
   if (at > 0 && at < name.length - 1) {
     const local = Array.from(name.slice(0, at));
@@ -2069,7 +2075,9 @@ function settings() {
        <div class="row"><span class="row-label">Keep proxy running after quit<span class="setting-description" id="keep-running-description">Quit exits the app; the proxy keeps running.<br>Reopen to manage or stop the proxy.</span></span>
          <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" aria-describedby="keep-running-description"></button></div>
        <div class="row"><span class="row-label">Appearance</span>
-         ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
+         ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>
+       <div class="row"><span class="row-label">Mask account names<span class="setting-description" id="mask-account-names-description">Show only part of an account email or ID in traffic and routing.</span></span>
+         <button class="switch" role="switch" aria-checked="${set.maskAccountNames}" data-action="mask-account-names" aria-label="Mask account names" aria-describedby="mask-account-names-description"></button></div>`
     )}
     ${configSettings()}
     ${filesBlock()}
@@ -2708,6 +2716,10 @@ async function act(action, el) {
       break;
     case "keep-running":
       await invoke("update_settings", { patch: { keepProxyRunningOnQuit: el.getAttribute("aria-checked") !== "true" } });
+      await refresh();
+      break;
+    case "mask-account-names":
+      await invoke("update_settings", { patch: { maskAccountNames: el.getAttribute("aria-checked") !== "true" } });
       await refresh();
       break;
     case "config-flag":
