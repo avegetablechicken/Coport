@@ -21,6 +21,52 @@ function loadSharedViews(context) {
 function loadHome(context) {
   vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nfunction trafficBlock(')), context);
 }
+test('Account emails and IDs are shortened for display', () => {
+  const { maskAccountName } = setup();
+  for (const [name, masked] of [
+    ['suzhi2333@gmail.com', 'su***3@gmail.com'],
+    ['alice@example.com', 'al***e@example.com'],
+    ['abc@example.com', 'a***c@example.com'],
+    ['ab@example.com', 'a***@example.com'],
+    ['a@example.com', '***@example.com'],
+    ['12345678-1234-4234-8234-123456789abc', '12345678…9abc'],
+  ]) {
+    assert.equal(maskAccountName(name), masked);
+    assert.notEqual(maskAccountName(name), name);
+  }
+  // Configuration names and aliases stay readable.
+  for (const name of ['work', 'default', 'Unidentified']) assert.equal(maskAccountName(name), name);
+});
+test('Traffic rings shorten account emails on every page', () => {
+  const { trafficShare } = setup();
+  const credentials = [credential('suzhi2333@gmail.com', 3), credential('work', 2)];
+  const html = trafficShare(credentials, 'all', 'local');
+  assert.match(html, /<span>su\*\*\*3@gmail\.com<\/span>/);
+  assert.match(html, /<span>work<\/span>/);
+  assert.doesNotMatch(html, /suzhi2333@gmail\.com/);
+});
+test('Activity Traffic shortens account emails in its rows and ring', () => {
+  const context = setup('all');
+  const el = { innerHTML: '', setAttribute() {} };
+  Object.assign(context, {
+    ui: { trafficScope: 'all', traffic: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
+      credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
+    openSelect: null, closeSelect() {}, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
+    trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
+    fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
+  });
+  vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
+  context.renderActivityTraffic();
+  assert.match(el.innerHTML, /<strong>su\*\*\*3@gmail\.com<\/strong>/);
+  assert.doesNotMatch(el.innerHTML, /suzhi2333@gmail\.com/);
+});
+test('Home Routing hides part of an account email', () => {
+  const context = setup();
+  vm.runInContext(source.slice(source.indexOf('function routeIdentity('), source.indexOf('function routingChain(')), context);
+  assert.equal(context.routeIdentity('suzhi2333@gmail.com', 'account').name, 'su***3@gmail.com');
+  assert.equal(context.routeIdentity('default', 'account').name, 'default');
+  assert.equal(context.routeIdentity('suzhi2333@gmail.com', 'provider').name, 'suzhi2333@gmail.com');
+});
 test('groups by service with one hue each and keeps unidentified last', () => {
   const { shareGroups } = setup();
   const groups = shareGroups([credential('Unidentified', 50), credential('a', 10), credential('b', 30, 'Claude'), credential('c', 20), credential('idle', 0)], requests);
@@ -387,6 +433,21 @@ test('home traffic draws the share ring above its chart', () => {
   context.ui.homeTraffic = { ...context.ui.homeTraffic };
   delete context.ui.homeTraffic.credentials;
   assert.doesNotMatch(context.trafficBlock(), /traffic-share/);
+});
+test('Home Traffic hides part of an account email while configuration names stay readable', () => {
+  const context = setup('all');
+  const stats = (requests) => ({ requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0] });
+  context.ui.homeTraffic = { ...stats(4), avgMs: 10, start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [
+    { service: 'Codex', credential: 'suzhi2333@gmail.com', ...stats(3) },
+    { service: 'Codex', credential: 'work', ...stats(1) },
+  ] };
+  Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
+  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  const html = context.trafficBlock();
+  assert.match(html, /<span>su\*\*\*3@gmail\.com<\/span>/);
+  assert.match(html, /<span>work<\/span>/);
+  assert.doesNotMatch(html, /suzhi2333@gmail\.com/);
 });
 test('forwarding Home reads the destination from the daemon cache, never local history', async () => {
   const calls = [];

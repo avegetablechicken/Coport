@@ -851,11 +851,11 @@ const ROUTE_ICON = {
   file: svg('<path d="M14 3H6v18h12V7zM14 3v5h4M9 12h6M9 16h6"/>'),
 };
 
-// Presentation only: full selectors remain intact in configuration and tooltips.
+// Presentation only: selectors remain intact in configuration. Account names
+// are shown shortened so the panel does not reveal a full identity.
 function routeIdentity(selector, source) {
   if (source === "account") {
-    const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(selector);
-    return { name: uuid ? `${selector.slice(0, 8)}…${selector.slice(-4)}` : selector, kind: "account", type: "Account" };
+    return { name: maskAccountName(selector), kind: "account", type: "Account" };
   }
   if (source === "provider" || source === "profile") {
     return { name: selector, kind: "proxy", type: source === "provider" ? "Provider configuration" : "Profile configuration" };
@@ -888,7 +888,7 @@ function routingRow(route, account, fileOnly = false) {
       + (needsWarning ? `<span class="route-activation route-warning tip-wide" tabindex="0" role="img" aria-label="${esc(warning)}" data-tip="${esc(warning)}">${ICON.warning}</span>` : "");
   if (account || route.kind === "api_key") {
     return `<div class="route-summary route-static">
-      <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(route.selector)}">${esc(identity.name)}</span>${activation}</span>
+      <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(identity.name)}">${esc(identity.name)}</span>${activation}</span>
       <span class="route-destination">${routingChain(route.proxies)}</span>
     </div>`;
   }
@@ -1258,6 +1258,23 @@ function modelTokenStats(stats, scope) {
 const SHARE_SERVICES = ["Codex", "Claude"];
 const SHARE_SHADES = 4;
 
+/// Traffic views hide part of an account name. An email keeps its domain, and
+/// an account ID keeps its ends; configuration names stay readable.
+function maskAccountName(name) {
+  const at = name.indexOf("@");
+  if (at > 0 && at < name.length - 1) {
+    const local = Array.from(name.slice(0, at));
+    if (local.length <= 1) return `***@${name.slice(at + 1)}`;
+    const head = local.length >= 5 ? local.slice(0, 2).join("") : local[0];
+    const tail = local.length >= 3 ? local[local.length - 1] : "";
+    return `${head}***${tail}@${name.slice(at + 1)}`;
+  }
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(name)) {
+    return `${name.slice(0, 8)}…${name.slice(-4)}`;
+  }
+  return name;
+}
+
 /// Credentials grouped by app, Codex then Claude, each group in its hue; traffic
 /// has no other service. `measure` gives a credential's amount, or null when it
 /// is unknown. Each credential takes a shade while they fit; beyond that the
@@ -1265,16 +1282,17 @@ const SHARE_SHADES = 4;
 /// requests come last; Others and unidentified are drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
+  const displayName = (c) => maskAccountName(c.credential);
   const used = credentials.filter((c) => c.requests > 0);
   return SHARE_SERVICES.filter((service) => used.some((c) => c.service === service)).map((service) => {
     const own = used.filter((c) => c.service === service);
     const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
     const hue = service.toLowerCase();
     const shown = named.length > SHARE_SHADES ? SHARE_SHADES - 1 : named.length;
-    const slices = named.slice(0, shown).map((c, i) => ({ name: c.credential, value: measure(c), color: `--${hue}-${i + 1}` }));
+    const slices = named.slice(0, shown).map((c, i) => ({ name: displayName(c), value: measure(c), color: `--${hue}-${i + 1}` }));
     const rest = named.slice(shown);
     if (rest.length) {
-      const members = rest.map((c) => ({ name: c.credential, value: measure(c) }));
+      const members = rest.map((c) => ({ name: displayName(c), value: measure(c) }));
       slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true, members });
     }
     for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true, unidentified: true });
@@ -1435,7 +1453,7 @@ function renderActivityTraffic() {
   const rows = traffic?.credentials.map((c) => {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
-      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong>${trafficReview(c, traffic.targets)}</div>
+      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets)}</div>
       ${chart(c, scope, true, traffic)}
       <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
@@ -1712,7 +1730,7 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
-    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(c.credential)}</strong>${trafficReview(c, traffic.targets, scope)}</div>
+    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets, scope)}</div>
     ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
   return body;
 }

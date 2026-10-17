@@ -25,6 +25,7 @@ function harness(invoke) {
   vm.runInContext(source.slice(relabelStart,relabelEnd),context);
   // Shared traffic views, markup and merging, as every page uses them.
   vm.runInContext(source.slice(source.indexOf('const trafficMarkup = new WeakMap();'), source.indexOf('/// Home shows the forwarded device')), context);
+  vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   vm.runInContext(code, context);
@@ -183,11 +184,18 @@ test('upstream account disclosures retain per-device expansion and place rings b
   Object.assign(h, { trafficReview: () => '', chart: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
-  const traffic = { requests: 1, errors: 0, credentials: [{ credential: 'Known', service: 'Claude', requests: 1, errors: 0 }] };
+  const traffic = { requests: 2, errors: 0, credentials: [
+    { credential: 'suzhi2333@gmail.com', service: 'Claude', requests: 1, errors: 0 },
+    { credential: 'work', service: 'Claude', requests: 1, errors: 0 },
+  ] };
   events.toggle({ target: { isConnected: true, matches: () => true, dataset: { deviceTraffic: 'device/a' }, open: true } });
   let html = h.deviceTrafficContent(traffic, 'model', 'device/a');
   assert.match(html, /data-device-traffic="device\/a" open/);
   assert.ok(html.indexOf('<ring>') < html.indexOf('<chart>'));
+  // Account emails are shortened; configuration names stay readable.
+  assert.match(html, /<strong>su\*\*\*3@gmail\.com<\/strong>/);
+  assert.match(html, /<strong>work<\/strong>/);
+  assert.doesNotMatch(html, /suzhi2333@gmail\.com/);
   assert.doesNotMatch(h.deviceTrafficContent(traffic, 'model', 'device/b'), /data-device-traffic="device\/b" open/);
   events.toggle({ target: { isConnected: false, matches: () => true, dataset: { deviceTraffic: 'device/a' }, open: false } });
   assert.match(h.deviceTrafficContent(traffic, 'model', 'device/a'), /data-device-traffic="device\/a" open/);
