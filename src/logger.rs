@@ -285,6 +285,14 @@ impl FileLog {
     fn write_file(&mut self, line: &[u8]) -> bool {
         // Account for external appends periodically, not with a syscall per record.
         if self.checked.elapsed() >= Duration::from_secs(1) {
+            // A transient disk error must not disable persistent statistics forever.
+            // Separate a possibly partial previous record before resuming JSONL.
+            if self.file.is_none() {
+                self.file = open_private(&self.path).ok().and_then(|mut file| {
+                    file.write_all(b"\n").ok()?;
+                    Some(file)
+                });
+            }
             if let Some(meta) = self.file.as_ref().and_then(|f| f.metadata().ok()) {
                 self.length = meta.len();
             }
@@ -307,6 +315,7 @@ impl FileLog {
         };
         if file.write_all(line).is_err() {
             self.file = None;
+            self.checked = Instant::now();
             eprintln!("Cannot write request log; continuing with stderr logging.");
             return false;
         }
@@ -547,6 +556,36 @@ mod tests {
         let line = fallback.text();
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"event\":\"fallback\""));
+    }
+
+    #[test]
+    fn persistent_logging_recovers_after_open_or_write_failure() {
+        for fail_write in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("proxy.log");
+            let fallback = Captured::default();
+            if !fail_write {
+                std::fs::create_dir(&path).unwrap();
+            }
+            let mut sink = FileLog::new(path.clone(), Box::new(fallback.clone()), false);
+            if fail_write {
+                // A read-only handle simulates a failed write after a partial record.
+                std::fs::write(&path, b"{partial").unwrap();
+                sink.file = Some(File::open(&path).unwrap());
+            }
+            sink.write(b"{\"event\":\"fallback\"}\n");
+            assert!(fallback.text().contains("fallback"));
+            assert!(sink.file.is_none());
+            if !fail_write {
+                std::fs::remove_dir(&path).unwrap();
+            }
+            sink.checked = Instant::now() - Duration::from_secs(2);
+            sink.write(b"{\"event\":\"recovered\"}\n");
+            sink.flush().unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().last(), Some("{\"event\":\"recovered\"}"));
+            assert!(!fallback.text().contains("recovered"));
+        }
     }
 
     #[test]
