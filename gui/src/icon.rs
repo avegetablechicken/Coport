@@ -1,9 +1,11 @@
 //! Procedurally rasterized icons, so the app ships without binary assets.
 //!
 //! The glyph is a lighthouse above the water: a port that shows traffic the
-//! way out. Its beams shine while the proxy runs and go dark otherwise; the
-//! lens turns half a circle when a model call reaches its upstream. The badge
-//! is set at dusk, a clay sky over a teal sea, after Claude and Codex.
+//! way out. Its lantern is lit while the proxy runs and goes dark otherwise;
+//! the lens turns half a circle when a model call reaches its upstream. The
+//! badge's beams always shine while it is lit, the menu bar glyph's only during
+//! a turn. The badge is set at dusk, a clay sky over a teal sea, after Claude
+//! and Codex.
 
 #[cfg(target_os = "macos")]
 use coport::routing::Service;
@@ -55,7 +57,8 @@ const SWELL: Wave = Wave {
 };
 
 /// A moment of the half turn the lens makes when a model call reaches its
-/// upstream: the angle of the beams, and how strongly they take the app's color.
+/// upstream: the angle of the beams, and how strongly they take the app's color,
+/// which in the menu bar is also how brightly they shine.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Turn {
     angle: f32,
@@ -63,7 +66,8 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// The beams across the tower, as the still icon shows them.
+    /// The beams across the tower, as the still badge shows them; the still
+    /// menu bar glyph has none.
     pub const REST: Self = Self {
         angle: 0.0,
         tint: 0.0,
@@ -107,7 +111,8 @@ pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
 }
 
 /// The menu bar lighthouse in `ink`, its light taking `accent` as the turn
-/// asks: the badge's clay sky for Claude, its teal sea for Codex.
+/// asks: the badge's clay sky for Claude, its teal sea for Codex. Its beams
+/// fade in and out with the tint, so a lighthouse without model calls has none.
 #[cfg(target_os = "macos")]
 fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<u8> {
     const SCALE: f32 = 0.88;
@@ -135,7 +140,11 @@ fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<
         }
         let beams = lens.hits(gx, gy);
         let beam = |px: &mut Rgba, hit: &Hit| {
-            over(px, tinted(turn.tint * (0.6 + 0.4 * hit.glow)), hit.alpha);
+            over(
+                px,
+                tinted(turn.tint * (0.6 + 0.4 * hit.glow)),
+                hit.alpha * turn.tint,
+            );
         };
         // Beams behind the lantern pass under the tower, the rest over it.
         for hit in beams.iter().flatten().filter(|h| !h.front) {
@@ -705,6 +714,27 @@ mod tests {
             assert!(codex[2] > codex[0] + 40, "{codex:?}");
         }
         assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_beams_shine_only_during_a_turn() {
+        // Columns well clear of the tower, where only the beams can reach.
+        let beams = |rgba: &[u8]| -> u64 {
+            rgba.chunks(4)
+                .enumerate()
+                .filter(|(i, _)| (i % 44).abs_diff(22) > 9)
+                .map(|(_, px)| px[3] as u64)
+                .sum()
+        };
+        assert_eq!(beams(&template(44, Status::Running)), 0);
+        for service in [Service::Claude, Service::Codex] {
+            for dark in [false, true] {
+                assert_eq!(beams(&beacon(44, Turn::REST, service, dark)), 0);
+                assert_eq!(beams(&beacon(44, Turn::at(1.0), service, dark)), 0);
+                assert!(beams(&beacon(44, Turn::at(0.2), service, dark)) > 0);
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
