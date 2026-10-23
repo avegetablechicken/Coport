@@ -68,16 +68,22 @@ test("route failures appear only after the proxy itself is reachable", () => {
   assert.match(measured, /42 ms/);
   assert.match(measured, /203\.0\.113\.5/);
   assert.match(measured, /Route unavailable:/);
-  assert.doesNotMatch(measured, /Unreachable|Available/);
+  assert.match(measured, /dot warn/);
+  assert.doesNotMatch(measured, /dot running|Unreachable|Available/);
   const unreachable = render({ state: "error", error: "timed out" }, proxy);
   assert.match(unreachable, /Unreachable/);
   assert.match(unreachable, /timed out/);
-  assert.doesNotMatch(unreachable, /Route unavailable:/);
+  assert.match(unreachable, /dot failed/);
+  assert.doesNotMatch(unreachable, /Route unavailable:|dot warn/);
   for (const probe of [null, { state: "idle" }, { state: "unavailable" }]) {
-    assert.doesNotMatch(render(probe, proxy), /Route unavailable:|Unreachable|Available/);
+    assert.doesNotMatch(render(probe, proxy), /Route unavailable:|Unreachable|Available|dot warn/);
   }
   // Retain the destination failure so it returns after connectivity recovers.
-  assert.match(render({ state: "ok", ms: 50 }, proxy), /Route unavailable:/);
+  const recovered = render({ state: "ok", ms: 50 }, proxy);
+  assert.match(recovered, /Route unavailable:/);
+  assert.match(recovered, /dot warn/);
+  // Destinations recovering restores the available indicator.
+  assert.match(render({ state: "ok", ms: 50 }, { ...proxy, routeFailures: [] }), /dot running/);
 });
 
 test("unavailable daemon is not reported as an unreachable proxy", () => {

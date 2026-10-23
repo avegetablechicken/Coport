@@ -45,7 +45,9 @@ Configured proxies are also tested automatically at app startup, then retested
 in the background once their last result is older than two minutes, whether or
 not the panel is open. The running proxy daemon performs these tests; the app
 tests directly only when no daemon is running. Opening the panel does not trigger
-a test; use **Test** or **Test All** to run one immediately. Entering Settings reads local device definitions,
+a test; use **Test** or **Test All** to run one immediately. A reachable proxy
+whose destinations are failing the daemon's route health checks shows an amber
+indicator and lists them as **Route unavailable**. Entering Settings reads local device definitions,
 uses cached account status, and does not poll remote device statistics. Devices
 is read-only: the first visit after the app starts retrieves remote statistics
 once, showing this device immediately and each peer as it answers. Later visits

@@ -807,7 +807,9 @@ function proxiesBlock() {
         .map((p) => {
           const probe = p.probe;
           const state = probe?.state ?? "idle";
-          const dot = { ok: "running", error: "failed" }[state] ?? "";
+          // A reachable proxy with failing destinations is not fully available.
+          const routeFailing = state === "ok" && p.routeFailures?.length > 0;
+          const dot = routeFailing ? "warn" : ({ ok: "running", error: "failed" }[state] ?? "");
           let value = `<span class="faint">—</span>`;
           if (state === "pending") value = `<span class="spinner"></span>`;
           else if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
@@ -825,7 +827,7 @@ function proxiesBlock() {
             <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
             <span class="row-sub">${esc(shown)}${exit}</span>
-            ${state === "ok" && p.routeFailures?.length ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
+            ${routeFailing ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
           </div>`;
         })
         .join("")
