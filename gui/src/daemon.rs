@@ -51,6 +51,10 @@ pub struct Status {
     pub metadata_supported: bool,
     #[serde(default)]
     pub credential_checks_supported: bool,
+    /// Account states are read from local data and learned identities only;
+    /// older daemons probe upstream to answer the same query.
+    #[serde(default)]
+    pub passive_account_states_supported: bool,
     pub port: u16,
     #[serde(default)]
     pub allow_external_access: bool,
@@ -762,6 +766,7 @@ async fn serve_until(
         proxy_probe_supported: true,
         metadata_supported: true,
         credential_checks_supported: true,
+        passive_account_states_supported: true,
         port,
         uptime_ms: 0,
         proxy_ca,
@@ -957,6 +962,17 @@ pub(crate) mod tests {
     /// A control endpoint registered in `dir` that answers status requests
     /// while `up` is set and otherwise drops them, like a daemon that stalls.
     pub(crate) fn fake_daemon(dir: &Path, up: Arc<std::sync::atomic::AtomicBool>) -> u16 {
+        fake_daemon_with(dir, up, |_| {}, Default::default())
+    }
+
+    /// Like `fake_daemon`, with `edit` applied to its status and every
+    /// request's action recorded in `actions`.
+    pub(crate) fn fake_daemon_with(
+        dir: &Path,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        edit: impl Fn(&mut Status) + Send + 'static,
+        actions: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> u16 {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let endpoint = Endpoint {
@@ -979,7 +995,10 @@ pub(crate) mod tests {
                 if stream.read_exact(&mut request).is_err() {
                     continue;
                 }
-                let bytes = serde_json::to_vec(&Response::Status(Box::new(Status {
+                if let Ok(request) = serde_json::from_slice::<serde_json::Value>(&request) {
+                    actions.lock().unwrap().push(request["action"].to_string());
+                }
+                let mut status = Status {
                     pid: 1,
                     version: String::new(),
                     forwarding_restore_supported: false,
@@ -990,6 +1009,7 @@ pub(crate) mod tests {
                     proxy_probe_supported: false,
                     metadata_supported: false,
                     credential_checks_supported: false,
+                    passive_account_states_supported: false,
                     port,
                     uptime_ms: 0,
                     proxy_ca: None,
@@ -998,8 +1018,9 @@ pub(crate) mod tests {
                     config_path: dir.join("config.yaml"),
                     log_path: dir.join("proxy.log"),
                     config_modified: None,
-                })))
-                .unwrap();
+                };
+                edit(&mut status);
+                let bytes = serde_json::to_vec(&Response::Status(Box::new(status))).unwrap();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
                 let _ = stream.write_all(&bytes);
             }

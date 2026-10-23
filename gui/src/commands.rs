@@ -35,6 +35,29 @@ pub(crate) async fn monitor_credentials(app: AppHandle) {
     }
 }
 
+/// Refreshes account route activation independently of the panel. It reads
+/// local data and identities already learned, never probing upstream; it
+/// notifies only when the result changes.
+pub(crate) async fn monitor_account_states(app: AppHandle) {
+    loop {
+        let task = {
+            let state = app.state::<AppState>();
+            let mut core = state.core.lock().unwrap();
+            core.refresh_config();
+            core.begin_account_states()
+        };
+        if let Some(task) = task {
+            let states = task.account_states().await;
+            app.state::<AppState>()
+                .core
+                .lock()
+                .unwrap()
+                .finish_account_states(&task, states);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
 /// Proxy test results older than this are retested.
 const PROXY_TEST_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -50,15 +73,10 @@ pub(crate) async fn monitor_proxies(app: AppHandle) {
     }
 }
 
-/// Returns immediately with the last account activation; a refresh of it runs
-/// in the background and emits `state-changed` when the result differs. Settings
-/// opts out of profile lookups and uses the cached result only.
+/// Returns immediately with the last account activation, which
+/// `monitor_account_states` refreshes; reading state starts no account work.
 #[tauri::command]
-pub async fn get_state(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    refresh_accounts: Option<bool>,
-) -> Result<Snapshot> {
+pub async fn get_state(state: State<'_, AppState>) -> Result<Snapshot> {
     let daemon = local_daemon().await?.map(|(_, status)| status);
     let stopped_restore = if daemon.is_none() {
         let result = tauri::async_runtime::spawn_blocking(|| {
@@ -90,19 +108,6 @@ pub async fn get_state(
     }
     if let Some(states) = core.account_states() {
         snapshot.set_account_route_states(states);
-    }
-    if refresh_accounts == Some(true)
-        && let Some(probe) = core.begin_account_states()
-    {
-        tauri::async_runtime::spawn(async move {
-            let states = probe.account_states().await;
-            let state = app.state::<AppState>();
-            state
-                .core
-                .lock()
-                .unwrap()
-                .finish_account_states(&probe, states);
-        });
     }
     Ok(snapshot)
 }

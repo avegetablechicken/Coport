@@ -101,7 +101,7 @@ test('an exit IP service failure leaves proxy reachability unverified', () => {
 });
 
 
-test("Settings state refresh opts out of account profile network lookups", async () => {
+test("Settings state refresh requests no account work", async () => {
   const calls = [];
   const refresh = source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;'));
   const context = {
@@ -115,7 +115,8 @@ test("Settings state refresh opts out of account profile network lookups", async
   vm.runInNewContext(refresh, context);
   await context.refresh();
   assert.equal(calls[0][0], 'get_state');
-  assert.equal(calls[0][1].refreshAccounts, false);
+  // Account states come from the backend's own schedule, never from a page read.
+  assert.equal(calls[0][1], undefined);
 });
 
 test('every passive page refresh opts out of upstream account probes', async () => {
@@ -124,7 +125,7 @@ test('every passive page refresh opts out of upstream account probes', async () 
     const calls=[];
     const context={ui:{page,refreshRequest:0,homeTrafficFetchedAt:Date.now()},invoke:async(command,args)=>{calls.push([command,args]);return command==='get_state'?{config:{details:{proxies:[]}}}:{rows:[]};},tagColors:()=>({}),render(){},scheduleActivityLog(){},homeTrafficDevice:()=>null};
     vm.runInNewContext(code,context);await context.refresh();await context.refresh();
-    assert.ok(calls.filter(([command])=>command==='get_state').every(([,args])=>args.refreshAccounts===false),page);
+    assert.ok(calls.filter(([command])=>command==='get_state').every(([,args])=>args===undefined),page);
   }
 });
 
@@ -138,4 +139,21 @@ test('traffic IPC reads cached identities without starting account probes', () =
     assert.match(body, /cached_credential_labels/);
     assert.doesNotMatch(body, /\.credential_labels\(|account_states\(|credential_reports\(/);
   }
+});
+
+test('account routes explain each activation state', () => {
+  const block = source.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
+  const row = (activation) => vm.runInNewContext(`${block}\nroutingRow(route, true, true)`, {
+    route: { selector: 'you@example.com', proxies: [], activation },
+    routeIdentity: (name) => ({ kind: 'account', name }), routingChain: () => '',
+    ROUTE_ICON: { account: '' }, ICON: { warning: '' }, esc: (value) => value,
+  });
+  // Not yet identified is not a failed probe.
+  assert.match(row('unknown'), /not identified yet/);
+  assert.doesNotMatch(row('unknown'), /Probe failed|could not confirm/);
+  assert.match(row('probe_failed'), /Probe failed/);
+  assert.match(row('probe_failed'), /could not confirm availability/);
+  assert.match(row('remote'), /confirmed this account is available/);
+  assert.match(row('inactive'), /Inactive/);
+  assert.doesNotMatch(row('active'), /Inactive|Probe failed|route-warning/);
 });

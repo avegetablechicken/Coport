@@ -98,7 +98,6 @@ mod transport;
 mod websocket_relay;
 use transport::*;
 
-type AccountCheck = (Instant, Result<Option<String>>);
 /// Claude OAuth identities by access token, with last use for bounded LRU
 /// eviction. An identity does not depend on routing, so one process can share
 /// the cache across servers rebuilt for configuration changes.
@@ -107,17 +106,6 @@ pub type ClaudeProfiles = Arc<Mutex<HashMap<String, (Instant, crate::claude::Cla
 /// this; successes are kept in `ClaudeProfiles` instead.
 const FAILED_PROBE_RETRY: Duration = Duration::from_secs(600);
 
-fn retain_account_checks(checks: &mut HashMap<String, AccountCheck>, failed: Duration) {
-    checks.retain(|_, (at, result)| {
-        at.elapsed()
-            < if result.is_ok() {
-                Duration::from_secs(30)
-            } else {
-                failed
-            }
-    });
-}
-
 pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
@@ -125,10 +113,12 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
-    // UI checks are serialized and cached briefly, including failures, which
-    // background discovery holds for longer. The key is the credential, so
-    // switching a saved login forces a new check.
-    account_checks: tokio::sync::Mutex<HashMap<String, AccountCheck>>,
+    // When background discovery last failed for a token, until a success. Only
+    // `ClaudeProfiles` holds identities. The key is the credential, so switching
+    // a saved login forces a new check.
+    failed_probes: tokio::sync::Mutex<HashMap<String, Instant>>,
+    // Serializes discovery, so concurrent runs share one probe per token.
+    discovery: tokio::sync::Mutex<()>,
     credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
     credential_proxy: Option<crate::credential_proxy::CredentialProxy>,
@@ -144,7 +134,8 @@ impl Server {
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
             refresh_routes: Default::default(),
-            account_checks: tokio::sync::Mutex::new(HashMap::new()),
+            failed_probes: tokio::sync::Mutex::new(HashMap::new()),
+            discovery: tokio::sync::Mutex::new(()),
             credential_checks: Default::default(),
             tls: None,
             credential_proxy: None,
@@ -175,9 +166,10 @@ impl Server {
         self
     }
 
-    /// Resolve locally unknown account routes using the same authenticated
-    /// profile probe as requests. Remote success retains its distinct state so
-    /// the UI can keep warning that the local OAuth metadata did not match.
+    /// Resolve locally unknown account routes from identities that requests or
+    /// background discovery already learned. Reading states never probes or runs
+    /// a shell. Remote success retains its distinct state so the UI can keep
+    /// warning that the local OAuth metadata did not match.
     pub async fn account_route_states(
         &self,
     ) -> [std::collections::BTreeMap<String, &'static str>; 2] {
@@ -185,11 +177,15 @@ impl Server {
         if !states[1].values().any(|state| *state == "unknown") {
             return states;
         }
-        let mut checks = self.account_checks.lock().await;
-        retain_account_checks(&mut checks, Duration::from_secs(30));
+        let failed_probes = self.failed_probes.lock().await;
         let mut confirmed = Vec::new();
-        let mut failed = false;
+        let (mut failed, mut pending) = (false, false);
         for (source, account) in self.config.claude.account_sources() {
+            let Ok(token) = account.claude_token_with_shell(false).await else {
+                // A login-shell variable is not read for display; it may exist.
+                pending |= matches!(account, crate::config::AccountSource::Env(_));
+                continue;
+            };
             let matched_local = account.claude_identity().is_some_and(|identity| {
                 crate::identity::routing_account_label(
                     &self.config.claude.routing,
@@ -205,68 +201,33 @@ impl Server {
             {
                 continue;
             }
-            let Ok(token) = account.claude_token().await else {
-                continue;
-            };
-            let result = if let Some((_, result)) = checks.get(&token) {
-                result.clone()
-            } else {
-                // A status refresh must revalidate upstream access, not merely
-                // reuse the request router's identity cache indefinitely.
-                if let Ok(mut profiles) = self.claude_profiles.lock() {
-                    profiles.remove(&token);
-                }
-                let mut log = RequestLog {
-                    logger: self.logger.clone(),
-                    fields: json!({"service": "claude"}).as_object().unwrap().clone(),
-                    started: Instant::now(),
-                    status: 0,
-                    bytes: 0,
-                    outcome: "account_probe_failed",
-                };
-                let result = async {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        "authorization",
-                        format!("Bearer {token}")
-                            .parse()
-                            .map_err(|_| Error::config("Invalid Claude account credential."))?,
-                    );
-                    let route = self.claude_route(&headers, None, &mut log).await?;
-                    Ok(route.identity.as_ref().and_then(|identity| {
-                        crate::identity::routing_account_label(
-                            &self.config.claude.routing,
-                            &identity.account_id,
-                            &identity.usernames,
-                            &source,
-                        )
-                    }))
-                };
-                let result = tokio::time::timeout(
-                    Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
-                    result,
-                )
-                .await
-                .unwrap_or_else(|_| Err(Error::config("Claude account probe timed out.")));
-                match &result {
-                    Ok(_) => log.outcome = "account_probe_finished",
-                    Err(error) => log.field("reason", error.message),
-                }
-                if checks.len() >= 128 {
-                    checks.clear();
-                }
-                checks.insert(token, (Instant::now(), result.clone()));
-                result
-            };
-            match result {
-                Ok(Some(label)) => confirmed.push(label),
-                Ok(None) => {}
-                Err(_) => failed = true,
+            let cached =
+                self.claude_profiles.lock().ok().and_then(|profiles| {
+                    profiles.get(&token).map(|(_, identity)| identity.clone())
+                });
+            match cached {
+                Some(identity) => confirmed.extend(crate::identity::routing_account_label(
+                    &self.config.claude.routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                )),
+                // Until its identity is known, an unmatched token could belong
+                // to any route that no other evidence settles. The retry delay
+                // does not expire a failure: it stays the latest result.
+                None if failed_probes.contains_key(&token) => failed = true,
+                None => pending = true,
             }
         }
         for state in states[1].values_mut() {
             if *state == "unknown" {
-                *state = if failed { "probe_failed" } else { "inactive" };
+                *state = if failed {
+                    "probe_failed"
+                } else if pending {
+                    "unknown"
+                } else {
+                    "inactive"
+                };
             }
         }
         for label in confirmed {
@@ -309,6 +270,7 @@ impl Server {
         let Some(proxy) = self.config.claude.routing.account_probe.as_ref() else {
             return labels;
         };
+        let _discovery = self.discovery.lock().await;
         for (source, account) in self.config.claude.account_sources() {
             if account.claude_identity().is_some_and(|identity| {
                 labels.contains_key(&("Claude".into(), identity.account_id))
@@ -318,11 +280,13 @@ impl Server {
             let Ok(token) = account.claude_token().await else {
                 continue;
             };
-            let mut checks = self.account_checks.lock().await;
-            retain_account_checks(&mut checks, FAILED_PROBE_RETRY);
-            if checks
+            // Readers of these failures never wait for the probe below.
+            if self
+                .failed_probes
+                .lock()
+                .await
                 .get(&token)
-                .is_some_and(|(_, result)| result.is_err())
+                .is_some_and(|at| at.elapsed() < FAILED_PROBE_RETRY)
             {
                 continue;
             }
@@ -366,20 +330,19 @@ impl Server {
                         &identity.usernames,
                         &source,
                     );
-                    if let Some(label) = &label {
-                        labels.insert(("Claude".into(), identity.account_id), label.clone());
+                    // The lookup stored the identity in `ClaudeProfiles`.
+                    self.failed_probes.lock().await.remove(&token);
+                    if let Some(label) = label {
+                        labels.insert(("Claude".into(), identity.account_id), label);
                     }
-                    if checks.len() >= 128 {
-                        checks.clear();
-                    }
-                    checks.insert(token, (Instant::now(), Ok(label)));
                 }
                 Err(error) => {
                     log.field("reason", error.message);
-                    if checks.len() >= 128 {
-                        checks.clear();
+                    let mut failed_probes = self.failed_probes.lock().await;
+                    if failed_probes.len() >= 128 {
+                        failed_probes.clear();
                     }
-                    checks.insert(token, (Instant::now(), Err(error)));
+                    failed_probes.insert(token, Instant::now());
                 }
             }
         }

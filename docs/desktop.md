@@ -78,12 +78,18 @@ The request log can be opened or revealed the same way. The
 right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 
 With `account_auth_file_only: true`, Routing shows account activation from the
-configured credentials. Claude accounts without a local route match are checked
-through `account_probe` using their saved OAuth token. A successful probe keeps
-the warning icon to indicate the missing local match; a failed probe shows
-`Probe failed` alongside the icon. Probe results are cached for 30 seconds;
-changing the token or configuration triggers a new check. Without a token, a
-probe cannot authenticate and the account remains inactive.
+configured credentials, refreshed in the background every 30 seconds whether or
+not the panel is open. Reading it never probes upstream or runs a login shell.
+A saved Claude login without a local route match is identified by the background
+credential worker through `account_probe` (see below), or by its first request;
+until then its candidate routes show a warning icon as not yet identified. A
+successful identification keeps the warning icon to indicate the missing local
+match; a failed one shows `Probe failed` alongside the icon until a later
+identification succeeds. An identity belongs to its token and does not expire;
+a new token is identified again. An account in an environment variable this
+process cannot read without a login shell is shown as not yet identified. Without
+a token, the account remains inactive. An older daemon is reported as needing a
+restart instead of being asked, since it probed upstream to answer.
 
 The GUI keeps its configuration, certificates, logs, preferences and daemon discovery
 in the persistent per-user `io.github.coport.gui` directory: `~/Library/Application Support/io.github.coport.gui/`
@@ -349,7 +355,7 @@ older daemon is reported explicitly instead of checking under a different proces
 environment. Warnings include the check time. When `claude.routing.account_probe`
 is explicitly set, the background worker also resolves missing saved Claude account
 identities through that route. Successful identities are cached per credential;
-failed lookups are retried on later check cycles. `account_fallback` alone does not
+a failed lookup is retried after 10 minutes. `account_fallback` alone does not
 authorize this discovery. Statistics views read the cache without initiating probes,
 and neither credentials nor Claude metadata files are rewritten. Credential warnings
 validate local credential resolution and routing, not upstream service availability. Configuration changes

@@ -432,9 +432,6 @@ fn key(raw: &str) -> Result<String> {
     }
     Ok(k.into())
 }
-pub(crate) async fn environment_key(name: &str) -> Result<String> {
-    environment_key_with_shell(name, true).await
-}
 pub(crate) async fn environment_key_with_shell(name: &str, shell: bool) -> Result<String> {
     let raw = match std::env::var(name) {
         Ok(value) => value,
@@ -665,7 +662,9 @@ impl Config {
         result
     }
     /// Local route activation, not upstream token validity. Archived logins are
-    /// deliberately excluded: only configured sources can admit requests.
+    /// deliberately excluded: only configured sources can admit requests. This
+    /// never runs a login shell, so an environment source this process cannot
+    /// read leaves the remaining routes `unknown` rather than `inactive`.
     pub async fn account_route_states(&self) -> [BTreeMap<String, &'static str>; 2] {
         let initial = |required: bool, routing: &crate::config::Routing| {
             routing
@@ -675,25 +674,46 @@ impl Config {
                 .map(|name| (name.clone(), "inactive"))
                 .collect::<BTreeMap<_, _>>()
         };
+        let unconfirmed = |states: &mut BTreeMap<String, &'static str>| {
+            for state in states.values_mut() {
+                if *state == "inactive" {
+                    *state = "unknown";
+                }
+            }
+        };
         let mut codex = initial(self.codex.account_auth_file_only, &self.codex.routing);
         if !codex.is_empty() {
+            let mut unread = false;
             for (source, account) in self.codex.account_sources() {
-                if let Ok(identity) = self.codex.account_identity(&account).await {
-                    if let Some(label) = routing_account_label(
-                        &self.codex.routing,
-                        &identity.account_id,
-                        &identity.usernames,
-                        &source,
-                    ) {
-                        codex.insert(label, "active");
+                match self
+                    .codex
+                    .account_identity_with_shell(&account, false)
+                    .await
+                {
+                    Ok(identity) => {
+                        if let Some(label) = routing_account_label(
+                            &self.codex.routing,
+                            &identity.account_id,
+                            &identity.usernames,
+                            &source,
+                        ) {
+                            codex.insert(label, "active");
+                        }
                     }
+                    Err(_) => unread |= matches!(account, AccountSource::Env(_)),
                 }
+            }
+            if unread {
+                unconfirmed(&mut codex);
             }
         }
         let mut claude = initial(self.claude.account_auth_file_only, &self.claude.routing);
         if !claude.is_empty() {
             for (source, account) in self.claude.account_sources() {
-                if account.claude_token().await.is_err() {
+                if account.claude_token_with_shell(false).await.is_err() {
+                    if matches!(account, AccountSource::Env(_)) {
+                        unconfirmed(&mut claude);
+                    }
                     continue;
                 }
                 let identity = account.claude_identity();
@@ -716,11 +736,7 @@ impl Config {
                 } else if self.claude.routing.account_fallback.is_none()
                     && self.claude.routing.account_probe.is_some()
                 {
-                    for state in claude.values_mut() {
-                        if *state == "inactive" {
-                            *state = "unknown";
-                        }
-                    }
+                    unconfirmed(&mut claude);
                 }
             }
         }
@@ -1018,6 +1034,20 @@ mod tests {
                 .iter()
                 .all(BTreeMap::is_empty)
         );
+    }
+    #[tokio::test]
+    async fn route_activation_never_runs_a_shell_for_environment_sources() {
+        // Unset here; only a login shell could supply it, which status never runs.
+        let config = Config::parse(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {default: none, first: none}\nclaude:\n  config_dirs: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {default: none}\n",
+        )
+        .unwrap();
+        let states = config.account_route_states().await;
+        assert!(
+            states[0].values().all(|state| *state == "unknown"),
+            "{states:?}"
+        );
+        assert_eq!(states[1]["default"], "unknown");
     }
     use serde_json::json;
     #[tokio::test]

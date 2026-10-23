@@ -41,6 +41,16 @@ impl Tasks {
     }
 
     async fn backend_for(&self, credentials: bool) -> Result<Option<daemon::Client>, String> {
+        Ok(self
+            .backend_status(credentials)
+            .await?
+            .map(|(client, _)| client))
+    }
+
+    async fn backend_status(
+        &self,
+        credentials: bool,
+    ) -> Result<Option<(daemon::Client, daemon::Status)>, String> {
         let Some((client, status)) = daemon::task_backend(self.directory.clone())
             .await
             .map_err(|e| e.to_string())?
@@ -61,7 +71,7 @@ impl Tasks {
             return Err("The running daemon uses a different configuration. Restart it before querying account metadata.".into());
         }
         daemon::check_task_config(&status).map_err(|e| e.to_string())?;
-        Ok(Some(client))
+        Ok(Some((client, status)))
     }
 
     pub async fn credential_reports(
@@ -73,8 +83,17 @@ impl Tasks {
         Ok(self.local_server().await.credential_reports().await)
     }
 
+    /// Route activation from local data and identities already learned; this
+    /// never probes upstream or runs a login shell.
     pub async fn account_states(&self) -> Result<AccountStates, String> {
-        if let Some(client) = self.backend().await? {
+        // Only file-only mode reports activation.
+        if !self.config.codex.account_auth_file_only && !self.config.claude.account_auth_file_only {
+            return Ok(Default::default());
+        }
+        if let Some((client, status)) = self.backend_status(false).await? {
+            if !status.passive_account_states_supported {
+                return Err("Restart the proxy daemon to show account status.".into());
+            }
             return client.account_states().await.map_err(|e| e.to_string());
         }
         let server = self.local_server().await;
@@ -212,6 +231,99 @@ mod tests {
         let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
         tasks.credential_reports().await.unwrap();
         assert!(connections.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn account_states_never_query_daemons_that_would_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  routing:\n    account: {{'remote@example.invalid': none}}\n", serde_json::to_string(dir.path()).unwrap())).unwrap();
+        let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
+        let actions = Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // An older daemon answers metadata queries but probes for account states.
+        crate::daemon::tests::fake_daemon_with(
+            dir.path(),
+            up,
+            |status| status.metadata_supported = true,
+            actions.clone(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                tasks.account_states().await.unwrap_err(),
+                "Restart the proxy daemon to show account status."
+            );
+        }
+        assert!(
+            actions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|action| action == "\"Status\""),
+            "{actions:?}"
+        );
+        // Without file-only mode there is nothing to report, and nothing is asked.
+        let mut config = tasks.config.clone();
+        config.claude.account_auth_file_only = false;
+        config.codex.account_auth_file_only = false;
+        let before = actions.lock().unwrap().len();
+        let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
+        assert_eq!(
+            tasks.account_states().await.unwrap(),
+            AccountStates::default()
+        );
+        assert_eq!(actions.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn local_account_states_read_learned_identities_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::write(
+            claude.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+        )
+        .unwrap();
+        // Counts connections to the probe route and closes them at once.
+        let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = trap.local_addr().unwrap().port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for stream in trap.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let config = Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  trap: http://127.0.0.1:{port}\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n    account_probe: trap\n",
+            serde_json::to_string(&claude).unwrap()
+        ))
+        .unwrap();
+        let profiles = ClaudeProfiles::default();
+        let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config)
+            .with_claude_profiles(profiles.clone());
+        // Unidentified until discovery or a request learns the token's account.
+        for _ in 0..3 {
+            let states = tasks.account_states().await.unwrap();
+            assert_eq!(states[1]["remote@example.invalid"], "unknown");
+        }
+        profiles.lock().unwrap().insert(
+            "saved-secret".into(),
+            (
+                std::time::Instant::now(),
+                coport::claude::ClaudeIdentity {
+                    account_id: "remote-account".into(),
+                    usernames: vec!["remote@example.invalid".into()],
+                },
+            ),
+        );
+        for _ in 0..3 {
+            let states = tasks.account_states().await.unwrap();
+            assert_eq!(states[1]["remote@example.invalid"], "remote");
+            assert_eq!(states[1]["other@example.invalid"], "inactive");
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

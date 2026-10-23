@@ -5,7 +5,7 @@ use crate::{
         AccountSource, Choice, Config, Routing, expand, normalize_auth, validate_env,
         validate_upstream,
     },
-    identity::{environment_key, environment_key_with_shell, valid_token},
+    identity::{environment_key_with_shell, valid_token},
 };
 use hyper::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -170,8 +170,15 @@ impl AccountSource {
         }
     }
     pub(crate) async fn claude_token(&self) -> Result<String> {
+        self.claude_token_with_shell(true).await
+    }
+    /// Without `allow_shell`, an environment source is read only from this
+    /// process, never by running login-shell startup scripts.
+    pub(crate) async fn claude_token_with_shell(&self, allow_shell: bool) -> Result<String> {
         let value = match self {
-            AccountSource::Env(name) => return environment_key(name).await,
+            AccountSource::Env(name) => {
+                return environment_key_with_shell(name, allow_shell).await;
+            }
             AccountSource::Directory(directory) => saved_credentials(directory).await?,
         };
         value["claudeAiOauth"]["accessToken"]

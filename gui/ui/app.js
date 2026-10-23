@@ -205,7 +205,7 @@ const ui = {
 async function refresh() {
   const request = ++ui.refreshRequest;
   const [snap, recent] = await Promise.all([
-    invoke("get_state", { refreshAccounts: false }),
+    invoke("get_state"),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
   if (request !== ui.refreshRequest) return;
@@ -880,9 +880,10 @@ function routingChain(names) {
 
 function routingRow(route, account, fileOnly = false) {
   const identity = routeIdentity(route.selector, route.kind || (account ? "account" : "unknown"));
-  const warning = route.activation === "remote"
-    ? "No match in the local OAuth account cache. The account probe confirmed this account is available."
-    : "No match in the local OAuth account cache. The account probe could not confirm availability. Check the credential and account probe connection.";
+  const warning = {
+    remote: "No match in the local OAuth account cache. The account probe confirmed this account is available.",
+    unknown: "No match in the local OAuth account cache. Its account is not identified yet; background discovery or its first request identifies it.",
+  }[route.activation] ?? "No match in the local OAuth account cache. The account probe could not confirm availability. Check the credential and account probe connection.";
   const needsWarning = ["unknown", "remote", "probe_failed"].includes(route.activation);
   const activation = !account || !fileOnly ? ""
     : (route.activation === "inactive"

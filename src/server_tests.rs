@@ -774,26 +774,16 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
         );
         assert!(lookup.requests.try_recv().is_err());
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), saved);
-        let checks = running.server.account_checks.lock().await;
-        let before = checks.values().next().unwrap().0;
-        drop(checks);
+        // Only failures are recorded; identities live in the profile cache.
+        let before = running.server.failed_probes.lock().await.clone();
+        assert_eq!(before.len(), usize::from(!succeeds));
         assert_eq!(
             running.server.cached_traffic_credential_labels().await,
             first
         );
         assert_eq!(running.server.traffic_credential_labels().await, first);
-        assert_eq!(
-            running
-                .server
-                .account_checks
-                .lock()
-                .await
-                .values()
-                .next()
-                .unwrap()
-                .0,
-            before
-        );
+        assert!(lookup.requests.try_recv().is_err());
+        assert_eq!(*running.server.failed_probes.lock().await, before);
     }
 }
 
@@ -846,7 +836,7 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
     );
     // The next periodic check, a minute later, still holds the failure.
     *running.server.credential_checks.lock().await = None;
-    for (at, _) in running.server.account_checks.lock().await.values_mut() {
+    for at in running.server.failed_probes.lock().await.values_mut() {
         *at = Instant::now() - Duration::from_secs(61);
     }
     running.server.credential_reports().await;
@@ -856,7 +846,7 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
     );
     // Expire both periodic and failed-probe caches, without waiting.
     *running.server.credential_checks.lock().await = None;
-    for (at, _) in running.server.account_checks.lock().await.values_mut() {
+    for at in running.server.failed_probes.lock().await.values_mut() {
         *at = Instant::now() - FAILED_PROBE_RETRY - Duration::from_secs(1);
     }
     running.server.credential_reports().await;
@@ -1022,7 +1012,7 @@ async fn traffic_labels_do_not_probe_without_an_explicit_lookup_route() {
 }
 
 #[tokio::test]
-async fn account_status_probes_remote_identity_and_preserves_warning_state() {
+async fn account_status_reads_discovered_identities_without_probing() {
     for (behavior, expected) in [("sse", "remote"), ("profile_unauthorized", "probe_failed")] {
         let mut lookup = fixture("http", behavior).await;
         let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
@@ -1035,16 +1025,21 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
         .unwrap();
         let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
         trust(&running, &lookup, &endpoint);
-        let states = running.server.account_route_states().await;
-        assert_eq!(states[1]["remote@example.invalid"], expected);
-        assert_eq!(
-            states[1]["other@example.invalid"],
-            if expected == "remote" {
-                "inactive"
-            } else {
-                "probe_failed"
-            }
+        // Before discovery, the saved login could belong to either route.
+        for _ in 0..3 {
+            let states = running.server.account_route_states().await;
+            assert_eq!(states[1]["remote@example.invalid"], "unknown");
+            assert_eq!(states[1]["other@example.invalid"], "unknown");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lookup.requests.recv())
+                .await
+                .is_err(),
+            "Reading account status never probes"
         );
+        // Periodic discovery probes once; status then reads its result.
+        *running.server.credential_checks.lock().await = None;
+        running.server.credential_reports().await;
         assert!(
             lookup
                 .requests
@@ -1056,37 +1051,36 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
         let request = lookup.requests.recv().await.unwrap();
         assert!(request.starts_with("GET /api/oauth/profile "));
         assert!(request.contains("authorization: Bearer saved-secret"));
-        // Both successes and failures are cached to avoid polling storms.
-        assert_eq!(running.server.account_route_states().await, states);
-        assert!(lookup.requests.try_recv().is_err());
-        for (at, _) in running.server.account_checks.lock().await.values_mut() {
-            *at = Instant::now() - Duration::from_secs(31);
+        let states = running.server.account_route_states().await;
+        assert_eq!(states[1]["remote@example.invalid"], expected);
+        assert_eq!(
+            states[1]["other@example.invalid"],
+            if expected == "remote" {
+                "inactive"
+            } else {
+                "probe_failed"
+            }
+        );
+        // A token's identity does not change, and a failure stays the latest
+        // result after its retry delay: neither expires with time.
+        for (at, _) in running.server.claude_profiles.lock().unwrap().values_mut() {
+            *at = Instant::now() - Duration::from_secs(24 * 3600);
         }
-        assert_eq!(running.server.account_route_states().await, states);
-        assert!(
-            lookup
-                .requests
-                .recv()
-                .await
-                .unwrap()
-                .starts_with("CONNECT ")
-        );
-        assert!(
-            lookup
-                .requests
-                .recv()
-                .await
-                .unwrap()
-                .starts_with("GET /api/oauth/profile ")
-        );
-        // Metadata that no longer matches a route still uses the saved token's probe.
+        for at in running.server.failed_probes.lock().await.values_mut() {
+            *at = Instant::now() - FAILED_PROBE_RETRY - Duration::from_secs(1);
+        }
+        for _ in 0..3 {
+            assert_eq!(running.server.account_route_states().await, states);
+        }
+        assert!(lookup.requests.try_recv().is_err());
+        // Metadata that no longer matches a route still uses the saved token's result.
         std::fs::write(
             dir.path().join(".claude.json"),
             r#"{"oauthAccount":{"accountUuid":"stale","emailAddress":"stale@example.invalid"}}"#,
         )
         .unwrap();
         assert_eq!(running.server.account_route_states().await, states);
-        // A changed credential cannot reuse another token's probe result.
+        // A changed credential cannot reuse another token's result.
         std::fs::write(
             &credentials,
             r#"{"claudeAiOauth":{"accessToken":"replacement-secret"}}"#,
@@ -1094,25 +1088,9 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
         .unwrap();
         assert_eq!(
             running.server.account_route_states().await[1]["remote@example.invalid"],
-            expected
+            "unknown"
         );
-        assert!(
-            lookup
-                .requests
-                .recv()
-                .await
-                .unwrap()
-                .starts_with("CONNECT ")
-        );
-        assert!(
-            lookup
-                .requests
-                .recv()
-                .await
-                .unwrap()
-                .contains("authorization: Bearer replacement-secret")
-        );
-        // Local matches take precedence, even with a failed cached remote check.
+        // Local matches take precedence over any remote result.
         std::fs::write(
             dir.path().join(".claude.json"),
             r#"{"oauthAccount":{"accountUuid":"local","emailAddress":"remote@example.invalid"}}"#,
@@ -1122,7 +1100,6 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
             running.server.account_route_states().await[1]["remote@example.invalid"],
             "active"
         );
-        assert!(lookup.requests.try_recv().is_err());
         std::fs::remove_file(&credentials).unwrap();
         assert_eq!(
             running.server.account_route_states().await[1]["remote@example.invalid"],
@@ -1133,6 +1110,18 @@ async fn account_status_probes_remote_identity_and_preserves_warning_state() {
         let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         assert!(!log.contains("saved-secret") && !log.contains("replacement-secret"));
     }
+}
+
+#[tokio::test]
+async fn account_status_leaves_unreadable_environment_sources_unknown() {
+    let running = running("claude:\n  config_dirs: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {'user@example.invalid': none}\n    account_probe: none\n").await;
+    for _ in 0..2 {
+        assert_eq!(
+            running.server.account_route_states().await[1]["user@example.invalid"],
+            "unknown"
+        );
+    }
+    assert!(running.server.claude_profiles.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

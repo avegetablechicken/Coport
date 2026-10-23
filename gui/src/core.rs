@@ -237,7 +237,7 @@ impl Core {
     }
 
     /// Starts an account activation refresh unless one is already running.
-    /// Profile lookups can take seconds, so snapshots never wait for them.
+    /// Credential reads can take a moment, so snapshots never wait for them.
     pub(crate) fn begin_account_states(
         &mut self,
     ) -> Option<std::sync::Arc<coport_gui::tasks::Tasks>> {
