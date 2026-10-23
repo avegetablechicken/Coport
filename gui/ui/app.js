@@ -470,7 +470,8 @@ function message(kind, text, actions = "") {
 function proxyBlock() {
   const s = ui.snap;
   const state = s.phase.state;
-  const label = s.phase.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Failed to start" }[state];
+  // Failed covers start and stop errors and lost daemon contact; the error says which.
+  const label = s.phase.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[state];
   const head = `<span class="state" data-morph="proxy-state"><span class="dot ${state}"></span>${label}</span>
     <button class="switch" role="switch" aria-checked="${state === "running"}" data-action="power" ${s.phase.busy ? "disabled" : ""} aria-label="Start or stop the proxy"></button>`;
   let messages = "";

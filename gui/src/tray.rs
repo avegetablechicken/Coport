@@ -210,6 +210,29 @@ pub fn sync(app: &AppHandle) {
     let _ = app.run_on_main_thread(move || sync_on_main_thread(&handle));
 }
 
+/// Icon status, headline and, unless running, the line shown instead of stats.
+/// Failed covers start and stop errors and lost daemon contact, so it claims
+/// neither that the proxy never started nor that it stopped listening.
+fn describe(phase: &Phase) -> (Status, String, Option<&'static str>) {
+    match phase {
+        Phase::Running { port, .. } => (
+            Status::Running,
+            format!("Running on 127.0.0.1:{port}"),
+            None,
+        ),
+        Phase::Stopped => (
+            Status::Stopped,
+            "Proxy stopped".to_owned(),
+            Some("Not listening"),
+        ),
+        Phase::Failed(_) => (
+            Status::Failed,
+            "Proxy status unavailable".to_owned(),
+            Some("Open the panel for details"),
+        ),
+    }
+}
+
 /// Pushes proxy state to the icon, tooltip and menu on the main thread only.
 fn sync_on_main_thread(app: &AppHandle) {
     let Some(tray) = app.try_state::<Tray>() else {
@@ -219,18 +242,13 @@ fn sync_on_main_thread(app: &AppHandle) {
         let state = app.state::<AppState>();
         let core = state.core.lock().unwrap();
         let phase = core.controller.phase();
-        let (status, headline) = match &phase {
-            Phase::Running { port, .. } => {
-                (Status::Running, format!("Running on 127.0.0.1:{port}"))
+        let (status, headline, idle) = describe(&phase);
+        let stats = match idle {
+            None => {
+                let stats = core.logs.stats();
+                format!("{} requests · {} errors", stats.requests, stats.errors)
             }
-            Phase::Stopped => (Status::Stopped, "Proxy stopped".to_owned()),
-            Phase::Failed(_) => (Status::Failed, "Proxy failed to start".to_owned()),
-        };
-        let stats = if matches!(phase, Phase::Running { .. }) {
-            let stats = core.logs.stats();
-            format!("{} requests · {} errors", stats.requests, stats.errors)
-        } else {
-            "Not listening".to_owned()
+            Some(idle) => idle.to_owned(),
         };
         let view = View {
             status,
@@ -457,4 +475,28 @@ fn image(status: Status) -> Image<'static> {
     #[cfg(not(target_os = "macos"))]
     let (size, rgba) = (64, icon::badge(64, Some(status), Turn::REST));
     Image::new_owned(rgba, size, size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_are_not_described_as_failed_starts() {
+        for message in [
+            "Lost contact with the proxy daemon. Restart to reconnect.",
+            "Cannot stop proxy daemon: timed out",
+            "Cannot start: address in use",
+        ] {
+            let (status, headline, idle) = describe(&Phase::Failed(message.into()));
+            assert_eq!(status, Status::Failed);
+            assert_eq!(headline, "Proxy status unavailable");
+            assert_eq!(idle, Some("Open the panel for details"));
+        }
+        let (status, headline, idle) = describe(&Phase::Stopped);
+        assert_eq!(
+            (status, headline.as_str(), idle),
+            (Status::Stopped, "Proxy stopped", Some("Not listening"))
+        );
+    }
 }

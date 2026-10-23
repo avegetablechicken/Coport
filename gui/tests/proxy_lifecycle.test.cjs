@@ -18,6 +18,20 @@ test('pending proxy operations remain visible and disable duplicate power reques
   assert.match(context.proxyBlock(), /Restart failed/);
 });
 
+test('a failed phase names no cause beyond its error', () => {
+  const ui = { snap: { phase: { state: 'failed', port: 8787 }, config: { exists: true } } };
+  const context = { ui, block: (_, head, body) => head + body, stat: () => '', fmtUptime: String, uptime: () => 0, message: (_, text) => text, esc: String };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function proxyBlock('), source.indexOf('\nfunction chart(')), context);
+  // Lost contact with a running daemon is not a failed start.
+  ui.snap.phase.error = 'Lost contact with the proxy daemon. Restart to reconnect.';
+  const html = context.proxyBlock();
+  assert.match(html, /dot failed/);
+  assert.match(html, /Status unavailable/);
+  assert.match(html, /Lost contact with the proxy daemon/);
+  assert.doesNotMatch(html, /Failed to start/);
+});
+
 test('a proxy CA missing hosts warns with what still works, then shrinks once kept', () => {
   const ui = { snap: { phase: { state: 'running', port: 8787 }, config: { exists: true } } };
   const context = {
