@@ -840,6 +840,57 @@ mod tests {
     }
 
     #[test]
+    fn aged_success_is_retested_by_the_daemon_and_replaced_by_its_failure() {
+        let _guard = crate::daemon::spawn_guard();
+        let dir = tempfile::tempdir().unwrap();
+        // The daemon's proxy has stopped listening since the last success.
+        let stopped = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stopped_endpoint = format!("http://{}", stopped.local_addr().unwrap());
+        drop(stopped);
+        let (_signal, daemon) = crate::daemon::tests::serve_with_proxies(
+            dir.path(),
+            &format!("proxies:\n  local: {stopped_endpoint}\n"),
+        );
+        crate::daemon::tests::wait_for_daemon(dir.path());
+        let mut controller = Controller::with_daemon(
+            Arc::new(|| {}),
+            dir.path().to_owned(),
+            dir.path().join("unused"),
+        );
+        // The GUI must not test this endpoint itself while the daemon runs.
+        let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", trap.local_addr().unwrap());
+        let name = "local".to_owned();
+        let earlier = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
+        controller.lock().probes.insert(
+            name.clone(),
+            (
+                Probe::Reachable {
+                    latency: std::time::Duration::from_millis(5),
+                    exit: None,
+                },
+                earlier,
+                std::time::SystemTime::now(),
+            ),
+        );
+        controller
+            .lock()
+            .probe_endpoints
+            .insert(name.clone(), endpoint.clone());
+        controller.probe_stale([(&name, &endpoint)], std::time::Duration::from_secs(1));
+        wait_for(|| matches!(controller.probes()[&name].0, Probe::Unreachable(_)));
+        assert!(
+            trap.accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        controller.stop().unwrap();
+        daemon.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn only_an_absent_daemon_permits_gui_networking() {
         use std::io::{Read, Write};
         let dir = tempfile::tempdir().unwrap();

@@ -2906,7 +2906,8 @@ setInterval(() => {
   if (el && ui.snap?.phase.state === "running") el.textContent = fmtUptime(uptime());
 }, 1000);
 
-// Check configured proxies once at startup; reopening the panel does not repeat it.
+// Check configured proxies at startup; the backend retests aged results on its own
+// schedule, so opening the panel does not trigger tests.
 const probeStale = () => invoke("probe_proxy", { name: null, staleOnly: true });
 
 // Linux has no system material behind the panel: the backend sends the screen

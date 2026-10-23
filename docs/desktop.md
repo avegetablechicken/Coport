@@ -41,8 +41,11 @@ This check does not retrieve statistics, start forwarding, or manage the remote 
 Device indicators show its result until a fresh statistics result is available.
 Opening the panel again does not repeat the startup check.
 
-Configured proxies are also tested automatically at app startup. Reopening the
-panel does not repeat these checks; use **Test** or **Test All** to run them again. Entering Settings reads local device definitions,
+Configured proxies are also tested automatically at app startup, then retested
+in the background once their last result is older than two minutes, whether or
+not the panel is open. The running proxy daemon performs these tests; the app
+tests directly only when no daemon is running. Opening the panel does not trigger
+a test; use **Test** or **Test All** to run one immediately. Entering Settings reads local device definitions,
 uses cached account status, and does not poll remote device statistics. Devices
 is read-only: the first visit after the app starts retrieves remote statistics
 once, showing this device immediately and each peer as it answers. Later visits

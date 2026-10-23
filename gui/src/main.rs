@@ -164,6 +164,7 @@ fn main() {
                 merged_cache: Default::default(),
             });
             tauri::async_runtime::spawn(commands::monitor_credentials(app.handle().clone()));
+            tauri::async_runtime::spawn(commands::monitor_proxies(app.handle().clone()));
             apply_appearance(app.handle(), appearance);
             tray::create(app.handle())?;
 

@@ -35,6 +35,21 @@ pub(crate) async fn monitor_credentials(app: AppHandle) {
     }
 }
 
+/// Proxy test results older than this are retested.
+const PROXY_TEST_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Retests proxies whose last result has aged, independently of the panel and
+/// its page. Tests run in the daemon when one is running, else in the GUI.
+pub(crate) async fn monitor_proxies(app: AppHandle) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let state = app.state::<AppState>();
+        let mut core = state.core.lock().unwrap();
+        core.refresh_config();
+        core.probe_stale(PROXY_TEST_MAX_AGE);
+    }
+}
+
 /// Returns immediately with the last account activation; a refresh of it runs
 /// in the background and emits `state-changed` when the result differs. Settings
 /// opts out of profile lookups and uses the cached result only.
@@ -361,13 +376,13 @@ pub async fn restart_proxy(app: AppHandle, state: State<'_, AppState>) -> Result
 }
 
 /// Tests one proxy, or all of them when `name` is absent. With `stale_only`,
-/// only proxies without a recent result are tested (used when the panel opens).
+/// only proxies without a recent result are tested (used at startup).
 #[tauri::command]
 pub fn probe_proxy(state: State<AppState>, name: Option<String>, stale_only: Option<bool>) {
     let mut core = state.core.lock().unwrap();
     if stale_only == Some(true) {
         core.refresh_config();
-        core.probe_stale(std::time::Duration::from_secs(120));
+        core.probe_stale(PROXY_TEST_MAX_AGE);
     } else {
         core.probe(name.as_deref());
     }
