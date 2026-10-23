@@ -96,6 +96,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 // Let GNOME's tray menu fade out before capturing the screen.
                 #[cfg(target_os = "linux")]
                 {
+                    // The pointer is still on the menu, under the tray icon.
+                    let anchor = anchor.or_else(|| panel::menu_anchor(app));
                     let handle = app.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(250)).await;

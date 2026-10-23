@@ -100,6 +100,39 @@ pub fn place(anchor: Option<Rect>, panel: (f64, f64), monitor: Rect, scale: f64)
     )
 }
 
+/// Share of the screen height, from its top or bottom edge, where a pointer
+/// may be on a tray menu.
+#[cfg(any(target_os = "linux", test))]
+const MENU_BAND: f64 = 0.4;
+
+/// The tray icon's place guessed from the pointer on its menu, for trays that
+/// report no geometry (Linux AppIndicator and StatusNotifier menus). The
+/// anchor spans the top bar above the pointer, or the bottom panel below it,
+/// so `place` centers the panel under the icon at the top bar's usual height.
+/// A pointer away from both edges did not come from the tray menu.
+#[cfg(any(target_os = "linux", test))]
+pub fn menu_anchor(pointer: (f64, f64), monitor: Rect, scale: f64) -> Option<Rect> {
+    let (x, y) = pointer;
+    if !monitor.contains(x, y) {
+        return None;
+    }
+    let band = monitor.h * MENU_BAND;
+    let bar = (TOP_BAR - GAP) * scale;
+    let top = if y < monitor.y + band {
+        monitor.y
+    } else if y >= monitor.y + monitor.h - band {
+        monitor.y + monitor.h - bar
+    } else {
+        return None;
+    };
+    Some(Rect {
+        x,
+        y: top,
+        w: 0.0,
+        h: bar,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +272,15 @@ mod tests {
             place(Some(point), (400.0, 600.0), SCREEN, 1.0),
             (800.0, 16.0)
         );
+    }
+
+    #[test]
+    fn tray_menu_pointer_opens_the_panel_under_its_bar() {
+        let anchor = menu_anchor((2500.0, 300.0), SCREEN, 2.0);
+        assert_eq!(place(anchor, (720.0, 1200.0), SCREEN, 2.0), (2140.0, 80.0));
+        let anchor = menu_anchor((2900.0, 1900.0), SCREEN, 2.0);
+        assert_eq!(place(anchor, (720.0, 1000.0), SCREEN, 2.0), (2264.0, 920.0));
+        assert_eq!(menu_anchor((1500.0, 1000.0), SCREEN, 2.0), None);
+        assert_eq!(menu_anchor((3500.0, 100.0), SCREEN, 2.0), None);
     }
 }

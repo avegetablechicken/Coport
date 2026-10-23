@@ -121,6 +121,19 @@ fn layout_anchor(_: &AppHandle, anchor: Rect) -> Rect {
     anchor
 }
 
+/// Where the tray icon probably is, from the pointer on its menu; Linux trays
+/// report no icon geometry.
+#[cfg(target_os = "linux")]
+pub fn menu_anchor(app: &AppHandle) -> Option<Rect> {
+    let p = app.cursor_position().ok()?;
+    let m = app
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find(|m| bounds(m).contains(p.x, p.y))?;
+    placement::menu_anchor((p.x, p.y), bounds(&m), m.scale_factor())
+}
+
 /// A monitor's rectangle in layout units.
 fn bounds(m: &Monitor) -> Rect {
     let unit = if IN_POINTS { m.scale_factor() } else { 1.0 };
