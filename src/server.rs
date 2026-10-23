@@ -124,6 +124,7 @@ pub struct Server {
     clients: Mutex<HashMap<String, reqwest::Client>>,
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
+    refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
     // UI checks are serialized and cached briefly, including failures, which
     // background discovery holds for longer. The key is the credential, so
     // switching a saved login forces a new check.
@@ -142,6 +143,7 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
+            refresh_routes: Default::default(),
             account_checks: tokio::sync::Mutex::new(HashMap::new()),
             credential_checks: Default::default(),
             tls: None,
@@ -157,6 +159,11 @@ impl Server {
     /// Reuse identities already looked up by another server in this process.
     pub fn with_claude_profiles(mut self, profiles: ClaudeProfiles) -> Self {
         self.claude_profiles = profiles;
+        self
+    }
+    /// Keep the Claude refresh routes learned from token responses.
+    pub fn with_refresh_routes(mut self, routes: crate::refresh_routes::RefreshRoutes) -> Self {
+        self.refresh_routes = Arc::new(routes);
         self
     }
     /// Decrypt CONNECT tunnels to credential-routed API hosts.
@@ -1238,15 +1245,36 @@ impl Server {
         let bytes = read_body(body).await?;
         let token = refresh_token(&bytes)
             .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
-        let (choice, account_id) = if claude {
-            self.config.claude.resolve_refresh(&token).await?
+        let learned = claude
+            .then(|| self.refresh_routes.identity(&token))
+            .flatten();
+        let (choice, account_id, configured) = if claude {
+            self.config
+                .claude
+                .resolve_refresh(&token, learned.as_ref())
+                .await?
         } else {
-            self.config.resolve_refresh(&token).await?
+            let (choice, account_id) = self.config.resolve_refresh(&token).await?;
+            let configured = account_id.is_some();
+            (choice, account_id, configured)
         };
-        // Only a saved refresh token names its account; a fallback has none.
-        log.field("credential_match", credential_match(account_id.is_some()));
+        // A learned or saved refresh token names its account; a probe has none.
+        log.field("credential_match", credential_match(configured));
         if let Some(id) = &account_id {
             log.field("account_id", id);
+        }
+        if let Some(identity) = learned
+            .as_ref()
+            .filter(|identity| Some(&identity.account_id) == account_id.as_ref())
+        {
+            if let Some(label) = crate::identity::routing_account_label(
+                &self.config.claude.routing,
+                &identity.account_id,
+                &identity.usernames,
+                "",
+            ) {
+                log.field("account_label", label);
+            }
         }
         let url = Url::parse(if claude {
             crate::claude::TOKEN_REFRESH_UPSTREAM
@@ -1256,15 +1284,77 @@ impl Server {
         .unwrap();
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = filtered_headers(&parts.headers);
+        if claude {
+            // The proxy reads the response to learn its refresh route and
+            // does not decompress it.
+            request
+                .headers_mut()
+                .insert("accept-encoding", "identity".parse().unwrap());
+        }
         *request.body_mut() = Some(bytes.into());
-        self.send_via(
-            &choice,
-            request,
-            false,
-            Deadline::new(self.config.request_timeout_seconds),
-            log,
-        )
-        .await
+        let response = self
+            .send_via(
+                &choice,
+                request,
+                false,
+                Deadline::new(self.config.request_timeout_seconds),
+                log,
+            )
+            .await?;
+        if !claude || !response.status().is_success() {
+            return Ok(response);
+        }
+        // The refresh token it replaces names the account even where the
+        // routing does not map it.
+        Ok(self.learn_refresh_route(response, learned))
+    }
+
+    /// Relays a successful Claude token response unchanged and, once it is
+    /// complete, records which account its new refresh token belongs to.
+    fn learn_refresh_route(
+        &self,
+        upstream: reqwest::Response,
+        previous: Option<crate::claude::ClaudeIdentity>,
+    ) -> reqwest::Response {
+        const LIMIT: usize = 65536;
+        let mut response = hyper::Response::builder()
+            .status(upstream.status())
+            .version(upstream.version());
+        *response.headers_mut().unwrap() = upstream.headers().clone();
+        let encoded = upstream
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"));
+        let routes = self.refresh_routes.clone();
+        let logger = self.logger.clone();
+        let mut stream = upstream.bytes_stream();
+        let body = async_stream::stream! {
+            let mut seen = Vec::new();
+            let mut whole = !encoded;
+            while let Some(chunk) = stream.next().await {
+                let Ok(bytes) = chunk else {
+                    yield chunk;
+                    return;
+                };
+                if whole && seen.len() + bytes.len() <= LIMIT {
+                    seen.extend_from_slice(&bytes);
+                } else {
+                    whole = false;
+                }
+                yield Ok(bytes);
+            }
+            if whole {
+                if let Err(error) = routes.learn_response(&seen, previous.as_ref()) {
+                    logger.write(
+                        "refresh_route_unsaved",
+                        [("reason".to_owned(), error.to_string().into())]
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+            }
+        };
+        reqwest::Response::from(response.body(reqwest::Body::wrap_stream(body)).unwrap())
     }
 
     pub async fn serve(

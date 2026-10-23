@@ -11,6 +11,7 @@ pub mod local_tls;
 pub mod logger;
 pub mod model_calls;
 mod observation_memory;
+pub mod refresh_routes;
 mod request_ids;
 pub mod routing;
 pub mod server;

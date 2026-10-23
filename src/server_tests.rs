@@ -148,6 +148,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     };
                     io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode=="oauth_account" {
+                    let body = r#"{"access_token":"new-access","refresh_token":"learned-refresh","expires_in":3600,"account":{"uuid":"acct-1","email_address":"one@example.invalid"}}"#;
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
                 else if response_mode=="delayed_headers" {
                     let _ = io.read_u8().await;
                     let _ = tx.send("DISCONNECTED".into());
@@ -1688,6 +1692,78 @@ async fn claude_oauth_usage_and_refresh_preserve_json_and_headers() {
             .unwrap()
             .contains("refresh-secret")
     );
+}
+
+#[tokio::test]
+async fn claude_refresh_routes_are_learned_from_token_responses() {
+    let mut probe = fixture("http", "oauth_account").await;
+    let mut mapped = fixture("http", "oauth_account").await;
+    let probe_endpoint = format!("http://127.0.0.1:{}", probe.addr.port());
+    let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
+    let running = running(&format!("proxies:\n  probe: {probe_endpoint}\n  mapped: {mapped_endpoint}\nclaude:\n  config_dirs: []\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    account_probe: probe\n")).await;
+    trust(&running, &probe, &probe_endpoint);
+    trust(&running, &mapped, &mapped_endpoint);
+    let refresh = |token: &str| {
+        http()
+            .post(format!("{}/anthropic/v1/oauth/token", running.url))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "gzip, br")
+            .body(format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"{token}"}}"#
+            ))
+            .send()
+    };
+    // An unknown login renews through the profile probe's route, and the
+    // answer names it.
+    let response = refresh("first-refresh").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(value["refresh_token"], "learned-refresh");
+    assert!(
+        probe
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT platform.claude.com:443")
+    );
+    let request = probe.requests.recv().await.unwrap();
+    assert!(request.contains("accept-encoding: identity"));
+    assert!(request.ends_with(r#""refresh_token":"first-refresh"}"#));
+    // Its next renewal takes the account's own route.
+    let response = refresh("learned-refresh").await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert!(
+        mapped
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT platform.claude.com:443")
+    );
+    assert!(
+        mapped
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .ends_with(r#""refresh_token":"learned-refresh"}"#)
+    );
+    assert!(probe.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let routed: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| record["event"] == "route_selected")
+        .collect();
+    assert_eq!(routed.len(), 2);
+    assert_eq!(routed[0]["credential_match"], "unmatched");
+    assert_eq!(routed[1]["credential_match"], "configured");
+    assert_eq!(routed[1]["account_id"], "acct-1");
+    assert_eq!(routed[1]["account_label"], "one@example.invalid");
+    assert!(!log.contains("learned-refresh"));
 }
 
 async fn read_response_head(socket: &mut tokio::net::TcpStream) -> String {

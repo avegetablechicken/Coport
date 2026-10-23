@@ -216,6 +216,10 @@ impl ClaudeIdentity {
         )
         .ok_or(Error::config("Claude profile is missing account identity."))
     }
+    /// The account an OAuth token response names, if any.
+    pub(crate) fn token_response(value: &serde_json::Value) -> Option<Self> {
+        Self::parse(&value["account"], "uuid", &["email_address"])
+    }
 }
 
 pub struct ClaudeRoute {
@@ -401,9 +405,26 @@ impl Claude {
         Ok(())
     }
 
-    /// Refresh credentials select the same local account route as access tokens.
-    /// No profile lookup is possible with a refresh token alone.
-    pub async fn resolve_refresh(&self, token: &str) -> Result<(Choice, Option<String>)> {
+    /// Refresh credentials select the same account route as access tokens.
+    /// A refresh token cannot query the profile API; the account an earlier
+    /// token response named (`learned`, see `crate::refresh_routes`) is used
+    /// first, then a saved login. An unknown one is refreshed through the
+    /// profile lookup's transport, and its response names the account.
+    /// Returns the route, its account, and whether the configuration holds
+    /// or maps it.
+    pub async fn resolve_refresh(
+        &self,
+        token: &str,
+        learned: Option<&ClaudeIdentity>,
+    ) -> Result<(Choice, Option<String>, bool)> {
+        // As for a looked-up access token (see `apply_profile`).
+        if !self.account_auth_file_only {
+            if let Some(identity) = learned {
+                let proxy = self.account_choice(Some(identity), None)?;
+                let configured = self.mapped_choice(identity).is_some();
+                return Ok((proxy, Some(identity.account_id.clone()), configured));
+            }
+        }
         let mut matches = Vec::new();
         let mut unavailable = false;
         for (label, account) in self.account_sources() {
@@ -426,11 +447,16 @@ impl Claude {
         }
         if let Some((label, identity)) = matches.pop() {
             let proxy = self.account_choice(identity.as_ref(), Some(&label))?;
-            return Ok((proxy, identity.map(|i| i.account_id)));
+            return Ok((proxy, identity.map(|i| i.account_id), true));
         }
         if !self.account_auth_file_only {
-            if let Some(proxy) = &self.routing.account_fallback {
-                return Ok((proxy.clone(), None));
+            if let Some(proxy) = self
+                .routing
+                .account_probe
+                .as_ref()
+                .or(self.routing.account_fallback.as_ref())
+            {
+                return Ok((proxy.clone(), None, false));
             }
         }
         if unavailable {
@@ -440,7 +466,7 @@ impl Claude {
         } else {
             Err(Error::new(
                 403,
-                "Claude refresh requires a saved refreshToken or an explicit account fallback with account_auth_file_only: false.",
+                "Claude refresh requires a saved refreshToken, or account_probe or account_fallback with account_auth_file_only: false.",
             ))
         }
     }
@@ -650,18 +676,21 @@ impl Claude {
         }))
     }
 
+    fn mapped_choice(&self, identity: &ClaudeIdentity) -> Option<&Choice> {
+        self.routing.account.get(&identity.account_id).or_else(|| {
+            identity
+                .usernames
+                .iter()
+                .find_map(|u| self.routing.account.get(u))
+        })
+    }
     fn account_choice(
         &self,
         identity: Option<&ClaudeIdentity>,
         label: Option<&str>,
     ) -> Result<Choice> {
-        let by_identity = identity.and_then(|i| {
-            self.routing
-                .account
-                .get(&i.account_id)
-                .or_else(|| i.usernames.iter().find_map(|u| self.routing.account.get(u)))
-        });
-        by_identity
+        identity
+            .and_then(|i| self.mapped_choice(i))
             .or_else(|| label.and_then(|s| self.routing.account.get(s)))
             .or(self.routing.account_fallback.as_ref())
             .cloned()
@@ -747,7 +776,7 @@ impl ClaudeRoute {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn refresh_routing_reloads_credentials_and_requires_explicit_fallback() {
+    async fn refresh_routing_reloads_credentials_and_requires_an_explicit_route() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(".credentials.json");
         let mut claude = Claude {
@@ -768,13 +797,13 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                claude.resolve_refresh(token).await.unwrap().0.label(),
+                claude.resolve_refresh(token, None).await.unwrap().0.label(),
                 "none"
             );
         }
         assert_eq!(
             claude
-                .resolve_refresh("old-refresh")
+                .resolve_refresh("old-refresh", None)
                 .await
                 .err()
                 .unwrap()
@@ -782,12 +811,26 @@ mod tests {
             403
         );
         claude.account_auth_file_only = false;
-        assert!(claude.resolve_refresh("external-refresh").await.is_ok());
+        assert!(
+            claude
+                .resolve_refresh("external-refresh", None)
+                .await
+                .is_ok()
+        );
         claude.routing.account_fallback = None;
-        claude.routing.account_probe = Some(Choice::direct());
+        claude.routing.account_probe = Some(Choice::One("probe".into()));
+        let (proxy, account, configured) = claude
+            .resolve_refresh("external-refresh", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (proxy.label().as_str(), account, configured),
+            ("probe", None, false)
+        );
+        claude.routing.account_probe = None;
         assert_eq!(
             claude
-                .resolve_refresh("external-refresh")
+                .resolve_refresh("external-refresh", None)
                 .await
                 .err()
                 .unwrap()
@@ -802,13 +845,81 @@ mod tests {
             .push(other.path().to_string_lossy().into_owned());
         assert_eq!(
             claude
-                .resolve_refresh("new-refresh")
+                .resolve_refresh("new-refresh", None)
                 .await
                 .err()
                 .unwrap()
                 .status,
             409
         );
+    }
+
+    #[tokio::test]
+    async fn a_learned_refresh_login_comes_before_saved_logins_and_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh"}}"#,
+        )
+        .unwrap();
+        let mut claude = Claude {
+            config_dirs: vec![dir.path().to_string_lossy().into_owned()],
+            account_auth_file_only: false,
+            routing: Routing {
+                account: [("one@example.invalid".to_owned(), Choice::One("one".into()))]
+                    .into_iter()
+                    .collect(),
+                account_fallback: Some(Choice::One("fallback".into())),
+                account_probe: Some(Choice::One("probe".into())),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let learned = |id: &str, email: &str| ClaudeIdentity {
+            account_id: id.into(),
+            usernames: vec![email.into()],
+        };
+        let mapped = learned("acct-1", "one@example.invalid");
+        let unmapped = learned("acct-2", "two@example.invalid");
+        let (proxy, account, configured) = claude
+            .resolve_refresh("refresh", Some(&mapped))
+            .await
+            .unwrap();
+        assert_eq!(
+            (proxy.label().as_str(), account.as_deref(), configured),
+            ("one", Some("acct-1"), true)
+        );
+        let (proxy, account, configured) = claude
+            .resolve_refresh("refresh", Some(&unmapped))
+            .await
+            .unwrap();
+        assert_eq!(
+            (proxy.label().as_str(), account.as_deref(), configured),
+            ("fallback", Some("acct-2"), false)
+        );
+        // Without a learned account, the saved login, then the probe.
+        let (proxy, _, configured) = claude.resolve_refresh("refresh", None).await.unwrap();
+        assert_eq!((proxy.label().as_str(), configured), ("fallback", true));
+        let (proxy, account, configured) = claude.resolve_refresh("unknown", None).await.unwrap();
+        assert_eq!(
+            (proxy.label().as_str(), account, configured),
+            ("probe", None, false)
+        );
+        // A file-only configuration routes saved logins alone.
+        claude.account_auth_file_only = true;
+        let (proxy, _, _) = claude
+            .resolve_refresh("refresh", Some(&mapped))
+            .await
+            .unwrap();
+        assert_eq!(proxy.label(), "fallback");
+        let rejected = claude.resolve_refresh("unknown", Some(&mapped)).await;
+        assert_eq!(rejected.err().unwrap().status, 403);
+        // Unmapped without a fallback, a learned account has no route, as
+        // for usage.
+        claude.account_auth_file_only = false;
+        claude.routing.account_fallback = None;
+        let rejected = claude.resolve_refresh("refresh", Some(&unmapped)).await;
+        assert_eq!(rejected.err().unwrap().status, 502);
     }
 
     #[test]
@@ -1069,8 +1180,16 @@ claude:
         assert!(c.resolve(&h).await.unwrap().matched_account);
         h.insert("authorization", "Bearer file-secret".parse().unwrap());
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
-        assert!(c.resolve_refresh("keychain-secret-refresh").await.is_ok());
-        assert!(c.resolve_refresh("file-secret-refresh").await.is_err());
+        assert!(
+            c.resolve_refresh("keychain-secret-refresh", None)
+                .await
+                .is_ok()
+        );
+        assert!(
+            c.resolve_refresh("file-secret-refresh", None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

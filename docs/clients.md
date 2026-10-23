@@ -325,13 +325,26 @@ and `anthropic-beta: oauth-2025-04-20`, and
 are passed through. The refresh `client_id`, `scope` and token are unchanged;
 no access token is injected.
 
-Refresh routing matches `claudeAiOauth.refreshToken` in the saved Claude logins
-of the configured directories and uses that account's identity/label/fallback
-proxy route. Duplicate matches fail. For credentials held only by the client,
-set `claude.account_auth_file_only: false` and explicitly configure
-`claude.routing.account_fallback` for refreshes. `account_probe` alone cannot
-route refreshes because a refresh token cannot query the profile API. Usage
-still identifies unmatched access tokens via the profile API before routing.
+A refresh token cannot query the profile API. Instead, the proxy learns from
+each successful token response it relays which account the new refresh token
+belongs to (the response's `account`, else the account of the refresh token it
+replaced). A refresh is routed by, in order:
+
+1. the account learned for its refresh token, routed as a looked-up access token
+   is: by `claude.routing.account`, else `account_fallback`;
+2. the saved Claude login of the configured directories whose
+   `claudeAiOauth.refreshToken` matches, by that account's identity, label or
+   fallback route (duplicate matches fail);
+3. for a token known to neither, the profile lookup's route, `account_probe`
+   (or `account_fallback` without one); its response teaches the account.
+
+Learned routes and the probe apply only with
+`claude.account_auth_file_only: false`. Learned routes keep only SHA-256 digests of
+refresh tokens, with the account ID and email, in `claude-refresh-routes.json`
+beside the configuration (the desktop app's data directory for `coportd`), and
+survive restarts. To read the response, the proxy asks the token endpoint for
+an uncompressed body. Usage still identifies unmatched access tokens via the
+profile API before routing.
 
 The unprefixed `/v1/oauth/token` and explicit
 `/https://platform.claude.com/v1/oauth/token` paths are also supported, including

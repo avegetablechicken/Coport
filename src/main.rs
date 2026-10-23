@@ -108,7 +108,12 @@ async fn run(args: Args) -> Result<()> {
         config.listen_port
     );
     let credential_proxy = coport::credential_proxy::CredentialProxy::prepare(&config, &tls_dir)?;
-    let mut server = Server::new(config, logger.clone());
+    let refresh_routes = coport::refresh_routes::RefreshRoutes::load(
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(coport::refresh_routes::FILE),
+    );
+    let mut server = Server::new(config, logger.clone()).with_refresh_routes(refresh_routes);
     if let Some(proxy) = credential_proxy {
         println!(
             "Proxy port routes {} by credential; clients trust {}",
