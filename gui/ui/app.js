@@ -1943,19 +1943,22 @@ async function refreshForwardingStatus() {
     if (ui.page === "settings") render();
   } catch (error) { toast(String(error)); }
 }
-function forwardingSettings() {
-  const devices = ui.devices.filter(device => device.ssh);
-  const rows = devices.map(device => {
-    const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
-    const busy = ui.deviceForwardingBusy === device.id;
-    const caps = matchingDeviceCapability(device)?.capabilities;
-    const unavailable = !status && !(caps?.forwarding && caps.forwardingAvailable);
-    return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy || unavailable ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
-  }).join("");
-  const hint = !devices.length ? "Add an SSH device above." : !ui.snap.forwardingRestoreSupported ? "Update the local proxy to enable startup restore." : "";
-  const tip = hint ? ` data-tip="${esc(hint)}"` : "";
-  const restore = `<div class="row"><span class="row-label"${tip}>Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup"${tip} data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>`;
-  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : ""));
+function deviceForwardingSettings(device) {
+  if (!device.ssh) return "";
+  const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
+  const entry = matchingDeviceCapability(device);
+  const caps = entry?.capabilities;
+  const available = !entry?.error && !entry?.pending && caps?.forwarding && caps.forwardingAvailable
+    && deviceConnectionStatus(device).state !== "failed";
+  // Keep an active forwarding switch reachable even after the peer goes
+  // offline, so the user can stop it without waiting for another connection.
+  if (!status && !available) return "";
+  const busy = ui.deviceForwardingBusy === device.id;
+  return `<div class="row device-forwarding-row"><span class="row-label">SSH forwarding</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy ? "disabled" : ""}></button></div>` + (status ? forwardingRestoreSettings() : "") + (status?.error ? message("warn", esc(status.error)) : "");
+}
+function forwardingRestoreSettings() {
+  const tip = !ui.snap.forwardingRestoreSupported ? ' data-tip="Update the local proxy to enable startup restore."' : "";
+  return `<div class="row device-forwarding-row"><span class="row-label"${tip}>Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup"${tip} data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>` + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "");
 }
 /// The views the Devices cards show for the selected range and category: this
 /// device's own, the forwarded device's from the daemon, other peers' from the
@@ -2030,9 +2033,10 @@ function deviceSettings() {
   const d = ui.deviceDraft || { transport: "ssh" };
   const rows = ui.devices.map(device => {
     const status = deviceConnectionStatus(device);
+    const forwarding = deviceForwardingSettings(device);
     const capabilities = deviceCapabilities(device);
     const tip = capabilities ? ` data-tip="${esc(capabilities)}" tabindex="0"` : "";
-    return `<div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>`;
+    return `<div class="device-settings-item"><div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>${forwarding}</div>`;
   }).join("");
   const form = ui.deviceFormOpen ? `<div class="device-form">
     <label>Connection${panelSelect("device-transport", [["ssh", "SSH"], ["http", "HTTP / HTTPS"]], d.transport, "Connection", "field")}</label>
@@ -2087,8 +2091,7 @@ function settings() {
     )}
     ${configSettings()}
     ${filesBlock()}
-    ${deviceSettings()}
-    ${forwardingSettings()}`;
+    ${deviceSettings()}`;
 }
 
 /// The fixed configuration and log files: a status per file, actions in a ⋯ menu.

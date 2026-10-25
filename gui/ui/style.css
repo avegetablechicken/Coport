@@ -1514,6 +1514,9 @@ html.linux.composited .route-tooltip {
 .devices-traffic-range { display: flex; justify-content: flex-end; padding: 0 12px 10px; }
 
 .device-setting-name { display: inline-flex; align-items: center; gap: 7px; }
+.device-setting-name > .dot { flex: 0 0 6px; }
+/* Match the device text: 6px status light plus its 7px gap. */
+.device-forwarding-row { padding-inline-start: 13px; }
 .device-setting-actions { display: inline-flex; align-items: center; gap: 8px; }
 
 .device-setting-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; row-gap: 0; }

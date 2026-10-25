@@ -111,14 +111,15 @@ test('configuration lives in Settings and Settings loading makes no remote reque
   const html = h.devicesPage(); assert.doesNotMatch(html, /device-save|Configure in Settings|Updates automatically/);
 });
 
-test('Settings places forwarding immediately after SSH device configuration', () => {
+test('Settings includes one Devices block without a separate forwarding block', () => {
   const code = source.slice(source.indexOf('function settings()'), source.indexOf('/// The fixed configuration'));
   const rendered = vm.runInNewContext(code + '\nsettings()', {
     ui: { snap: { settings: { maskAccountNames: false } } }, ICON: {}, panelSelect: () => '',
-    block: (title, aside, body) => (title === 'General' ? body : `[${title}]`), configSettings: () => '[Network]', filesBlock: () => '[Files]', forwardingSettings: () => '[Request forwarding]', deviceSettings: () => '[Devices]',
+    block: (title, aside, body) => (title === 'General' ? body : `[${title}]`), configSettings: () => '[Network]', filesBlock: () => '[Files]', deviceSettings: () => '[Devices]',
   });
-  assert.ok(rendered.includes('[Files]\n    [Devices]\n    [Request forwarding]'));
-  assert.ok(rendered.trim().endsWith('[Request forwarding]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
+  assert.ok(rendered.includes('[Files]\n    [Devices]'));
+  assert.doesNotMatch(rendered, /Request forwarding/);
+  assert.ok(rendered.trim().endsWith('[Devices]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);
   assert.match(rendered, /Mask account names/);
   assert.match(rendered, /aria-checked="false" data-action="mask-account-names"/);
 });
@@ -507,29 +508,50 @@ test('duplicate devices show an exclusion notice instead of a connection failure
   assert.doesNotMatch(html, /dot failed/);
 });
 
-test('Forwarding controls and status appear only in Settings', () => {
+test('forwarding appears below its available SSH device only in Settings', () => {
   const h = harness(async () => []);
   const device = { id: 'ssh', name: 'Remote', ssh: { host: 'host' } };
   h.ui.devices = [device, { id: 'http', name: 'HTTP peer', data: { transport: 'http', url: 'http://host' } }];
-  let html = h.forwardingSettings();
-  assert.match(html, /^Request forwarding/);
-  assert.match(html, /class="switch" role="switch" aria-checked="false"[^>]*data-action="device-forward"[^>]*><\/button>/);
-  assert.doesNotMatch(html, /Start forwarding|Stop forwarding|Updating…/);
-  assert.doesNotMatch(html, /HTTP peer/);
-  assert.doesNotMatch(h.devicesPage(), /data-action="device-forward"|Start forwarding|Stop forwarding/);
-  assert.doesNotMatch(h.devicesPage(), /Request forwarding|>Off</);
-  assert.doesNotMatch(html, /class="state"|>Off<|>Enabled<|<span class="row-label">Request forwarding/);
+  h.ui.deviceCapabilities = { ssh: { capabilities: { forwarding: true, forwardingAvailable: true } } };
+  let html = h.deviceSettings();
+  assert.match(html, /^Devices/);
+  assert.doesNotMatch(html, /Request forwarding|Start forwarding|Stop forwarding|Updating…/);
+  assert.match(html, /class="switch" role="switch" aria-checked="false"[^>]*data-action="device-forward" data-id="ssh"[^>]*><\/button>/);
+  const groups = html.split('<div class="device-settings-item">').slice(1);
+  assert.match(groups[0], /Remote[\s\S]*SSH forwarding/);
+  assert.doesNotMatch(groups[1], /SSH forwarding|data-action="device-forward"/);
+  assert.doesNotMatch(html, /data-action="forwarding-restore"/);
+  assert.doesNotMatch(h.devicesPage(), /data-action="device-forward"|data-action="forwarding-restore"/);
   h.ui.deviceForwarders = [{ deviceId: 'ssh', port: 23456, error: '<connection lost>' }];
-  html = h.forwardingSettings();
-  assert.match(html, /class="switch" role="switch" aria-checked="true"[^>]*><\/button>/);
-  assert.doesNotMatch(html, /23456|Local endpoint/);
+  h.ui.deviceCapabilities.ssh = { error: 'offline' };
+  html = h.deviceSettings();
+  assert.match(html, /aria-checked="true"[^>]*data-action="device-forward"[^>]*><\/button>/);
+  assert.match(html, /SSH forwarding[\s\S]*data-action="device-forward"[\s\S]*Restore on startup[\s\S]*data-action="forwarding-restore"/);
+  assert.equal((html.match(/data-action="forwarding-restore"/g) || []).length, 1);
   assert.match(html, /&lt;connection lost>/);
-  assert.doesNotMatch(html, /class="state"|>Off<|>Enabled<|Connection error/);
-  assert.doesNotMatch(h.devicesPage(), /Request forwarding|data-action="device-forward"|23456|connection lost|Connection error|>Enabled</);
+  assert.doesNotMatch(html, /23456|Local endpoint/);
+  assert.doesNotMatch(h.devicesPage(), /data-action="device-forward"|23456|connection lost/);
   h.ui.deviceForwardingBusy = 'ssh';
-  assert.match(h.forwardingSettings(), /aria-checked="true" aria-busy="true"[^>]*disabled><\/button>/);
+  assert.match(h.deviceSettings(), /aria-checked="true" aria-busy="true"[^>]*disabled><\/button>/);
   h.ui.devices = [];
-  assert.match(h.forwardingSettings(), /Add an SSH device above/);
+  assert.doesNotMatch(h.deviceSettings(), /SSH forwarding|forwarding-restore|Add an SSH device above/);
+});
+
+test('unknown, unsupported, pending and failed SSH devices have no forwarding switch', () => {
+  const calls = [];
+  const h = harness(async command => { calls.push(command); return []; });
+  h.ui.devices = [{ id: 'ssh', name: 'Remote', ssh: { host: 'host' } }];
+  const capable = { forwarding: true, forwardingAvailable: true };
+  for (const entry of [undefined, { pending: true, capabilities: capable }, { error: 'denied', capabilities: capable },
+    { capabilities: { forwarding: false, forwardingAvailable: true } },
+    { capabilities: { forwarding: true, forwardingAvailable: false } }]) {
+    h.ui.deviceCapabilities = { ssh: entry };
+    assert.doesNotMatch(h.deviceSettings(), /data-action="device-forward"|data-action="forwarding-restore"/);
+  }
+  h.ui.deviceCapabilities = { ssh: { capabilities: capable, checkedAt: 1 } };
+  h.ui.deviceStates = { ssh: { host: 'host', state: 'failed', label: 'SSH failed', checkedAt: 2 } };
+  assert.doesNotMatch(h.deviceSettings(), /data-action="device-forward"/);
+  assert.deepEqual(calls, []);
 });
 
 test('forwarding toggles only the selected device and refreshes confirmed state', async () => {
@@ -717,7 +739,10 @@ test('restore switch changes only after daemon confirms persistence', async () =
   const calls=[];
   const h=harness(async (command,args)=>{calls.push([command,args]);});
   h.ui.snap.forwardingRestoreSupported=true;
-  assert.match(h.forwardingSettings(),/data-action="forwarding-restore"/);
+  h.ui.devices=[{id:'ssh',name:'Remote',ssh:{host:'host'}}];
+  h.ui.deviceCapabilities={ssh:{capabilities:{forwarding:true,forwardingAvailable:true}}};
+  h.ui.deviceForwarders=[{deviceId:'ssh',name:'Remote'}];
+  assert.match(h.deviceSettings(),/data-action="forwarding-restore"/);
   await h.action('forwarding-restore');
   assert.equal(calls[0][0],'set_forwarding_restore'); assert.equal(calls[0][1].enabled,true);
   assert.equal(h.ui.snap.forwardingRestore,true);
@@ -726,7 +751,7 @@ test('restore switch changes only after daemon confirms persistence', async () =
   assert.equal(h.ui.snap.forwardingRestore,true); assert.equal(h.ui.forwardingRestoreBusy,false);
 });
 
-test('cached daemon capabilities disable unsupported switches without a check button', async () => {
+test('cached daemon capabilities hide unsupported switches and retain active forwarding controls', async () => {
   const results = [{ deviceId:'ms', pending:false, capabilities:{version:'0.1.0',runningVersion:'0.1.0',statistics:true,forwarding:false,running:true,forwardingAvailable:false}, error:null }];
   const calls=[];
   const h=harness(async command=>{calls.push(command);return results;});
@@ -735,18 +760,18 @@ test('cached daemon capabilities disable unsupported switches without a check bu
   assert.deepEqual(calls,['get_device_capabilities']);
   assert.match(h.deviceCapabilities(device),/Coport 0.1.0/);
   assert.doesNotMatch(h.deviceSettings(),/Check version|device-capabilities|<br>|Up to 32|SSH also supports/);
-  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  assert.doesNotMatch(h.deviceSettings(),/data-action="device-forward"/);
   results[0].capabilities.forwarding=true;results[0].capabilities.forwardingAvailable=true;
   await h.loadDeviceCapabilities();
-  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  assert.match(h.deviceSettings(),/data-action="device-forward"[^>]*data-enabled="(?:true|false)" ><\/button>/);
   results[0].capabilities=null;results[0].error='old daemon has no capabilities command';
   await h.loadDeviceCapabilities();
   assert.equal(h.deviceCapabilities(device), "Version unavailable: old daemon has no capabilities command");
   assert.match(h.deviceSettings(), /data-tip="Version unavailable: old daemon has no capabilities command" tabindex="0"/);
   assert.doesNotMatch(h.deviceSettings(), />Version unavailable|setting-description/);
-  assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  assert.doesNotMatch(h.deviceSettings(),/data-action="device-forward"/);
   h.ui.deviceForwarders=[{deviceId:'ms',name:'MS'}];
-  assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
+  assert.match(h.deviceSettings(),/data-action="device-forward"[^>]*data-enabled="(?:true|false)" ><\/button>/);
 });
 
 
@@ -754,8 +779,9 @@ test('forwarding settings keep mechanisms in documentation instead of repeated h
   const h = harness(async () => []);
   h.ui.snap.forwardingRestoreSupported = true;
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
-  const html = h.forwardingSettings();
-  assert.match(html, /Restore on startup/);
+  h.ui.deviceCapabilities = { ms: { capabilities: { forwarding: true, forwardingAvailable: true } } };
+  const html = h.deviceSettings();
+  assert.doesNotMatch(html, /Restore on startup|forwarding-restore/);
   assert.doesNotMatch(html, /placeholder|Clients keep|Switching disconnects|Only one remote|If the remote is offline|daemon runs/);
 });
 
@@ -1120,4 +1146,31 @@ test('between refreshes the Devices timer reads no statistics for peers', async 
   h.ui.deviceRemoteAttemptAt = Date.now() - 30000;
   await h.loadDevices();
   assert.equal(calls.filter((command) => command === 'get_merged_data').length, 1);
+});
+
+
+test('startup restore follows only the active device when forwarding switches targets', () => {
+  const h = harness(async () => []);
+  h.ui.devices = ['first', 'second'].map(id => ({ id, name: id, ssh: { host: id } }));
+  h.ui.deviceCapabilities = Object.fromEntries(h.ui.devices.map(d => [d.id, { capabilities: { forwarding: true, forwardingAvailable: true } }]));
+  h.ui.snap.forwardingRestoreSupported = true;
+  h.ui.snap.forwardingRestore = true;
+  for (const selected of ['first', 'second']) {
+    h.ui.deviceForwarders = [{ deviceId: selected }];
+    const html = h.deviceSettings();
+    assert.equal((html.match(/data-action="device-forward"/g) || []).length, 2);
+    assert.equal((html.match(/data-action="forwarding-restore"/g) || []).length, 1);
+    const groups = html.split('<div class="device-settings-item">').slice(1);
+    for (let i = 0; i < 2; i++) {
+      if (h.ui.devices[i].id === selected) {
+        assert.match(groups[i], /SSH forwarding[\s\S]*aria-checked="true"[^>]*data-action="device-forward"[\s\S]*Restore on startup[\s\S]*aria-checked="true"[^>]*data-action="forwarding-restore"/);
+      } else {
+        assert.match(groups[i], /aria-checked="false"[^>]*data-action="device-forward"/);
+        assert.doesNotMatch(groups[i], /forwarding-restore/);
+      }
+    }
+  }
+  h.ui.deviceForwarders = [];
+  assert.doesNotMatch(h.deviceSettings(), /forwarding-restore/);
+  assert.equal(h.ui.snap.forwardingRestore, true);
 });
