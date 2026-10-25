@@ -2043,11 +2043,11 @@ function deviceSettings() {
     <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" data-tip="Defaults to the SSH config name or HTTP origin."></label>
     ${d.transport === "ssh" ? `
       <label>SSH config name or host<input class="field" id="device-host" value="${esc(d.host || "")}" maxlength="255" placeholder="mbp16"></label>
-      <label>Remote executable (optional)<input class="field" id="device-binary" value="${esc(d.binary === "coportd" ? "" : d.binary || "")}" maxlength="4096" data-tip="Leave empty to discover automatically."></label>
+      <label>Coport path (optional)<input class="field" id="device-binary" value="${esc(d.binary === "coportd" ? "" : d.binary || "")}" maxlength="4096" data-tip="Path to the Coport executable on the remote device. Leave empty to find it automatically."></label>
     ` : `
-      <label>Data API origin<input class="field" id="device-url" value="${esc(d.url || "")}" placeholder="http://LAN-IP:8788 or https://host:8788"></label>
-      <label>Local access key file<input class="field" id="device-key-file" value="${esc(d.key || "")}" placeholder="/absolute/path/to/data.key"></label>
-      <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" data-tip="Use either a file or an environment variable."></label>
+      <label>Statistics URL<input class="field" id="device-url" value="${esc(d.url || "")}" placeholder="http://LAN-IP:8788 or https://host:8788"></label>
+      <label>Access key file<input class="field" id="device-key-file" value="${esc(d.key || "")}" placeholder="/absolute/path/to/data.key"></label>
+      <label>Access key variable<input class="field" id="device-key-env" value="${esc(d.env || "")}" data-tip="Name of the environment variable containing the access key. Use this or an access key file."></label>
       <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
     `}
     <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
@@ -2080,8 +2080,8 @@ function settings() {
       "",
       `<div class="row"><span class="row-label">Launch at login</span>
          <button class="switch" role="switch" aria-checked="${set.launchAtLogin}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
-       <div class="row"><span class="row-label">Start proxy when the app opens</span>
-         <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy when the app opens"></button></div>
+       <div class="row"><span class="row-label">Start proxy on startup</span>
+         <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy on startup"></button></div>
        <div class="row"><span class="row-label" data-tip="Reopen the app to manage or stop the background proxy.">Keep proxy running after quit</span>
          <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" data-tip="Reopen the app to manage or stop the background proxy."></button></div>
        <div class="row"><span class="row-label">Appearance</span>
@@ -2158,20 +2158,20 @@ function configSettings() {
     "",
     `${field("listen_port", "Listen port")}
      ${flag("allow_external_access", "Share statistics", "Requires external_data in the configuration file. Shares read-only statistics. Restart to apply.")}
-     ${flag("connect_credential_routing", "Proxy port credential routing", "Routes HTTPS_PROXY traffic by account or API key. Requires trusting Coport's CA. Restart to apply.")}
+     ${flag("connect_credential_routing", "Enable HTTPS proxy", "Other apps can use Coport via HTTPS_PROXY. Routes by account or API key. Requires trusting Coport's CA. Restart to apply.")}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}
        ${field("websocket.first_output_seconds", "First output", "s")}
        ${field("websocket.read_seconds", "Read", "s")}
        ${field("websocket.write_seconds", "Write", "s")}
-       ${field("websocket.inter_turn_idle_seconds", "Inter-turn idle", "s", "0 disables this timer.")}
+       ${field("websocket.inter_turn_idle_seconds", "Between turns", "s", "0 disables this timer.")}
      </details>`
   )}
   ${block(
     "Subscription Logins",
     "",
-    `${flag("auto_refresh_access_token", "Refresh expired access tokens", "If a login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
+    `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
      ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
      ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}`
   )}`;
