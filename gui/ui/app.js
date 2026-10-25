@@ -2084,10 +2084,10 @@ function settings() {
          <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy on startup"></button></div>
        <div class="row"><span class="row-label" data-tip="Reopen the app to manage or stop the background proxy.">Keep proxy running after quit</span>
          <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" data-tip="Reopen the app to manage or stop the background proxy."></button></div>
-       <div class="row"><span class="row-label">Appearance</span>
-         ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>
        <div class="row"><span class="row-label" data-tip="Applies to traffic and routing views.">Mask account names</span>
-         <button class="switch" role="switch" aria-checked="${set.maskAccountNames}" data-action="mask-account-names" aria-label="Mask account names" data-tip="Applies to traffic and routing views."></button></div>`
+         <button class="switch" role="switch" aria-checked="${set.maskAccountNames}" data-action="mask-account-names" aria-label="Mask account names" data-tip="Applies to traffic and routing views."></button></div>
+       <div class="row"><span class="row-label">Appearance</span>
+         ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>`
     )}
     ${configSettings()}
     ${filesBlock()}
