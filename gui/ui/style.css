@@ -427,15 +427,6 @@ select:focus-visible {
   color: var(--label);
 }
 
-.setting-description {
-  margin-top: 3px;
-  color: var(--tertiary);
-  font-size: 10px;
-  font-weight: 400;
-  line-height: 1.45;
-  white-space: normal;
-}
-
 /* Special-purpose rules (docs MCP fallback, account probe). */
 .row.minor {
   min-height: 16px;
@@ -827,11 +818,6 @@ input.field::placeholder {
   color: var(--label);
   pointer-events: none;
 }
-
-/* Keep Network controls flush with the other settings rows. */
-.config-action-row { display: grid; grid-template-columns: minmax(0, 1fr) 68px; row-gap: 0; }
-.config-action-row .switch { justify-self: end; }
-.config-action-row .setting-description { grid-column: 1 / -1; }
 
 /* ---------------------------------------------------------------- requests */
 

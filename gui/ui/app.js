@@ -1933,8 +1933,7 @@ function deviceCapabilities(device) {
   const entry = matchingDeviceCapability(device);
   const caps = entry?.capabilities;
   const error = entry?.error || ui.deviceCapabilitiesError;
-  const text = error ? "Version unavailable" : entry?.pending ? "Checking…" : caps ? `Coport ${esc(caps.version)}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${esc(caps.runningVersion)}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Unavailable" : " · Offline"}` : "Checking…";
-  return `<div class="row"><span class="row-label setting-description"${error ? ` data-tip="${esc(error)}"` : ""}>${text}</span></div>`;
+  return error ? `Version unavailable: ${error}` : entry?.pending ? "Checking…" : caps ? `Coport ${caps.version}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${caps.runningVersion}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Unavailable" : " · Offline"}` : "Checking…";
 }
 async function refreshForwardingStatus() {
   try {
@@ -1953,9 +1952,10 @@ function forwardingSettings() {
     const unavailable = !status && !(caps?.forwarding && caps.forwardingAvailable);
     return `<div class="row"><span class="row-label">${esc(device.name)}</span><button class="switch" role="switch" aria-checked="${!!status}" aria-busy="${busy}" aria-label="Forward requests through ${esc(device.name)}" data-action="device-forward" data-id="${esc(device.id)}" data-enabled="${!status}" ${ui.deviceForwardingBusy || unavailable ? "disabled" : ""}></button></div>` + (status?.error ? message("warn", esc(status.error)) : "");
   }).join("");
-  const restore = `<div class="row"><span class="row-label">Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup" data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>`;
   const hint = !devices.length ? "Add an SSH device above." : !ui.snap.forwardingRestoreSupported ? "Update the local proxy to enable startup restore." : "";
-  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "") + (hint ? `<div class="placeholder">${hint}</div>` : ""));
+  const tip = hint ? ` data-tip="${esc(hint)}"` : "";
+  const restore = `<div class="row"><span class="row-label"${tip}>Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup"${tip} data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>`;
+  return block("Request forwarding", "", rows + restore + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : ""));
 }
 /// The views the Devices cards show for the selected range and category: this
 /// device's own, the forwarded device's from the daemon, other peers' from the
@@ -2030,18 +2030,20 @@ function deviceSettings() {
   const d = ui.deviceDraft || { transport: "ssh" };
   const rows = ui.devices.map(device => {
     const status = deviceConnectionStatus(device);
-    return `<div class="row device-setting-row"><span class="device-setting-name row-label"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>` + deviceCapabilities(device);
+    const capabilities = deviceCapabilities(device);
+    const tip = capabilities ? ` data-tip="${esc(capabilities)}" tabindex="0"` : "";
+    return `<div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>`;
   }).join("");
   const form = ui.deviceFormOpen ? `<div class="device-form">
     <label>Connection${panelSelect("device-transport", [["ssh", "SSH"], ["http", "HTTP / HTTPS"]], d.transport, "Connection", "field")}</label>
-    <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" placeholder="Defaults to the SSH config name or HTTP origin"></label>
+    <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" data-tip="Defaults to the SSH config name or HTTP origin."></label>
     ${d.transport === "ssh" ? `
       <label>SSH config name or host<input class="field" id="device-host" value="${esc(d.host || "")}" maxlength="255" placeholder="mbp16"></label>
-      <label>Remote executable (optional; discovered automatically)<input class="field" id="device-binary" value="${esc(d.binary === "coportd" ? "" : d.binary || "")}" maxlength="4096" placeholder="Automatic discovery"></label>
+      <label>Remote executable (optional)<input class="field" id="device-binary" value="${esc(d.binary === "coportd" ? "" : d.binary || "")}" maxlength="4096" data-tip="Leave empty to discover automatically."></label>
     ` : `
       <label>Data API origin<input class="field" id="device-url" value="${esc(d.url || "")}" placeholder="http://LAN-IP:8788 or https://host:8788"></label>
       <label>Local access key file<input class="field" id="device-key-file" value="${esc(d.key || "")}" placeholder="/absolute/path/to/data.key"></label>
-      <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" placeholder="Use either a file or an environment variable"></label>
+      <label>Access key environment variable (alternative)<input class="field" id="device-key-env" value="${esc(d.env || "")}" data-tip="Use either a file or an environment variable."></label>
       <label>CA certificate (optional)<input class="field" id="device-ca-file" value="${esc(d.ca || "")}" placeholder="/absolute/path/to/ca.pem"></label>
     `}
     <div class="message-actions"><button class="btn primary" data-action="device-save" aria-label="Save device">Save</button><button class="btn" data-action="device-cancel">Cancel</button></div>
@@ -2076,12 +2078,12 @@ function settings() {
          <button class="switch" role="switch" aria-checked="${set.launchAtLogin}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
        <div class="row"><span class="row-label">Start proxy when the app opens</span>
          <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy when the app opens"></button></div>
-       <div class="row"><span class="row-label">Keep proxy running after quit<span class="setting-description" id="keep-running-description">Quit exits the app; the proxy keeps running.<br>Reopen to manage or stop the proxy.</span></span>
-         <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" aria-describedby="keep-running-description"></button></div>
+       <div class="row"><span class="row-label" data-tip="Reopen the app to manage or stop the background proxy.">Keep proxy running after quit</span>
+         <button class="switch" role="switch" aria-checked="${set.keepProxyRunningOnQuit}" data-action="keep-running" aria-label="Keep proxy running after quit" data-tip="Reopen the app to manage or stop the background proxy."></button></div>
        <div class="row"><span class="row-label">Appearance</span>
          ${panelSelect("appearance", [["System", "System"], ["Light", "Light"], ["Dark", "Dark"]], set.appearance, "Appearance", "", 'data-setting="appearance"')}</div>
-       <div class="row"><span class="row-label">Mask account names<span class="setting-description" id="mask-account-names-description">Show only part of an account email or ID in traffic and routing.</span></span>
-         <button class="switch" role="switch" aria-checked="${set.maskAccountNames}" data-action="mask-account-names" aria-label="Mask account names" aria-describedby="mask-account-names-description"></button></div>`
+       <div class="row"><span class="row-label" data-tip="Applies to traffic and routing views.">Mask account names</span>
+         <button class="switch" role="switch" aria-checked="${set.maskAccountNames}" data-action="mask-account-names" aria-label="Mask account names" data-tip="Applies to traffic and routing views."></button></div>`
     )}
     ${configSettings()}
     ${filesBlock()}
@@ -2138,23 +2140,22 @@ function configSettings() {
   if (!v) return "";
   const field = (key, label, unit = "", description = "") => {
     const id = `config-${key.replaceAll(".", "-")}`;
-    const note = description ? `<span class="setting-description" id="${id}-description">${description}</span>` : "";
-    return `<div class="row"><span class="row-label">${label}${note}</span>
+    const tip = description ? ` data-tip="${esc(description)}"` : "";
+    return `<div class="row"><span class="row-label"${tip}>${label}</span>
       <span class="number-field"><input class="field" id="${id}" data-config="${key}" inputmode="decimal" spellcheck="false"
-        value="${esc(String(v[key]))}" aria-label="${label}"${description ? ` aria-describedby="${id}-description"` : ""} /><span class="unit">${unit}</span></span></div>`;
+        value="${esc(String(v[key]))}" aria-label="${label}"${tip} /><span class="unit">${unit}</span></span></div>`;
   };
-  const flag = (key, label, description, separateNote = false) => {
-    const id = `config-${key.replaceAll(".", "-")}`;
-    const note = `<span class="setting-description" id="${id}-description">${description}</span>`;
-    return `<div class="row${separateNote ? " config-action-row" : ""}"><span class="row-label">${label}${separateNote ? "" : note}</span>
-      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}" aria-describedby="${id}-description"></button>${separateNote ? note : ""}</div>`;
+  const flag = (key, label, description) => {
+    const tip = ` data-tip="${esc(description)}"`;
+    return `<div class="row"><span class="row-label"${tip}>${label}</span>
+      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}"${tip}></button></div>`;
   };
   return `${block(
     "Network",
     "",
     `${field("listen_port", "Listen port")}
-     ${flag("allow_external_access", "Share statistics", "Enable the separate read-only data API. Configure external_data in YAML first; restart to apply.", true)}
-     ${flag("connect_credential_routing", "Proxy port credential routing", "Decrypt HTTPS_PROXY clients' API traffic with a separate local CA and route it by credential, like base URL clients. Restart to apply.", true)}
+     ${flag("allow_external_access", "Share statistics", "Requires external_data in the configuration file. Shares read-only statistics. Restart to apply.")}
+     ${flag("connect_credential_routing", "Proxy port credential routing", "Routes HTTPS_PROXY traffic by account or API key. Requires trusting Coport's CA. Restart to apply.")}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}
@@ -2167,9 +2168,9 @@ function configSettings() {
   ${block(
     "Subscription Logins",
     "",
-    `${flag("auto_refresh_access_token", "Refresh expired access tokens", "Off by default. After a model request returns 401, refresh its saved Codex or Claude login and retry once. Saves rotated tokens to the original credential store. Restart to apply.", true)}
-     ${flag("codex.account_auth_file_only", "Codex: saved logins only", "Off also accepts other ChatGPT logins, routed by their token claims.")}
-     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "Off also accepts other Claude logins after a profile lookup.")}`
+    `${flag("auto_refresh_access_token", "Refresh expired access tokens", "If a login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
+     ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
+     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}`
   )}`;
 }
 

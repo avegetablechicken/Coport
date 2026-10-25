@@ -741,8 +741,9 @@ test('cached daemon capabilities disable unsupported switches without a check bu
   assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
   results[0].capabilities=null;results[0].error='old daemon has no capabilities command';
   await h.loadDeviceCapabilities();
-  assert.match(h.deviceCapabilities(device),/data-tip="old daemon/);
-  assert.match(h.deviceCapabilities(device),/>Version unavailable<\/span>/);
+  assert.equal(h.deviceCapabilities(device), "Version unavailable: old daemon has no capabilities command");
+  assert.match(h.deviceSettings(), /data-tip="Version unavailable: old daemon has no capabilities command" tabindex="0"/);
+  assert.doesNotMatch(h.deviceSettings(), />Version unavailable|setting-description/);
   assert.match(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
   h.ui.deviceForwarders=[{deviceId:'ms',name:'MS'}];
   assert.doesNotMatch(h.forwardingSettings(),/data-action="device-forward"[^>]*disabled/);
