@@ -1,4 +1,5 @@
-//! Read-only access to CLI logins kept in the OS credential store.
+//! Access to CLI logins kept in the OS credential store. Writes only occur
+//! for explicitly enabled OAuth rotation.
 use crate::{Error, Result};
 use std::{
     collections::BTreeMap,
@@ -13,6 +14,8 @@ type Key = (String, String);
 /// does not turn into a stream of system prompts.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
+static GATE: LazyLock<Arc<tokio::sync::Mutex<()>>> = LazyLock::new(Default::default);
+
 static FAILURES: Mutex<BTreeMap<Key, Instant>> = Mutex::new(BTreeMap::new());
 
 /// The stored secret, or `None` when the store has no such entry.
@@ -22,7 +25,6 @@ static FAILURES: Mutex<BTreeMap<Key, Instant>> = Mutex::new(BTreeMap::new());
 /// so a caller that gives up mid-prompt neither lets another read start nor
 /// loses a denial, and the store never occupies more than one blocking thread.
 pub(crate) async fn read(service: &str, account: &str) -> Result<Option<String>> {
-    static GATE: LazyLock<Arc<tokio::sync::Mutex<()>>> = LazyLock::new(Default::default);
     let gate = GATE.clone().lock_owned().await;
     let key = (service.to_owned(), account.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -32,6 +34,51 @@ pub(crate) async fn read(service: &str, account: &str) -> Result<Option<String>>
     .await
     .unwrap_or(Err(()))
     .map_err(|_| Error::config("Cannot read the OS credential store."))
+}
+
+/// Compare and replace under the same gate as reads; never log credential values.
+pub(crate) async fn replace(
+    service: &str,
+    account: &str,
+    expected: serde_json::Value,
+    updated: String,
+) -> Result<()> {
+    let gate = GATE.clone().lock_owned().await;
+    let key = (service.to_owned(), account.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        let current = read_blocking(key.clone())?
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        if current.as_ref() != Some(&expected) {
+            return Err(());
+        }
+        save(&key.0, &key.1, &updated)
+    })
+    .await
+    .unwrap_or(Err(()))
+    .map_err(|_| Error::config("Cannot save refreshed login in the OS credential store."))
+}
+#[cfg(all(
+    not(test),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn save(service: &str, account: &str, value: &str) -> std::result::Result<(), ()> {
+    keyring::Entry::new(service, account)
+        .map_err(|_| ())?
+        .set_password(value)
+        .map_err(|_| ())
+}
+#[cfg(all(
+    not(test),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn save(_: &str, _: &str, _: &str) -> std::result::Result<(), ()> {
+    Err(())
+}
+#[cfg(test)]
+fn save(service: &str, account: &str, value: &str) -> std::result::Result<(), ()> {
+    set_test_entry(service, account, Some(value));
+    Ok(())
 }
 
 fn read_blocking(key: Key) -> std::result::Result<Option<String>, ()> {

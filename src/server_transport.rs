@@ -88,7 +88,7 @@ impl Deadline {
             Ok(remaining)
         }
     }
-    async fn run<T>(self, future: impl std::future::Future<Output = T>) -> Result<T> {
+    pub(super) async fn run<T>(self, future: impl std::future::Future<Output = T>) -> Result<T> {
         tokio::time::timeout(self.remaining()?, future)
             .await
             .map_err(|_| Error::config("Outbound operation timed out."))

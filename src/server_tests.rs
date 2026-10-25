@@ -97,6 +97,23 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                 if head || (response_mode == "drop_twice" && !profile) {
                     io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
                 }
+                else if response_mode.starts_with("auto_") {
+                    let refresh = request.starts_with("POST /oauth/token ") || request.starts_with("POST /v1/oauth/token ");
+                    if refresh && response_mode == "auto_wait" { ready.notified().await; }
+                    let (status, body) = if refresh {
+                        match response_mode {
+                            "auto_rejected" => (400, r#"{"error":"invalid_grant"}"#),
+                            "auto_invalid" => (200, r#"{"access_token":"invalid token"}"#),
+                            "auto_rate_limit" => (429, "{}"),
+                            _ => (200, r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#),
+                        }
+                    } else if request.contains("authorization: Bearer new-access") && response_mode != "auto_retry_401" {
+                        (200, "model-result")
+                    } else {
+                        (401, "original-unauthorized")
+                    };
+                    io.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
                 else if let Some(status) = response_mode.strip_prefix("status_") {
                     io.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 4\r\nRetry-After: 120\r\nConnection: close\r\n\r\noops").as_bytes()).await.unwrap();
                 }
@@ -3991,5 +4008,283 @@ async fn a_named_host_shared_by_both_apps_routes_like_its_base_url() {
             assert!(response.status().is_client_error(), "{origin}{path}");
             assert!(fixture.requests.try_recv().is_err());
         }
+    }
+}
+
+async fn auto_refresh_setup(
+    claude: bool,
+    enabled: bool,
+    mode: &'static str,
+) -> (tempfile::TempDir, std::path::PathBuf, Running, Fixture) {
+    let fixture = fixture("http", mode).await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let home = tempfile::tempdir().unwrap();
+    let (filename, value, section) = if claude {
+        (
+            ".credentials.json",
+            json!({"other":"preserved","claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret","scopes":["user:inference","user:profile"]}}),
+            format!(
+                "claude:\n  config_dirs: [{}]\n  routing:\n    account_fallback: selected\n    api_key: {{\"upstream.invalid/v1\": selected}}\n",
+                serde_json::to_string(home.path()).unwrap()
+            ),
+        )
+    } else {
+        (
+            "auth.json",
+            json!({"other":"preserved","tokens":{"account_id":"acct-1","access_token":"access-secret","refresh_token":"refresh-secret"}}),
+            format!(
+                "codex:\n  homes: [{}]\n  base_url:\n    account: https://upstream.invalid/backend-api\n  routing:\n    account: {{acct-1: selected}}\n    api_key: {{\"upstream.invalid/v1\": selected}}\n",
+                serde_json::to_string(home.path()).unwrap()
+            ),
+        )
+    };
+    let file = home.path().join(filename);
+    std::fs::write(&file, value.to_string()).unwrap();
+    let running = running(&format!(
+        "auto_refresh_access_token: {enabled}\nproxies:\n  selected: {endpoint}\n{section}"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    (home, file, running, fixture)
+}
+fn auto_model_path(claude: bool) -> &'static str {
+    if claude {
+        "/anthropic/v1/messages"
+    } else {
+        "/responses"
+    }
+}
+async fn auto_model(running: &Running, claude: bool) -> reqwest::Response {
+    http()
+        .post(format!("{}{}", running.url, auto_model_path(claude)))
+        .bearer_auth("access-secret")
+        .header("cookie", "private-cookie")
+        .header("user-agent", "test-model-client")
+        .body("model-body")
+        .send()
+        .await
+        .unwrap()
+}
+fn take_requests(fixture: &mut Fixture) -> Vec<String> {
+    let mut requests = Vec::new();
+    while let Ok(request) = fixture.requests.try_recv() {
+        if !request.starts_with("CONNECT ") {
+            requests.push(request);
+        }
+    }
+    requests
+}
+#[tokio::test]
+async fn auto_refresh_rotates_saved_tokens_once_for_concurrent_and_repeated_model_calls() {
+    for claude in [false, true] {
+        let (_home, file, running, mut fixture) =
+            auto_refresh_setup(claude, true, "auto_success").await;
+        let (one, two) = tokio::join!(auto_model(&running, claude), auto_model(&running, claude));
+        assert_eq!(one.status(), 200);
+        assert_eq!(two.status(), 200);
+        assert_eq!(
+            auto_model(&running, claude).await.text().await.unwrap(),
+            "model-result"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let service = if claude {
+            Service::Claude
+        } else {
+            Service::Codex
+        };
+        assert_eq!(
+            crate::oauth_credentials::access(&saved, service),
+            Some("new-access")
+        );
+        assert_eq!(
+            crate::oauth_credentials::refresh(&saved, service),
+            Some("new-refresh")
+        );
+        assert_eq!(saved["other"], "preserved");
+        // A configured API gateway must receive the caller's original token,
+        // even if it also happens to be an old OAuth alias in this process.
+        let scope = if claude { "anthropic" } else { "codex" };
+        let response = http()
+            .post(format!(
+                "{}/{scope}/https://upstream.invalid/v1/responses",
+                running.url
+            ))
+            .bearer_auth("access-secret")
+            .body("api-body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        let requests = take_requests(&mut fixture);
+        let refreshes: Vec<_> = requests
+            .iter()
+            .filter(|r| r.contains("refresh-secret"))
+            .collect();
+        assert_eq!(refreshes.len(), 1, "{requests:?}");
+        let refresh = refreshes[0];
+        for forbidden in [
+            "access-secret",
+            "private-cookie",
+            "test-model-client",
+            "authorization:",
+            "model-body",
+        ] {
+            assert!(!refresh.contains(forbidden));
+        }
+        if claude {
+            let body: serde_json::Value =
+                serde_json::from_str(refresh.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["scope"], "user:inference user:profile");
+            assert_eq!(body["client_id"], "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        } else {
+            assert!(
+                refresh
+                    .contains("grant_type=refresh_token&refresh_token=refresh-secret&client_id=")
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.contains("authorization: Bearer new-access"))
+                .all(|r| r.ends_with("model-body"))
+        );
+        running.server.logger.flush().unwrap();
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        for secret in [
+            "access-secret",
+            "refresh-secret",
+            "new-access",
+            "new-refresh",
+        ] {
+            assert!(!log.contains(secret));
+        }
+        // A logout revokes old access-token aliases.
+        std::fs::remove_file(file).unwrap();
+        assert_ne!(auto_model(&running, claude).await.status(), 200);
+    }
+}
+#[tokio::test]
+async fn auto_refresh_is_opt_in_and_never_runs_for_usage_reads() {
+    for claude in [false, true] {
+        let (_home, file, running, mut fixture) =
+            auto_refresh_setup(claude, false, "auto_success").await;
+        let before = std::fs::read(&file).unwrap();
+        assert_eq!(auto_model(&running, claude).await.status(), 401);
+        assert_eq!(take_requests(&mut fixture).len(), 1);
+        assert_eq!(std::fs::read(file).unwrap(), before);
+        let (_home, file, running, mut fixture) =
+            auto_refresh_setup(claude, true, "auto_success").await;
+        let before = std::fs::read(&file).unwrap();
+        let path = if claude {
+            "/anthropic/api/oauth/usage"
+        } else {
+            "/wham/usage"
+        };
+        for _ in 0..3 {
+            let response = http()
+                .get(format!("{}{path}", running.url))
+                .bearer_auth("access-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+        }
+        assert_eq!(take_requests(&mut fixture).len(), 3);
+        assert_eq!(std::fs::read(file).unwrap(), before);
+    }
+}
+#[tokio::test]
+async fn auto_refresh_failure_is_bounded_and_keeps_the_original_response() {
+    for mode in [
+        "auto_rejected",
+        "auto_invalid",
+        "auto_rate_limit",
+        "auto_retry_401",
+    ] {
+        let (_home, file, running, mut fixture) = auto_refresh_setup(false, true, mode).await;
+        let before = std::fs::read(&file).unwrap();
+        for _ in 0..2 {
+            let response = auto_model(&running, false).await;
+            assert_eq!(response.status(), 401);
+            assert_eq!(response.text().await.unwrap(), "original-unauthorized");
+        }
+        let requests = take_requests(&mut fixture);
+        // A second 401 after rotation is allowed one refresh on its newer
+        // generation, but the original request itself is never retried twice.
+        let count = requests
+            .iter()
+            .filter(|r| r.starts_with("POST /oauth/token "))
+            .count();
+        assert_eq!(
+            count,
+            if mode == "auto_retry_401" { 2 } else { 1 },
+            "{mode}"
+        );
+        if mode != "auto_retry_401" {
+            assert_eq!(std::fs::read(file).unwrap(), before);
+        }
+    }
+}
+#[tokio::test]
+async fn auto_refresh_does_not_overwrite_an_external_account_switch() {
+    let (_home, file, running, mut fixture) = auto_refresh_setup(false, true, "auto_wait").await;
+    let url = format!("{}/responses", running.url);
+    let call = tokio::spawn(async move {
+        http()
+            .post(url)
+            .bearer_auth("access-secret")
+            .body("model-body")
+            .send()
+            .await
+            .unwrap()
+    });
+    loop {
+        let request = fixture.requests.recv().await.unwrap();
+        if request.starts_with("POST /oauth/token ") {
+            break;
+        }
+    }
+    let switched = r#"{"tokens":{"account_id":"another","access_token":"external-access","refresh_token":"external-refresh"}}"#;
+    std::fs::write(&file, switched).unwrap();
+    fixture.release.notify_one();
+    assert_eq!(call.await.unwrap().status(), 401);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), switched);
+    assert!(take_requests(&mut fixture).is_empty());
+}
+
+#[tokio::test]
+async fn auto_refresh_ignores_other_statuses_and_logins_without_refresh_tokens() {
+    for claude in [false, true] {
+        for status in ["status_403", "status_429", "status_500"] {
+            let (_home, file, running, mut fixture) =
+                auto_refresh_setup(claude, true, status).await;
+            let original = std::fs::read(&file).unwrap();
+            let response = auto_model(&running, claude).await;
+            assert_eq!(
+                response.status().as_u16().to_string(),
+                status.trim_start_matches("status_")
+            );
+            assert_eq!(take_requests(&mut fixture).len(), 1);
+            assert_eq!(std::fs::read(file).unwrap(), original);
+        }
+        let (_home, file, running, mut fixture) =
+            auto_refresh_setup(claude, true, "auto_success").await;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        if claude {
+            value["claudeAiOauth"]
+                .as_object_mut()
+                .unwrap()
+                .remove("refreshToken");
+        } else {
+            value["tokens"]
+                .as_object_mut()
+                .unwrap()
+                .remove("refresh_token");
+        }
+        std::fs::write(&file, value.to_string()).unwrap();
+        assert_eq!(auto_model(&running, claude).await.status(), 401);
+        assert_eq!(take_requests(&mut fixture).len(), 1);
     }
 }

@@ -15,7 +15,10 @@ enum Kind {
 type Getter = fn(&Config) -> Value;
 
 /// Configuration values the Settings page may change, as dotted YAML keys.
-const EDITABLE: [(&str, Kind, Getter); 11] = [
+const EDITABLE: [(&str, Kind, Getter); 12] = [
+    ("auto_refresh_access_token", Kind::Flag, |c| {
+        json!(c.auto_refresh_access_token)
+    }),
     ("listen_port", Kind::Port, |c| json!(c.listen_port)),
     ("allow_external_access", Kind::Flag, |c| {
         json!(c.allow_external_access)
@@ -225,6 +228,36 @@ mod tests {
 
     const EXAMPLE: &str = include_str!("../../config.example.yaml");
     const BASE: &str = "listen_port: 8787 # local\nrequest_timeout_seconds: 300\n";
+
+    #[test]
+    fn automatic_refresh_toggle_preserves_lf_crlf_comments_and_other_settings() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            let original = [
+                "listen_port: 8787 # local",
+                "request_timeout_seconds: 300",
+                "auto_refresh_access_token: false # opt in",
+                "",
+            ]
+            .join(newline);
+            std::fs::write(&path, &original).unwrap();
+            assert_eq!(
+                values(&Config::read(&path).unwrap())["auto_refresh_access_token"],
+                false
+            );
+            set_value(&path, "auto_refresh_access_token", &json!(true)).unwrap();
+            assert!(Config::read(&path).unwrap().auto_refresh_access_token);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original.replace("false # opt in", "true # opt in")
+            );
+            set_value(&path, "auto_refresh_access_token", &json!(false)).unwrap();
+            assert!(!Config::read(&path).unwrap().auto_refresh_access_token);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(set_value(&path, "auto_refresh_access_token", &json!("true")).is_err());
+        }
+    }
 
     #[test]
     fn external_access_can_be_enabled_and_disabled_without_changing_other_settings() {

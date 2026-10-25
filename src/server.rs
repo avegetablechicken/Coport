@@ -97,6 +97,8 @@ mod transport;
 #[path = "websocket_relay.rs"]
 mod websocket_relay;
 use transport::*;
+#[path = "auto_refresh.rs"]
+mod auto_refresh;
 
 /// Claude OAuth identities by access token, with last use for bounded LRU
 /// eviction. An identity does not depend on routing, so one process can share
@@ -113,6 +115,7 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
+    auto_refresh: auto_refresh::RefreshState,
     // When background discovery last failed for a token, until a success. Only
     // `ClaudeProfiles` holds identities. The key is the credential, so switching
     // a saved login forces a new check.
@@ -134,6 +137,7 @@ impl Server {
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
             refresh_routes: Default::default(),
+            auto_refresh: Default::default(),
             failed_probes: tokio::sync::Mutex::new(HashMap::new()),
             discovery: tokio::sync::Mutex::new(()),
             credential_checks: Default::default(),
@@ -777,7 +781,7 @@ impl Server {
     }
     async fn forward(
         &self,
-        incoming: Request<Incoming>,
+        mut incoming: Request<Incoming>,
         target: &str,
         service: Service,
         log: &mut RequestLog,
@@ -836,6 +840,30 @@ impl Server {
         } else {
             None
         };
+        let auto_refresh_model = self.config.auto_refresh_access_token
+            && explicit_api_route.is_none()
+            && explicit_codex_route.is_none()
+            && crate::model_calls::is_model_endpoint(incoming.method().as_str(), target);
+        let rotation_guard = if auto_refresh_model {
+            Some(self.auto_refresh.rotation.read().await)
+        } else {
+            None
+        };
+        if auto_refresh_model {
+            if let Some(token) = incoming
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+            {
+                if let Some(current) = self.refreshed_alias(service, token).await {
+                    incoming.headers_mut().insert(
+                        "authorization",
+                        format!("Bearer {current}").parse().unwrap(),
+                    );
+                }
+            }
+        }
         let claude_target = if claude {
             Some(
                 crate::claude::target(target)
@@ -1006,13 +1034,30 @@ impl Server {
                 upstream_url(&r.upstream, target, r.account_id.is_some())?
             }
         };
+        let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
+            || route.as_ref().is_some_and(|r| r.custom_upstream);
+        let refresh_snapshot = if auto_refresh_model && !native_tls && !docs {
+            let token = if let Some(r) = &claude_route {
+                (r.matched_account && r.bearer).then_some(r.token.as_str())
+            } else {
+                route
+                    .as_ref()
+                    .filter(|r| r.account_id.is_some() && r.provider.is_none())
+                    .map(|r| r.token.as_str())
+            };
+            match token {
+                Some(token) => self.refresh_snapshot(service, token).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        drop(rotation_guard);
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
         if log.fields.contains_key("model_call_id") {
             crate::model_calls::observe_request(&bytes, log);
         }
-        let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)
-            || route.as_ref().is_some_and(|r| r.custom_upstream);
         let mut headers = filtered_headers(&parts.headers);
         if docs {
             let allowed = [
@@ -1063,14 +1108,33 @@ impl Server {
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
-        self.send_via(
-            &choice,
-            request,
-            native_tls,
-            Deadline::new(self.config.request_timeout_seconds),
-            log,
-        )
-        .await
+        let deadline = Deadline::new(self.config.request_timeout_seconds);
+        let retry = refresh_snapshot.as_ref().and_then(|_| request.try_clone());
+        let response = self
+            .send_via(&choice, request, native_tls, deadline, log)
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let (Some(snapshot), Some(mut retry)) = (refresh_snapshot, retry) {
+                match self.renew_access(&snapshot, &choice, deadline, log).await {
+                    Ok(token) => {
+                        retry
+                            .headers_mut()
+                            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+                        // OAuth routes always use Authorization, never an API key.
+                        retry.headers_mut().remove("x-api-key");
+                        drop(response);
+                        return self
+                            .send_via(&choice, retry, native_tls, deadline, log)
+                            .await;
+                    }
+                    Err(error) => {
+                        log.field("oauth_refresh", "failed");
+                        log.field("oauth_refresh_reason", error.message);
+                    }
+                }
+            }
+        }
+        Ok(response)
     }
 
     /// CONNECT is served only for destinations decrypted and routed by credential.

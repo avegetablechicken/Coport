@@ -20,7 +20,7 @@ pub struct Identity {
 pub fn valid_token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b > 32 && b < 127)
 }
-fn claims(token: &str) -> Value {
+pub(crate) fn claims(token: &str) -> Value {
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 {
         return Value::Null;
@@ -148,11 +148,16 @@ const KEYRING_SERVICE: &str = "Codex Auth";
 /// The login the Codex CLI saved for `home`, read from wherever that home's
 /// `config.toml` tells Codex to keep it.
 pub(crate) async fn saved_auth(home: &Path) -> Result<Value> {
+    Ok(saved_auth_store(home).await?.1)
+}
+pub(crate) async fn saved_auth_store(
+    home: &Path,
+) -> Result<(crate::oauth_credentials::Store, Value)> {
+    use crate::oauth_credentials::Store;
     let settings = auth_settings(home)?;
     let file = || {
-        let raw = std::fs::read(home.join("auth.json"))
-            .map_err(|_| Error::config("Cannot read Codex auth.json."))?;
-        serde_json::from_slice::<Value>(&raw).map_err(|_| Error::config("Invalid Codex auth.json."))
+        let store = Store::File(home.join("auth.json"));
+        Ok((store.clone(), store.read_file()?))
     };
     let keyring = || async {
         if settings.features.secret_auth_storage {
@@ -164,6 +169,12 @@ pub(crate) async fn saved_auth(home: &Path) -> Result<Value> {
             .await?
             .map(|raw| {
                 serde_json::from_str::<Value>(&raw)
+                    .map(|value| {
+                        (
+                            Store::Keychain(KEYRING_SERVICE.into(), keyring_account(home)),
+                            value,
+                        )
+                    })
                     .map_err(|_| Error::config("Invalid Codex login in the OS credential store."))
             })
             .transpose()
@@ -1281,6 +1292,33 @@ mod tests {
                 toml::from_str(&format!("[features]\nsecret_auth_storage = {enabled}\n")).unwrap();
             assert_eq!(settings.features.secret_auth_storage, enabled);
         }
+    }
+
+    #[tokio::test]
+    async fn rotated_oauth_credentials_write_back_to_the_selected_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"cli_auth_credentials_store = "keyring"
+[features]
+secret_auth_storage = false
+"#,
+        )
+        .unwrap();
+        let original = serde_json::json!({"tokens":{"account_id":"test", "access_token":"old", "refresh_token":"refresh"}, "other":42});
+        crate::keychain::set_test_entry(
+            KEYRING_SERVICE,
+            &keyring_account(dir.path()),
+            Some(&original.to_string()),
+        );
+        let (store, read) = saved_auth_store(dir.path()).await.unwrap();
+        assert_eq!(read, original);
+        let mut updated = original.clone();
+        updated["tokens"]["access_token"] = "new".into();
+        store.replace(&read, &updated).await.unwrap();
+        assert_eq!(saved_auth(dir.path()).await.unwrap(), updated);
+        assert!(!dir.path().join("auth.json").exists());
+        assert!(store.replace(&read, &original).await.is_err());
     }
 
     #[test]

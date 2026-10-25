@@ -434,3 +434,23 @@ access.
 - Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
 - After rebuilding a running service, restart that process to use the new executable.
+
+## Automatic OAuth renewal
+
+`auto_refresh_access_token: false` is the default. Enable **Refresh expired access tokens**
+in GUI Settings → Subscription Logins, or set this YAML value to `true`, then restart
+the proxy to apply it. Only model HTTP requests (including a WebSocket upgrade rejected
+with HTTP 401) trigger renewal. Usage reads, Settings, Devices, API keys, and tokens
+without a saved refresh token do not trigger renewal. Errors inside an already-open
+WebSocket or SSE stream are not replayed.
+
+After an upstream HTTP 401, Coport refreshes the matched saved Codex/Claude login
+through that account's configured transport, saves rotated credentials to the original
+file or OS credential store, and retries the buffered request once. It preserves other
+credential fields and refuses to overwrite a login changed during renewal. Concurrent
+requests share renewal; rejected refresh tokens stay blocked for that server instance,
+while transient failures pause retries for 60 seconds. A failed renewal returns the
+original 401. In-memory aliases allow callers still holding the old access
+token to use the rotated login; aliases are bounded, disappear on proxy restart, and
+are revoked when the saved login changes externally or is removed. Clients should still
+reload their saved login after rotation.

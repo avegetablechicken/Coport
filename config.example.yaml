@@ -1,3 +1,5 @@
+# Refresh saved OAuth logins on model HTTP 401, then retry once.
+auto_refresh_access_token: false
 # Shared server settings. Restart after changing YAML.
 listen_port: 8787
 # Opt in to the independent read-only statistics API (desktop coportd only).

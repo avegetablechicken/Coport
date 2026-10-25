@@ -10,6 +10,7 @@ mod keychain;
 pub mod local_tls;
 pub mod logger;
 pub mod model_calls;
+mod oauth_credentials;
 mod observation_memory;
 pub mod refresh_routes;
 mod request_ids;

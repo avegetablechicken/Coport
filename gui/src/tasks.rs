@@ -281,7 +281,7 @@ mod tests {
         std::fs::create_dir(&claude).unwrap();
         std::fs::write(
             claude.join(".credentials.json"),
-            r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"saved-secret","refreshToken":"fake-refresh"}}"#,
         )
         .unwrap();
         // Counts connections to the probe route and closes them at once.
@@ -296,7 +296,7 @@ mod tests {
             }
         });
         let config = Config::parse(&format!(
-            "listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  trap: http://127.0.0.1:{port}\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n    account_probe: trap\n",
+            "listen_port: 8787\nauto_refresh_access_token: true\nrequest_timeout_seconds: 3\nproxies:\n  trap: http://127.0.0.1:{port}\ncodex:\n  homes: []\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n    account_probe: trap\n",
             serde_json::to_string(&claude).unwrap()
         ))
         .unwrap();

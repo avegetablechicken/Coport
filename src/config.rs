@@ -128,6 +128,8 @@ struct Raw {
     #[serde(default)]
     allow_external_access: bool,
     #[serde(default)]
+    auto_refresh_access_token: bool,
+    #[serde(default)]
     external_data: Option<crate::external_access::DataConfig>,
     request_timeout_seconds: f64,
     #[serde(default)]
@@ -200,6 +202,8 @@ pub struct Config {
     pub claude: crate::claude::Claude,
     pub listen_port: u16,
     pub allow_external_access: bool,
+    /// Refresh saved OAuth logins after a model request returns HTTP 401.
+    pub auto_refresh_access_token: bool,
     pub external_data: Option<crate::external_access::DataConfig>,
     pub request_timeout_seconds: f64,
     pub websocket: WebSocketTimeouts,
@@ -260,6 +264,7 @@ impl Config {
             claude: raw.claude,
             listen_port: raw.listen_port,
             allow_external_access: raw.allow_external_access,
+            auto_refresh_access_token: raw.auto_refresh_access_token,
             external_data: raw.external_data,
             request_timeout_seconds: raw.request_timeout_seconds,
             websocket: raw.websocket,
@@ -642,6 +647,20 @@ pub fn redacted_endpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_oauth_refresh_is_opt_in_and_strictly_boolean() {
+        let base = "listen_port: 8787\nrequest_timeout_seconds: 30\n";
+        assert!(!Config::parse(base).unwrap().auto_refresh_access_token);
+        assert!(
+            Config::parse(&format!("{base}auto_refresh_access_token: true\n"))
+                .unwrap()
+                .auto_refresh_access_token
+        );
+        for value in ["null", "1", "'true'", "[]"] {
+            assert!(Config::parse(&format!("{base}auto_refresh_access_token: {value}\n")).is_err());
+        }
+    }
 
     #[test]
     fn external_access_is_explicit_and_strictly_boolean() {

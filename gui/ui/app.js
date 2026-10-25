@@ -2167,7 +2167,8 @@ function configSettings() {
   ${block(
     "Subscription Logins",
     "",
-    `${flag("codex.account_auth_file_only", "Codex: saved logins only", "Off also accepts other ChatGPT logins, routed by their token claims.")}
+    `${flag("auto_refresh_access_token", "Refresh expired access tokens", "Off by default. After a model request returns 401, refresh its saved Codex or Claude login and retry once. Saves rotated tokens to the original credential store. Restart to apply.", true)}
+     ${flag("codex.account_auth_file_only", "Codex: saved logins only", "Off also accepts other ChatGPT logins, routed by their token claims.")}
      ${flag("claude.account_auth_file_only", "Claude: saved logins only", "Off also accepts other Claude logins after a profile lookup.")}`
   )}`;
 }

@@ -121,10 +121,15 @@ fn keychain_account() -> String {
 /// The OAuth login Claude Code saved for a config directory. Like Claude Code,
 /// the macOS keychain takes precedence over `.credentials.json`.
 async fn saved_credentials(directory: &std::path::Path) -> Result<serde_json::Value> {
+    Ok(saved_credentials_store(directory).await?.1)
+}
+pub(crate) async fn saved_credentials_store(
+    directory: &std::path::Path,
+) -> Result<(crate::oauth_credentials::Store, serde_json::Value)> {
+    use crate::oauth_credentials::Store;
     let file = || {
-        let raw = std::fs::read(directory.join(".credentials.json"))
-            .map_err(|_| Error::config("Cannot read Claude credentials file."))?;
-        serde_json::from_slice(&raw).map_err(|_| Error::config("Invalid Claude credentials file."))
+        let store = Store::File(directory.join(".credentials.json"));
+        Ok((store.clone(), store.read_file()?))
     };
     #[cfg(any(target_os = "macos", test))]
     {
@@ -132,9 +137,11 @@ async fn saved_credentials(directory: &std::path::Path) -> Result<serde_json::Va
         for service in keychain_services(directory) {
             match crate::keychain::read(&service, &keychain_account()).await {
                 Ok(Some(raw)) => {
-                    return serde_json::from_str(&raw).map_err(|_| {
-                        Error::config("Invalid Claude credentials in the OS credential store.")
-                    });
+                    return serde_json::from_str(&raw)
+                        .map(|value| (Store::Keychain(service, keychain_account()), value))
+                        .map_err(|_| {
+                            Error::config("Invalid Claude credentials in the OS credential store.")
+                        });
                 }
                 Ok(None) => {}
                 Err(error) => failure = Some(error),
@@ -782,6 +789,30 @@ impl ClaudeRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn rotated_claude_login_keeps_keychain_precedence_and_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({"claudeAiOauth":{"accessToken":"old", "refreshToken":"refresh"}, "other":42});
+        let file = dir.path().join(".credentials.json");
+        std::fs::write(&file, "stale file stays untouched").unwrap();
+        crate::keychain::set_test_entry(
+            &keychain_services(dir.path())[0],
+            &keychain_account(),
+            Some(&original.to_string()),
+        );
+        let (store, read) = saved_credentials_store(dir.path()).await.unwrap();
+        assert_eq!(read, original);
+        let mut updated = original.clone();
+        updated["claudeAiOauth"]["accessToken"] = "new".into();
+        store.replace(&read, &updated).await.unwrap();
+        assert_eq!(saved_credentials(dir.path()).await.unwrap(), updated);
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "stale file stays untouched"
+        );
+        assert!(store.replace(&read, &original).await.is_err());
+    }
+
     #[tokio::test]
     async fn refresh_routing_reloads_credentials_and_requires_an_explicit_route() {
         let dir = tempfile::tempdir().unwrap();
