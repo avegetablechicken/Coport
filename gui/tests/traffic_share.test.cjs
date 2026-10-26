@@ -88,20 +88,53 @@ test('groups by service with one hue each and keeps unidentified last', () => {
   const { shareGroups } = setup();
   const groups = shareGroups([credential('Unidentified', 50), credential('a', 10), credential('b', 30, 'Claude'), credential('c', 20), credential('idle', 0)], requests);
   assert.deepEqual(plain(groups.map((g) => [g.service, g.value])), [['Codex', 80], ['Claude', 30]]);
-  assert.deepEqual(groups[0].slices.map((s) => [s.name, s.value, s.color ?? null]), [['c', 20, '--codex-1'], ['a', 10, '--codex-2'], ['Unidentified', 50, null]]);
-  assert.deepEqual(groups[1].slices.map((s) => s.color), ['--claude-1']);
+  assert.deepEqual(groups[0].slices.map((s) => [s.name, s.value, s.color ?? null]), [['c', 20, 'var(--codex-1)'], ['a', 10, 'var(--codex-2)'], ['Unidentified', 50, null]]);
+  assert.deepEqual(groups[1].slices.map((s) => s.color), ['var(--claude-1)']);
 });
-test('folds credentials beyond the shades into Others per service', () => {
+test('keeps every sizable credential and folds only tiny ones into Others', () => {
   const { shareGroups } = setup();
+  // Six large credentials all keep their slice; there is no fixed count.
   const named = Array.from({ length: 6 }, (_, i) => credential(`c${i}`, 100 - i, 'Claude'));
-  const [group] = shareGroups([...named, credential('Unidentified', 5, 'Claude')], requests);
-  assert.deepEqual(group.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (3)', 'Unidentified']);
-  assert.equal(group.slices[3].value, 97 + 96 + 95);
-  assert.equal(group.slices[3].muted, true);
-  // Others never holds a single credential: four fit, five group two.
-  const four = shareGroups(named.slice(0, 4), requests)[0].slices;
-  assert.deepEqual(four.map((s) => s.color), ['--claude-1', '--claude-2', '--claude-3', '--claude-4']);
-  assert.deepEqual(shareGroups(named.slice(0, 5), requests)[0].slices.map((s) => s.name), ['c0', 'c1', 'c2', 'Others (2)']);
+  const [all] = shareGroups([...named, credential('Unidentified', 5, 'Claude')], requests);
+  assert.deepEqual(all.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'Unidentified']);
+  // Under 2.5% of the whole ring, two or more fold, with any service.
+  const tiny = [credential('t0', 2, 'Claude'), credential('t1', 1, 'Claude'), credential('x', 500)];
+  const [codex, claude] = shareGroups([...named, ...tiny], requests);
+  assert.deepEqual(codex.slices.map((s) => s.name), ['x']);
+  assert.deepEqual(claude.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'Others (2)']);
+  const others = claude.slices[6];
+  assert.equal(others.value, 3);
+  assert.equal(others.muted, true);
+  assert.deepEqual(plain(others.members), [{ name: 't0', value: 2 }, { name: 't1', value: 1 }]);
+  // Others never holds a single credential: a lone tiny one keeps its slice.
+  const lone = shareGroups([...named, tiny[0], tiny[2]], requests)[1].slices;
+  assert.deepEqual(lone.map((s) => s.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 't0']);
+  // The threshold is inclusive: exactly 2.5% stays.
+  const edge = shareGroups([credential('big', 76), credential('e', 2), credential('f', 1), credential('g', 1)], requests)[0].slices;
+  assert.deepEqual(plain(edge.map((s) => [s.name, s.value])), [['big', 76], ['e', 2], ['Others (2)', 2]]);
+});
+test('unknown amounts keep their row instead of folding', () => {
+  const { shareGroups } = setup();
+  const measure = (c) => c.inputTokens;
+  const tokens = (inputTokens) => ({ inputTokens });
+  const [group] = shareGroups([credential('a', 1, 'Codex', tokens(1000)), credential('b', 1), credential('c', 1, 'Codex', tokens(1)), credential('d', 1, 'Codex', tokens(0))], measure);
+  assert.deepEqual(plain(group.slices.map((s) => [s.name, s.value])), [['a', 1000], ['b', null], ['Others (2)', 1]]);
+});
+test('shades follow the defined ones and blend between them beyond four', () => {
+  const { shareGroups, shareShade } = setup();
+  const four = shareGroups(Array.from({ length: 4 }, (_, i) => credential(`c${i}`, 10 - i, 'Claude')), requests)[0].slices;
+  assert.deepEqual(four.map((s) => s.color), ['var(--claude-1)', 'var(--claude-2)', 'var(--claude-3)', 'var(--claude-4)']);
+  const seven = Array.from({ length: 7 }, (_, i) => shareShade('Codex', i, 7));
+  assert.deepEqual(seven, [
+    'var(--codex-1)',
+    'color-mix(in srgb, var(--codex-2) 50%, var(--codex-1))',
+    'var(--codex-2)',
+    'color-mix(in srgb, var(--codex-3) 50%, var(--codex-2))',
+    'var(--codex-3)',
+    'color-mix(in srgb, var(--codex-4) 50%, var(--codex-3))',
+    'var(--codex-4)',
+  ]);
+  assert.equal(new Set(Array.from({ length: 12 }, (_, i) => shareShade('Claude', i, 12))).size, 12);
 });
 test('Codex comes before Claude whatever the order or size', () => {
   const { shareGroups } = setup();
@@ -283,9 +316,9 @@ test('Models leaves out unidentified calls without tokens, All keeps them', () =
 });
 test('Others lists every configuration it groups on hover', () => {
   const { trafficShare } = setup();
-  const named = Array.from({ length: 5 }, (_, i) => credential(`c${i}`, 100 - i, 'Claude'));
+  const named = [credential('c0', 100, 'Claude'), credential('c1', 99, 'Claude'), credential('c2', 2, 'Claude'), credential('c3', 1, 'Claude')];
   const html = trafficShare(named, 'all');
-  const tip = 'Claude · Others (2): 193 requests\nc3: 97 requests\nc4: 96 requests';
+  const tip = 'Claude · Others (2): 3 requests\nc2: 2 requests\nc3: 1 requests';
   // Both the legend row and its ring sector carry the list.
   assert.equal(html.split(`title="${tip}"`).length, 2);
   assert.equal(html.split(`<title>${tip}</title>`).length, 2);

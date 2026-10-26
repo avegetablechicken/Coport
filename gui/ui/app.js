@@ -1261,6 +1261,9 @@ function modelTokenStats(stats, scope) {
 
 const SHARE_SERVICES = ["Codex", "Claude"];
 const SHARE_SHADES = 4;
+/// The smallest part of the ring a sector is drawn at, so it stays hoverable;
+/// credentials below it fold into Others.
+const SHARE_MIN = 0.025;
 
 /// Settings may show account names in full; masking is the default.
 function accountNamesMasked() {
@@ -1287,20 +1290,22 @@ function maskAccountName(name) {
 
 /// Credentials grouped by app, Codex then Claude, each group in its hue; traffic
 /// has no other service. `measure` gives a credential's amount, or null when it
-/// is unknown. Each credential takes a shade while they fit; beyond that the
-/// largest keep theirs and at least two others fold into "Others". Unidentified
-/// requests come last; Others and unidentified are drawn without a hue.
+/// is unknown. Each credential keeps its own slice unless it is under SHARE_MIN
+/// of the whole ring; at least two such credentials fold into "Others" per
+/// service. Unknown amounts keep their row. Unidentified requests come last;
+/// Others and unidentified are drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
   const displayName = (c) => maskAccountName(c.credential);
   const used = credentials.filter((c) => c.requests > 0);
+  const total = sum(used) ?? 0;
+  const small = (c) => measure(c) != null && measure(c) < total * SHARE_MIN;
   return SHARE_SERVICES.filter((service) => used.some((c) => c.service === service)).map((service) => {
     const own = used.filter((c) => c.service === service);
     const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
-    const hue = service.toLowerCase();
-    const shown = named.length > SHARE_SHADES ? SHARE_SHADES - 1 : named.length;
-    const slices = named.slice(0, shown).map((c, i) => ({ name: displayName(c), value: measure(c), color: `--${hue}-${i + 1}` }));
-    const rest = named.slice(shown);
+    const rest = named.filter(small).length >= 2 ? named.filter(small) : [];
+    const kept = named.filter((c) => !rest.includes(c));
+    const slices = kept.map((c, i) => ({ name: displayName(c), value: measure(c), color: shareShade(service, i, kept.length) }));
     if (rest.length) {
       const members = rest.map((c) => ({ name: displayName(c), value: measure(c) }));
       slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true, members });
@@ -1308,6 +1313,17 @@ function shareGroups(credentials, measure) {
     for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true, unidentified: true });
     return { service, value: sum(own), slices };
   });
+}
+
+/// The `index`th of `count` shades of a service's hue, darkest first. Up to
+/// SHARE_SHADES use the defined shades; more are blended between them.
+function shareShade(service, index, count) {
+  const shade = (n) => `var(--${service.toLowerCase()}-${n})`;
+  if (count <= SHARE_SHADES) return shade(index + 1);
+  const at = (index * (SHARE_SHADES - 1)) / (count - 1);
+  const low = Math.floor(at);
+  const mix = Math.round((at - low) * 100);
+  return mix ? `color-mix(in srgb, ${shade(low + 2)} ${mix}%, ${shade(low + 1)})` : shade(low + 1);
 }
 
 /// A donut sector between fractions `from` and `to` of the turn, starting at
@@ -1377,9 +1393,9 @@ function trafficShare(credentials, scope, source = "") {
   // Unknown and zero amounts stay in the legend but take no slice.
   const slices = groups.flatMap((g) => g.slices.filter((s) => s.value > 0).map((s) => ({ ...s, service: g.service })));
   // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
-  const widths = slices.map((s) => Math.max(s.value / total, 0.025));
+  const widths = slices.map((s) => Math.max(s.value / total, SHARE_MIN));
   const turn = widths.reduce((sum, w) => sum + w, 0);
-  const color = (s) => (s.muted ? "var(--track)" : `var(${s.color})`);
+  const color = (s) => (s.muted ? "var(--track)" : s.color);
   const amount = (n) => (n == null ? "no reported usage" : `${n.toLocaleString("en-US")} ${unit}`);
   // Others lists every configuration it groups, one per line.
   const label = (s) => [`${s.service} · ${s.name}: ${amount(s.value)}`, ...(s.members ?? []).map((m) => `${m.name}: ${amount(m.value)}`)].join("\n");
@@ -1470,7 +1486,7 @@ function renderActivityTraffic() {
   }).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
   const notes = [
-    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; a service with more than four shows its three largest and groups the rest as Others.",
+    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; credentials under 2.5% of the ring are grouped as Others when there are at least two.",
     "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
     `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Requests from a renamed configuration, one with a changed base URL, or logged before base URLs were recorded are merged and marked for review. Unidentified requests have no logged credential, or match no single current configuration. Logs are never rewritten.",
