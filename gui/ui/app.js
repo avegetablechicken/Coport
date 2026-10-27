@@ -1697,6 +1697,12 @@ function selectDeviceTraffic() {
   ui.mergedData = cached;
   return true;
 }
+/// A refresh first publishes every peer as pending. Such a frame would drop
+/// peers the shown view already has, so that view stays until they answer.
+function dropsShownPeers(view, shown) {
+  return !!shown?.sources?.some(old => old.traffic
+    && view.sources?.find(source => source.name === old.name)?.error === "TRAFFIC_UPDATING");
+}
 async function loadMergedData(force = false, refreshRemote = false) {
   if (ui.mergedDataLoading && !force) return;
   const request = ++ui.mergedDataRequest;
@@ -1715,7 +1721,10 @@ async function loadMergedData(force = false, refreshRemote = false) {
       if (completed || request !== ui.mergedDataRequest) return;
       relabelDeviceViews(data, requestedDevices, ui.devices || []);
       ui.deviceTrafficViews ||= Object.create(null);
-      for (const view of data) ui.deviceTrafficViews[`${view.minutes}:${view.scope}`] = view;
+      for (const view of data) {
+        const key = `${view.minutes}:${view.scope}`;
+        if (!dropsShownPeers(view, ui.deviceTrafficViews[key])) ui.deviceTrafficViews[key] = view;
+      }
       selectDeviceTraffic();
       // Statuses and errors stay visible while another range waits for peers.
       ui.mergedDataLatest = ui.mergedData || data[0];

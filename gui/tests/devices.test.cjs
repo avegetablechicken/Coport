@@ -840,6 +840,45 @@ test('a background failure retains the selected traffic already rendered', async
   assert.equal(context.ui.mergedDataError, 'Background statistics failed');
 });
 
+test('a periodic refresh keeps shown peers until they answer instead of flashing them away', async () => {
+  const pending = [];
+  const h = devicesHarness((command, args) => command === 'get_merged_data' ? new Promise((resolve, reject) => pending.push({ args, resolve, reject })) : Promise.resolve([]));
+  h.ui.localTrafficViews = { '30:model': { requests: 1, start: 0, end: 60_000, bucketMinutes: 1, counts: [1], errorCounts: [0], tokenCounts: [0], credentials: [] } };
+  const view = (requests, error) => ({ minutes: 30, scope: 'model', start: 0, end: 60_000, bucketMinutes: 1,
+    sources: [{ name: 'MS', included: !error, ...(error ? { error } : { traffic: { requests, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] } }) }] });
+  const shown = view(5);
+  h.ui.deviceTrafficViews = { '30:model': shown };
+  h.selectDeviceTraffic();
+  assert.match(h.devicesPage(), /device\/ms:model:5/);
+  assert.match(h.mergedDataBlock(), /merged:model:6/);
+
+  const refresh = h.loadMergedData(true, true);
+  // The backend's first refresh frame lists every peer as pending.
+  pending[0].args.onUpdate.onmessage([view(0, 'TRAFFIC_UPDATING')]);
+  assert.equal(h.ui.mergedData, shown);
+  assert.match(h.devicesPage(), /device\/ms:model:5/);
+  assert.match(h.mergedDataBlock(), /merged:model:6/);
+  assert.doesNotMatch(h.mergedDataBlock(), /Loading traffic…/);
+  // The peer's answer replaces the shown view at once.
+  pending[0].args.onUpdate.onmessage([view(8)]);
+  assert.match(h.devicesPage(), /device\/ms:model:8/);
+  assert.match(h.mergedDataBlock(), /merged:model:9/);
+  // A real failure is shown, never hidden behind the earlier success.
+  pending[0].args.onUpdate.onmessage([view(0, 'Permission denied')]);
+  assert.match(h.mergedDataBlock(), /MS: Permission denied/);
+  assert.match(h.devicesPage(), /Traffic unavailable/);
+  pending[0].resolve([view(8)]);
+  await refresh;
+
+  // With nothing shown yet, a cold refresh still renders its placeholders.
+  h.ui.deviceTrafficViews = Object.create(null); h.ui.mergedData = null;
+  const cold = h.loadMergedData(true, true);
+  pending[1].args.onUpdate.onmessage([view(0, 'TRAFFIC_UPDATING')]);
+  assert.match(h.mergedDataBlock(), /MS: Loading traffic…/);
+  pending[1].resolve([view(3)]);
+  await cold;
+});
+
 test('open Devices refreshes remote statistics every 30 seconds; Settings never does', async () => {
   const calls=[];
   const h=harness(async(command,args)=>{calls.push([command,args]);return command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : [];});
