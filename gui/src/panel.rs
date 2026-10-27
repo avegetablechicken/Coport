@@ -42,6 +42,11 @@ fn state(app: &AppHandle) -> tauri::State<'_, PanelState> {
 
 /// Shows the panel next to `anchor` (tray icon rectangle or click point).
 pub fn show(app: &AppHandle, anchor: Option<Rect>) {
+    present(app, anchor, true);
+}
+
+/// Shows the panel as `show`, taking focus from the active app only if `focus`.
+pub fn present(app: &AppHandle, anchor: Option<Rect>, focus: bool) {
     let panel = state(app);
     panel.generation.fetch_add(1, Ordering::SeqCst);
     if let Some(anchor) = anchor {
@@ -52,9 +57,30 @@ pub fn show(app: &AppHandle, anchor: Option<Rect>) {
     };
     let hidden = !w.is_visible().unwrap_or(false);
     layout(&w, &panel, hidden);
-    let _ = w.show();
-    let _ = w.set_focus();
+    if focus {
+        let _ = w.show();
+        let _ = w.set_focus();
+    } else {
+        order_front(&w);
+    }
     let _ = w.emit("panel-shown", ());
+}
+
+/// Shows the panel without making it the key window, which would end keyboard
+/// navigation of the menu bar even while the app stays inactive.
+fn order_front(w: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = w.ns_window() {
+        // SAFETY: Tauri returns the panel's NSWindow, used here on the main thread.
+        let () = unsafe {
+            objc2::msg_send![
+                &*ns_window.cast::<objc2::runtime::AnyObject>(),
+                orderFrontRegardless
+            ]
+        };
+        return;
+    }
+    let _ = w.show();
 }
 
 pub fn hide(app: &AppHandle) {
@@ -62,6 +88,8 @@ pub fn hide(app: &AppHandle) {
         let _ = w.hide();
         let _ = w.emit("panel-hidden", ());
     }
+    #[cfg(target_os = "macos")]
+    crate::tray::end_session(app);
 }
 
 pub fn toggle(app: &AppHandle, anchor: Option<Rect>) {
