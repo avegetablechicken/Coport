@@ -35,6 +35,8 @@
   --claude-2: #f28a5c;
   --claude-3: #f7b292;
   --claude-4: #fbd2c0;
+  /* Unidentified traffic has no hue, but must still read on the block. */
+  --share-unidentified: rgba(0, 0, 0, 0.08);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
@@ -63,6 +65,7 @@
     --teal: #40c8e0;
     --indigo: #5e5ce6;
     --brown: #ac8e68;
+    --share-unidentified: rgba(255, 255, 255, 0.48);
   }
 }
 

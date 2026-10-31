@@ -340,7 +340,11 @@ test('Others takes the next shade of its service, fainter past the defined ones'
   const html = trafficShare(named, 'all');
   const fill = (name) => html.match(new RegExp(`<path style="--slice:([^"]+)"[^>]*><title>Claude · ${name}`))[1];
   assert.equal(fill('Others \\(2\\)'), 'var(--claude-2)');
-  assert.equal(fill('Unidentified'), 'var(--track)');
+  assert.equal(fill('Unidentified'), 'var(--share-unidentified)');
+  // Light keeps the faint fill; dark needs a stronger one to show on the block.
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  const alphas = [...css.matchAll(/--share-unidentified: rgba\((\d+), \d+, \d+, ([\d.]+)\);/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  assert.deepEqual(alphas, [[0, 0.08], [255, 0.48]]);
   // Only Unidentified dims its legend row.
   assert.match(html, /<div class="share-item" title="Claude · Others \(2\)/);
   assert.match(html, /<div class="share-item muted" title="Claude · Unidentified/);

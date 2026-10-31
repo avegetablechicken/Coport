@@ -1402,7 +1402,7 @@ function trafficShare(credentials, scope, source = "") {
   // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
   const widths = slices.map((s) => Math.max(s.value / total, SHARE_MIN));
   const turn = widths.reduce((sum, w) => sum + w, 0);
-  const color = (s) => s.color ?? "var(--track)";
+  const color = (s) => s.color ?? "var(--share-unidentified)";
   const amount = (n) => (n == null ? "no reported usage" : `${n.toLocaleString("en-US")} ${unit}`);
   // Others lists every configuration it groups, one per line.
   const label = (s) => [`${s.service} · ${s.name}: ${amount(s.value)}`, ...(s.members ?? []).map((m) => `${m.name}: ${amount(m.value)}`)].join("\n");
