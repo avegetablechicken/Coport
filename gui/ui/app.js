@@ -1292,8 +1292,8 @@ function maskAccountName(name) {
 /// has no other service. `measure` gives a credential's amount, or null when it
 /// is unknown. Each credential keeps its own slice unless it is under SHARE_MIN
 /// of the whole ring; at least two such credentials fold into "Others" per
-/// service. Unknown amounts keep their row. Unidentified requests come last;
-/// Others and unidentified are drawn without a hue.
+/// service. Unknown amounts keep their row. Others takes the next shade after
+/// the credentials, and unidentified requests come last, drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
   const displayName = (c) => maskAccountName(c.credential);
@@ -1308,7 +1308,7 @@ function shareGroups(credentials, measure) {
     const slices = kept.map((c, i) => ({ name: displayName(c), value: measure(c), color: shareShade(service, i, kept.length) }));
     if (rest.length) {
       const members = rest.map((c) => ({ name: displayName(c), value: measure(c) }));
-      slices.push({ name: `Others (${rest.length})`, value: sum(rest), muted: true, members });
+      slices.push({ name: `Others (${rest.length})`, value: sum(rest), color: othersShade(service, kept.length), members });
     }
     for (const c of own) if (c.credential === "Unidentified") slices.push({ name: c.credential, value: measure(c), muted: true, unidentified: true });
     return { service, value: sum(own), slices };
@@ -1324,6 +1324,13 @@ function shareShade(service, index, count) {
   const low = Math.floor(at);
   const mix = Math.round((at - low) * 100);
   return mix ? `color-mix(in srgb, ${shade(low + 2)} ${mix}%, ${shade(low + 1)})` : shade(low + 1);
+}
+
+/// Others follows `kept` credentials: the next defined shade while one is left,
+/// otherwise fainter than the last.
+function othersShade(service, kept) {
+  if (kept < SHARE_SHADES) return shareShade(service, kept, kept + 1);
+  return `color-mix(in srgb, var(--${service.toLowerCase()}-${SHARE_SHADES}) 70%, transparent)`;
 }
 
 /// A donut sector between fractions `from` and `to` of the turn, starting at
@@ -1395,7 +1402,7 @@ function trafficShare(credentials, scope, source = "") {
   // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
   const widths = slices.map((s) => Math.max(s.value / total, SHARE_MIN));
   const turn = widths.reduce((sum, w) => sum + w, 0);
-  const color = (s) => (s.muted ? "var(--track)" : s.color);
+  const color = (s) => s.color ?? "var(--track)";
   const amount = (n) => (n == null ? "no reported usage" : `${n.toLocaleString("en-US")} ${unit}`);
   // Others lists every configuration it groups, one per line.
   const label = (s) => [`${s.service} · ${s.name}: ${amount(s.value)}`, ...(s.members ?? []).map((m) => `${m.name}: ${amount(m.value)}`)].join("\n");
@@ -2184,6 +2191,7 @@ function configSettings() {
     `${field("listen_port", "Listen port")}
      ${flag("allow_external_access", "Share statistics", "Requires external_data in the configuration file. Shares read-only statistics. Restart to apply.")}
      ${flag("connect_credential_routing", "Enable HTTPS proxy", "Other apps can use Coport via HTTPS_PROXY. Routes by account or API key. Requires trusting Coport's CA. Restart to apply.")}
+     ${v.connect_credential_routing ? flag("connect_passthrough", "Pass through other hosts", "Non-API hosts follow the system proxy settings, unread and unlogged. Restart to apply.") : ""}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}

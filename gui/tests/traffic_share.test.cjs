@@ -104,7 +104,7 @@ test('keeps every sizable credential and folds only tiny ones into Others', () =
   assert.deepEqual(claude.slices.map((s) => s.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'Others (2)']);
   const others = claude.slices[6];
   assert.equal(others.value, 3);
-  assert.equal(others.muted, true);
+  assert.equal(others.color, 'color-mix(in srgb, var(--claude-4) 70%, transparent)');
   assert.deepEqual(plain(others.members), [{ name: 't0', value: 2 }, { name: 't1', value: 1 }]);
   // Others never holds a single credential: a lone tiny one keeps its slice.
   const lone = shareGroups([...named, tiny[0], tiny[2]], requests)[1].slices;
@@ -322,6 +322,28 @@ test('Others lists every configuration it groups on hover', () => {
   // Both the legend row and its ring sector carry the list.
   assert.equal(html.split(`title="${tip}"`).length, 2);
   assert.equal(html.split(`<title>${tip}</title>`).length, 2);
+});
+test('Others takes the next shade of its service, fainter past the defined ones', () => {
+  const { shareGroups, trafficShare } = setup();
+  const others = (count) => {
+    const kept = Array.from({ length: count }, (_, i) => credential(`k${i}`, 1000, 'Codex'));
+    return shareGroups([...kept, credential('t0', 1), credential('t1', 1)], requests)[0].slices.at(-1);
+  };
+  assert.equal(others(1).name, 'Others (2)');
+  assert.equal(others(1).color, 'var(--codex-2)');
+  assert.equal(others(3).color, 'var(--codex-4)');
+  assert.equal(others(4).color, 'color-mix(in srgb, var(--codex-4) 70%, transparent)');
+  assert.equal(others(6).color, 'color-mix(in srgb, var(--codex-4) 70%, transparent)');
+  // Credentials past the fourth still blend between the defined shades.
+  assert.equal(shareGroups(Array.from({ length: 6 }, (_, i) => credential(`k${i}`, 100)), requests)[0].slices.at(-1).color, 'var(--codex-4)');
+  const named = [credential('c0', 100, 'Claude'), credential('c1', 2, 'Claude'), credential('c2', 1, 'Claude'), credential('Unidentified', 20, 'Claude')];
+  const html = trafficShare(named, 'all');
+  const fill = (name) => html.match(new RegExp(`<path style="--slice:([^"]+)"[^>]*><title>Claude · ${name}`))[1];
+  assert.equal(fill('Others \\(2\\)'), 'var(--claude-2)');
+  assert.equal(fill('Unidentified'), 'var(--track)');
+  // Only Unidentified dims its legend row.
+  assert.match(html, /<div class="share-item" title="Claude · Others \(2\)/);
+  assert.match(html, /<div class="share-item muted" title="Claude · Unidentified/);
 });
 test('Unidentified takes an extra row in All, so named rows match Models', () => {
   const { trafficShare } = setup();
