@@ -169,6 +169,11 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     let body = r#"{"access_token":"new-access","refresh_token":"learned-refresh","expires_in":3600,"account":{"uuid":"acct-1","email_address":"one@example.invalid"}}"#;
                     io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode=="codex_oauth_account" {
+                    // Codex token responses name the account in their JWT claims.
+                    let body = r#"{"access_token":"h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC0xIn0sImVtYWlsIjoib25lQGV4YW1wbGUuaW52YWxpZCJ9.s","refresh_token":"learned-refresh","id_token":"h.e30.s"}"#;
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
                 else if response_mode=="delayed_headers" {
                     let _ = io.read_u8().await;
                     let _ = tx.send("DISCONNECTED".into());
@@ -342,8 +347,8 @@ async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credenti
         assert!(!request.to_lowercase().contains("authorization"));
         assert!(!request.contains("access-secret"));
         assert!(!request.contains("private-cookie"));
-        // Without a client Accept-Encoding the proxy adds none of its own.
-        assert!(!request.to_lowercase().contains("accept-encoding"));
+        // The proxy reads the response to learn its refresh route.
+        assert!(request.contains("accept-encoding: identity"));
         assert!(request.ends_with(body));
         fixture.release.notify_one();
         assert_eq!(
@@ -1757,6 +1762,76 @@ async fn claude_refresh_routes_are_learned_from_token_responses() {
             .ends_with(r#""refresh_token":"learned-refresh"}"#)
     );
     assert!(probe.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let routed: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| record["event"] == "route_selected")
+        .collect();
+    assert_eq!(routed.len(), 2);
+    assert_eq!(routed[0]["credential_match"], "unmatched");
+    assert_eq!(routed[1]["credential_match"], "configured");
+    assert_eq!(routed[1]["account_id"], "acct-1");
+    assert_eq!(routed[1]["account_label"], "one@example.invalid");
+    assert!(!log.contains("learned-refresh"));
+}
+
+#[tokio::test]
+async fn codex_refresh_routes_are_learned_from_token_responses() {
+    let mut fallback = fixture("http", "codex_oauth_account").await;
+    let mut mapped = fixture("http", "codex_oauth_account").await;
+    let fallback_endpoint = format!("http://127.0.0.1:{}", fallback.addr.port());
+    let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
+    let running = running(&format!("proxies:\n  fallback: {fallback_endpoint}\n  mapped: {mapped_endpoint}\ncodex:\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    account_fallback: fallback\n")).await;
+    trust(&running, &fallback, &fallback_endpoint);
+    trust(&running, &mapped, &mapped_endpoint);
+    let refresh = |token: &str| {
+        http()
+            .post(format!("{}/oauth/token", running.url))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept-encoding", "gzip, br")
+            .body(format!("grant_type=refresh_token&refresh_token={token}"))
+            .send()
+    };
+    // A login no saved auth.json holds renews through account_fallback, and
+    // the answer names it.
+    let response = refresh("first-refresh").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(value["refresh_token"], "learned-refresh");
+    assert!(
+        fallback
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT auth.openai.com:443")
+    );
+    let request = fallback.requests.recv().await.unwrap();
+    assert!(request.contains("accept-encoding: identity"));
+    assert!(request.ends_with("refresh_token=first-refresh"));
+    // Its next renewal takes the account's own route.
+    let response = refresh("learned-refresh").await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert!(
+        mapped
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT auth.openai.com:443")
+    );
+    assert!(
+        mapped
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .ends_with("refresh_token=learned-refresh")
+    );
+    assert!(fallback.requests.try_recv().is_err());
     running.server.logger.flush().unwrap();
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     let routed: Vec<serde_json::Value> = log

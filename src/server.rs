@@ -115,6 +115,7 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
+    codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
     // When background discovery last failed for a token, until a success. Only
     // `ClaudeProfiles` holds identities. The key is the credential, so switching
@@ -137,6 +138,7 @@ impl Server {
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
             refresh_routes: Default::default(),
+            codex_refresh_routes: Default::default(),
             auto_refresh: Default::default(),
             failed_probes: tokio::sync::Mutex::new(HashMap::new()),
             discovery: tokio::sync::Mutex::new(()),
@@ -159,6 +161,14 @@ impl Server {
     /// Keep the Claude refresh routes learned from token responses.
     pub fn with_refresh_routes(mut self, routes: crate::refresh_routes::RefreshRoutes) -> Self {
         self.refresh_routes = Arc::new(routes);
+        self
+    }
+    /// Keep the Codex refresh routes learned from token responses.
+    pub fn with_codex_refresh_routes(
+        mut self,
+        routes: crate::refresh_routes::RefreshRoutes<crate::identity::Identity>,
+    ) -> Self {
+        self.codex_refresh_routes = Arc::new(routes);
         self
     }
     /// Decrypt CONNECT tunnels to credential-routed API hosts.
@@ -1275,14 +1285,30 @@ impl Server {
         let learned = claude
             .then(|| self.refresh_routes.identity(&token))
             .flatten();
+        let mut codex_identity = None;
         let (choice, account_id, configured) = if claude {
             self.config
                 .claude
                 .resolve_refresh(&token, learned.as_ref())
                 .await?
         } else {
-            let (choice, account_id) = self.config.resolve_refresh(&token).await?;
-            let configured = account_id.is_some();
+            let learned = self.codex_refresh_routes.identity(&token);
+            let (choice, identity, configured) = self
+                .config
+                .resolve_refresh(&token, learned.as_ref())
+                .await?;
+            if let Some(label) = identity.as_ref().and_then(|i| {
+                crate::identity::routing_account_label(
+                    &self.config.codex.routing,
+                    &i.account_id,
+                    &i.usernames,
+                    "",
+                )
+            }) {
+                log.field("account_label", label);
+            }
+            let account_id = identity.as_ref().map(|i| i.account_id.clone());
+            codex_identity = identity;
             (choice, account_id, configured)
         };
         // A learned or saved refresh token names its account; a probe has none.
@@ -1311,13 +1337,11 @@ impl Server {
         .unwrap();
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = filtered_headers(&parts.headers);
-        if claude {
-            // The proxy reads the response to learn its refresh route and
-            // does not decompress it.
-            request
-                .headers_mut()
-                .insert("accept-encoding", "identity".parse().unwrap());
-        }
+        // The proxy reads the response to learn its refresh route and does
+        // not decompress it.
+        request
+            .headers_mut()
+            .insert("accept-encoding", "identity".parse().unwrap());
         *request.body_mut() = Some(bytes.into());
         let response = self
             .send_via(
@@ -1328,20 +1352,25 @@ impl Server {
                 log,
             )
             .await?;
-        if !claude || !response.status().is_success() {
+        if !response.status().is_success() {
             return Ok(response);
         }
         // The refresh token it replaces names the account even where the
         // routing does not map it.
-        Ok(self.learn_refresh_route(response, learned))
+        Ok(if claude {
+            self.learn_refresh_route(response, self.refresh_routes.clone(), learned)
+        } else {
+            self.learn_refresh_route(response, self.codex_refresh_routes.clone(), codex_identity)
+        })
     }
 
-    /// Relays a successful Claude token response unchanged and, once it is
+    /// Relays a successful token response unchanged and, once it is
     /// complete, records which account its new refresh token belongs to.
-    fn learn_refresh_route(
+    fn learn_refresh_route<A: crate::refresh_routes::Account>(
         &self,
         upstream: reqwest::Response,
-        previous: Option<crate::claude::ClaudeIdentity>,
+        routes: Arc<crate::refresh_routes::RefreshRoutes<A>>,
+        previous: Option<A>,
     ) -> reqwest::Response {
         const LIMIT: usize = 65536;
         let mut response = hyper::Response::builder()
@@ -1352,7 +1381,6 @@ impl Server {
             .headers()
             .get("content-encoding")
             .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"));
-        let routes = self.refresh_routes.clone();
         let logger = self.logger.clone();
         let mut stream = upstream.bytes_stream();
         let body = async_stream::stream! {

@@ -78,6 +78,26 @@ impl Identity {
             ),
         })
     }
+    /// The account a successful token response names, by the ChatGPT
+    /// account of its access or ID token.
+    pub(crate) fn token_response(value: &Value) -> Option<Self> {
+        let token = value["access_token"].as_str().unwrap_or("");
+        let (access, id) = (
+            claims(token),
+            claims(value["id_token"].as_str().unwrap_or("")),
+        );
+        let account_id = [&access, &id].into_iter().find_map(|c| {
+            c["https://api.openai.com/auth"]["chatgpt_account_id"]
+                .as_str()
+                .filter(|s| valid_token(s))
+        })?;
+        Some(Self {
+            account_id: account_id.into(),
+            token: token.into(),
+            refresh_token: None,
+            usernames: usernames(&access, &id),
+        })
+    }
     pub fn from_token(token: &str) -> Option<Self> {
         let c = claims(token);
         let id = c["https://api.openai.com/auth"]["chatgpt_account_id"]

@@ -240,23 +240,34 @@ impl Config {
     }
 }
 impl Config {
-    /// Refresh requests carry no Bearer token; the refresh token selects the
-    /// saved login whose proxy is used. Nothing is injected upstream.
-    pub async fn resolve_refresh(&self, refresh_token: &str) -> Result<(Choice, Option<String>)> {
+    /// Refresh requests carry no Bearer token. The refresh token selects the
+    /// saved login whose proxy is used; otherwise the account an earlier token
+    /// response named (`learned`, see `crate::refresh_routes`) routes as an
+    /// unmatched access token would. Nothing is injected upstream. Returns
+    /// the route, its account, and whether the configuration holds or maps it.
+    pub async fn resolve_refresh(
+        &self,
+        refresh_token: &str,
+        learned: Option<&Identity>,
+    ) -> Result<(Choice, Option<Identity>, bool)> {
         let mut unavailable = false;
         for (label, source) in &self.codex.account_sources() {
             match self.codex.account_identity(source).await {
                 Ok(i) if i.refresh_token.as_deref() == Some(refresh_token) => {
                     let proxy = self.account_choice(&i, Some(label))?;
-                    return Ok((proxy, Some(i.account_id)));
+                    return Ok((proxy, Some(i), true));
                 }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
             }
         }
         if !self.codex.account_auth_file_only {
+            if let Some(identity) = learned {
+                let proxy = self.account_choice(identity, None)?;
+                return Ok((proxy, Some(identity.clone()), self.account_mapped(identity)));
+            }
             if let Some(proxy) = &self.codex.routing.account_fallback {
-                return Ok((proxy.clone(), None));
+                return Ok((proxy.clone(), None, false));
             }
         }
         if unavailable {
@@ -266,7 +277,7 @@ impl Config {
         } else {
             Err(Error::new(
                 403,
-                "Token refresh requires a refresh token saved in a configured Codex auth.json.",
+                "Token refresh requires a refresh token saved in a configured Codex auth.json, or a learned route or account_fallback with account_auth_file_only: false.",
             ))
         }
     }

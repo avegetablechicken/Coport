@@ -710,9 +710,13 @@ async fn serve_until(
         uncovered: proxy.uncovered(),
         unrestricted: proxy.ca_unrestricted(),
     });
-    let mut server = Server::new(config, logger.clone()).with_refresh_routes(
-        coport::refresh_routes::RefreshRoutes::load(dir.join(coport::refresh_routes::FILE)),
-    );
+    let mut server = Server::new(config, logger.clone())
+        .with_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
+            dir.join(coport::refresh_routes::FILE),
+        ))
+        .with_codex_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
+            dir.join(coport::refresh_routes::CODEX_FILE),
+        ));
     if let Some(proxy) = credential_proxy {
         server = server.with_credential_proxy(proxy);
     }

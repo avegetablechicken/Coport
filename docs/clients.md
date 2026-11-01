@@ -95,10 +95,26 @@ export CODEX_REFRESH_TOKEN_URL_OVERRIDE="http://127.0.0.1:7889/oauth/token"
 
 `POST /oauth/token` (or `/https://auth.openai.com/oauth/token`) is forwarded to
 `https://auth.openai.com/oauth/token`. The request has no Bearer token, so the
-`refresh_token` in the JSON or form body selects the Codex `auth.json` login
-whose `refresh_token` matches, and that account's proxy is used. Unmatched refresh
-tokens use `account_fallback` only when `account_auth_file_only` is false;
-otherwise they are rejected with 403 before any connection. The body is sent
+`refresh_token` in the JSON or form body selects the route, in order:
+
+1. the Codex `auth.json` login whose `refresh_token` matches, by that account's
+   proxy;
+2. the account learned for its refresh token, routed as an unmatched access
+   token is: by `codex.routing.account`, else `account_fallback`;
+3. `account_fallback`.
+
+A refresh token cannot be looked up upstream, so the proxy learns from each
+successful token response it relays which account the new refresh token
+belongs to: the ChatGPT account of its access or ID token, else the account of
+the refresh token it replaced. A login renewed elsewhere, such as by an account
+manager keeping logins outside `auth.json`, thus keeps its own route once one
+renewal has passed through the proxy. Learned routes and `account_fallback`
+apply only with `codex.account_auth_file_only: false`; otherwise unmatched
+refresh tokens are rejected with 403 before any connection. Learned routes keep
+only SHA-256 digests of refresh tokens, with the account ID and usernames, in
+`codex-refresh-routes.json` beside the configuration (the desktop app's data
+directory for `coportd`), and survive restarts. To read the response, the proxy
+asks the token endpoint for an uncompressed body. The body is otherwise sent
 unchanged and no credential is added; the refresh token is never logged.
 
 The explicit upstream URL form also works, for example:
