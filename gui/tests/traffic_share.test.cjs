@@ -110,15 +110,26 @@ test('keeps every sizable credential and folds only tiny ones into Others', () =
   const lone = shareGroups([...named, tiny[0], tiny[2]], requests)[1].slices;
   assert.deepEqual(lone.map((s) => s.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 't0']);
   // The threshold is inclusive: exactly 2.5% stays.
-  const edge = shareGroups([credential('big', 76), credential('e', 2), credential('f', 1), credential('g', 1)], requests)[0].slices;
-  assert.deepEqual(plain(edge.map((s) => [s.name, s.value])), [['big', 76], ['e', 2], ['Others (2)', 2]]);
+  const edge = shareGroups([credential('big', 72), credential('s', 4), credential('e', 2), credential('f', 1), credential('g', 1)], requests)[0].slices;
+  assert.deepEqual(plain(edge.map((s) => [s.name, s.value])), [['big', 72], ['s', 4], ['e', 2], ['Others (2)', 2]]);
+});
+test('the two largest of each service never fold into Others', () => {
+  const { shareGroups } = setup();
+  const tiny = (name, n) => credential(name, n, 'Claude');
+  // Claude is tiny next to Codex: its two largest stay, the third and fourth fold.
+  const [, claude] = shareGroups([credential('x', 1000), tiny('t0', 3), tiny('t1', 2), tiny('t2', 1), tiny('t3', 1)], requests);
+  assert.deepEqual(claude.slices.map((s) => s.name), ['t0', 't1', 'Others (2)']);
+  assert.deepEqual(plain(claude.slices[2].members.map((m) => m.name)), ['t2', 't3']);
+  // A tiny third alone keeps its slice, and so do two or fewer.
+  assert.deepEqual(shareGroups([credential('x', 1000), tiny('t0', 3), tiny('t1', 2), tiny('t2', 1)], requests)[1].slices.map((s) => s.name), ['t0', 't1', 't2']);
+  assert.deepEqual(shareGroups([credential('x', 1000), tiny('t0', 3), tiny('t1', 2)], requests)[1].slices.map((s) => s.name), ['t0', 't1']);
 });
 test('unknown amounts keep their row instead of folding', () => {
   const { shareGroups } = setup();
   const measure = (c) => c.inputTokens;
   const tokens = (inputTokens) => ({ inputTokens });
-  const [group] = shareGroups([credential('a', 1, 'Codex', tokens(1000)), credential('b', 1), credential('c', 1, 'Codex', tokens(1)), credential('d', 1, 'Codex', tokens(0))], measure);
-  assert.deepEqual(plain(group.slices.map((s) => [s.name, s.value])), [['a', 1000], ['b', null], ['Others (2)', 1]]);
+  const [group] = shareGroups([credential('a', 1, 'Codex', tokens(1000)), credential('a2', 1, 'Codex', tokens(900)), credential('b', 1), credential('c', 1, 'Codex', tokens(1)), credential('d', 1, 'Codex', tokens(0))], measure);
+  assert.deepEqual(plain(group.slices.map((s) => [s.name, s.value])), [['a', 1000], ['a2', 900], ['b', null], ['Others (2)', 1]]);
 });
 test('shades follow the defined ones and blend between them beyond four', () => {
   const { shareGroups, shareShade } = setup();
@@ -329,17 +340,17 @@ test('Others takes the next shade of its service, fainter past the defined ones'
     const kept = Array.from({ length: count }, (_, i) => credential(`k${i}`, 1000, 'Codex'));
     return shareGroups([...kept, credential('t0', 1), credential('t1', 1)], requests)[0].slices.at(-1);
   };
-  assert.equal(others(1).name, 'Others (2)');
-  assert.equal(others(1).color, 'var(--codex-2)');
+  assert.equal(others(2).name, 'Others (2)');
+  assert.equal(others(2).color, 'var(--codex-3)');
   assert.equal(others(3).color, 'var(--codex-4)');
   assert.equal(others(4).color, 'color-mix(in srgb, var(--codex-4) 70%, transparent)');
   assert.equal(others(6).color, 'color-mix(in srgb, var(--codex-4) 70%, transparent)');
   // Credentials past the fourth still blend between the defined shades.
   assert.equal(shareGroups(Array.from({ length: 6 }, (_, i) => credential(`k${i}`, 100)), requests)[0].slices.at(-1).color, 'var(--codex-4)');
-  const named = [credential('c0', 100, 'Claude'), credential('c1', 2, 'Claude'), credential('c2', 1, 'Claude'), credential('Unidentified', 20, 'Claude')];
+  const named = [credential('c0', 100, 'Claude'), credential('c1', 90, 'Claude'), credential('c2', 2, 'Claude'), credential('c3', 1, 'Claude'), credential('Unidentified', 20, 'Claude')];
   const html = trafficShare(named, 'all');
   const fill = (name) => html.match(new RegExp(`<path style="--slice:([^"]+)"[^>]*><title>Claude · ${name}`))[1];
-  assert.equal(fill('Others \\(2\\)'), 'var(--claude-2)');
+  assert.equal(fill('Others \\(2\\)'), 'var(--claude-3)');
   assert.equal(fill('Unidentified'), 'var(--share-unidentified)');
   // Light keeps the faint fill; dark needs a stronger one to show on the block.
   const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');

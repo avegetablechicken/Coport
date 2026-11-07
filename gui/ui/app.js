@@ -1290,9 +1290,9 @@ function maskAccountName(name) {
 
 /// Credentials grouped by app, Codex then Claude, each group in its hue; traffic
 /// has no other service. `measure` gives a credential's amount, or null when it
-/// is unknown. Each credential keeps its own slice unless it is under SHARE_MIN
-/// of the whole ring; at least two such credentials fold into "Others" per
-/// service. Unknown amounts keep their row. Others takes the next shade after
+/// is unknown. The two largest of a service always keep their slice; past them
+/// a credential under SHARE_MIN of the whole ring folds into "Others", when at
+/// least two do. Unknown amounts keep their row. Others takes the next shade after
 /// the credentials, and unidentified requests come last, drawn without a hue.
 function shareGroups(credentials, measure) {
   const sum = (list) => list.some((c) => measure(c) != null) ? list.reduce((total, c) => total + (measure(c) ?? 0), 0) : null;
@@ -1303,7 +1303,8 @@ function shareGroups(credentials, measure) {
   return SHARE_SERVICES.filter((service) => used.some((c) => c.service === service)).map((service) => {
     const own = used.filter((c) => c.service === service);
     const named = own.filter((c) => c.credential !== "Unidentified").sort((a, b) => (measure(b) ?? -1) - (measure(a) ?? -1));
-    const rest = named.filter(small).length >= 2 ? named.filter(small) : [];
+    const foldable = named.slice(2).filter(small);
+    const rest = foldable.length >= 2 ? foldable : [];
     const kept = named.filter((c) => !rest.includes(c));
     const slices = kept.map((c, i) => ({ name: displayName(c), value: measure(c), color: shareShade(service, i, kept.length) }));
     if (rest.length) {
@@ -1493,7 +1494,7 @@ function renderActivityTraffic() {
   }).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
   const notes = [
-    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; credentials under 2.5% of the ring are grouped as Others when there are at least two.",
+    "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; past each service's two largest, credentials under 2.5% of the ring are grouped as Others when there are at least two.",
     "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
     `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Requests from a renamed configuration, one with a changed base URL, or logged before base URLs were recorded are merged and marked for review. Unidentified requests have no logged credential, or match no single current configuration. Logs are never rewritten.",
