@@ -302,15 +302,21 @@ page merges processed statistics and never starts, stops or restarts remote serv
 
 Both machines need this version of Coport. The destination must have existing
 GUI configuration and identity files created by starting its desktop daemon.
-At startup the daemon atomically records its executable in the owner-only
-`summary-executable` file in its application data directory. SSH reads that record
+At startup the daemon preserves an independent helper copy in its application data
+directory (`summary-helper`, or `summary-helper.exe` on Windows). On Linux/macOS it
+also atomically records its original executable in the owner-only
+`summary-executable` file. SSH reads that record
 locally, checks ownership, permissions and file type, and executes `--summary-stream`
 (or `--summary` for older helpers) for statistics or `--forward` when request forwarding is explicitly enabled.
-The path stays on the destination. A stale or unsafe record fails closed with an
-instruction to restart the destination app. When no record exists, discovery checks
-`PATH`, standard user/system binary locations and macOS Applications bundles.
-No directory scanning, configuration export, service restart or registration write
-occurs during a statistics request.
+The path stays on the destination. If the original executable is removed, Linux
+and macOS use the private preserved helper. For older Linux installations without
+that copy, discovery can use the deleted executable of a same-user running process
+whose original path exactly matches the registration. If no helper is available,
+discovery checks `PATH`, standard user/system binary locations and macOS Applications
+bundles. Unsafe records or preserved helpers still fail closed. The helper copy is
+updated only at daemon startup; statistics requests never export configuration,
+restart services or write registration files. Windows supports the desktop client
+and HTTP/HTTPS statistics; this does not add native Windows SSH destination support.
 Statistics connections return processed statistics without an HTTP listener. Raw logs and remote configurations are not returned.
 
 Set up key authentication (or an SSH agent) and connect once from a terminal to

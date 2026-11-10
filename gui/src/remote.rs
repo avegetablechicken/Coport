@@ -149,6 +149,11 @@ fn discovery_command(script: &str, operation: &str) -> String {
 
 /// Published privately at daemon startup, never by a summary request.
 pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
+    if !binary.is_absolute() {
+        return Err(io::Error::other(
+            "Invalid Coport executable path for SSH discovery",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -160,10 +165,32 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
         }
         let mut record = path.to_vec();
         record.push(b'\n');
+        preserve_summary_executable(dir, binary)?;
         crate::settings::write_private(&dir.join("summary-executable"), &record)?;
     }
     #[cfg(not(unix))]
-    let _ = (dir, binary);
+    preserve_summary_executable(dir, binary)?;
+    Ok(())
+}
+
+/// Keep the helper independent of build directories and replaceable app bundles.
+/// Only daemon startup publishes it; read-only SSH requests never repair files.
+fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut source = std::fs::File::open(binary)?;
+    let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+    io::copy(&mut source, &mut staged)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    staged.as_file().sync_all()?;
+    staged
+        .persist(dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX)))
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -716,17 +743,33 @@ mod tests {
         std::fs::write(&binary, b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --summary ] || exit 9\nprintf '%s\\n' '{\"result\":\"summary-only\"}'\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         register_summary_executable(&dir, &binary).unwrap();
+        // This fixture models older installations with only a path record.
+        std::fs::remove_file(dir.join("summary-helper")).unwrap();
         (home, dir, binary)
+    }
+
+    #[cfg(unix)]
+    fn isolated_discovery_script() -> String {
+        // Tests must never discover an actual installation on the test host.
+        DISCOVERY_SCRIPT.replace(
+            "/usr/local/bin/coportd /opt/homebrew/bin/coportd /Applications/Coport.app/Contents/MacOS/coportd",
+            "",
+        )
     }
 
     #[cfg(unix)]
     fn run_discovery(home: &Path, binary: &str) -> std::process::Output {
         let _guard = crate::daemon::spawn_guard();
+        let command = if binary.is_empty() || binary == "coportd" {
+            discovery_command(&isolated_discovery_script(), "--summary")
+        } else {
+            summary_command(binary)
+        };
         std::process::Command::new("/bin/sh")
-            .args(["-c", &summary_command(binary)])
+            .args(["-c", &command])
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", home.join(".local/bin"))
             .output()
             .unwrap()
     }
@@ -779,7 +822,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn discovery_rejects_public_symlinked_and_stale_records_without_falling_back() {
+    fn discovery_rejects_unsafe_records_and_reports_missing_installations() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let (home, dir, binary) = discovery_fixture();
         let marker = dir.join("summary-executable");
@@ -793,10 +836,132 @@ mod tests {
         assert!(!run_discovery(home.path(), "").status.success());
         std::fs::remove_file(&marker).unwrap();
         register_summary_executable(&dir, &binary).unwrap();
+        std::fs::remove_file(dir.join("summary-helper")).unwrap();
         std::fs::remove_file(&binary).unwrap();
         let output = run_discovery(home.path(), "");
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserved_helper_survives_installation_removal_and_repeated_reads() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (home, dir, binary) = discovery_fixture();
+        register_summary_executable(&dir, &binary).unwrap();
+        let helper = dir.join("summary-helper");
+        let before = std::fs::read(&helper).unwrap();
+        let record = std::fs::read(dir.join("summary-executable")).unwrap();
+        std::fs::remove_file(&binary).unwrap();
+        for _ in 0..2 {
+            let output = run_discovery(home.path(), "");
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(std::fs::read(&helper).unwrap(), before);
+            assert_eq!(
+                std::fs::read(dir.join("summary-executable")).unwrap(),
+                record
+            );
+        }
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(run_discovery(home.path(), "").status.code(), Some(126));
+        std::fs::remove_file(&helper).unwrap();
+        symlink(&binary, &helper).unwrap();
+        assert_eq!(run_discovery(home.path(), "").status.code(), Some(126));
+    }
+
+    #[test]
+    fn preserved_helper_is_independent_and_replaced_at_startup_on_all_platforms() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("build/coportd");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"old executable").unwrap();
+        register_summary_executable(&state, &source).unwrap();
+        let helper = state.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&source, b"new executable").unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), b"old executable");
+        register_summary_executable(&state, &source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), b"new executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_registration_discovers_replacement_without_rewriting_cache() {
+        let (home, dir, binary) = discovery_fixture();
+        let marker = dir.join("summary-executable");
+        let before = std::fs::read(&marker).unwrap();
+        let replacement = home.path().join(".local/bin/coportd");
+        std::fs::create_dir_all(replacement.parent().unwrap()).unwrap();
+        std::fs::rename(binary, replacement).unwrap();
+        for _ in 0..2 {
+            let output = run_discovery(home.path(), "");
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(std::fs::read(&marker).unwrap(), before);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_executes_unlinked_running_binary_only_for_registered_path() {
+        let _guard = crate::daemon::spawn_guard();
+        let (home, dir, binary) = discovery_fixture();
+        // A native executable is required: a shell script's /proc/exe points
+        // to its interpreter. sleep keeps the deleted inode alive, and its
+        // --version output proves discovery executed that inode successfully.
+        std::fs::copy("/bin/sleep", &binary).unwrap();
+        struct Running(std::process::Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Running(
+            std::process::Command::new(&binary)
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        std::fs::remove_file(&binary).unwrap();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{}/exe", child.0.id())).unwrap(),
+            std::path::PathBuf::from(format!("{} (deleted)", binary.display()))
+        );
+        let marker = dir.join("summary-executable");
+        let before = std::fs::read(&marker).unwrap();
+        let lf = isolated_discovery_script().replace("\r\n", "\n");
+        for script in [lf.clone(), lf.replace('\n', "\r\n")] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &discovery_command(&script, "--version")])
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("PATH", home.path().join(".local/bin"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("sleep"));
+            assert_eq!(std::fs::read(&marker).unwrap(), before);
+        }
+        crate::settings::write_private(
+            &marker,
+            format!("{}\n", binary.with_file_name("unrelated-coportd").display()).as_bytes(),
+        )
+        .unwrap();
+        // Same user and process name are insufficient: the path must match.
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &discovery_command(&isolated_discovery_script(), "--summary"),
+            ])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("PATH", home.path().join(".local/bin"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(127));
     }
 
     #[cfg(unix)]

@@ -149,6 +149,52 @@ impl Drop for Cleanup {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn ssh_discovery_survives_removal_of_running_daemon_installation() {
+    let home = tempfile::tempdir().unwrap();
+    let state = if cfg!(target_os = "macos") {
+        home.path()
+            .join("Library/Application Support/io.github.coport.gui")
+    } else {
+        home.path().join(".config/io.github.coport.gui")
+    };
+    std::fs::create_dir_all(&state).unwrap();
+    let _cleanup = Cleanup(state.clone());
+    fixture(&state);
+    let installed = home.path().join("coportd");
+    std::fs::copy(helper(), &installed).unwrap();
+    let (client, before) = daemon::start(
+        &installed,
+        &state,
+        &state.join("config.yaml"),
+        &state.join("proxy.log"),
+    )
+    .unwrap();
+    std::fs::remove_file(installed).unwrap();
+    let record = std::fs::read(state.join("summary-executable")).unwrap();
+    let script = include_str!("../src/ssh_summary.sh").replace("\r\n", "\n");
+    for operation in ["--summary", "--capabilities", "--summary"] {
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script.replace("--summary", operation)])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("PATH", home.path().join("empty-path"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if operation == "--capabilities" {
+            assert_eq!(value["running"], true);
+        }
+        assert_eq!(client.status().unwrap().pid, before.pid);
+        assert_eq!(
+            std::fs::read(state.join("summary-executable")).unwrap(),
+            record
+        );
+    }
+}
+
 fn parent(dir: &Path, keep: bool) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "short_lived_gui_controller", "--nocapture"])
