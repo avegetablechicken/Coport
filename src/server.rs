@@ -211,7 +211,7 @@ impl Server {
             });
             if matched_local
                 || self.config.claude.routing.account.contains_key(&source)
-                || self.config.claude.routing.account_fallback.is_some()
+                || self.config.claude.routing.account_default().is_some()
             {
                 continue;
             }

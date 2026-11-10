@@ -55,8 +55,19 @@ Either service section can be omitted. Within each section:
 | `routing.account.<label>` | Proxy choice for that account source |
 | `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, or Claude settings name |
 | `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
-| `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback` for compatibility |
-| `routing.api_key_fallback` | Proxy choice for an unmatched API Key credential |
+| `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback`, then `fallback` |
+| `routing.fallback` | Default proxy choice for unmatched API Key and account requests |
+
+`routing.fallback` replaces `routing.api_key_fallback`; rename the old key when
+upgrading. The old key is rejected rather than silently broadening an API-only
+route to account traffic. Each service has its own default. Explicit account
+routes take priority over `account_fallback`, which takes priority over `fallback`.
+Unknown refresh tokens use `account_fallback`, then `fallback`; Claude first tries
+`account_probe`. These unknown-account paths require `account_auth_file_only: false`.
+Successful refresh responses teach the next token's account route.
+Fallbacks apply when no route matches, not when a selected route fails. Ordered
+candidates within a selected route keep their existing reachability behavior.
+`mcp_fallback` remains independent, with direct access when omitted.
 
 `codex.homes` and `claude.config_dirs` are lists of directory paths. When
 omitted, they default to `["~/.codex"]` and `["~/.claude"]` respectively. An explicit
@@ -120,7 +131,7 @@ Only configure `routing.api_key` when needed.
 ## Service-specific matching
 
 Codex account routing tries account ID, then email/preferred username/name from
-the login tokens, then the matched source label, then `codex.routing.account_fallback`.
+the login tokens, then the matched source label, then `codex.routing.account_fallback`, then `codex.routing.fallback`.
 A supplied `ChatGPT-Account-Id` must match the token's actual account ID.
 Access-token profile metadata takes precedence over top-level claims and ID-token
 metadata. These are routing hints; upstream authentication still validates tokens.
@@ -136,7 +147,7 @@ For Claude's standard `~/.claude/.credentials.json`, account metadata comes from
 `~/.claude.json` → `oauthAccount`. Custom credential directories use their own
 `.claude.json`; they do not inherit another login's home metadata. UUID, email,
 display name, and full name are matched in that order, followed by the source
-label (`default`) and `claude.routing.account_fallback`.
+label (`default`), `claude.routing.account_fallback`, then `claude.routing.fallback`.
 Metadata refreshes per request. Missing/malformed metadata leaves explicit source
 label and fallback routing available. An environment-backed account source has
 no associated metadata file and uses its configured label/fallback. If a saved
@@ -154,10 +165,10 @@ metadata; it is never reused for a different incoming token.
 Claude tokens are opaque, so an unknown token requires `GET /api/oauth/profile`
 on `claude.base_url`. Before identity is known, **`claude.routing.account_probe`
 provides the lookup proxy** (including ordered candidates or explicit `none` for
-direct access). When omitted, `account_fallback` supplies the lookup proxy for
-backward compatibility. If neither is configured, lookup fails; no implicit direct
+direct access). When omitted, `account_fallback`, then `fallback`, supplies the lookup proxy.
+If none is configured, lookup fails; no implicit direct
 route or another account's proxy is used. `account_probe` does not authorize model
-requests: after identity lookup, an account mapping or `account_fallback` is required. Only the
+requests: after identity lookup, an account mapping, `account_fallback` or `fallback` is required. Only the
 Bearer token and profile-request headers are sent, without model payload, cookies
 or client headers. The account returned by the API selects the final UUID/email
 route for the model request. Example:
@@ -295,7 +306,7 @@ codex:
   routing:
     api_key:
       OPENAI_API_KEY: [us, jp]
-    api_key_fallback: [us, jp, none]
+    fallback: [us, jp, none]
     mcp_fallback: [jp, none]
 claude:
   routing:

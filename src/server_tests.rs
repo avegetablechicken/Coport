@@ -590,7 +590,7 @@ async fn claude_native_auth_paths_and_sse_passthrough() {
         let file = credentials.path().join(".credentials.json");
         std::fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"model-secret"}}"#).unwrap();
         let dir = serde_json::to_string(&credentials.path()).unwrap();
-        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{dir}]\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    api_key_fallback: selected\n")).await;
+        let running = running(&format!("proxies:\n  selected: {endpoint}\nclaude:\n  config_dirs: [{dir}]\n  base_url: https://upstream.invalid\n  routing:\n    account_fallback: selected\n    fallback: selected\n")).await;
         trust(&running, &fixture, &endpoint);
         let name = if bearer { "authorization" } else { "x-api-key" };
         let value = if bearer {
@@ -713,7 +713,7 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
     )
     .unwrap();
     let running = running(&format!(
-        "claude:\n  config_dirs: [{:?}]\n  routing:\n    account_fallback: none\n    api_key_fallback: none\ncodex:\n  routing:\n    api_key_fallback: none\n",
+        "claude:\n  config_dirs: [{:?}]\n  routing:\n    account_fallback: none\n    fallback: none\ncodex:\n  routing:\n    fallback: none\n",
         login.path().to_string_lossy()
     ))
     .await;
@@ -732,7 +732,7 @@ async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
             .unwrap();
         assert_eq!(response.status(), 401);
     }
-    let running = self::running("codex:\n  routing:\n    api_key_fallback: none\n").await;
+    let running = self::running("codex:\n  routing:\n    fallback: none\n").await;
     let response = http()
         .post(format!("{}/v1/messages", running.url))
         .bearer_auth("openai-secret")
@@ -1392,7 +1392,7 @@ async fn tls_connect_and_https_connect_stream_before_completion() {
             "{mode}://test%40user:p%3Ass%40word@localhost:{}",
             fixture.addr.port()
         );
-        let running=running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key_fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
+        let running=running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
         trust(&running, &fixture, &endpoint);
         let response = http()
             .post(format!("{}/v1/responses?private=hidden", running.url))
@@ -1450,7 +1450,7 @@ async fn ordered_probes_are_credential_free_and_cached() {
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_port = dead.local_addr().unwrap().port();
     drop(dead);
-    let running=running(&format!("proxies:\n  dead: http://127.0.0.1:{dead_port}\ncodex:\n  routing:\n    api_key_fallback: [dead, none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
+    let running=running(&format!("proxies:\n  dead: http://127.0.0.1:{dead_port}\ncodex:\n  routing:\n    fallback: [dead, none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
     trust(&running, &fixture, "none");
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1522,7 +1522,7 @@ async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
 async fn request_limits_duplicates_and_chunked_upload() {
     let mut fixture = fixture("direct", "redirect").await;
     let running = running(
-        "codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+        "codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
     )
     .await;
     trust(&running, &fixture, "none");
@@ -1567,7 +1567,7 @@ async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
         (false, hyper::Method::GET),
     ] {
         let mut fixture = fixture("direct", "sse").await;
-        let running=running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+        let running=running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
         trust(&running, &fixture, "none");
         let response = http()
             .request(method.clone(), format!("{}/responses", running.url))
@@ -1707,144 +1707,150 @@ async fn claude_oauth_usage_and_refresh_preserve_json_and_headers() {
 
 #[tokio::test]
 async fn claude_refresh_routes_are_learned_from_token_responses() {
-    let mut probe = fixture("http", "oauth_account").await;
-    let mut mapped = fixture("http", "oauth_account").await;
-    let probe_endpoint = format!("http://127.0.0.1:{}", probe.addr.port());
-    let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
-    let running = running(&format!("proxies:\n  probe: {probe_endpoint}\n  mapped: {mapped_endpoint}\nclaude:\n  config_dirs: []\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    account_probe: probe\n")).await;
-    trust(&running, &probe, &probe_endpoint);
-    trust(&running, &mapped, &mapped_endpoint);
-    let refresh = |token: &str| {
-        http()
-            .post(format!("{}/anthropic/v1/oauth/token", running.url))
-            .header("content-type", "application/json")
-            .header("accept-encoding", "gzip, br")
-            .body(format!(
-                r#"{{"grant_type":"refresh_token","refresh_token":"{token}"}}"#
-            ))
-            .send()
-    };
-    // An unknown login renews through the profile probe's route, and the
-    // answer names it.
-    let response = refresh("first-refresh").await.unwrap();
-    assert_eq!(response.status(), 200);
-    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
-    assert_eq!(value["refresh_token"], "learned-refresh");
-    assert!(
-        probe
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("CONNECT platform.claude.com:443")
-    );
-    let request = probe.requests.recv().await.unwrap();
-    assert!(request.contains("accept-encoding: identity"));
-    assert!(request.ends_with(r#""refresh_token":"first-refresh"}"#));
-    // Its next renewal takes the account's own route.
-    let response = refresh("learned-refresh").await.unwrap();
-    assert_eq!(response.status(), 200);
-    response.bytes().await.unwrap();
-    assert!(
-        mapped
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("CONNECT platform.claude.com:443")
-    );
-    assert!(
-        mapped
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .ends_with(r#""refresh_token":"learned-refresh"}"#)
-    );
-    assert!(probe.requests.try_recv().is_err());
-    running.server.logger.flush().unwrap();
-    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
-    let routed: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["event"] == "route_selected")
-        .collect();
-    assert_eq!(routed.len(), 2);
-    assert_eq!(routed[0]["credential_match"], "unmatched");
-    assert_eq!(routed[1]["credential_match"], "configured");
-    assert_eq!(routed[1]["account_id"], "acct-1");
-    assert_eq!(routed[1]["account_label"], "one@example.invalid");
-    assert!(!log.contains("learned-refresh"));
+    for bootstrap in ["account_probe", "account_fallback", "fallback"] {
+        let mut probe = fixture("http", "oauth_account").await;
+        let mut mapped = fixture("http", "oauth_account").await;
+        let probe_endpoint = format!("http://127.0.0.1:{}", probe.addr.port());
+        let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
+        let running = running(&format!("proxies:\n  probe: {probe_endpoint}\n  mapped: {mapped_endpoint}\nclaude:\n  config_dirs: []\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    {bootstrap}: probe\n")).await;
+        trust(&running, &probe, &probe_endpoint);
+        trust(&running, &mapped, &mapped_endpoint);
+        let refresh = |token: &str| {
+            http()
+                .post(format!("{}/anthropic/v1/oauth/token", running.url))
+                .header("content-type", "application/json")
+                .header("accept-encoding", "gzip, br")
+                .body(format!(
+                    r#"{{"grant_type":"refresh_token","refresh_token":"{token}"}}"#
+                ))
+                .send()
+        };
+        // An unknown login renews through the profile probe's route, and the
+        // answer names it.
+        let response = refresh("first-refresh").await.unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(value["refresh_token"], "learned-refresh");
+        assert!(
+            probe
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT platform.claude.com:443")
+        );
+        let request = probe.requests.recv().await.unwrap();
+        assert!(request.contains("accept-encoding: identity"));
+        assert!(request.ends_with(r#""refresh_token":"first-refresh"}"#));
+        // Its next renewal takes the account's own route.
+        let response = refresh("learned-refresh").await.unwrap();
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT platform.claude.com:443")
+        );
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .ends_with(r#""refresh_token":"learned-refresh"}"#)
+        );
+        assert!(probe.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        let routed: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|record: &serde_json::Value| record["event"] == "route_selected")
+            .collect();
+        assert_eq!(routed.len(), 2);
+        assert_eq!(routed[0]["credential_match"], "unmatched");
+        assert_eq!(routed[1]["credential_match"], "configured");
+        assert_eq!(routed[1]["account_id"], "acct-1");
+        assert_eq!(routed[1]["account_label"], "one@example.invalid");
+        assert!(!log.contains("learned-refresh"));
+    }
 }
 
 #[tokio::test]
 async fn codex_refresh_routes_are_learned_from_token_responses() {
-    let mut fallback = fixture("http", "codex_oauth_account").await;
-    let mut mapped = fixture("http", "codex_oauth_account").await;
-    let fallback_endpoint = format!("http://127.0.0.1:{}", fallback.addr.port());
-    let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
-    let running = running(&format!("proxies:\n  fallback: {fallback_endpoint}\n  mapped: {mapped_endpoint}\ncodex:\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    account_fallback: fallback\n")).await;
-    trust(&running, &fallback, &fallback_endpoint);
-    trust(&running, &mapped, &mapped_endpoint);
-    let refresh = |token: &str| {
-        http()
-            .post(format!("{}/oauth/token", running.url))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("accept-encoding", "gzip, br")
-            .body(format!("grant_type=refresh_token&refresh_token={token}"))
-            .send()
-    };
-    // A login no saved auth.json holds renews through account_fallback, and
-    // the answer names it.
-    let response = refresh("first-refresh").await.unwrap();
-    assert_eq!(response.status(), 200);
-    let value: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
-    assert_eq!(value["refresh_token"], "learned-refresh");
-    assert!(
-        fallback
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("CONNECT auth.openai.com:443")
-    );
-    let request = fallback.requests.recv().await.unwrap();
-    assert!(request.contains("accept-encoding: identity"));
-    assert!(request.ends_with("refresh_token=first-refresh"));
-    // Its next renewal takes the account's own route.
-    let response = refresh("learned-refresh").await.unwrap();
-    assert_eq!(response.status(), 200);
-    response.bytes().await.unwrap();
-    assert!(
-        mapped
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .starts_with("CONNECT auth.openai.com:443")
-    );
-    assert!(
-        mapped
-            .requests
-            .recv()
-            .await
-            .unwrap()
-            .ends_with("refresh_token=learned-refresh")
-    );
-    assert!(fallback.requests.try_recv().is_err());
-    running.server.logger.flush().unwrap();
-    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
-    let routed: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["event"] == "route_selected")
-        .collect();
-    assert_eq!(routed.len(), 2);
-    assert_eq!(routed[0]["credential_match"], "unmatched");
-    assert_eq!(routed[1]["credential_match"], "configured");
-    assert_eq!(routed[1]["account_id"], "acct-1");
-    assert_eq!(routed[1]["account_label"], "one@example.invalid");
-    assert!(!log.contains("learned-refresh"));
+    for bootstrap in ["account_fallback", "fallback"] {
+        let mut fallback = fixture("http", "codex_oauth_account").await;
+        let mut mapped = fixture("http", "codex_oauth_account").await;
+        let fallback_endpoint = format!("http://127.0.0.1:{}", fallback.addr.port());
+        let mapped_endpoint = format!("http://127.0.0.1:{}", mapped.addr.port());
+        let running = running(&format!("proxies:\n  fallback: {fallback_endpoint}\n  mapped: {mapped_endpoint}\ncodex:\n  account_auth_file_only: false\n  routing:\n    account:\n      one@example.invalid: mapped\n    {bootstrap}: fallback\n")).await;
+        trust(&running, &fallback, &fallback_endpoint);
+        trust(&running, &mapped, &mapped_endpoint);
+        let refresh = |token: &str| {
+            http()
+                .post(format!("{}/oauth/token", running.url))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept-encoding", "gzip, br")
+                .body(format!("grant_type=refresh_token&refresh_token={token}"))
+                .send()
+        };
+        // A login no saved auth.json holds renews through account_fallback, and
+        // the answer names it.
+        let response = refresh("first-refresh").await.unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(value["refresh_token"], "learned-refresh");
+        assert!(
+            fallback
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT auth.openai.com:443")
+        );
+        let request = fallback.requests.recv().await.unwrap();
+        assert!(request.contains("accept-encoding: identity"));
+        assert!(request.ends_with("refresh_token=first-refresh"));
+        // Its next renewal takes the account's own route.
+        let response = refresh("learned-refresh").await.unwrap();
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT auth.openai.com:443")
+        );
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .ends_with("refresh_token=learned-refresh")
+        );
+        assert!(fallback.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        let routed: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|record: &serde_json::Value| record["event"] == "route_selected")
+            .collect();
+        assert_eq!(routed.len(), 2);
+        assert_eq!(routed[0]["credential_match"], "unmatched");
+        assert_eq!(routed[1]["credential_match"], "configured");
+        assert_eq!(routed[1]["account_id"], "acct-1");
+        assert_eq!(routed[1]["account_label"], "one@example.invalid");
+        assert!(!log.contains("learned-refresh"));
+    }
 }
 
 async fn read_response_head(socket: &mut tokio::net::TcpStream) -> String {
@@ -2207,7 +2213,7 @@ async fn unavailable_proxy_recovers_while_idle() {
 #[tokio::test]
 async fn disconnect_before_headers_does_not_invent_a_502() {
     let mut fixture = fixture("direct", "delayed_headers").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
         .await
@@ -2247,7 +2253,7 @@ async fn safe_get_retries_transport_failures_on_the_same_route_and_stops_at_thre
             } else {
                 format!("http://{}", fixture.addr)
             };
-            let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key_fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
+            let running = running(&format!("proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    fallback: selected\n  base_url:\n    api_key: https://upstream.invalid/v1\n")).await;
             trust(&running, &fixture, &endpoint);
             let response = http()
                 .get(format!("{}/models?secret=private-query", running.url))
@@ -2312,7 +2318,7 @@ async fn unsafe_requests_and_http_errors_are_not_retried() {
         (hyper::Method::GET, "", false, "status_503", 503),
     ] {
         let mut fixture = fixture("direct", response_mode).await;
-        let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+        let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
         trust(&running, &fixture, "none");
         let mut request = http()
             .request(method, format!("{}/models", running.url))
@@ -2344,7 +2350,7 @@ async fn unsafe_requests_and_http_errors_are_not_retried() {
 #[tokio::test]
 async fn safe_get_retries_share_the_original_timeout_budget() {
     let mut fixture = fixture("direct", "slow_drop_then_delay").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let response = tokio::time::timeout(
         Duration::from_millis(3800),
@@ -2397,7 +2403,7 @@ fn transient_health_failures_need_confirmation_and_recovery_is_immediate() {
 #[tokio::test]
 async fn api_response_clears_only_its_own_exit_failures() {
     let fixture = fixture("direct", "redirect").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: [none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: [none]\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let key = ProbeKey {
         endpoint: "none".into(),
@@ -2736,7 +2742,7 @@ fn model_stream_body(mode: &str) -> (&'static str, Vec<u8>) {
 async fn http_model_calls_observe_compressed_and_untyped_streams_without_changing_them() {
     for mode in ["zstd_sse", "untyped_sse"] {
         let mut fixture = fixture("direct", mode).await;
-        let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+        let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
         trust(&running, &fixture, "none");
         // Codex compresses request bodies with zstd when signed in with ChatGPT. They
         // are forwarded untouched and not decoded; the model comes from the response.
@@ -2962,7 +2968,7 @@ async fn rejected_requests_with_unread_bodies_receive_a_complete_response() {
 #[tokio::test]
 async fn a_connection_serves_requests_one_after_another() {
     let mut fixture = fixture("direct", "oauth_json").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
         .await
@@ -2998,7 +3004,7 @@ async fn a_connection_serves_requests_one_after_another() {
 #[tokio::test]
 async fn a_stream_failing_midway_closes_the_connection_without_completing_the_body() {
     let mut fixture = fixture("direct", "sse").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
         .await
@@ -3038,7 +3044,7 @@ async fn a_stream_failing_midway_closes_the_connection_without_completing_the_bo
 #[tokio::test]
 async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_rejected() {
     let mut fixture = fixture("direct", "redirect").await;
-    let running = running("codex:\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
+    let running = running("codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n").await;
     trust(&running, &fixture, "none");
     let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
         .await
@@ -3350,7 +3356,7 @@ async fn a_decrypted_tunnel_serves_requests_one_after_another() {
 async fn a_tunnel_opened_for_a_fallback_request_has_no_app() {
     let mut fixture = fixture("direct", "oauth_json").await;
     let running = running(
-        "connect_credential_routing: true\ncodex:\n  homes: []\n  routing:\n    api_key_fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+        "connect_credential_routing: true\ncodex:\n  homes: []\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
     )
     .await;
     trust(&running, &fixture, "none");

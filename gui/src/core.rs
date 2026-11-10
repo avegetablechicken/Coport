@@ -697,7 +697,7 @@ fn service(
     };
     let mut fallbacks = vec![
         fallback("accountFallback", &routing.account_fallback),
-        fallback("apiKeyFallback", &routing.api_key_fallback),
+        fallback("fallback", &routing.fallback),
     ];
     fallbacks.push(if codex {
         fallback("mcpFallback", &routing.mcp_fallback)
@@ -705,7 +705,10 @@ fn service(
         fallback("accountProbe", &routing.account_probe)
     });
     ServiceDto {
-        configured: auth_env || !routing.account.is_empty() || !routing.api_key.is_empty(),
+        configured: auth_env
+            || !routing.account.is_empty()
+            || !routing.api_key.is_empty()
+            || routing.account_default().is_some(),
         upstreams: upstreams
             .into_iter()
             .map(|(key, value)| KeyValue {

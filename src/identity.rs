@@ -764,7 +764,7 @@ impl Config {
                 };
                 if let Some(label) = label {
                     claude.insert(label, "active");
-                } else if self.claude.routing.account_fallback.is_none()
+                } else if self.claude.routing.account_default().is_none()
                     && self.claude.routing.account_probe.is_some()
                 {
                     unconfirmed(&mut claude);
@@ -855,13 +855,13 @@ impl Config {
             for name in routing.api_key.keys().chain(routing.account.keys()) {
                 labels.insert((service.into(), name.clone()), name.clone());
             }
-            if routing.api_key_fallback.is_some() {
+            if routing.fallback.is_some() {
                 let provider = if service == "Codex" {
                     "openai-fallback"
                 } else {
                     "claude-api-key-fallback"
                 };
-                labels.insert((service.into(), provider.into()), "api_key_fallback".into());
+                labels.insert((service.into(), provider.into()), "fallback".into());
             }
             if routing.account_fallback.is_some() && service == "Claude" {
                 labels.insert(
@@ -895,7 +895,7 @@ impl Config {
                     .find_map(|u| self.codex.routing.account.get(u))
             })
             .or_else(|| source.and_then(|s| self.codex.routing.account.get(s)))
-            .or(self.codex.routing.account_fallback.as_ref())
+            .or(self.codex.routing.account_default())
             .cloned()
             .ok_or(Error::config(
                 "Current account has no proxy mapping; forwarding refused.",
@@ -948,6 +948,7 @@ pub(crate) fn routing_account_label(
                 .as_ref()
                 .map(|_| "account_fallback".into())
         })
+        .or_else(|| routing.fallback.as_ref().map(|_| "fallback".into()))
 }
 
 #[cfg(test)]

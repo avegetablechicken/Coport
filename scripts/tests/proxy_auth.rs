@@ -156,7 +156,7 @@ fn exercise(scheme: &'static str, password: &str, expected: &'static str) {
         encoded(password),
         probe.port
     );
-    app.config(&format!("proxies:\n  authenticated: \"{endpoint}\"\ncodex:\n  routing:\n    api_key_fallback: authenticated\n"));
+    app.config(&format!("proxies:\n  authenticated: \"{endpoint}\"\ncodex:\n  routing:\n    fallback: authenticated\n"));
     app.restart();
     assert_eq!(
         app.request(Some("model-secret"), None, "/v1/models", "GET")

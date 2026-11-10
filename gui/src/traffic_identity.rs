@@ -150,11 +150,11 @@ impl Identities {
                 Err(_) => {}
             }
         }
-        if config.codex.routing.api_key_fallback.is_some() {
-            result.insert("Codex", &config.codex.base_url.api_key, "api_key_fallback");
+        if config.codex.routing.fallback.is_some() {
+            result.insert("Codex", &config.codex.base_url.api_key, "fallback");
         }
-        if config.claude.routing.api_key_fallback.is_some() {
-            result.insert("Claude", &config.claude.base_url, "api_key_fallback");
+        if config.claude.routing.fallback.is_some() {
+            result.insert("Claude", &config.claude.base_url, "fallback");
         }
         result.assignments = assignments
             .iter()

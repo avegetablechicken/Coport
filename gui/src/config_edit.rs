@@ -370,7 +370,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         let text = format!(
-            "{BASE}proxies:\n  us: &p http://127.0.0.1:8101\ncodex:\n  homes: []\n  routing:\n    api_key_fallback: us\n"
+            "{BASE}proxies:\n  us: &p http://127.0.0.1:8101\ncodex:\n  homes: []\n  routing:\n    fallback: us\n"
         );
         std::fs::write(&path, &text).unwrap();
         set_value(&path, "request_timeout_seconds", &json!(42.5)).unwrap();

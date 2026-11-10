@@ -49,7 +49,7 @@ impl<'de> Deserialize<'de> for Claude {
             .ok_or_else(|| D::Error::custom("Claude settings must be a mapping."))?;
         // Routing lives under `routing`; the retired inline layout put it on
         // the section itself and on each account.
-        if ["api_key", "account_fallback", "api_key_fallback"]
+        if ["api_key", "account_fallback", "fallback"]
             .iter()
             .any(|key| map.contains_key(*key))
         {
@@ -333,7 +333,7 @@ impl Claude {
         for choice in [
             &self.routing.account_fallback,
             &self.routing.account_probe,
-            &self.routing.api_key_fallback,
+            &self.routing.fallback,
         ]
         .into_iter()
         .flatten()
@@ -468,7 +468,7 @@ impl Claude {
                 .routing
                 .account_probe
                 .as_ref()
-                .or(self.routing.account_fallback.as_ref())
+                .or(self.routing.account_default())
             {
                 return Ok((proxy.clone(), None, false));
             }
@@ -480,7 +480,7 @@ impl Claude {
         } else {
             Err(Error::new(
                 403,
-                "Claude refresh requires a saved refreshToken, or account_probe or account_fallback with account_auth_file_only: false.",
+                "Claude refresh requires a saved refreshToken, or account_probe or account_fallback/fallback with account_auth_file_only: false.",
             ))
         }
     }
@@ -590,15 +590,15 @@ impl Claude {
             (label.clone(), proxy.clone(), true)
         } else if needs_profile {
             let proxy = self.routing.account_probe.as_ref()
-                .or(self.routing.account_fallback.as_ref())
+                .or(self.routing.account_default())
                 .ok_or(Error::config(
-                    "Claude profile lookup requires routing.account_probe or routing.account_fallback.",
+                    "Claude profile lookup requires routing.account_probe or routing.account_fallback/fallback.",
                 ))?;
             ("claude-profile".into(), proxy.clone(), matched_account)
         } else if let Some(proxy) = if bearer {
-            &self.routing.account_fallback
+            self.routing.account_default()
         } else {
-            &self.routing.api_key_fallback
+            self.routing.fallback.as_ref()
         } {
             (
                 if bearer {
@@ -706,7 +706,7 @@ impl Claude {
         identity
             .and_then(|i| self.mapped_choice(i))
             .or_else(|| label.and_then(|s| self.routing.account.get(s)))
-            .or(self.routing.account_fallback.as_ref())
+            .or(self.routing.account_default())
             .cloned()
             .ok_or(Error::config("Claude account has no proxy route."))
     }
@@ -1250,7 +1250,7 @@ claude:
 
     #[tokio::test]
     async fn fallbacks_require_valid_auth_and_preserve_header_type_and_betas() {
-        let c = config("claude:\n  account_auth_file_only: false\n  routing:\n    account_fallback: none\n    api_key_fallback: none\n").claude;
+        let c = config("claude:\n  account_auth_file_only: false\n  routing:\n    account_fallback: none\n    fallback: none\n").claude;
         for bearer in [false, true] {
             let mut h = HeaderMap::new();
             let name = if bearer { "authorization" } else { "x-api-key" };
@@ -1354,7 +1354,7 @@ claude:
         for extra in [
             "codex:\n  routing:\n      api_key:\n        BAD-NAME: none",
             "codex:\n  routing:\n      account_fallback: []",
-            "codex:\n  routing:\n      api_key_fallback: absent",
+            "codex:\n  routing:\n      fallback: absent",
             "codex:\n  base_url: http://api.anthropic.com",
             "auth_env: 'not a name'\n  routing:\n    account: {default: none}",
             "accounts: {a: {auth_env: TOKEN}}\n  routing:\n    account: {a: none}",
@@ -1372,7 +1372,7 @@ claude:
 
     #[test]
     fn claude_has_one_base_and_rejects_split_bases() {
-        let c = config("claude:\n  base_url: https://gateway.invalid/api\n  routing:\n    account_fallback: none\n    api_key_fallback: none\n").claude;
+        let c = config("claude:\n  base_url: https://gateway.invalid/api\n  routing:\n    account_fallback: none\n    fallback: none\n").claude;
         assert_eq!(
             c.url("/v1/messages?beta=true").unwrap().as_str(),
             "https://gateway.invalid/api/v1/messages?beta=true"

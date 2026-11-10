@@ -146,7 +146,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     };
     if !claude.account.is_empty()
         || claude.account_fallback.is_some()
-        || claude.api_key_fallback.is_some()
+        || claude.fallback.is_some()
         || claude
             .api_key
             .keys()
@@ -155,11 +155,11 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         add(&url(&config.claude.base_url)?, "/anthropic/");
         add(&url(crate::claude::TOKEN_REFRESH_UPSTREAM)?, "/anthropic/");
     }
-    if !codex.account.is_empty() || codex.account_fallback.is_some() {
+    if !codex.account.is_empty() || codex.account_default().is_some() {
         add(&url(&config.codex.base_url.account)?, "/codex/");
         add(&url(crate::routing::TOKEN_REFRESH_UPSTREAM)?, "/codex/");
     }
-    if codex.api_key_fallback.is_some() || credential_selectors(&codex.api_key) {
+    if codex.fallback.is_some() || credential_selectors(&codex.api_key) {
         add(&url(&config.codex.base_url.api_key)?, "/codex/");
     }
     for key in claude
@@ -223,6 +223,26 @@ mod tests {
         parsed.codex.homes.clear();
         parsed.claude.config_dirs.clear();
         parsed
+    }
+
+    #[test]
+    fn unified_fallback_includes_account_and_refresh_destinations() {
+        let config = config(
+            "codex:\n  homes: []\n  routing:\n    fallback: none\nclaude:\n  config_dirs: []\n  routing:\n    fallback: none\n",
+        );
+        let routes = scopes(&config).unwrap();
+        for host in ["chatgpt.com", "auth.openai.com", "api.openai.com"] {
+            assert_eq!(
+                routes[&(host.to_owned(), 443)],
+                format!("/codex/https://{host}")
+            );
+        }
+        for host in ["api.anthropic.com", "platform.claude.com"] {
+            assert_eq!(
+                routes[&(host.to_owned(), 443)],
+                format!("/anthropic/https://{host}")
+            );
+        }
     }
 
     #[test]

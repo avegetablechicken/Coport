@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn poisoned_health_cache_is_discarded_without_changing_routing() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:9000\ncodex:\n  homes: []\n  routing:\n    api_key_fallback: selected\nclaude:\n  config_dirs: []\n").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\nproxies:\n  selected: http://127.0.0.1:9000\ncodex:\n  homes: []\n  routing:\n    fallback: selected\nclaude:\n  config_dirs: []\n").unwrap();
         let server = Arc::new(Server::new(
             config,
             Arc::new(Logger::new(dir.path().join("proxy.log"))),
@@ -593,7 +593,7 @@ mod tests {
                 .config
                 .codex
                 .routing
-                .api_key_fallback
+                .fallback
                 .as_ref()
                 .unwrap()
                 .label(),

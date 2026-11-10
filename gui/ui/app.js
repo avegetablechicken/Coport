@@ -841,7 +841,7 @@ const MINOR_FALLBACKS = new Set(["mcpFallback", "accountProbe"]);
 
 const FALLBACK_LABEL = {
   accountFallback: "Account fallback",
-  apiKeyFallback: "API key fallback",
+  fallback: "Default fallback",
   mcpFallback: "Docs MCP fallback",
   accountProbe: "Account probe",
 };

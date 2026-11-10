@@ -297,7 +297,7 @@ fn mixed_providers_mcp_account_endpoints_and_independent_fallbacks() {
     refused(&app, &a, &b, Some("provider-key-one"), 409);
     app.write("home/.env", "PROVIDER_B_KEY=chat-mixed-token\n");
     refused(&app, &a, &b, Some("chat-mixed-token"), 409);
-    mixed(&app, &a, &b, None, "    api_key_fallback: jp\n");
+    mixed(&app, &a, &b, None, "    fallback: jp\n");
     app.restart();
     refused(&app, &a, &b, Some("chat-mixed-token"), 409);
     let before = a.count();
@@ -334,7 +334,7 @@ fn mixed_providers_mcp_account_endpoints_and_independent_fallbacks() {
         &a,
         &b,
         Some("https://fallback-default.invalid/v1"),
-        "    api_key_fallback: jp\n",
+        "    fallback: jp\n",
     );
     app.restart();
     b.reaches(
@@ -349,7 +349,7 @@ fn mixed_providers_mcp_account_endpoints_and_independent_fallbacks() {
         &a,
         &b,
         Some("https://fallback-default.invalid/v1"),
-        "    api_key_fallback: missing\n",
+        "    fallback: missing\n",
     );
     b.reaches(
         &app,
@@ -363,7 +363,7 @@ fn mixed_providers_mcp_account_endpoints_and_independent_fallbacks() {
     login(&app, "fallback-account", "fallback-account-token");
     app.write("home/config.toml","[model_providers.reverse]\nenv_key = \"REVERSE_TEST_KEY\"\nbase_url = \"https://provider-a.invalid/v1\"\n");
     fs::remove_file(app.path("home/.env")).unwrap();
-    app.config(&format!("proxies:\n  us: http://127.0.0.1:{}\n  jp: http://127.0.0.1:{}\ncodex:\n  homes: [{}]\n  base_url:\n    account: https://chatgpt-mixed.invalid/backend-api\n    api_key: https://fallback-default.invalid/v1\n  routing:\n    api_key:\n      reverse: us\n      EXTRA_KEY_B: jp\n    account_fallback: us\n    api_key_fallback: jp\n    mcp_fallback: us\n",a.port,b.port,json!(app.path("home"))));
+    app.config(&format!("proxies:\n  us: http://127.0.0.1:{}\n  jp: http://127.0.0.1:{}\ncodex:\n  homes: [{}]\n  base_url:\n    account: https://chatgpt-mixed.invalid/backend-api\n    api_key: https://fallback-default.invalid/v1\n  routing:\n    api_key:\n      reverse: us\n      EXTRA_KEY_B: jp\n    account_fallback: us\n    fallback: jp\n    mcp_fallback: us\n",a.port,b.port,json!(app.path("home"))));
     app.restart();
     for (token, path, probe, host) in [
         (

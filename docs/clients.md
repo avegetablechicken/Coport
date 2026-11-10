@@ -209,8 +209,8 @@ connection. These hosts are decrypted:
 | Service | Hosts |
 | --- | --- |
 | Claude, with any account or non-URL API Key route or fallback | `claude.base_url` and `platform.claude.com` |
-| Codex, with account routes or `account_fallback` | `codex.base_url.account` and `auth.openai.com` |
-| Codex, with non-URL API Key routes or `api_key_fallback` | `codex.base_url.api_key` |
+| Codex, with account routes, `account_fallback` or `fallback` | `codex.base_url.account` and `auth.openai.com` |
+| Codex, with non-URL API Key routes or `fallback` | `codex.base_url.api_key` |
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Either, for each URL route | that route's host and port, including public IPv4 addresses |

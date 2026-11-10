@@ -50,7 +50,8 @@ codex:
     account:
       default: [us, jp]
       # "you@example.com": jp # ID/email/username takes priority over default.
-    # account_fallback: jp
+    # fallback: jp # Default for API keys and accounts without an explicit route.
+    # account_fallback: jp # Optional account-only override.
     # mcp_fallback: jp # Public documentation MCP; omitted means direct.
 
 claude:
@@ -65,10 +66,11 @@ claude:
       default: claude_official
       # "you@example.com": claude_official # UUID/email/name precedes default.
     # account_probe: claude_official # OAuth account identity probe when file-only is false.
-    # account_fallback: claude_official
+    # fallback: claude_official # Default for API keys and accounts.
+    # account_fallback: claude_official # Optional account-only override.
   # With account_auth_file_only: false, other tokens are identified via profile API.
   # account_probe supplies the lookup proxy before the account is known.
-  # If omitted, account_fallback supplies it for backward compatibility.
+  # If omitted, account_fallback, then fallback, supplies the lookup proxy.
   # With true, unmatched tokens are rejected even when a fallback exists.
 
 # Omit API Key entries unless configured. To enable them, add under routing:

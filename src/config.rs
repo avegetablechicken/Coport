@@ -57,10 +57,16 @@ pub struct Routing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_probe: Option<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_fallback: Option<Choice>,
+    pub fallback: Option<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_fallback: Option<Choice>,
 }
+impl Routing {
+    pub fn account_default(&self) -> Option<&Choice> {
+        self.account_fallback.as_ref().or(self.fallback.as_ref())
+    }
+}
+
 /// Where an account credential comes from: the login the CLI saved for a
 /// configured directory, or an access token environment variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,16 +336,17 @@ impl Config {
         if let Some(name) = &self.codex.auth_env {
             validate_env(name)?;
         }
-        let accounts =
-            !self.codex.routing.account.is_empty() || self.codex.routing.account_fallback.is_some();
+        let accounts = !self.codex.routing.account.is_empty()
+            || self.codex.routing.account_default().is_some();
         if (self.codex.auth_env.is_some() && !accounts)
             || (self.codex.account_auth_file_only
-                && accounts
+                && (!self.codex.routing.account.is_empty()
+                    || self.codex.routing.account_fallback.is_some())
                 && self.codex.auth_env.is_none()
                 && self.codex.homes.is_empty())
         {
             return Err(Error::config(
-                "Codex routing requires account sources and account mappings or account_fallback.",
+                "Codex routing requires account sources and account mappings, account_fallback or fallback.",
             ));
         }
         for (name, endpoint) in &self.proxies {
@@ -364,7 +371,7 @@ impl Config {
         }
         for c in [
             &self.codex.routing.account_fallback,
-            &self.codex.routing.api_key_fallback,
+            &self.codex.routing.fallback,
             &self.codex.routing.mcp_fallback,
         ]
         .into_iter()
@@ -428,7 +435,7 @@ pub(crate) fn account_sources(
     if let Some(name) = auth_env {
         return vec![("default".into(), AccountSource::Env(name.into()))];
     }
-    if routing.account.is_empty() && routing.account_fallback.is_none() {
+    if routing.account.is_empty() && routing.account_default().is_none() {
         return Vec::new();
     }
     directories
@@ -646,6 +653,19 @@ pub fn redacted_endpoint(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_api_only_fallback_requires_explicit_migration() {
+        for service in ["codex", "claude"] {
+            assert!(super::Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\n{service}:\n  routing:\n    fallback: none\n")).is_ok());
+            assert!(
+                super::Config::parse(&format!(
+                    "listen_port: 8787\nrequest_timeout_seconds: 3\n{service}:\n  routing:\n    api_key_fallback: none\n"
+                ))
+                .is_err()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -789,7 +809,7 @@ mod tests {
             "claude:\n  accounts:\n    a: {auth_file: .credentials.json, proxy: none}\n",
             "claude:\n  api_key: {ANTHROPIC_API_KEY: none}\n",
             "claude:\n  account_fallback: none\n",
-            "claude:\n  api_key_fallback: none\n",
+            "claude:\n  fallback: none\n",
             "claude:\n  base_url: {account: https://api.anthropic.com, api_key: https://api.anthropic.com}\n",
             "codex:\n  base_url: {account: https://chatgpt.com/backend-api/codex}\n",
         ] {
@@ -804,8 +824,8 @@ mod tests {
     fn rejects_invalid_layouts_and_proxy_choices() {
         for invalid in [
             "unknown: value\n",
-            "codex:\n  routing:\n    api_key_fallback: []\n",
-            "codex:\n  routing:\n    api_key_fallback: missing\n",
+            "codex:\n  routing:\n    fallback: []\n",
+            "codex:\n  routing:\n    fallback: missing\n",
             "codex:\n  routing:\n    unknown: none\n",
             "codex:\n  typo: true\n",
             "codex:\n  homes: []\n  routing:\n    account: {test: none}\n",
@@ -937,14 +957,11 @@ proxies:
 codex:
   routing:
     api_key: {TOKEN: [jp_lab, jp]}
-    api_key_fallback: [jp, none]
+    fallback: [jp, none]
 "#;
         let c = Config::parse(text).unwrap();
         assert_eq!(c.codex.routing.api_key["TOKEN"].names(), ["jp_lab", "jp"]);
-        assert_eq!(
-            c.codex.routing.api_key_fallback.unwrap().names(),
-            ["jp", "none"]
-        );
+        assert_eq!(c.codex.routing.fallback.unwrap().names(), ["jp", "none"]);
     }
 
     #[tokio::test]

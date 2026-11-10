@@ -145,7 +145,7 @@ impl Config {
         if identities.is_empty()
             && !self.codex.account_auth_file_only
             && (!self.codex.routing.account.is_empty()
-                || self.codex.routing.account_fallback.is_some())
+                || self.codex.routing.account_default().is_some())
         {
             if let Some(i) = Identity::from_token(token) {
                 identities.push((i, None));
@@ -213,8 +213,14 @@ impl Config {
         if let Some(r) = matches.pop() {
             return Ok(r);
         }
+        if self.codex.account_auth_file_only && Identity::from_token(token).is_some() {
+            return Err(Error::new(
+                401,
+                "Codex token does not match a saved account credential.",
+            ));
+        }
         if fallback {
-            if let Some(proxy) = &self.codex.routing.api_key_fallback {
+            if let Some(proxy) = &self.codex.routing.fallback {
                 return Ok(Route {
                     token: token.into(),
                     account_id: None,
@@ -266,7 +272,7 @@ impl Config {
                 let proxy = self.account_choice(identity, None)?;
                 return Ok((proxy, Some(identity.clone()), self.account_mapped(identity)));
             }
-            if let Some(proxy) = &self.codex.routing.account_fallback {
+            if let Some(proxy) = self.codex.routing.account_default() {
                 return Ok((proxy.clone(), None, false));
             }
         }
@@ -277,7 +283,7 @@ impl Config {
         } else {
             Err(Error::new(
                 403,
-                "Token refresh requires a refresh token saved in a configured Codex auth.json, or a learned route or account_fallback with account_auth_file_only: false.",
+                "Token refresh requires a refresh token saved in a configured Codex auth.json, or a learned route or account_fallback/fallback with account_auth_file_only: false.",
             ))
         }
     }
@@ -402,6 +408,160 @@ pub fn query_url(base: &str, target: &str) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unified_fallback_preserves_account_and_probe_precedence() {
+        let mut config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  account_auth_file_only: false\n  routing:\n    fallback: none\nclaude:\n  config_dirs: []\n  account_auth_file_only: false\n  routing:\n    fallback: none\n").unwrap();
+        let identity = Identity {
+            account_id: "acct".into(),
+            token: "access".into(),
+            refresh_token: None,
+            usernames: vec![],
+        };
+        let claude_identity = crate::claude::ClaudeIdentity {
+            account_id: "acct".into(),
+            usernames: vec![],
+        };
+        let choice = |name: &str| Choice::One(name.into());
+        assert_eq!(
+            config.resolve_refresh("new", None).await.unwrap().0.label(),
+            "none"
+        );
+        assert_eq!(
+            config
+                .claude
+                .resolve_refresh("new", None)
+                .await
+                .unwrap()
+                .0
+                .label(),
+            "none"
+        );
+        assert_eq!(
+            config.account_choice(&identity, None).unwrap().label(),
+            "none"
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("authorization", "Bearer access".parse().unwrap());
+        let route = config.claude.resolve(&headers).await.unwrap();
+        assert!(route.needs_profile);
+        assert_eq!(route.proxy.label(), "none");
+        for routing in [&mut config.codex.routing, &mut config.claude.routing] {
+            routing.account_fallback = Some(choice("account"));
+            routing.account.insert("acct".into(), choice("mapped"));
+        }
+        config.claude.routing.account_probe = Some(choice("probe"));
+        assert_eq!(
+            config.resolve_refresh("new", None).await.unwrap().0.label(),
+            "account"
+        );
+        assert_eq!(
+            config
+                .claude
+                .resolve_refresh("new", None)
+                .await
+                .unwrap()
+                .0
+                .label(),
+            "probe"
+        );
+        assert_eq!(
+            config
+                .resolve_refresh("known", Some(&identity))
+                .await
+                .unwrap()
+                .0
+                .label(),
+            "mapped"
+        );
+        assert_eq!(
+            config
+                .claude
+                .resolve_refresh("known", Some(&claude_identity))
+                .await
+                .unwrap()
+                .0
+                .label(),
+            "mapped"
+        );
+        assert_eq!(
+            config.claude.resolve(&headers).await.unwrap().proxy.label(),
+            "probe"
+        );
+        let mut route = config.claude.resolve(&headers).await.unwrap();
+        config
+            .claude
+            .apply_profile(&mut route, claude_identity.clone())
+            .unwrap();
+        assert_eq!(route.proxy.label(), "mapped");
+        config.codex.routing.account.clear();
+        config.claude.routing.account.clear();
+        assert_eq!(
+            config.account_choice(&identity, None).unwrap().label(),
+            "account"
+        );
+        config
+            .claude
+            .apply_profile(&mut route, claude_identity.clone())
+            .unwrap();
+        assert_eq!(route.proxy.label(), "account");
+        config.claude.routing.account_fallback = None;
+        config
+            .claude
+            .apply_profile(&mut route, claude_identity.clone())
+            .unwrap();
+        assert_eq!(route.proxy.label(), "none");
+        // An account override does not redirect API key traffic.
+        assert_eq!(
+            config
+                .resolve(Some("Bearer api-key"), true)
+                .await
+                .unwrap()
+                .proxy
+                .label(),
+            "none"
+        );
+        headers.remove("authorization");
+        headers.insert("x-api-key", "api-key".parse().unwrap());
+        assert_eq!(
+            config.claude.resolve(&headers).await.unwrap().proxy.label(),
+            "none"
+        );
+        let account_token = "h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC0xIn19.s";
+        assert_eq!(
+            config
+                .resolve(Some(&format!("Bearer {account_token}")), true)
+                .await
+                .unwrap()
+                .proxy
+                .label(),
+            "account"
+        );
+        config.codex.account_auth_file_only = true;
+        assert!(
+            config
+                .resolve(Some(&format!("Bearer {account_token}")), true)
+                .await
+                .is_err()
+        );
+        config.claude.account_auth_file_only = true;
+        assert!(
+            config
+                .resolve_refresh("known", Some(&identity))
+                .await
+                .is_err()
+        );
+        assert!(
+            config
+                .claude
+                .resolve_refresh("known", Some(&claude_identity))
+                .await
+                .is_err()
+        );
+        headers.remove("x-api-key");
+        headers.insert("authorization", "Bearer access".parse().unwrap());
+        assert!(config.claude.resolve(&headers).await.is_err());
+    }
     #[tokio::test]
     async fn explicit_url_routes_need_auth_but_no_local_key_source_or_fallback() {
         let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  routing:\n    api_key:\n      'api.invalid/v1': none\n").unwrap();
