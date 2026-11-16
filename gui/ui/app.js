@@ -222,6 +222,12 @@ async function refresh() {
   render();
 }
 
+/// Rereads the login item, which System Settings can change while the app runs.
+async function refreshLaunchAtLogin() {
+  const state = await invoke("refresh_launch_at_login");
+  if (ui.snap) ui.snap.settings.launchAtLogin = state;
+}
+
 let refreshTimer;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
@@ -2112,7 +2118,8 @@ function settings() {
       "General",
       "",
       `<div class="row"><span class="row-label">Launch at login</span>
-         <button class="switch" role="switch" aria-checked="${set.launchAtLogin}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
+         <button class="switch" role="switch" aria-checked="${set.launchAtLogin !== "off"}" data-action="launch-at-login" aria-label="Launch at login"></button></div>
+       ${set.launchAtLogin === "needsApproval" ? message("warn", "macOS blocks Coport from opening at login. Allow it in Login Items.", `<button class="btn" data-action="open-login-items">Open Login Items</button>`) : ""}
        <div class="row"><span class="row-label">Start proxy on startup</span>
          <button class="switch" role="switch" aria-checked="${set.startProxyOnLaunch}" data-action="auto-start" aria-label="Start proxy on startup"></button></div>
        <div class="row"><span class="row-label" data-tip="Reopen the app to manage or stop the background proxy.">Keep proxy running after quit</span>
@@ -2568,7 +2575,7 @@ async function act(action, el) {
           selectDeviceTraffic();
           loadDevices();
         }
-        if (ui.page === "settings") await loadDevices();
+        if (ui.page === "settings") await Promise.all([loadDevices(), refreshLaunchAtLogin()]);
       } finally {
         if (ui.pageChange === change) ui.pageChange = null;
       }
@@ -2752,6 +2759,9 @@ async function act(action, el) {
         toast(String(e));
       }
       await refresh();
+      break;
+    case "open-login-items":
+      await invoke("open_login_items");
       break;
     case "auto-start":
       await invoke("update_settings", { patch: { startProxyOnLaunch: el.getAttribute("aria-checked") !== "true" } });
@@ -2971,7 +2981,7 @@ window.__TAURI__.event
 listen("state-changed", scheduleRefresh);
 const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;
 let panelHiddenAt = null;
-listen("panel-shown", () => {
+listen("panel-shown", async () => {
   const returnHome = panelHiddenAt !== null && Date.now() - panelHiddenAt >= PANEL_PAGE_TIMEOUT_MS;
   panelHiddenAt = null;
   if (returnHome) {
@@ -2981,6 +2991,8 @@ listen("panel-shown", () => {
     $("content").scrollTop = 0;
   }
   if (ui.devicesLoaded) loadDeviceCapabilities();
+  // Returning from System Settings may have allowed or blocked the login item.
+  if (ui.page === "settings") await refreshLaunchAtLogin();
   return refresh();
 });
 listen("panel-hidden", () => {

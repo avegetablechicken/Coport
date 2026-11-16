@@ -429,6 +429,18 @@ pub fn set_launch_at_login(state: State<AppState>, enabled: bool) -> Result {
     state.core.lock().unwrap().set_launch_at_login(enabled)
 }
 
+#[tauri::command]
+pub fn refresh_launch_at_login(state: State<AppState>) -> platform::LoginItem {
+    state.core.lock().unwrap().refresh_launch_at_login()
+}
+
+/// Opens System Settings where macOS lists login items it blocks.
+#[tauri::command]
+pub fn open_login_items() {
+    #[cfg(target_os = "macos")]
+    platform::open_login_items();
+}
+
 /// Replaces the configuration with a YAML file chosen in a file dialog, after
 /// validating it. Returns false when the dialog is cancelled.
 #[tauri::command]

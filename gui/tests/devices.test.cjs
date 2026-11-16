@@ -6,7 +6,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.j
 const start = source.indexOf('function deviceConnectionKey(');
 const code = source.slice(start, source.indexOf('// ---------------------------------------------------------------- settings', start));
 function harness(invoke) {
-  const ui = { page: 'devices', devices: [], snap: { phase: { state: 'running', port: 8787 } } };
+  const ui = { page: 'devices', devices: [], snap: { phase: { state: 'running', port: 8787 }, settings: {} } };
   const fields = {}, listeners = {};
   const context = { ui, invoke, Promise, ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', loadMergedData() {}, toast() {}, changePage: update => update(),
     message: (_, text) => text, esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
@@ -29,6 +29,7 @@ function harness(invoke) {
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   vm.runInContext(code, context);
+  vm.runInContext(source.slice(source.indexOf('async function refreshLaunchAtLogin('), source.indexOf('let refreshTimer;')), context);
   context.fields = fields; context.listeners = listeners;
   context.action = async (name, el = context.el || { dataset: {} }) => {
     context.el = el;
@@ -623,7 +624,8 @@ test('entering Settings through navigation reads definitions without remote stat
   await h.action('page', { dataset: { page: 'settings' } });
   await Promise.resolve();
   assert.equal(h.ui.page, 'settings');
-  assert.deepEqual(calls, ['get_devices', 'get_device_forwarders', 'get_device_capabilities']);
+  // The login item status is a local system read.
+  assert.deepEqual(calls, ['get_devices', 'refresh_launch_at_login', 'get_device_forwarders', 'get_device_capabilities']);
 });
 
 test('leaving Devices while definitions load prevents starting remote statistics', async () => {

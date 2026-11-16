@@ -111,7 +111,12 @@ cannot be restored by this migration.
 
 The CLI continues to log beside its
 configuration unless `--log-file` is supplied. Opening the app shows the
-panel; Launch at Login starts it with `--background`. Only one instance runs per
+panel; Launch at Login starts it without the panel. On macOS 13 and later the
+bundled app registers itself with `SMAppService` as an Open at Login item,
+listed under Coport in System Settings, and recognizes that launch; it replaces
+the `~/Library/LaunchAgents` plist written by earlier versions, and Settings
+warns when macOS blocks it. Elsewhere Launch at Login passes `--background`.
+Only one instance runs per
 user, and launching again opens its panel. Do not run the desktop app and the
 background service on the same port at the same time.
 

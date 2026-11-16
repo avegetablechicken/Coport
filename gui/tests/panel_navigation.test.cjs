@@ -16,6 +16,7 @@ function panel(page = "settings") {
   const rendered = [];
   const probes = [];
   const sshChecks = [];
+  const loginReads = [];
   vm.runInNewContext(handlers, {
     ui,
     Date: { now: () => now },
@@ -27,10 +28,11 @@ function panel(page = "settings") {
     refresh: async () => {},
     probeStale: () => probes.push("stale"),
     checkConfiguredSsh: () => sshChecks.push("startup"),
+    refreshLaunchAtLogin: async () => loginReads.push(ui.page),
     invoke: command => probes.push(command),
     setInterval() {},
   });
-  return { ui, content, rendered, events, probes, sshChecks, advance: (ms) => { now += ms; } };
+  return { ui, content, rendered, events, probes, sshChecks, loginReads, advance: (ms) => { now += ms; } };
 }
 
 test("first show and short reopening preserve the current page", async () => {
@@ -100,6 +102,18 @@ test("SSH availability is checked once at app startup, not on every panel reopen
   assert.deepEqual(p.sshChecks, ['startup']);
 });
 
+test("reopening Settings rereads the login item that System Settings may have changed", async () => {
+  const p = panel();
+  await p.events["panel-shown"]();
+  p.events["panel-hidden"]();
+  p.advance(timeout);
+  await p.events["panel-shown"]();
+  const other = panel("activity");
+  await other.events["panel-shown"]();
+  assert.deepEqual(p.loginReads, ["settings"]);
+  assert.deepEqual(other.loginReads, []);
+});
+
 // Page changes: the shown page stays while the next one reads its first data,
 // then one motion (changePage) shows it.
 function navigation(page = "main") {
@@ -111,7 +125,7 @@ function navigation(page = "main") {
   const context = {
     ui, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
     changePage: (update) => { changes.push({ page: ui.page, traffic: ui.traffic, homeTraffic: ui.homeTraffic, mergedData: ui.mergedData }); update(); },
-    loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, homeTrafficDevice: () => null,
+    loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
     loadActivity: () => new Promise((resolve) => loads.push(resolve)),
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
   };

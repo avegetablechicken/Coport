@@ -120,6 +120,8 @@ fn main() {
             commands::probe_proxy,
             commands::update_settings,
             commands::set_launch_at_login,
+            commands::refresh_launch_at_login,
+            commands::open_login_items,
             commands::import_config,
             commands::set_config_value,
             commands::create_example_config,
@@ -130,6 +132,11 @@ fn main() {
             commands::quit_app,
         ])
         .setup(move |app| {
+            // macOS opens the login item without arguments.
+            #[cfg(target_os = "macos")]
+            if platform::launched_at_login() {
+                open = false;
+            }
             #[cfg(target_os = "linux")]
             appearance::configure(app)?;
             // Menu bar app: no Dock icon and no app menu.

@@ -20,7 +20,7 @@ pub struct Core {
     pub controller: Controller,
     pub logs: LogFeed,
     pub settings: Settings,
-    pub launch_at_login: bool,
+    pub launch_at_login: platform::LoginItem,
     config: ConfigCache,
     account_probe: Option<std::sync::Arc<coport_gui::tasks::Tasks>>,
     /// Outlives `account_probe`, which is rebuilt for each configuration.
@@ -112,6 +112,8 @@ impl Core {
             }
         });
         let log_path = attached.as_ref().map(|status| status.log_path.clone());
+        #[cfg(target_os = "macos")]
+        platform::migrate_launch_at_login();
         Self {
             logs: LogFeed::new(
                 log_path.unwrap_or_else(crate::settings::log_path),
@@ -356,6 +358,12 @@ impl Core {
         let result = platform::set_launch_at_login(enable).map_err(|e| e.to_string());
         self.launch_at_login = platform::launch_at_login();
         result
+    }
+
+    /// Rereads the login item, which System Settings can switch off or allow.
+    pub fn refresh_launch_at_login(&mut self) -> platform::LoginItem {
+        self.launch_at_login = platform::launch_at_login();
+        self.launch_at_login
     }
 
     /// Probes proxies whose last result is missing or older than `max_age`.
@@ -901,7 +909,7 @@ struct SettingsDto {
     start_proxy_on_launch: bool,
     keep_proxy_running_on_quit: bool,
     mask_account_names: bool,
-    launch_at_login: bool,
+    launch_at_login: platform::LoginItem,
     /// Size of the request log in use, if it exists yet.
     log_bytes: Option<u64>,
     traffic_compatibility: TrafficCompatibilityDto,
