@@ -4369,3 +4369,101 @@ async fn auto_refresh_ignores_other_statuses_and_logins_without_refresh_tokens()
         assert_eq!(take_requests(&mut fixture).len(), 1);
     }
 }
+
+#[tokio::test]
+async fn claude_auto_rotation_registers_the_new_token_for_manual_renewal() {
+    let mut lookup = fixture("http", "sse").await;
+    let mut upstream = fixture("http", "auto_success").await;
+    let lookup_url = format!("http://{}", lookup.addr);
+    let account_url = format!("http://{}", upstream.addr);
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".credentials.json");
+    std::fs::write(
+        &file,
+        json!({"claudeAiOauth":{"accessToken":"access-secret","refreshToken":"refresh-secret"}})
+            .to_string(),
+    )
+    .unwrap();
+    let config = format!(
+        "auto_refresh_access_token: true\nproxies:\n  selected: {account_url}\n  probe: {lookup_url}\nclaude:\n  account_auth_file_only: false\n  config_dirs: [{}]\n  routing:\n    account: {{remote@example.invalid: selected}}\n    account_probe: probe\n",
+        serde_json::to_string(home.path()).unwrap()
+    );
+    let active = running(&config).await;
+    trust(&active, &lookup, &lookup_url);
+    trust(&active, &upstream, &account_url);
+    assert_eq!(auto_model(&active, true).await.status(), 200);
+    let requests = take_requests(&mut upstream);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /v1/oauth/token "))
+            .count(),
+        1
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    let rotated = saved["claudeAiOauth"]["refreshToken"].as_str().unwrap();
+    assert_eq!(rotated, "new-refresh");
+    let cached = active.server.refresh_routes.identity(rotated);
+    let renew = || {
+        http()
+            .post(format!("{}/anthropic/v1/oauth/token", active.url))
+            .header("content-type", "application/json")
+            .body(json!({"grant_type":"refresh_token","refresh_token":rotated}).to_string())
+            .send()
+    };
+    let response = renew().await.unwrap();
+    assert_eq!(cached.unwrap().usernames, ["remote@example.invalid"]);
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        take_requests(&mut upstream)
+            .iter()
+            .filter(|r| r.starts_with("POST /v1/oauth/token "))
+            .count(),
+        1
+    );
+
+    // An earlier daemon may already have saved a login with no cached route.
+    let restarted = running(&config).await;
+    take_requests(&mut lookup);
+    trust(&restarted, &lookup, &lookup_url);
+    trust(&restarted, &upstream, &account_url);
+    assert!(restarted.server.refresh_routes.identity(rotated).is_none());
+    let response = http()
+        .post(format!("{}/anthropic/v1/oauth/token", restarted.url))
+        .header("content-type", "application/json")
+        .body(json!({"grant_type":"refresh_token","refresh_token":rotated}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let recovery_probe = take_requests(&mut lookup);
+    assert_eq!(recovery_probe.len(), 1);
+    assert!(recovery_probe[0].starts_with("GET /api/oauth/profile "));
+    assert!(recovery_probe[0].contains("authorization: Bearer new-access"));
+    assert_eq!(
+        take_requests(&mut upstream)
+            .iter()
+            .filter(|r| r.starts_with("POST /v1/oauth/token "))
+            .count(),
+        1
+    );
+    // A fresh daemon receiving Copool's profile request first identifies the
+    // bearer via the probe, then forwards the original GET via the account.
+    let cold = running(&config).await;
+    trust(&cold, &lookup, &lookup_url);
+    trust(&cold, &upstream, &account_url);
+    let response = http()
+        .get(format!("{}/anthropic/api/oauth/profile", cold.url))
+        .bearer_auth("new-access")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    for received in [take_requests(&mut lookup), take_requests(&mut upstream)] {
+        assert_eq!(received.len(), 1);
+        assert!(received[0].starts_with("GET /api/oauth/profile "));
+        assert!(received[0].contains("authorization: Bearer new-access"));
+    }
+}

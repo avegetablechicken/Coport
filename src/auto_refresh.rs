@@ -103,6 +103,7 @@ impl Server {
         &self,
         snapshot: &Snapshot,
         choice: &Choice,
+        claude_identity: Option<&crate::claude::ClaudeIdentity>,
         deadline: Deadline,
         log: &mut RequestLog,
     ) -> Result<String> {
@@ -176,6 +177,23 @@ impl Server {
         let (active_store, active) = credentials::load(&snapshot.source, snapshot.service).await?;
         if active_store != store || active != current {
             return Err(Error::config("Saved login changed during refresh."));
+        }
+        if snapshot.service == Service::Claude {
+            if let Some(token) = credentials::refresh(&updated, Service::Claude) {
+                let identity = crate::claude::ClaudeIdentity::token_response(&payload)
+                    .or_else(|| claude_identity.cloned())
+                    .or_else(|| self.refresh_routes.identity(refresh));
+                if let Some(identity) = identity {
+                    if let Err(error) = self.refresh_routes.learn(token, &identity) {
+                        self.logger.write(
+                            "refresh_route_unsaved",
+                            [("reason".to_owned(), error.to_string().into())]
+                                .into_iter()
+                                .collect(),
+                        );
+                    }
+                }
+            }
         }
         store.replace(&current, &updated).await?;
         let token = credentials::access(&updated, snapshot.service)

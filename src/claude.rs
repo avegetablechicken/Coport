@@ -431,6 +431,22 @@ impl Claude {
         token: &str,
         learned: Option<&ClaudeIdentity>,
     ) -> Result<(Choice, Option<String>, bool)> {
+        self.resolve_refresh_with_profile(token, learned, |_, _| async {
+            Err(Error::config("Claude account has no proxy route."))
+        })
+        .await
+    }
+
+    pub(crate) async fn resolve_refresh_with_profile<F, Fut>(
+        &self,
+        token: &str,
+        learned: Option<&ClaudeIdentity>,
+        lookup: F,
+    ) -> Result<(Choice, Option<String>, bool)>
+    where
+        F: FnOnce(String, Choice) -> Fut,
+        Fut: std::future::Future<Output = Result<ClaudeIdentity>>,
+    {
         // As for a looked-up access token (see `apply_profile`).
         if !self.account_auth_file_only {
             if let Some(identity) = learned {
@@ -447,7 +463,7 @@ impl Claude {
             };
             match value {
                 Ok(value) if value["claudeAiOauth"]["refreshToken"].as_str() == Some(token) => {
-                    matches.push((label, account.claude_identity()));
+                    matches.push((label, account.claude_identity(), value));
                 }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
@@ -459,8 +475,32 @@ impl Claude {
                 "Claude refresh credential matches multiple routes.",
             ));
         }
-        if let Some((label, identity)) = matches.pop() {
-            let proxy = self.account_choice(identity.as_ref(), Some(&label))?;
+        if let Some((label, mut identity, saved)) = matches.pop() {
+            let proxy = match self.account_choice(identity.as_ref(), Some(&label)) {
+                Ok(choice) => choice,
+                Err(error) => {
+                    // Older releases saved the rotated pair without its refresh route.
+                    // Only the paired access token may identify this saved refresh token.
+                    let probe = self.routing.account_probe.as_ref();
+                    let access = saved["claudeAiOauth"]["accessToken"]
+                        .as_str()
+                        .filter(|v| valid_token(v));
+                    match (
+                        self.account_auth_file_only,
+                        identity.as_ref(),
+                        access,
+                        probe,
+                    ) {
+                        (false, None, Some(access), Some(probe)) => {
+                            let named = lookup(access.into(), probe.clone()).await?;
+                            let choice = self.account_choice(Some(&named), None)?;
+                            identity = Some(named);
+                            choice
+                        }
+                        _ => return Err(error),
+                    }
+                }
+            };
             return Ok((proxy, identity.map(|i| i.account_id), true));
         }
         if !self.account_auth_file_only {

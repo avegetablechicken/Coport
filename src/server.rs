@@ -1087,7 +1087,7 @@ impl Server {
                 headers.remove(n);
             }
         }
-        if let Some(r) = claude_route {
+        if let Some(r) = &claude_route {
             r.headers(&mut headers)?;
         } else if !docs {
             let r = route.unwrap();
@@ -1125,7 +1125,16 @@ impl Server {
             .await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let (Some(snapshot), Some(mut retry)) = (refresh_snapshot, retry) {
-                match self.renew_access(&snapshot, &choice, deadline, log).await {
+                match self
+                    .renew_access(
+                        &snapshot,
+                        &choice,
+                        claude_route.as_ref().and_then(|r| r.identity.as_ref()),
+                        deadline,
+                        log,
+                    )
+                    .await
+                {
                     Ok(token) => {
                         retry
                             .headers_mut()
@@ -1282,14 +1291,25 @@ impl Server {
         let bytes = read_body(body).await?;
         let token = refresh_token(&bytes)
             .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
-        let learned = claude
+        let mut learned = claude
             .then(|| self.refresh_routes.identity(&token))
             .flatten();
         let mut codex_identity = None;
         let (choice, account_id, configured) = if claude {
+            let existing = learned.clone();
+            let recovered = &mut learned;
+            let logger = &mut *log;
             self.config
                 .claude
-                .resolve_refresh(&token, learned.as_ref())
+                .resolve_refresh_with_profile(
+                    &token,
+                    existing.as_ref(),
+                    |access, probe| async move {
+                        let named = self.lookup_claude_identity(&access, &probe, logger).await?;
+                        *recovered = Some(named.clone());
+                        Ok(named)
+                    },
+                )
                 .await?
         } else {
             let learned = self.codex_refresh_routes.identity(&token);
