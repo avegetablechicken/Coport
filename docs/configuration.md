@@ -467,9 +467,13 @@ Code takes, together with any other tool that follows the same protocol, before 
 spends a refresh token. Inside the lock Coport rereads the login and leaves one renewed
 by another program to the client instead of spending its token again. While another
 program holds the lock, Coport waits up to 10 seconds, then returns the original 401;
-it holds the lock for at most one 30-second refresh. Refreshes that clients send through
-the proxy (`/oauth/token`) are relayed without taking the lock, since the client may
-already hold it. Concurrent
+it holds the lock for at most one 30-second refresh. A lock left by a holder that exited
+is freed as Claude Code frees it: after 60 seconds without an update, or, on macOS and
+Linux, once its mtime has stood still for 7.5 seconds and the holder's
+`.oauth_refresh.lock.owner` record proves that process gone. Coport writes the same
+record while it holds the lock, so Claude Code can do the same should Coport exit
+mid-refresh. Refreshes that clients send through the proxy (`/oauth/token`) are relayed
+without taking the lock, since the client may already hold it. Concurrent
 requests share renewal; rejected refresh tokens stay blocked for that server instance,
 while transient failures pause retries for 60 seconds. A failed renewal returns the
 original 401. In-memory aliases allow callers still holding the old access

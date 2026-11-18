@@ -4428,6 +4428,33 @@ async fn auto_refresh_waits_for_claude_code_and_never_spends_the_token_it_renewe
     );
     assert!(locks.iter().all(|lock| !lock.exists()));
 }
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_refresh_takes_over_from_a_claude_code_that_died_holding_its_lock() {
+    let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
+    // Claude Code exited mid-renewal seconds ago: its locks are far from
+    // stale, but its owner record proves it gone.
+    let locks = crate::claude_refresh_lock::hold_as_dead_claude_code(home.path());
+    let response = auto_model(&running, true).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "model-result");
+    assert_eq!(
+        crate::oauth_credentials::access(&read_json(&file), Service::Claude),
+        Some("new-access")
+    );
+    let refreshes = take_requests(&mut fixture)
+        .iter()
+        .filter(|r| r.contains("refresh-secret"))
+        .count();
+    assert_eq!(refreshes, 1);
+    assert!(locks.iter().all(|lock| !lock.exists()));
+    assert!(
+        !home
+            .path()
+            .join(crate::claude_refresh_lock::OWNER_FILE)
+            .exists()
+    );
+}
 #[tokio::test]
 async fn auto_refresh_gives_up_while_another_renewal_holds_the_lock() {
     let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
