@@ -165,8 +165,10 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
         }
         let mut record = path.to_vec();
         record.push(b'\n');
-        preserve_summary_executable(dir, binary)?;
+        // Record the running executable first: if the copy below fails, an
+        // older registered path must not keep pointing discovery elsewhere.
         crate::settings::write_private(&dir.join("summary-executable"), &record)?;
+        preserve_summary_executable(dir, binary)?;
     }
     #[cfg(not(unix))]
     preserve_summary_executable(dir, binary)?;
@@ -983,6 +985,23 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.join("summary-executable")).unwrap(),
             format!("{}\n", moved.display()).as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_helper_copy_still_records_the_running_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_home, dir, binary) = discovery_fixture();
+        let replaced = binary.with_file_name("replaced-coportd");
+        std::fs::copy(&binary, &replaced).unwrap();
+        // Executable but unreadable: copying it into a helper fails.
+        std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let _ = register_summary_executable(&dir, &replaced);
+        // The old path must not stay registered, or discovery could run it.
+        assert_eq!(
+            std::fs::read(dir.join("summary-executable")).unwrap(),
+            format!("{}\n", replaced.display()).as_bytes()
         );
     }
     #[test]
