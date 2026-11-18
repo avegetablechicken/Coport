@@ -908,10 +908,9 @@ mod tests {
     fn discovery_executes_unlinked_running_binary_only_for_registered_path() {
         let _guard = crate::daemon::spawn_guard();
         let (home, dir, binary) = discovery_fixture();
-        // A native executable is required: a shell script's /proc/exe points
-        // to its interpreter. sleep keeps the deleted inode alive, and its
-        // --version output proves discovery executed that inode successfully.
-        std::fs::copy("/bin/sleep", &binary).unwrap();
+        // Copy the interpreter itself. A renamed coreutils multicall binary
+        // may select its operation by argv[0] and exit when named coportd.
+        std::fs::copy("/bin/sh", &binary).unwrap();
         struct Running(std::process::Child);
         impl Drop for Running {
             fn drop(&mut self) {
@@ -919,9 +918,10 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let child = Running(
+        let mut child = Running(
             std::process::Command::new(&binary)
-                .arg("60")
+                .args(["-c", "read -r line"])
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
@@ -935,14 +935,17 @@ mod tests {
         let lf = isolated_discovery_script().replace("\r\n", "\n");
         for script in [lf.clone(), lf.replace('\n', "\r\n")] {
             let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &discovery_command(&script, "--version")])
+                .args([
+                    "-c",
+                    &discovery_command(&script, "-c 'echo discovered-shell'"),
+                ])
                 .env("HOME", home.path())
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
                 .env("PATH", home.path().join(".local/bin"))
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{:?}", output);
-            assert!(String::from_utf8_lossy(&output.stdout).contains("sleep"));
+            assert_eq!(output.stdout, b"discovered-shell\n");
             assert_eq!(std::fs::read(&marker).unwrap(), before);
         }
         crate::settings::write_private(
@@ -962,6 +965,7 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(127));
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[cfg(unix)]
