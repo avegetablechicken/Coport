@@ -532,11 +532,14 @@ pub fn start(binary: &Path, dir: &Path, config: &Path, log: &Path) -> io::Result
 
 struct Registration {
     path: PathBuf,
-    _lock: File,
+    lock: File,
 }
 impl Drop for Registration {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // Windows releases a lock left on a closed handle only when system
+        // resources allow, so an immediate restart could still find it held.
+        let _ = self.lock.unlock();
     }
 }
 
@@ -655,7 +658,7 @@ async fn serve_until(
     })?;
     let registration = Registration {
         path: dir.join(ENDPOINT),
-        _lock: lock,
+        lock,
     };
     let config_path = std::path::absolute(config)?;
     let log_path = std::path::absolute(log)?;

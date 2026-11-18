@@ -343,10 +343,11 @@ fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
         dir.path().join("proxy.log"),
     );
     let first = gui.daemon_status().unwrap().pid;
-    gui.start(
+    gui.try_start(
         &dir.path().join("config.yaml"),
         dir.path().join("proxy.log"),
-    );
+    )
+    .unwrap();
     assert_ne!(gui.daemon_status().unwrap().pid, first);
     assert_eq!(gui.daemon_status().unwrap().port, port);
     gui.stop().unwrap();
