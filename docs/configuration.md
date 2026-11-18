@@ -458,7 +458,18 @@ WebSocket or SSE stream are not replayed.
 After an upstream HTTP 401, Coport refreshes the matched saved Codex/Claude login
 through that account's configured transport, saves rotated credentials to the original
 file or OS credential store, and retries the buffered request once. It preserves other
-credential fields and refuses to overwrite a login changed during renewal. Concurrent
+credential fields, including edits made while the refresh ran, and never overwrites a
+login whose refresh token changed meanwhile (another renewal or an account switch).
+
+A Claude login is renewed only while holding Claude Code's own refresh lock
+(`<config dir>/.oauth_refresh.lock` and the legacy `<config dir>.lock`), which Claude
+Code takes, together with any other tool that follows the same protocol, before it
+spends a refresh token. Inside the lock Coport rereads the login and leaves one renewed
+by another program to the client instead of spending its token again. While another
+program holds the lock, Coport waits up to 10 seconds, then returns the original 401;
+it holds the lock for at most one 30-second refresh. Refreshes that clients send through
+the proxy (`/oauth/token`) are relayed without taking the lock, since the client may
+already hold it. Concurrent
 requests share renewal; rejected refresh tokens stay blocked for that server instance,
 while transient failures pause retries for 60 seconds. A failed renewal returns the
 original 401. In-memory aliases allow callers still holding the old access

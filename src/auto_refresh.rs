@@ -1,6 +1,7 @@
 //! Opt-in, reactive renewal of saved OAuth logins for model requests only.
 use super::*;
 use crate::{
+    claude_refresh_lock::{RefreshLock, Wait},
     config::AccountSource,
     oauth_credentials::{self as credentials, Store},
 };
@@ -74,12 +75,14 @@ impl Server {
         }
         found
     }
-    fn remember_rotation(&self, old: &Snapshot, updated: Value) {
+    /// `replaced` is the saved login the rotation was written over: the
+    /// request's snapshot, plus any unrelated edits made meanwhile.
+    fn remember_rotation(&self, old: &Snapshot, replaced: &Value, updated: Value) {
         let mut aliases = self.auto_refresh.aliases.lock().unwrap();
         // Update aliases only for this exact generation, not other accounts
         // that happened to use the same storage path in the past.
         for alias in aliases.values_mut() {
-            if alias.store == old.store && alias.service == old.service && alias.value == old.value
+            if alias.store == old.store && alias.service == old.service && &alias.value == replaced
             {
                 alias.value = updated.clone();
             }
@@ -116,13 +119,23 @@ impl Server {
             .or_default()
             .clone();
         let mut attempt = deadline.run(gate.lock()).await?;
+        // Claude Code and other renewers of this login take the same lock and
+        // reread the login inside it, so one refresh token is spent only once.
+        let lock = refresh_lock(snapshot, deadline).await?;
+        // Others wait for this lock: hold it for one bounded refresh only.
+        let deadline = if lock.is_some() {
+            deadline.cap(LOCKED_REFRESH_SECONDS)
+        } else {
+            deadline
+        };
         let (store, current) = credentials::load(&snapshot.source, snapshot.service).await?;
         if store != snapshot.store {
             return Err(Error::config("Login storage changed during request."));
         }
-        if current != snapshot.value {
-            // Only reuse a rotation performed by this server. An unrelated
-            // external edit must be retried by the client with its current login.
+        if !same_generation(snapshot.service, &current, &snapshot.value) {
+            // Only reuse a rotation performed by this server. Another renewal
+            // or an account switch is left to the client, which rereads its
+            // current login; it may name another account than this request's.
             let old = credentials::access(&snapshot.value, snapshot.service).unwrap();
             return self
                 .refreshed_alias(snapshot.service, old)
@@ -136,6 +149,9 @@ impl Server {
             key == &generation && (*permanent || at.elapsed() < Duration::from_secs(60))
         }) {
             return Err(Error::config("OAuth refresh is paused for this login."));
+        }
+        if lock.as_ref().is_some_and(RefreshLock::compromised) {
+            return Err(Error::config("Login refresh lock was taken over."));
         }
         let mut request = refresh_request(snapshot.service, &current)?;
         // Never send incoming model headers, cookies or its access token here.
@@ -171,13 +187,20 @@ impl Server {
                     .map_err(|_| Error::config("Invalid OAuth refresh response."))
             })
             .await??;
-        let updated = merge_tokens(snapshot.service, &current, &payload)?;
+        // Validate the response before touching the saved login.
+        merge_tokens(snapshot.service, &current, &payload)?;
         let _rotation = deadline.run(self.auto_refresh.rotation.write()).await?;
-        // Recheck the active backend as well as its contents before writing.
+        // Recheck the active backend and generation before writing. Edits
+        // that leave the spent refresh token in place (another field, an MCP
+        // login) are kept, and the new tokens merged into them: dropping them
+        // would leave only the spent token saved. A login whose refresh token
+        // changed meanwhile belongs to someone else and is never overwritten.
         let (active_store, active) = credentials::load(&snapshot.source, snapshot.service).await?;
-        if active_store != store || active != current {
+        if active_store != store || credentials::refresh(&active, snapshot.service) != Some(refresh)
+        {
             return Err(Error::config("Saved login changed during refresh."));
         }
+        let updated = merge_tokens(snapshot.service, &active, &payload)?;
         if snapshot.service == Service::Claude {
             if let Some(token) = credentials::refresh(&updated, Service::Claude) {
                 let identity = crate::claude::ClaudeIdentity::token_response(&payload)
@@ -195,14 +218,48 @@ impl Server {
                 }
             }
         }
-        store.replace(&current, &updated).await?;
+        store.replace(&active, &updated).await?;
+        drop(lock);
         let token = credentials::access(&updated, snapshot.service)
             .unwrap()
             .to_owned();
-        self.remember_rotation(snapshot, updated);
+        self.remember_rotation(snapshot, &active, updated);
         attempt.failed = None;
         log.field("oauth_refresh", "succeeded");
         Ok(token)
+    }
+}
+
+/// Both tokens unchanged: the same login generation, whatever else changed.
+fn same_generation(service: Service, a: &Value, b: &Value) -> bool {
+    credentials::access(a, service) == credentials::access(b, service)
+        && credentials::refresh(a, service) == credentials::refresh(b, service)
+}
+
+/// The longest a refresh holds Claude Code's lock, which others wait for.
+const LOCKED_REFRESH_SECONDS: f64 = 30.0;
+
+/// How long a model request waits for another program's Claude renewal.
+const LOCK_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(600)
+} else {
+    Duration::from_secs(10)
+};
+
+/// Claude Code's refresh lock for a Claude login saved in a configuration
+/// directory. Taken only for renewals this server starts: a refresh it
+/// relays may come from Claude Code holding this very lock.
+async fn refresh_lock(snapshot: &Snapshot, deadline: Deadline) -> Result<Option<RefreshLock>> {
+    let (Service::Claude, AccountSource::Directory(dir)) = (snapshot.service, &snapshot.source)
+    else {
+        return Ok(None);
+    };
+    let dir = dir.clone();
+    let wait = Wait::up_to(LOCK_WAIT.min(deadline.remaining()?));
+    match tokio::task::spawn_blocking(move || RefreshLock::acquire(&dir, wait)).await {
+        Ok(Ok(Some(lock))) => Ok(Some(lock)),
+        Ok(Ok(None)) => Err(Error::config("Another program is renewing this login.")),
+        _ => Err(Error::config("Cannot take the login refresh lock.")),
     }
 }
 

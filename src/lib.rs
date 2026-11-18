@@ -1,5 +1,6 @@
 pub mod claude;
 mod claude_api;
+mod claude_refresh_lock;
 mod claude_settings;
 mod codex_env;
 pub mod config;

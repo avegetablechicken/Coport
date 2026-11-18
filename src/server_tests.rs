@@ -4307,11 +4307,19 @@ async fn auto_refresh_failure_is_bounded_and_keeps_the_original_response() {
         }
     }
 }
-#[tokio::test]
-async fn auto_refresh_does_not_overwrite_an_external_account_switch() {
-    let (_home, file, running, mut fixture) = auto_refresh_setup(false, true, "auto_wait").await;
-    let url = format!("{}/responses", running.url);
-    let call = tokio::spawn(async move {
+/// Waits for the proxy's refresh request to reach the upstream fixture.
+async fn await_refresh(fixture: &mut Fixture) {
+    loop {
+        let request = fixture.requests.recv().await.unwrap();
+        if request.starts_with("POST /oauth/token ") || request.starts_with("POST /v1/oauth/token ")
+        {
+            break;
+        }
+    }
+}
+fn spawn_auto_model(running: &Running, claude: bool) -> tokio::task::JoinHandle<reqwest::Response> {
+    let url = format!("{}{}", running.url, auto_model_path(claude));
+    tokio::spawn(async move {
         http()
             .post(url)
             .bearer_auth("access-secret")
@@ -4319,19 +4327,149 @@ async fn auto_refresh_does_not_overwrite_an_external_account_switch() {
             .send()
             .await
             .unwrap()
-    });
-    loop {
-        let request = fixture.requests.recv().await.unwrap();
-        if request.starts_with("POST /oauth/token ") {
-            break;
+    })
+}
+fn read_json(file: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
+}
+#[tokio::test]
+async fn auto_refresh_does_not_overwrite_an_external_account_switch() {
+    for claude in [false, true] {
+        let (_home, file, running, mut fixture) =
+            auto_refresh_setup(claude, true, "auto_wait").await;
+        let call = spawn_auto_model(&running, claude);
+        await_refresh(&mut fixture).await;
+        let switched = if claude {
+            r#"{"claudeAiOauth":{"accessToken":"external-access","refreshToken":"external-refresh"}}"#
+        } else {
+            r#"{"tokens":{"account_id":"another","access_token":"external-access","refresh_token":"external-refresh"}}"#
+        };
+        std::fs::write(&file, switched).unwrap();
+        fixture.release.notify_one();
+        assert_eq!(call.await.unwrap().status(), 401);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), switched);
+        assert!(take_requests(&mut fixture).is_empty());
+    }
+}
+#[tokio::test]
+async fn auto_refresh_merges_its_rotation_into_unrelated_edits_made_meanwhile() {
+    for claude in [false, true] {
+        let (home, file, running, mut fixture) =
+            auto_refresh_setup(claude, true, "auto_wait").await;
+        let locks = crate::claude_refresh_lock::lock_paths(home.path());
+        let call = spawn_auto_model(&running, claude);
+        await_refresh(&mut fixture).await;
+        // Claude Code's lock is held for the whole Claude renewal, and only
+        // for Claude: Codex has no such protocol.
+        assert_eq!(locks.iter().all(|lock| lock.is_dir()), claude);
+        // Another program changes an unrelated part of the saved login while
+        // the refresh token is being spent, e.g. Claude Code's MCP logins.
+        let mut edited = read_json(&file);
+        edited["mcpOAuth"] = json!({"server":{"accessToken":"mcp-access"}});
+        let section = if claude { "claudeAiOauth" } else { "tokens" };
+        edited[section]["clientId"] = "kept-client".into();
+        std::fs::write(&file, edited.to_string()).unwrap();
+        fixture.release.notify_one();
+        let response = call.await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "model-result");
+        let saved = read_json(&file);
+        let service = if claude {
+            Service::Claude
+        } else {
+            Service::Codex
+        };
+        assert_eq!(
+            crate::oauth_credentials::access(&saved, service),
+            Some("new-access")
+        );
+        assert_eq!(
+            crate::oauth_credentials::refresh(&saved, service),
+            Some("new-refresh")
+        );
+        assert_eq!(saved["mcpOAuth"]["server"]["accessToken"], "mcp-access");
+        assert_eq!(saved[section]["clientId"], "kept-client");
+        assert_eq!(saved["other"], "preserved");
+        assert!(locks.iter().all(|lock| !lock.exists()));
+        // Requests still carrying the old access token use the rotation.
+        assert_eq!(auto_model(&running, claude).await.status(), 200);
+        let refreshes = take_requests(&mut fixture)
+            .iter()
+            .filter(|r| r.contains("refresh-secret"))
+            .count();
+        assert_eq!(refreshes, 0);
+    }
+}
+#[tokio::test]
+async fn auto_refresh_waits_for_claude_code_and_never_spends_the_token_it_renewed() {
+    let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
+    let locks = crate::claude_refresh_lock::lock_paths(home.path());
+    // Claude Code holds its refresh lock (both directories) and is renewing.
+    for lock in &locks {
+        std::fs::create_dir(lock).unwrap();
+    }
+    let call = spawn_auto_model(&running, true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let renewed = json!({"other":"preserved","claudeAiOauth":{"accessToken":"code-access","refreshToken":"code-refresh","expiresAt":4102444800000u64}});
+    std::fs::write(&file, renewed.to_string()).unwrap();
+    for lock in locks.iter().rev() {
+        std::fs::remove_dir(lock).unwrap();
+    }
+    // The request is left for the client to retry with its current login.
+    let response = call.await.unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(response.text().await.unwrap(), "original-unauthorized");
+    assert_eq!(read_json(&file), renewed);
+    assert!(
+        !take_requests(&mut fixture)
+            .iter()
+            .any(|r| r.contains("/oauth/token")),
+        "the spent refresh token must not be sent again"
+    );
+    assert!(locks.iter().all(|lock| !lock.exists()));
+}
+#[tokio::test]
+async fn auto_refresh_gives_up_while_another_renewal_holds_the_lock() {
+    let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
+    let before = std::fs::read(&file).unwrap();
+    let locks = crate::claude_refresh_lock::lock_paths(home.path());
+    // Held by a live process: the current lock alone, or the legacy one alone.
+    for held in [&locks[..], &locks[..1], &locks[1..]] {
+        for lock in held {
+            std::fs::create_dir(lock).unwrap();
+        }
+        let response = auto_model(&running, true).await;
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.text().await.unwrap(), "original-unauthorized");
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        for lock in &locks {
+            // Another holder's lock is never removed, nor ours left behind.
+            assert_eq!(lock.exists(), held.contains(lock));
+        }
+        for lock in held {
+            std::fs::remove_dir(lock).unwrap();
         }
     }
-    let switched = r#"{"tokens":{"account_id":"another","access_token":"external-access","refresh_token":"external-refresh"}}"#;
-    std::fs::write(&file, switched).unwrap();
-    fixture.release.notify_one();
-    assert_eq!(call.await.unwrap().status(), 401);
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), switched);
-    assert!(take_requests(&mut fixture).is_empty());
+    assert!(
+        !take_requests(&mut fixture)
+            .iter()
+            .any(|r| r.contains("/oauth/token"))
+    );
+    // A dead holder's stale lock does not block renewal for good.
+    for lock in &locks {
+        std::fs::create_dir(lock).unwrap();
+        crate::claude_refresh_lock::touch(
+            lock,
+            std::time::SystemTime::now() - Duration::from_secs(120),
+        )
+        .unwrap();
+    }
+    assert_eq!(auto_model(&running, true).await.status(), 200);
+    assert_eq!(
+        crate::oauth_credentials::access(&read_json(&file), Service::Claude),
+        Some("new-access")
+    );
+    assert!(locks.iter().all(|lock| !lock.exists()));
 }
 
 #[tokio::test]

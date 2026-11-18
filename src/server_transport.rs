@@ -77,10 +77,10 @@ impl Deadline {
     pub(super) fn new(seconds: f64) -> Self {
         Self(Instant::now() + Duration::from_secs_f64(seconds))
     }
-    fn cap(self, seconds: f64) -> Self {
+    pub(super) fn cap(self, seconds: f64) -> Self {
         Self(self.0.min(Self::new(seconds).0))
     }
-    fn remaining(self) -> Result<Duration> {
+    pub(super) fn remaining(self) -> Result<Duration> {
         let remaining = self.0.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             Err(Error::config("Outbound operation timed out."))
