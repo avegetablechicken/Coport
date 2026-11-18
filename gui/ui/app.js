@@ -1395,16 +1395,12 @@ function shareMeasure(scope) {
 /// grouped by service. Rings of the same `source` are one ring across pages.
 function trafficShare(credentials, scope, source = "") {
   const { unit, measure, format } = shareMeasure(scope);
-  // Unidentified model calls were rejected before reaching an upstream, so they
-  // report no tokens; Models leaves them out, with any service left empty.
-  const groups = shareGroups(credentials, measure)
-    .map((g) => (scope === "model" ? { ...g, slices: g.slices.filter((s) => !s.unidentified || s.value > 0) } : g))
-    .filter((g) => g.slices.length);
+  const visible = scope === "model" ? credentials.filter((c) => shareTokens(c) > 0) : credentials;
+  const groups = shareGroups(visible, measure);
   const total = groups.reduce((sum, g) => sum + (g.value ?? 0), 0);
   if (!total) return "";
   const size = 84;
   const value = (n) => (n == null ? "—" : format(n));
-  // Unknown and zero amounts stay in the legend but take no slice.
   const slices = groups.flatMap((g) => g.slices.filter((s) => s.value > 0).map((s) => ({ ...s, service: g.service })));
   // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
   const widths = slices.map((s) => Math.max(s.value / total, SHARE_MIN));

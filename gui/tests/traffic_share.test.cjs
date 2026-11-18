@@ -165,15 +165,20 @@ test('All shows request counts without percentages', () => {
 });
 test('Models shows reported tokens and leaves unknown usage out of the ring', () => {
   const { trafficShare } = setup();
-  const html = trafficShare([
+  const credentials = [
     credential('a', 3, 'Codex', { inputTokens: 1_200_000, outputTokens: 300_000 }),
     credential('b', 2, 'Claude', { inputTokens: 800, outputTokens: null }),
     credential('silent', 5, 'Claude'),
-  ], 'model');
+    credential('zero', 1, 'Claude', { inputTokens: 0, outputTokens: 0 }),
+  ];
+  const html = trafficShare(credentials, 'model');
   assert.match(html, /<strong>1\.5M<\/strong><span>tokens<\/span>/);
   assert.match(html, /<span>a<\/span><span>1\.5M<\/span>/);
   assert.match(html, /<span>b<\/span><span>800<\/span>/);
-  assert.match(html, /<span>silent<\/span><span>—<\/span>/);
+  assert.doesNotMatch(html, /silent|zero/);
+  const all = trafficShare(credentials, 'all');
+  assert.match(all, /<span>silent<\/span><span>5<\/span>/);
+  assert.match(all, /<span>zero<\/span><span>1<\/span>/);
   assert.match(html, /Codex · a: 1,500,000 tokens/);
   assert.equal((html.match(/<path /g) || []).length, 2);
   assert.doesNotMatch(html, /%/);
