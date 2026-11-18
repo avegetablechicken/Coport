@@ -30,7 +30,9 @@
 //! may be sending while it holds the lock (for example, a token refresh it
 //! relays through this process): that waits for itself until the lock goes
 //! stale.
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -322,6 +324,7 @@ fn jitter(backoff: Duration, attempt: u32) -> Duration {
 
 /// A directory's birth time as Node and Bun report `birthtimeMs`:
 /// seconds × 1000 + nanoseconds ÷ 10⁶. `None` where the file system keeps none.
+#[cfg(unix)]
 fn birth_ms(path: &Path) -> Option<f64> {
     let birth = fs::metadata(path).ok()?.created().ok()?;
     let since = birth.duration_since(SystemTime::UNIX_EPOCH).ok()?;
