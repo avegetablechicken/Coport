@@ -294,8 +294,12 @@ mod login {
     }
 
     /// Replaces a login item written by an earlier version with the app's own.
+    /// One switched off in System Settings stays as it is: registering the
+    /// app's own item would turn it back on against that choice.
     pub fn migrate() {
-        if main_app().is_some() && legacy_plist().is_some_and(|path| path.is_file()) {
+        if main_app().is_some()
+            && legacy_plist().is_some_and(|path| legacy_state(&path) == LoginItem::On)
+        {
             let _ = set(true);
         }
     }
