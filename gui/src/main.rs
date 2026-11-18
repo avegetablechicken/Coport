@@ -139,9 +139,6 @@ fn main() {
             }
             #[cfg(target_os = "linux")]
             appearance::configure(app)?;
-            // Menu bar app: no Dock icon and no app menu.
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             if let Err(error) = coport_gui::data_migration::prepare() {
                 use tauri_plugin_dialog::DialogExt;
@@ -208,6 +205,15 @@ fn main() {
             eprintln!("Cannot start: {e}");
             std::process::exit(1);
         }
+    };
+    // Menu bar app: no Dock icon and no app menu. tao applies this policy at
+    // launch, before it creates the panel, which can join a full-screen app's
+    // space only if created while the app is an accessory.
+    #[cfg(target_os = "macos")]
+    let app = {
+        let mut app = app;
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        app
     };
     app.run(|app, event| {
         if app.try_state::<AppState>().is_none() {

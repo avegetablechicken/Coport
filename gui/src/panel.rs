@@ -56,6 +56,7 @@ pub fn present(app: &AppHandle, anchor: Option<Rect>, focus: bool) {
         return;
     };
     let hidden = !w.is_visible().unwrap_or(false);
+    join_active_space(&w);
     layout(&w, &panel, hidden);
     if focus {
         let _ = w.show();
@@ -64,6 +65,26 @@ pub fn present(app: &AppHandle, anchor: Option<Rect>, focus: bool) {
         order_front(&w);
     }
     let _ = w.emit("panel-shown", ());
+}
+
+/// Shows the panel in whichever space is active, including a full-screen
+/// app's, as the menu bar it hangs from; a plain window stays in the desktop
+/// space it was first shown in, and showing it switches back there.
+fn join_active_space(w: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = w.ns_window() {
+        use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+        // SAFETY: Tauri returns the panel's NSWindow, used here on the main thread.
+        let ns_window = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setCollectionBehavior(
+            ns_window.collectionBehavior()
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = w;
 }
 
 /// Shows the panel without making it the key window, which would end keyboard
