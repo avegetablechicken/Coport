@@ -958,17 +958,30 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let dir = config_dir(&home);
             let [current, _] = held_by(&dir, dead_pid(), |_| {});
+            let stop = Arc::new(AtomicBool::new(false));
             let bumper = {
-                let current = current.clone();
+                let (current, stop) = (current.clone(), stop.clone());
                 thread::spawn(move || {
-                    for step in 0..20u64 {
-                        thread::sleep(Duration::from_millis(30));
+                    let mut step = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        step += 1;
                         let _ = touch(&current, SystemTime::now() + Duration::from_millis(step));
+                        thread::sleep(Duration::from_millis(50));
                     }
                 })
             };
-            assert!(RefreshLock::acquire(&dir, quick(500)).unwrap().is_none());
+            // A still mtime would be taken over after one second, well within
+            // the wait. Bumps come far more often than that, so a busy machine
+            // delaying a few of them cannot make the holder look dead.
+            let wait = Wait {
+                total: Duration::from_secs(2),
+                backoff: Duration::from_millis(10),
+                watch: Duration::from_secs(1),
+            };
+            let acquired = RefreshLock::acquire(&dir, wait).unwrap();
+            stop.store(true, Ordering::Relaxed);
             bumper.join().unwrap();
+            assert!(acquired.is_none());
             assert!(current.is_dir());
         }
     }
