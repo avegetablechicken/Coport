@@ -171,7 +171,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             &icon,
             status_item::Handlers {
                 press: Box::new(move || panel::toggle(&press, anchor(&press))),
-                begin: Box::new(move |focus| panel::present(&begin, anchor(&begin), focus)),
+                begin: Box::new(move |clicked| panel::present(&begin, anchor(&begin), !clicked)),
                 end: Box::new(move || panel::hide(&end)),
             },
         );
@@ -250,6 +250,13 @@ fn describe(phase: &Phase) -> (Status, String, Option<&'static str>) {
 #[cfg(target_os = "macos")]
 pub fn end_session(app: &AppHandle) {
     status_item::end_session(app);
+}
+
+/// Moves keyboard navigation of the menu bar from the open panel to the
+/// neighbouring item.
+#[cfg(target_os = "macos")]
+pub fn navigate(app: &AppHandle, right: bool) {
+    status_item::navigate(app, right);
 }
 
 /// Pushes proxy state to the icon, tooltip and menu on the main thread only.
@@ -386,8 +393,10 @@ fn play(app: &AppHandle, service: Service) {
 /// status item's expanded interface session joins keyboard navigation of the
 /// menu bar (Control-F8). There the panel follows that session, as the system's
 /// own items do: a left click or navigation begins it, and a click elsewhere,
-/// another item or Escape ends it. Only a click focuses the panel, which would
-/// otherwise end keyboard navigation. tray-icon releases before 0.25.1
+/// another item or Escape ends it. The panel is focused either way, as a menu
+/// takes keys. The focused panel receives ←/→ too, and AppKit only moves on
+/// when the item's own navigation window has them, so the frontend hands the
+/// ones it does not use back through `navigate`. tray-icon releases before 0.25.1
 /// keep the menu attached (see build.rs), so it is taken off the item and pops
 /// up on a right click; an attached menu or a clicked button would begin a
 /// session as well.
@@ -414,8 +423,8 @@ mod status_item {
     pub struct Handlers {
         /// The button was pressed other than by the mouse.
         pub press: Box<dyn Fn() + Send>,
-        /// The expanded interface session began: show the panel, focused when a
-        /// click on the item began it.
+        /// The expanded interface session began: show the panel, told whether a
+        /// click on the item rather than keyboard navigation began it.
         pub begin: Box<dyn Fn(bool) + Send>,
         /// The session ended: hide the panel.
         pub end: Box<dyn Fn() + Send>,
@@ -558,6 +567,38 @@ mod status_item {
                     let () = unsafe { msg_send![&*session, cancel] };
                 }
             })
+        });
+    }
+
+    /// Moves menu bar navigation to the item beside this one, ending this
+    /// item's session, as ←/→ do in an open menu. AppKit has no public call for
+    /// it; `_navigateLeft` and `_navigateRight` are what its own handling of
+    /// the keys uses. Without a session there is no navigation to move.
+    pub fn navigate(app: &AppHandle, right: bool) {
+        let _ = app.run_on_main_thread(move || {
+            let Some(item) = INSTALLED.with(|cell| Some(cell.borrow().as_ref()?.item.clone()))
+            else {
+                return;
+            };
+            if session(&item).is_none() {
+                return;
+            }
+            let step = if right {
+                sel!(_navigateRight)
+            } else {
+                sel!(_navigateLeft)
+            };
+            if item.respondsToSelector(step) {
+                // SAFETY: the item responds to the selector, which takes no
+                // arguments and returns nothing.
+                let () = unsafe {
+                    if right {
+                        msg_send![&*item, _navigateRight]
+                    } else {
+                        msg_send![&*item, _navigateLeft]
+                    }
+                };
+            }
         });
     }
 

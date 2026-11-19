@@ -129,6 +129,7 @@ fn main() {
             commands::copy_text,
             commands::fit_panel,
             commands::hide_panel,
+            commands::navigate_menu_bar,
             commands::quit_app,
         ])
         .setup(move |app| {

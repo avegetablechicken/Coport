@@ -541,6 +541,16 @@ pub fn hide_panel(app: AppHandle) {
     panel::hide(&app);
 }
 
+/// Moves menu bar keyboard navigation from the open panel to the neighbouring
+/// item (macOS); elsewhere the panel is not part of such navigation.
+#[tauri::command]
+pub fn navigate_menu_bar(app: AppHandle, right: bool) {
+    #[cfg(target_os = "macos")]
+    crate::tray::navigate(&app, right);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, right);
+}
+
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
     app.exit(0);

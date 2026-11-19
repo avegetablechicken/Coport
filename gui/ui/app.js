@@ -146,6 +146,8 @@ function serviceMark(service) {
 
 const ui = {
   snap: null,
+  // Opened by keyboard navigation of the menu bar (macOS 27); see menuBarStep.
+  menuBarNavigation: false,
   devices: [],
   mergedData: null,
   mergedDataError: "",
@@ -2882,6 +2884,21 @@ document.addEventListener("input", (event) => {
   searchTimer = setTimeout(() => loadActivity(), 120);
 });
 
+/// Whether keys on `el` edit text, where ←/→ move the caret.
+function textEntry(el) {
+  return Boolean(el?.closest?.("textarea, [contenteditable], input:not([type=checkbox]):not([type=radio]):not([type=button])"));
+}
+
+/// While keyboard navigation of the menu bar holds the panel open (macOS 27),
+/// the focused panel receives ←/→; those it does not use move the navigation
+/// on to the neighbouring item, as from a menu. Every other key keeps its own
+/// meaning. Returns "left", "right" or null.
+function menuBarStep(event) {
+  if (!ui.menuBarNavigation || event.defaultPrevented || event.isComposing) return null;
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || textEntry(event.target)) return null;
+  return event.key === "ArrowLeft" ? "left" : event.key === "ArrowRight" ? "right" : null;
+}
+
 document.addEventListener("keydown", (event) => {
   const editor = $("range-editor");
   if (editor && !editor.hidden && editor.contains(event.target) && (event.key === "Escape" || event.key === "Enter")) {
@@ -2914,6 +2931,12 @@ document.addEventListener("keydown", (event) => {
   if (event.target.matches("[data-config]") && (event.key === "Enter" || event.key === "Escape")) {
     if (event.key === "Escape") event.target.value = ui.snap.config.details?.editable[event.target.dataset.config] ?? "";
     event.target.blur();
+    return;
+  }
+  const step = openSelect ? null : menuBarStep(event);
+  if (step) {
+    event.preventDefault();
+    invoke("navigate_menu_bar", { right: step === "right" });
     return;
   }
   const mod = event.metaKey || event.ctrlKey;
@@ -2977,7 +3000,11 @@ window.__TAURI__.event
 listen("state-changed", scheduleRefresh);
 const PANEL_PAGE_TIMEOUT_MS = 60 * 1000;
 let panelHiddenAt = null;
-listen("panel-shown", async () => {
+listen("panel-shown", async ({ payload } = {}) => {
+  ui.menuBarNavigation = Boolean(payload?.keyboard);
+  // Keys start on the panel, not in a text field left focused, where ←/→
+  // would not move along the menu bar.
+  if (ui.menuBarNavigation && textEntry(document.activeElement)) document.activeElement.blur();
   const returnHome = panelHiddenAt !== null && Date.now() - panelHiddenAt >= PANEL_PAGE_TIMEOUT_MS;
   panelHiddenAt = null;
   if (returnHome) {
@@ -2992,6 +3019,7 @@ listen("panel-shown", async () => {
   return refresh();
 });
 listen("panel-hidden", () => {
+  ui.menuBarNavigation = false;
   // Repeated native hide events must not extend the previous page's lifetime.
   panelHiddenAt ??= Date.now();
   closeSelect();
