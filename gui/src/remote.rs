@@ -189,10 +189,16 @@ fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
-    staged.as_file().sync_all()?;
-    staged
+    let helper = staged
         .persist(dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX)))
         .map_err(|error| error.error)?;
+    // Readers see the whole helper as soon as it is renamed into place. The
+    // daemon becomes ready only after this returns, and flushing tens of MiB
+    // can take seconds on a busy disk, so the flush runs aside. A crash before
+    // it completes can leave a damaged helper, which the next start replaces.
+    std::thread::spawn(move || {
+        let _ = helper.sync_all();
+    });
     Ok(())
 }
 
