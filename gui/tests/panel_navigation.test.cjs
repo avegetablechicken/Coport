@@ -128,6 +128,8 @@ function navigation(page = "main") {
     loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
     loadActivity: () => new Promise((resolve) => loads.push(resolve)),
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
+    // Nothing in the panel has focus to keep across renders.
+    document: { activeElement: null },
   };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function render()"), source.indexOf("\nfunction renderTop()")), context);
