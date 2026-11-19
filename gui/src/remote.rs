@@ -179,27 +179,26 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
 /// Only daemon startup publishes it; read-only SSH requests never repair files.
 fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let mut source = std::fs::File::open(binary)?;
-    let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-    io::copy(&mut source, &mut staged)?;
+    // The daemon becomes ready only after this returns, so the copy must stay
+    // cheap. Copying to a fresh path lets the platform clone the file (APFS,
+    // Btrfs, XFS) or copy it inside the kernel. The copy is not flushed:
+    // flushing tens of MiB took seconds on a busy disk, and a helper damaged
+    // by a crash is replaced by the next start. The staging directory is
+    // private, so the copy is never reachable with the source's permissions.
+    let staging = tempfile::Builder::new()
+        .prefix(".summary-helper")
+        .tempdir_in(dir)?;
+    let staged = staging.path().join("helper");
+    std::fs::copy(binary, &staged)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        staged
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))?;
     }
-    let helper = staged
-        .persist(dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX)))
-        .map_err(|error| error.error)?;
-    // Readers see the whole helper as soon as it is renamed into place. The
-    // daemon becomes ready only after this returns, and flushing tens of MiB
-    // can take seconds on a busy disk, so the flush runs aside. A crash before
-    // it completes can leave a damaged helper, which the next start replaces.
-    std::thread::spawn(move || {
-        let _ = helper.sync_all();
-    });
-    Ok(())
+    std::fs::rename(
+        &staged,
+        dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX)),
+    )
 }
 
 fn ssh_command(device: &Device, command: &str) -> Result<tokio::process::Command, String> {
