@@ -310,6 +310,11 @@ Windows the generic credential `gemini:antigravity`, on Linux the Secret
 Service item of that service and user name. With `saved_login`, it is read for
 each request; a request whose Bearer token is that login's access token is the
 saved login. Antigravity renews the token itself and saves the new one there.
+So is an access token issued by a refresh of the login's refresh token that
+Coport relayed: apps that renew the login themselves, such as Copool and
+OpenQuota, may keep the new token without saving it in the item. Such tokens
+are kept in memory as SHA-256 digests until their `expires_in` (at most 64),
+and stop counting as the saved login once the item holds another refresh token.
 The macOS Keychain asks once whether Coport may read the item.
 
 The saved login takes the route of its email, then `default`, then
@@ -338,7 +343,9 @@ an explicit `account_probe` has yet to name the login, every route is unknown, o
 route that carried it.
 
 With `account_auth_file_only: true`, any other token is rejected. With `false`,
-another token is named by `GET https://www.googleapis.com/oauth2/v2/userinfo`
+an access token a relayed refresh issued for a learned refresh token takes its
+account's route; any
+other token is named by `GET https://www.googleapis.com/oauth2/v2/userinfo`
 through `account_probe` (omitted: `account_fallback`, then `fallback`); only the
 Bearer token is sent, never the request or its headers. The returned email then
 selects its route, else `account_fallback`, then `fallback`; `default` stays the

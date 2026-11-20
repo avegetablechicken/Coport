@@ -482,7 +482,9 @@ the explicit URL `/antigravity/https://oauth2.googleapis.com/token`:
   refused with 403.
 - The response is relayed unchanged. Its ID token names the account, which is
   learned for the refresh token the request renewed, as Codex's learned refresh
-  routes are, so later requests of that login need no account lookup.
+  routes are, so later requests of that login need no account lookup. The new
+  access token counts as that login until it expires, even if the client keeps
+  it without saving it in Antigravity's credential store item.
 
 Coport never refreshes or writes the Antigravity login itself.
 

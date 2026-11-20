@@ -147,6 +147,94 @@ pub(crate) fn parse_login(raw: &str) -> Option<Login> {
     })
 }
 
+fn digest(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Access tokens issued by refreshes the proxy relayed for a known login.
+/// Apps that renew the saved login themselves, as Copool and OpenQuota do,
+/// keep the new access token privately while the credential store still
+/// holds an older one; Google keeps the refresh token, so the new token is
+/// still that login. Kept in memory as digests until they expire.
+#[derive(Default)]
+pub struct RenewedTokens {
+    tokens: std::sync::Mutex<std::collections::HashMap<String, Renewed>>,
+}
+#[derive(Clone)]
+struct Renewed {
+    /// Digest of the refresh token the access token was issued for.
+    refresh: String,
+    identity: Option<AntigravityIdentity>,
+    expires: std::time::Instant,
+}
+impl RenewedTokens {
+    const LIMIT: usize = 64;
+    /// Google's default lifetime, when a response names none.
+    const LIFETIME: u64 = 3600;
+
+    /// Records the access token of a successful refresh `response` for
+    /// `refresh_token`: the account its ID token names, else `identity`.
+    pub(crate) fn learn_response(
+        &self,
+        response: &[u8],
+        refresh_token: &str,
+        identity: Option<AntigravityIdentity>,
+    ) {
+        let Ok(value) = serde_json::from_slice::<Value>(response) else {
+            return;
+        };
+        let Some(access) = value["access_token"].as_str().filter(|t| valid_token(t)) else {
+            return;
+        };
+        let lifetime = value["expires_in"]
+            .as_u64()
+            .unwrap_or(Self::LIFETIME)
+            .min(24 * Self::LIFETIME);
+        let renewed = Renewed {
+            refresh: digest(refresh_token),
+            identity: AntigravityIdentity::token_response(&value).or(identity),
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(lifetime),
+        };
+        let Ok(mut tokens) = self.tokens.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        tokens.retain(|_, renewed| renewed.expires > now);
+        while tokens.len() >= Self::LIMIT {
+            let Some(soonest) = tokens
+                .iter()
+                .min_by_key(|(_, renewed)| renewed.expires)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            tokens.remove(&soonest);
+        }
+        tokens.insert(digest(access), renewed);
+    }
+
+    fn get(&self, access_token: &str) -> Option<Renewed> {
+        let tokens = self.tokens.lock().ok()?;
+        tokens
+            .get(&digest(access_token))
+            .filter(|renewed| renewed.expires > std::time::Instant::now())
+            .cloned()
+    }
+}
+impl Renewed {
+    /// Whether this token was issued for `login`'s refresh token.
+    fn renews(&self, login: &Login) -> bool {
+        login
+            .refresh_token
+            .as_deref()
+            .is_some_and(|refresh| digest(refresh) == self.refresh)
+    }
+}
+
 pub struct AntigravityRoute {
     pub token: String,
     pub proxy: Choice,
@@ -316,6 +404,7 @@ impl Antigravity {
         &self,
         headers: &HeaderMap,
         learned: &RefreshRoutes<AntigravityIdentity>,
+        renewed: &RenewedTokens,
     ) -> Result<AntigravityRoute> {
         let token = headers
             .get("authorization")
@@ -346,8 +435,14 @@ impl Antigravity {
                 label: label.into(),
             })
         };
-        if let Some(login) = login.filter(|login| login.access_token == token) {
-            let identity = Self::login_identity(&login, learned);
+        let renewed = renewed.get(token);
+        // The saved login's current token, or one a relayed refresh issued
+        // for its refresh token; the credential store's is checked first.
+        if let Some(login) = login.filter(|login| {
+            login.access_token == token || renewed.as_ref().is_some_and(|r| r.renews(login))
+        }) {
+            let identity = Self::login_identity(&login, learned)
+                .or_else(|| renewed.as_ref().and_then(|r| r.identity.clone()));
             // Antigravity's own login names no account; an explicit probe
             // route lets email routes apply to it, once per login.
             let probe = self
@@ -378,6 +473,13 @@ impl Antigravity {
                 401,
                 "Antigravity token does not match the saved login.",
             ));
+        }
+        // Issued by a relayed refresh of another account's learned login.
+        if let Some(identity) = renewed.and_then(|r| r.identity) {
+            let proxy = self
+                .account_choice(Some(&identity), false)
+                .ok_or(Error::config("Antigravity account has no proxy route."))?;
+            return route(proxy, Some(identity), false, false, "antigravity-account");
         }
         let probe = self
             .routing
@@ -681,14 +783,18 @@ mod tests {
         );
         let route = file_only
             .antigravity
-            .resolve(&headers(TEST_SAVED_TOKEN), &learned)
+            .resolve(
+                &headers(TEST_SAVED_TOKEN),
+                &learned,
+                &RenewedTokens::default(),
+            )
             .await
             .unwrap();
         assert!(route.matched_login && route.configured && !route.needs_profile);
         assert_eq!(route.proxy.label(), "us");
         let error = file_only
             .antigravity
-            .resolve(&headers("other"), &learned)
+            .resolve(&headers("other"), &learned, &RenewedTokens::default())
             .await
             .err()
             .unwrap();
@@ -696,7 +802,7 @@ mod tests {
         assert!(
             file_only
                 .antigravity
-                .resolve(&HeaderMap::new(), &learned)
+                .resolve(&HeaderMap::new(), &learned, &RenewedTokens::default())
                 .await
                 .is_err()
         );
@@ -707,7 +813,11 @@ mod tests {
         );
         let mut route = probed
             .antigravity
-            .resolve(&headers(TEST_SAVED_TOKEN), &learned)
+            .resolve(
+                &headers(TEST_SAVED_TOKEN),
+                &learned,
+                &RenewedTokens::default(),
+            )
             .await
             .unwrap();
         assert!(route.needs_profile && route.matched_login);
@@ -724,7 +834,11 @@ mod tests {
         set_test_login("renewed-token", "saved-refresh");
         let renewed = probed
             .antigravity
-            .resolve(&headers("renewed-token"), &learned)
+            .resolve(
+                &headers("renewed-token"),
+                &learned,
+                &RenewedTokens::default(),
+            )
             .await
             .unwrap();
         assert!(!renewed.needs_profile && renewed.matched_login);
@@ -737,14 +851,18 @@ mod tests {
         set_test_login("switched-token", "other-refresh");
         let switched = probed
             .antigravity
-            .resolve(&headers("switched-token"), &learned)
+            .resolve(
+                &headers("switched-token"),
+                &learned,
+                &RenewedTokens::default(),
+            )
             .await
             .unwrap();
         assert!(switched.needs_profile && switched.identity.is_none());
         set_test_login(TEST_SAVED_TOKEN, "saved-refresh");
         let mut other = probed
             .antigravity
-            .resolve(&headers("other"), &learned)
+            .resolve(&headers("other"), &learned, &RenewedTokens::default())
             .await
             .unwrap();
         assert!(other.needs_profile && !other.matched_login && !other.configured);
@@ -752,5 +870,66 @@ mod tests {
         // Another token neither takes the saved login's default nor a fallback.
         assert!(probed.antigravity.apply_profile(&mut other, carol).is_err());
         assert!(AntigravityIdentity::userinfo(&json!({"name": "x"})).is_err());
+    }
+
+    #[test]
+    fn relayed_refreshes_name_their_new_access_tokens_until_they_expire() {
+        let renewed = RenewedTokens::default();
+        // {"email":"remote@example.invalid","sub":"1"}
+        let named = br#"{"access_token":"named","expires_in":3599,"id_token":"h.eyJlbWFpbCI6InJlbW90ZUBleGFtcGxlLmludmFsaWQiLCJzdWIiOiIxIn0.s"}"#;
+        let carol = AntigravityIdentity::new("carol@example.invalid");
+        renewed.learn_response(named, "refresh", carol.clone());
+        let token = renewed.get("named").unwrap();
+        // The ID token names the account ahead of the refresh route's.
+        assert_eq!(token.identity.unwrap().email, "remote@example.invalid");
+        let login = |refresh: &str| Login {
+            access_token: "stored".into(),
+            refresh_token: Some(refresh.into()),
+            identity: None,
+        };
+        assert!(token_renews(&renewed, "named", &login("refresh")));
+        assert!(!token_renews(&renewed, "named", &login("other")));
+        // Without an ID token, the route's account; an expired, malformed or
+        // tokenless response names nothing.
+        renewed.learn_response(br#"{"access_token":"plain"}"#, "refresh", carol);
+        assert_eq!(
+            renewed.get("plain").unwrap().identity.unwrap().email,
+            "carol@example.invalid"
+        );
+        renewed.learn_response(
+            br#"{"access_token":"spent","expires_in":0}"#,
+            "refresh",
+            None,
+        );
+        assert!(renewed.get("spent").is_none());
+        renewed.learn_response(b"not json", "refresh", None);
+        renewed.learn_response(br#"{"expires_in":3599}"#, "refresh", None);
+        assert!(renewed.get("unknown").is_none());
+        // Bounded: the soonest to expire make room.
+        for n in 0..RenewedTokens::LIMIT + 8 {
+            let body = format!(r#"{{"access_token":"t{n}","expires_in":{}}}"#, 60 + n);
+            renewed.learn_response(body.as_bytes(), "refresh", None);
+        }
+        let held = renewed.tokens.lock().unwrap().len();
+        assert_eq!(held, RenewedTokens::LIMIT);
+        assert!(renewed.get("t0").is_none());
+        assert!(
+            renewed
+                .get(&format!("t{}", RenewedTokens::LIMIT + 7))
+                .is_some()
+        );
+        // Only digests are kept.
+        assert!(
+            !renewed
+                .tokens
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.contains("t1"))
+        );
+    }
+
+    fn token_renews(renewed: &RenewedTokens, token: &str, login: &Login) -> bool {
+        renewed.get(token).is_some_and(|r| r.renews(login))
     }
 }

@@ -5059,6 +5059,59 @@ async fn antigravity_refresh(running: &Running, refresh: &str, client: &str) -> 
         .unwrap()
 }
 
+// Copool and OpenQuota renew Antigravity's saved login themselves and keep
+// the new access token without saving it where the login is read; their
+// next requests were refused as not the saved login's.
+#[tokio::test]
+async fn an_access_token_a_relayed_refresh_issued_for_the_saved_login_is_that_login() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let client = crate::antigravity::CLIENT_ID;
+    let token = fixture("http", "google_token").await;
+    let mut payload = fixture("http", "gemini_sse").await;
+    let token_endpoint = format!("http://127.0.0.1:{}", token.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let running = running(&format!(
+        "proxies:\n  login: {token_endpoint}\n  account: {payload_endpoint}\nantigravity:\n  routing:\n    account:\n      default: login\n      remote@example.invalid: account\n"
+    ))
+    .await;
+    trust(&running, &token, &token_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+    crate::antigravity::set_test_login("saved-access", "saved-refresh");
+    let status = |token: &'static str| {
+        let running = &running;
+        async move {
+            http()
+                .post(format!(
+                    "{}/antigravity/v1internal:generateContent",
+                    running.url
+                ))
+                .bearer_auth(token)
+                .body("private-payload")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status("renewed-access").await, 401);
+
+    let response = antigravity_refresh(&running, "saved-refresh", client).await;
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("renewed-access"));
+    // The client keeps the new token; the saved login still holds the old one.
+    antigravity_request(&running, "renewed-access").await;
+    expect_payload(&mut payload, "renewed-access").await;
+    antigravity_request(&running, "saved-access").await;
+    expect_payload(&mut payload, "saved-access").await;
+    assert_eq!(status("other-access").await, 401);
+
+    // Once Antigravity signs in to another login, it no longer is.
+    crate::antigravity::set_test_login("next-access", "next-refresh");
+    assert_eq!(status("renewed-access").await, 401);
+    assert!(payload.requests.try_recv().is_err());
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
 #[tokio::test]
 async fn antigravity_token_refresh_routes_like_codex_and_learns_its_id_token_account() {
     let _login = crate::antigravity::TEST_LOGIN.lock().await;

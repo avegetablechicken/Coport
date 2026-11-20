@@ -49,7 +49,11 @@ impl Server {
             return self.forward_antigravity_refresh(incoming, log).await;
         }
         let mut route = settings
-            .resolve(incoming.headers(), &self.antigravity_refresh_routes)
+            .resolve(
+                incoming.headers(),
+                &self.antigravity_refresh_routes,
+                &self.antigravity_renewed,
+            )
             .await?;
         // Validate the target before any account lookup.
         let url = settings.url(rest)?;
@@ -155,7 +159,20 @@ impl Server {
         if !response.status().is_success() {
             return Ok(response);
         }
-        Ok(self.learn_refresh_route(response, routes.clone(), route.identity, Some(token)))
+        // The new access token is this login's too, though the client may
+        // keep it without saving it where the saved login is read.
+        let renewed = self.antigravity_renewed.clone();
+        let (sent, identity) = (token.clone(), route.identity.clone());
+        let observe: ResponseObserver = Box::new(move |body| {
+            renewed.learn_response(body, &sent, identity);
+        });
+        Ok(self.learn_refresh_route(
+            response,
+            routes.clone(),
+            route.identity,
+            Some(token),
+            Some(observe),
+        ))
     }
 
     /// The route a credential takes, as records name it: the saved login's

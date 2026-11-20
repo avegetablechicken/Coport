@@ -120,6 +120,7 @@ pub struct Server {
     antigravity_profiles: AntigravityProfiles,
     antigravity_refresh_routes:
         Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
+    antigravity_renewed: Arc<crate::antigravity::RenewedTokens>,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
     codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
@@ -145,6 +146,7 @@ impl Server {
             claude_profiles: Default::default(),
             antigravity_profiles: Default::default(),
             antigravity_refresh_routes: Default::default(),
+            antigravity_renewed: Default::default(),
             refresh_routes: Default::default(),
             codex_refresh_routes: Default::default(),
             auto_refresh: Default::default(),
@@ -1399,25 +1401,28 @@ impl Server {
         // The refresh token it replaces names the account even where the
         // routing does not map it.
         Ok(if claude {
-            self.learn_refresh_route(response, self.refresh_routes.clone(), learned, None)
+            self.learn_refresh_route(response, self.refresh_routes.clone(), learned, None, None)
         } else {
             self.learn_refresh_route(
                 response,
                 self.codex_refresh_routes.clone(),
                 codex_identity,
                 None,
+                None,
             )
         })
     }
 
     /// Relays a successful token response unchanged and, once it is
-    /// complete, records which account its new refresh token belongs to.
+    /// complete, records which account its new refresh token belongs to and
+    /// passes the whole response to `observe`.
     fn learn_refresh_route<A: crate::refresh_routes::Account>(
         &self,
         upstream: reqwest::Response,
         routes: Arc<crate::refresh_routes::RefreshRoutes<A>>,
         previous: Option<A>,
         sent: Option<String>,
+        observe: Option<ResponseObserver>,
     ) -> reqwest::Response {
         const LIMIT: usize = 65536;
         let mut response = hyper::Response::builder()
@@ -1446,6 +1451,9 @@ impl Server {
                 yield Ok(bytes);
             }
             if whole {
+                if let Some(observe) = observe {
+                    observe(&seen);
+                }
                 if let Err(error) =
                     routes.learn_response_for(&seen, sent.as_deref(), previous.as_ref())
                 {
@@ -1918,6 +1926,8 @@ pub fn filtered_headers(source: &HeaderMap) -> HeaderMap {
     }
     result
 }
+/// Sees a whole token response once it has been relayed.
+type ResponseObserver = Box<dyn FnOnce(&[u8]) + Send>;
 fn empty() -> Body {
     Full::new(Bytes::new())
         .map_err(|e: Infallible| match e {})
