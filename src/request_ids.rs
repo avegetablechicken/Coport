@@ -134,40 +134,42 @@ impl<'de> Deserialize<'de> for Wrapped {
     }
 }
 
+/// The first usable session a body names, and where. Each place is tried in
+/// turn, so an unusable one never hides a later one.
+fn body_session(ids: &Ids) -> Option<(String, &'static str)> {
+    let usable = |id: Option<&str>| id.filter(|v| valid(v)).map(str::to_owned);
+    if let Some(id) = usable(ids.session_id.as_str()) {
+        return Some((id, "body:session_id"));
+    }
+    if let Some(id) = usable(ids.metadata.get("session_id").and_then(Value::as_str)) {
+        return Some((id, "body:metadata.session_id"));
+    }
+    if let Some(user) = ids.metadata.get("user_id").and_then(Value::as_str) {
+        // Claude metadata may encode session_id in a JSON string, or in the
+        // legacy user_<hash>_account_<id>_session_<uuid> form. Never log user_id.
+        let parsed = serde_json::from_str::<Ids>(user).ok();
+        if let Some(id) = usable(parsed.as_ref().and_then(|p| p.session_id.as_str())) {
+            return Some((id, "body:metadata.user_id.session_id"));
+        }
+        if let Some((prefix, id)) = user.rsplit_once("_session_") {
+            if prefix.starts_with("user_")
+                && prefix.contains("_account_")
+                && uuid::Uuid::parse_str(id).is_ok()
+            {
+                return Some((id.to_owned(), "body:metadata.user_id.session_id"));
+            }
+        }
+    }
+    usable(ids.request.session_id.as_deref()).map(|id| (id, "body:request.sessionId"))
+}
+
 pub(crate) fn body(bytes: &[u8], fields: &mut Map<String, Value>, websocket: bool) {
     let Ok(ids) = serde_json::from_slice::<Ids>(bytes) else {
         return;
     };
     if websocket || !fields.get("session_id").is_some_and(Value::is_string) {
-        if let Some(id) = ids.session_id.as_str().filter(|v| valid(v)) {
-            record(fields, "session_id", id, "body:session_id");
-        } else if let Some(id) = ids
-            .metadata
-            .get("session_id")
-            .and_then(Value::as_str)
-            .filter(|v| valid(v))
-        {
-            record(fields, "session_id", id, "body:metadata.session_id");
-        } else if let Some(user) = ids.metadata.get("user_id").and_then(Value::as_str) {
-            // Claude metadata may encode session_id in a JSON string, or in the
-            // legacy user_<hash>_account_<id>_session_<uuid> form. Never log user_id.
-            let parsed = serde_json::from_str::<Ids>(user).ok();
-            if let Some(id) = parsed
-                .as_ref()
-                .and_then(|p| p.session_id.as_str())
-                .filter(|v| valid(v))
-            {
-                record(fields, "session_id", id, "body:metadata.user_id.session_id");
-            } else if let Some((prefix, id)) = user.rsplit_once("_session_") {
-                if prefix.starts_with("user_")
-                    && prefix.contains("_account_")
-                    && uuid::Uuid::parse_str(id).is_ok()
-                {
-                    record(fields, "session_id", id, "body:metadata.user_id.session_id");
-                }
-            }
-        } else if let Some(id) = ids.request.session_id.as_deref().filter(|v| valid(v)) {
-            record(fields, "session_id", id, "body:request.sessionId");
+        if let Some((id, source)) = body_session(&ids) {
+            record(fields, "session_id", &id, source);
         }
     }
     if !fields
@@ -298,6 +300,14 @@ mod tests {
             assert_eq!(fields["session_id"], session);
             assert_eq!(fields["client_request_id"], "snake");
         }
+        // Claude-style metadata without a session does not hide the wrapper's.
+        let mut fields = Map::new();
+        super::headers(&HeaderMap::new(), &mut fields);
+        let payload = json!({"metadata":{"user_id":"PRIVATE"}, "request":{"sessionId":"wrapped"}});
+        body(payload.to_string().as_bytes(), &mut fields, false);
+        assert_eq!(fields["session_id"], "wrapped");
+        assert_eq!(fields["session_id_source"], "body:request.sessionId");
+        assert!(!serde_json::to_string(&fields).unwrap().contains("PRIVATE"));
         for request in [
             json!(7),
             json!({"sessionId":{"nested":"PRIVATE"}}),
