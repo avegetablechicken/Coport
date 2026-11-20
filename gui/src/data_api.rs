@@ -977,11 +977,9 @@ mod tests {
             );
         }
     }
-    /// Readers from before Antigravity reject a summary naming it, so only a
-    /// reader that names it receives its groups, over HTTP and over SSH.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn antigravity_groups_reach_only_readers_that_name_them() {
+    /// A state directory whose log holds one Antigravity and one Codex model
+    /// call; returns it with its log and configuration.
+    fn antigravity_traffic() -> (tempfile::TempDir, PathBuf, &'static str) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();
         let log = dir.path().join("logs/proxy.log");
@@ -1001,27 +999,34 @@ mod tests {
             ) + &row("codex", "/v1/responses"),
         )
         .unwrap();
-        let config = "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n";
-        std::fs::write(dir.path().join("config.yaml"), config).unwrap();
-        prepare_identity(dir.path()).unwrap();
-        let services = |summary: &Summary| {
-            let mut all: Vec<_> = summary
-                .groups
-                .iter()
-                .chain(
-                    summary
-                        .windows
-                        .iter()
-                        .chain(&summary.previous_windows)
-                        .flat_map(|w| &w.groups),
-                )
-                .map(|g| g.service)
-                .collect();
-            all.sort();
-            all.dedup();
-            all
-        };
+        let config: &str = "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n";
+        (dir, log, config)
+    }
+    /// The services any group of a summary belongs to.
+    fn summary_services(summary: &Summary) -> Vec<Service> {
+        let mut all: Vec<_> = summary
+            .groups
+            .iter()
+            .chain(
+                summary
+                    .windows
+                    .iter()
+                    .chain(&summary.previous_windows)
+                    .flat_map(|w| &w.groups),
+            )
+            .map(|g| g.service)
+            .collect();
+        all.sort();
+        all.dedup();
+        all
+    }
 
+    /// Readers from before Antigravity reject a summary naming it, so only an
+    /// HTTP reader that names it receives its groups.
+    #[tokio::test]
+    async fn antigravity_groups_reach_only_http_readers_that_name_them() {
+        let (_dir, log, config) = antigravity_traffic();
+        let services = summary_services;
         let key = DataKey::new(KEY).unwrap();
         let bytes = publish(
             &Config::parse(config).unwrap(),
@@ -1073,6 +1078,18 @@ mod tests {
             );
         }
 
+        assert!(names_antigravity(" Antigravity "));
+        assert!(!names_antigravity("antigravity-next,codex"));
+    }
+
+    /// As over HTTP, for the SSH helper's stream and single summary.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_groups_reach_only_ssh_readers_that_name_them() {
+        let (dir, _log, config) = antigravity_traffic();
+        std::fs::write(dir.path().join("config.yaml"), config).unwrap();
+        prepare_identity(dir.path()).unwrap();
+        let services = summary_services;
         for antigravity in [false, true] {
             let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
             let mut output = Vec::new();
@@ -1100,8 +1117,6 @@ mod tests {
                 antigravity
             );
         }
-        assert!(names_antigravity(" Antigravity "));
-        assert!(!names_antigravity("antigravity-next,codex"));
     }
     #[tokio::test]
     async fn starting_data_listener_does_not_scan_logs_before_returning() {
