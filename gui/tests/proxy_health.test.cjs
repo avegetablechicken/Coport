@@ -7,14 +7,29 @@ const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 const block = source.match(/function proxiesBlock\(\) \{[\s\S]*?\r?\n\}/)[0];
 
-function render(probe, proxy = {}) {
+function renderProxies(proxies) {
   return vm.runInNewContext(`${block}\nproxiesBlock()`, {
-    ui: { snap: { config: { details: { proxies: [{ name: "used", endpoint: "http://127.0.0.1:12345", probe, ...proxy }] } } } },
+    ui: { snap: { config: { details: { proxies } } } },
     block: (_title, _aside, body) => body,
     flag: () => "", tag: (name) => name, esc: (value) => value,
     ICON: { restart: "" },
   });
 }
+
+function render(probe, proxy = {}) {
+  return renderProxies([{ name: "used", endpoint: "http://127.0.0.1:12345", probe, ...proxy }]);
+}
+
+test("home sorts proxy rows by host and port across schemes", () => {
+  const proxies = Object.freeze([
+    { name: "alpha", endpoint: "http://10.0.0.10:80" },
+    { name: "beta", endpoint: "https://10.0.0.2:10000" },
+    { name: "gamma", endpoint: "socks5://10.0.0.2:900" },
+  ]);
+  const html = renderProxies(proxies);
+  const names = Array.from(html.matchAll(/data-name="([^"]+)"/g), (match) => match[1]);
+  assert.deepEqual(names, ["gamma", "beta", "alpha"]);
+});
 
 test("runtime success renders as available without fabricated latency", () => {
   const html = render({ state: "ok", ms: null });

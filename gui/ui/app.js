@@ -857,8 +857,11 @@ function proxiesBlock() {
   const d = ui.snap.config.details;
   if (!d) return "";
   const aside = d.proxies.length ? `<button class="text-link" data-action="probe">Test All</button>` : "";
+  const address = (p) => p.endpoint.replace(/^\w+:\/\//, "");
+  const order = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
   const body = d.proxies.length
-    ? d.proxies
+    ? [...d.proxies]
+        .sort((a, b) => order.compare(address(a), address(b)))
         .map((p) => {
           const probe = p.probe;
           const state = probe?.state ?? "idle";
