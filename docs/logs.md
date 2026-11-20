@@ -57,7 +57,8 @@ reconciliation is read-only and never rewrites retained logs.
 | `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |
 | `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
 
-Every record of a proxied request carries `service`, `codex` or `claude`: the app
+Every record of a proxied request carries `service`, `codex`, `claude` or
+`antigravity`: the app
 the proxy routes the request to, decided from its target before the first record.
 Token refreshes belong to their app. Routed requests also carry
 `credential_match`: `configured` when the credential is one the configuration
@@ -69,7 +70,7 @@ routed and takes that request's `service` and account only when it is
 `configured`. A CONNECT whose TLS handshake fails, that closes before a request,
 whose first request is unmatched, or that is refused has no `service`, whatever
 its host. A CONNECT with one counts as a request of that app, but never toward
-latency. Traffic statistics count requests of the two apps only.
+latency. Traffic statistics count requests of these three apps only.
 
 Request logs keep the proxy-generated `request_id` separate from the client's
 `client_request_id` and `session_id`. Session headers are checked in this order:
