@@ -84,7 +84,9 @@ For uncompressed JSON model requests, absent header IDs can be filled from
 `session_id` or `metadata.session_id`, and `client_request_id` or `request_id`.
 Claude's `metadata.user_id` JSON-string session field and legacy
 `user_<hash>_account_<id>_session_<uuid>` form are also recognized; the user/account
-portion is never logged. Body IDs appear in subsequent lifecycle records, since
+portion is never logged. Antigravity's Cloud Code requests name the request in a
+top-level `requestId` and the session in `request.sessionId`, used after the fields
+above; nothing else of the wrapped request is read. Body IDs appear in subsequent lifecycle records, since
 `request_received` and HTTP `model_call_started` precede body parsing. Compressed
 request bodies are not decoded, so their IDs must be supplied in headers.
 WebSocket calls inherit the handshake session ID unless the individual

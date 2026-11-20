@@ -64,6 +64,74 @@ struct Ids {
     event_id: Value,
     #[serde(default)]
     metadata: Value,
+    /// Cloud Code (Antigravity) names its request at the top level.
+    #[serde(default, rename = "requestId")]
+    request_id_camel: Value,
+    /// Cloud Code (Antigravity) wraps the Gemini request, which carries the
+    /// session; nothing else of it is read.
+    #[serde(default)]
+    request: Wrapped,
+}
+
+/// The `sessionId` of a wrapped request. Any other shape is ignored without
+/// rejecting the other IDs, and its content is skipped, not copied.
+#[derive(Default)]
+struct Wrapped {
+    session_id: Option<String>,
+}
+impl<'de> Deserialize<'de> for Wrapped {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Wrapped;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Wrapped, A::Error> {
+                let mut wrapped = Wrapped::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "sessionId" && wrapped.session_id.is_none() {
+                        wrapped.session_id = match map.next_value::<Value>()? {
+                            Value::String(id) => Some(id),
+                            _ => None,
+                        };
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(wrapped)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Wrapped, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Wrapped::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+            fn visit_unit<E>(self) -> Result<Wrapped, E> {
+                Ok(Wrapped::default())
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 pub(crate) fn body(bytes: &[u8], fields: &mut Map<String, Value>, websocket: bool) {
@@ -98,6 +166,8 @@ pub(crate) fn body(bytes: &[u8], fields: &mut Map<String, Value>, websocket: boo
                     record(fields, "session_id", id, "body:metadata.user_id.session_id");
                 }
             }
+        } else if let Some(id) = ids.request.session_id.as_deref().filter(|v| valid(v)) {
+            record(fields, "session_id", id, "body:request.sessionId");
         }
     }
     if !fields
@@ -107,6 +177,7 @@ pub(crate) fn body(bytes: &[u8], fields: &mut Map<String, Value>, websocket: boo
         for (value, source) in [
             (&ids.client_request_id, "body:client_request_id"),
             (&ids.request_id, "body:request_id"),
+            (&ids.request_id_camel, "body:requestId"),
         ]
         .into_iter()
         .chain(websocket.then_some((&ids.event_id, "body:event_id")))
@@ -191,6 +262,58 @@ mod tests {
             body(payload.to_string().as_bytes(), &mut fields, false);
             assert_eq!(fields["session_id"], session);
             assert_eq!(fields["client_request_id"], "client-request");
+            assert!(!serde_json::to_string(&fields).unwrap().contains("PRIVATE"));
+        }
+    }
+
+    /// Antigravity's Cloud Code requests, as `agy` sends them: the request ID
+    /// at the top level, the session inside the wrapped Gemini request.
+    #[test]
+    fn cloud_code_ids_come_from_the_wrapper_without_its_content() {
+        let payload = json!({"model":"gemini-model", "project":"PRIVATE", "requestId":"agent-request",
+            "requestType":"agent", "userAgent":"antigravity",
+            "request":{"contents":[{"role":"user","parts":[{"text":"PRIVATE PROMPT"}]}],
+                "systemInstruction":{"parts":[{"text":"PRIVATE"}]}, "sessionId":"agent-session",
+                "labels":{"private":"PRIVATE"}}});
+        let mut fields = Map::new();
+        super::headers(&HeaderMap::new(), &mut fields);
+        body(payload.to_string().as_bytes(), &mut fields, false);
+        assert_eq!(fields["session_id"], "agent-session");
+        assert_eq!(fields["session_id_source"], "body:request.sessionId");
+        assert_eq!(fields["client_request_id"], "agent-request");
+        assert_eq!(fields["client_request_id_source"], "body:requestId");
+        assert!(!serde_json::to_string(&fields).unwrap().contains("PRIVATE"));
+
+        // Snake-case IDs keep precedence; a wrapper of another shape, or an
+        // unusable session, rejects nothing else.
+        for (request, session) in [
+            (json!({"sessionId":"wrapped"}), "top"),
+            (json!("text"), "top"),
+            (json!([{"sessionId":"listed"}]), "top"),
+        ] {
+            let mut fields = Map::new();
+            super::headers(&HeaderMap::new(), &mut fields);
+            let payload = json!({"session_id":"top", "request_id":"snake", "requestId":"camel", "request":request});
+            body(payload.to_string().as_bytes(), &mut fields, false);
+            assert_eq!(fields["session_id"], session);
+            assert_eq!(fields["client_request_id"], "snake");
+        }
+        for request in [
+            json!(7),
+            json!({"sessionId":{"nested":"PRIVATE"}}),
+            json!({"sessionId":"bad\nline"}),
+        ] {
+            let mut fields = Map::new();
+            super::headers(&HeaderMap::new(), &mut fields);
+            body(
+                json!({"requestId":"camel", "request":request})
+                    .to_string()
+                    .as_bytes(),
+                &mut fields,
+                false,
+            );
+            assert_eq!(fields["session_id"], Value::Null);
+            assert_eq!(fields["client_request_id"], "camel");
             assert!(!serde_json::to_string(&fields).unwrap().contains("PRIVATE"));
         }
     }
