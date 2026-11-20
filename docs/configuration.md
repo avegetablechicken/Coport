@@ -535,6 +535,9 @@ with HTTP 401) trigger renewal. Usage reads, Settings, Devices, API keys, and to
 without a saved refresh token do not trigger renewal. Errors inside an already-open
 WebSocket or SSE stream are not replayed.
 
+Antigravity is never renewed this way: it renews its login itself, and Coport only
+routes those refreshes (see [Antigravity](#antigravity)).
+
 After an upstream HTTP 401, Coport refreshes the matched saved Codex/Claude login
 through that account's configured transport, saves rotated credentials to the original
 file or OS credential store, and retries the buffered request once. It preserves other

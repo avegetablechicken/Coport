@@ -733,7 +733,7 @@ mod tests {
                 .sum()
         };
         assert_eq!(beams(&template(44, Status::Running)), 0);
-        for service in [Service::Claude, Service::Codex] {
+        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
             for dark in [false, true] {
                 assert_eq!(beams(&beacon(44, Turn::REST, service, dark)), 0);
                 assert_eq!(beams(&beacon(44, Turn::at(1.0), service, dark)), 0);

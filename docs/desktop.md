@@ -80,7 +80,8 @@ right-click menu offers Open Panel, Start/Stop, Restart and Quit.
 With `account_auth_file_only: true`, Routing shows account activation from the
 configured credentials, refreshed in the background every 30 seconds whether or
 not the panel is open. Reading it never probes upstream or runs a login shell.
-A saved Claude login without a local route match is identified by the background
+A saved Claude login without a local route match, or Antigravity's saved login
+before its email is known, is identified by the background
 credential worker through `account_probe` (see below), or by its first request;
 until then its candidate routes show a warning icon as not yet identified. A
 successful identification keeps the warning icon to indicate the missing local
@@ -365,17 +366,18 @@ local routes, and the selected remote mode stays active for subsequent retries.
 selected device also restores local handling. The daemon owns forwarding, so closing
 the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
 Home's credential warnings use current diagnostic results rather than startup logs.
-The daemon checks Codex and Claude credentials every 60 seconds after each check,
+The daemon checks Codex, Claude and Antigravity credentials every 60 seconds after each check,
 regardless of success or failure, and continues when the GUI is closed. The GUI
 reads these results in the background and checks locally only when the daemon is
 confirmed absent; hiding the panel does not stop the GUI timer. An unavailable or
 older daemon is reported explicitly instead of checking under a different process
 environment. Warnings include the check time. When `claude.routing.account_probe`
-is explicitly set, the background worker also resolves missing saved Claude account
-identities through that route. Successful identities are cached per credential;
+or `antigravity.routing.account_probe` is explicitly set, the background worker
+also resolves missing saved Claude account identities, or the email of
+Antigravity's saved login, through that route. Successful identities are cached per credential;
 a failed lookup is retried after 10 minutes. `account_fallback` alone does not
 authorize this discovery. Statistics views read the cache without initiating probes,
-and neither credentials nor Claude metadata files are rewritten. Credential warnings
+and neither credentials, Claude metadata files nor the OS credential store are rewritten. Credential warnings
 validate local credential resolution and routing, not upstream service availability. Configuration changes
 still require restarting a running daemon.
 
