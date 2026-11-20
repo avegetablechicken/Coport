@@ -124,7 +124,18 @@ fn quote(value: &str) -> String {
 const DISCOVERY_SCRIPT: &str = include_str!("ssh_summary.sh");
 
 fn summary_command(binary: &str) -> String {
-    helper_command(binary, "--summary")
+    reader(&helper_command(binary, "--summary"))
+}
+
+/// A summary command naming the services this reader parses, which older
+/// helpers ignore (see [`crate::data_api::SERVICES_ENV`]). `env` comes from
+/// a fixed path and accepts the assignment under any login shell.
+fn reader(command: &str) -> String {
+    format!(
+        "/usr/bin/env {}={} {command}",
+        crate::data_api::SERVICES_ENV,
+        crate::data_api::SERVICES
+    )
 }
 
 pub(crate) fn helper_command(binary: &str, operation: &str) -> String {
@@ -285,11 +296,11 @@ pub async fn summary_progressive(
     // Four arguments also make old helpers reject this as an unknown command:
     // three positional arguments would otherwise be interpreted as daemon startup.
     let operation = format!("--summary-stream --window {minutes} {scope}");
-    let command = if device.binary.is_empty() || device.binary == "coportd" {
+    let command = reader(&if device.binary.is_empty() || device.binary == "coportd" {
         discovery_command(DISCOVERY_SCRIPT, &operation)
     } else {
         format!("{} {operation}", quote(&device.binary))
-    };
+    });
     let mut process = ssh_command(device, &command)?
         .spawn()
         .map_err(|e| format!("Cannot start SSH: {e}"))?;
@@ -620,7 +631,7 @@ mod tests {
         let lf = DISCOVERY_SCRIPT.replace("\r\n", "\n");
         for script in [lf.clone(), lf.replace('\n', "\r\n")] {
             let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &discovery_command(&script, "--summary")])
+                .args(["-c", &reader(&discovery_command(&script, "--summary"))])
                 .env("HOME", home.path())
                 .env("XDG_CONFIG_HOME", home.path().join(".config"))
                 .env("PATH", "/usr/bin:/bin")
@@ -631,7 +642,10 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(
+                output.stdout,
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+            );
         }
     }
     #[test]
@@ -747,7 +761,7 @@ mod tests {
         };
         let binary = home.path().join("build with spaces ' $literal/coportd");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --summary ] || exit 9\nprintf '%s\\n' '{\"result\":\"summary-only\"}'\n").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --summary ] || exit 9\nprintf '{\"result\":\"summary-only\",\"services\":\"%s\"}\\n' \"$COPORT_SUMMARY_SERVICES\"\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         register_summary_executable(&dir, &binary).unwrap();
         // This fixture models older installations with only a path record.
@@ -768,7 +782,10 @@ mod tests {
     fn run_discovery(home: &Path, binary: &str) -> std::process::Output {
         let _guard = crate::daemon::spawn_guard();
         let command = if binary.is_empty() || binary == "coportd" {
-            discovery_command(&isolated_discovery_script(), "--summary")
+            reader(&discovery_command(
+                &isolated_discovery_script(),
+                "--summary",
+            ))
         } else {
             summary_command(binary)
         };
@@ -799,7 +816,10 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(
+                output.stdout,
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+            );
             assert!(output.stderr.is_empty());
             assert_eq!(std::fs::read(&marker).unwrap(), before);
         }
@@ -824,7 +844,10 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+        assert_eq!(
+            output.stdout,
+            b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+        );
         assert!(!dir.join("summary-executable").exists());
     }
     #[cfg(unix)]
@@ -863,7 +886,10 @@ mod tests {
         for _ in 0..2 {
             let output = run_discovery(home.path(), "");
             assert!(output.status.success(), "{:?}", output);
-            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(
+                output.stdout,
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+            );
             assert_eq!(std::fs::read(&helper).unwrap(), before);
             assert_eq!(
                 std::fs::read(dir.join("summary-executable")).unwrap(),
@@ -905,7 +931,10 @@ mod tests {
         for _ in 0..2 {
             let output = run_discovery(home.path(), "");
             assert!(output.status.success(), "{:?}", output);
-            assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+            assert_eq!(
+                output.stdout,
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+            );
             assert_eq!(std::fs::read(&marker).unwrap(), before);
         }
     }
@@ -986,7 +1015,10 @@ mod tests {
         register_summary_executable(&dir, &moved).unwrap();
         let output = run_discovery(home.path(), "");
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"{\"result\":\"summary-only\"}\n");
+        assert_eq!(
+            output.stdout,
+            b"{\"result\":\"summary-only\",\"services\":\"antigravity\"}\n"
+        );
         assert_eq!(
             std::fs::read(dir.join("summary-executable")).unwrap(),
             format!("{}\n", moved.display()).as_bytes()

@@ -51,6 +51,7 @@ fn main() {
                 &helper_directory(&args, 4)?,
                 minutes,
                 scope,
+                coport_gui::data_api::reader_names_antigravity(),
                 std::io::stdout().lock(),
             )
         })();
@@ -61,8 +62,12 @@ fn main() {
         return;
     }
     if args.first().is_some_and(|arg| arg == "--summary") {
-        let result =
-            helper_directory(&args, 1).and_then(|dir| coport_gui::data_api::read_summary(&dir));
+        let result = helper_directory(&args, 1).and_then(|dir| {
+            coport_gui::data_api::read_summary(
+                &dir,
+                coport_gui::data_api::reader_names_antigravity(),
+            )
+        });
         match result {
             Ok(summary) => println!("{}", serde_json::to_string(&summary).unwrap()),
             Err(error) => {

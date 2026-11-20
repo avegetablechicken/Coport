@@ -114,7 +114,56 @@ pub fn account_reference(service: &str, account: &str) -> Option<String> {
             .collect(),
     )
 }
+/// Every reader parses Codex and Claude groups; one from before Antigravity
+/// rejects a whole summary naming it. Readers therefore name the further
+/// services they parse, over HTTP in this header and over SSH in this
+/// environment variable, both ignored by older exporters. Groups of a service
+/// the reader did not name are left out.
+pub const SERVICES_HEADER: &str = "x-coport-services";
+pub const SERVICES_ENV: &str = "COPORT_SUMMARY_SERVICES";
+/// The further services this version parses.
+pub const SERVICES: &str = "antigravity";
+
+/// Whether a reader's comma-separated service list names Antigravity.
+pub fn names_antigravity(list: &str) -> bool {
+    list.split(',')
+        .any(|name| name.trim().eq_ignore_ascii_case("antigravity"))
+}
+
+/// Whether the reader that started this helper names Antigravity.
+pub fn reader_names_antigravity() -> bool {
+    std::env::var(SERVICES_ENV).is_ok_and(|list| names_antigravity(&list))
+}
+
+/// A published summary as a reader receives it; see [`SERVICES_HEADER`].
+fn for_reader(bytes: &[u8], antigravity: bool) -> Result<Vec<u8>, String> {
+    let named = bytes
+        .windows(b"\"Antigravity\"".len())
+        .any(|part| part == b"\"Antigravity\"");
+    if antigravity || !named {
+        return Ok(bytes.to_vec());
+    }
+    let mut summary: Summary =
+        serde_json::from_slice(bytes).map_err(|_| "Cannot decode processed summary")?;
+    summary.without_antigravity();
+    summary.validate()?;
+    serde_json::to_vec(&summary).map_err(|_| "Cannot encode processed summary".into())
+}
+
 impl Summary {
+    /// Leaves out Antigravity's groups for a reader that cannot parse them.
+    pub fn without_antigravity(&mut self) {
+        let keep = |group: &Group| group.service != Service::Antigravity;
+        self.groups.retain(keep);
+        for window in self
+            .windows
+            .iter_mut()
+            .chain(self.previous_windows.iter_mut())
+        {
+            window.groups.retain(keep);
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         if !matches!(self.schema_version, 1..=4)
@@ -335,7 +384,8 @@ fn read_node_id(dir: &Path) -> io::Result<String> {
 }
 /// Same processed DTO as HTTP. This command reads existing identity/config/log
 /// files only; it does not start/stop services or open a network listener.
-pub fn read_summary(dir: &Path) -> io::Result<Summary> {
+/// `antigravity`: whether the reader parses Antigravity's groups.
+pub fn read_summary(dir: &Path, antigravity: bool) -> io::Result<Summary> {
     let (config_path, log) = crate::daemon::Client::discover(dir)
         .map(|(_, status)| (status.config_path, status.log_path))
         .unwrap_or_else(|| (dir.join("config.yaml"), dir.join("logs/proxy.log")));
@@ -343,7 +393,11 @@ pub fn read_summary(dir: &Path) -> io::Result<Summary> {
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
     let bytes = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
-    serde_json::from_slice(&bytes).map_err(io::Error::other)
+    let mut summary: Summary = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if !antigravity {
+        summary.without_antigravity();
+    }
+    Ok(summary)
 }
 
 /// Flush the requested range before computing the remaining history.
@@ -351,16 +405,18 @@ pub fn stream_summary(
     dir: &Path,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
+    antigravity: bool,
     output: impl io::Write,
 ) -> io::Result<()> {
     let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-    stream_summary_at(dir, minutes, scope, end, output)
+    stream_summary_at(dir, minutes, scope, end, antigravity, output)
 }
 fn stream_summary_at(
     dir: &Path,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
     end: i64,
+    antigravity: bool,
     mut output: impl io::Write,
 ) -> io::Result<()> {
     bucket_minutes(minutes).ok_or_else(|| io::Error::other("Unsupported traffic range"))?;
@@ -371,11 +427,14 @@ fn stream_summary_at(
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
     let first = publish_selected(&config, &log, &key, &node, minutes, scope, end)
+        .and_then(|bytes| for_reader(&bytes, antigravity))
         .map_err(io::Error::other)?;
     output.write_all(&first)?;
     output.write_all(b"\n")?;
     output.flush()?;
-    let rest = publish_at(&config, &log, &key, &node, end).map_err(io::Error::other)?;
+    let rest = publish_at(&config, &log, &key, &node, end)
+        .and_then(|bytes| for_reader(&bytes, antigravity))
+        .map_err(io::Error::other)?;
     output.write_all(&rest)?;
     output.write_all(b"\n")?;
     output.flush()
@@ -665,9 +724,13 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         reply(&mut socket, 503, b"{}").await;
         return;
     }
+    let antigravity = reader_services(&head).is_some_and(|list| names_antigravity(&list));
     if let Ok(Some((minutes, scope))) = requested_window(&head) {
         let selected = (|| {
             let mut summary: Summary = serde_json::from_slice(&bytes).ok()?;
+            if !antigravity {
+                summary.without_antigravity();
+            }
             summary
                 .windows
                 .retain(|w| w.minutes == minutes && w.scope == scope);
@@ -686,7 +749,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             None => reply(&mut socket, 503, b"{}").await,
         }
     } else {
-        reply(&mut socket, 200, &bytes).await;
+        match for_reader(&bytes, antigravity) {
+            Ok(bytes) => reply(&mut socket, 200, &bytes).await,
+            Err(_) => reply(&mut socket, 503, b"{}").await,
+        }
     }
 }
 fn validate_request(head: &[u8], key: &DataKey) -> Result<(), u16> {
@@ -730,6 +796,17 @@ fn validate_request(head: &[u8], key: &DataKey) -> Result<(), u16> {
     }
     requested_window(head)?;
     Ok(())
+}
+/// The services a reader names in [`SERVICES_HEADER`].
+fn reader_services(head: &[u8]) -> Option<String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut headers);
+    request.parse(head).ok()?;
+    let header = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(SERVICES_HEADER))?;
+    std::str::from_utf8(header.value).ok().map(str::to_owned)
 }
 fn requested_window(head: &[u8]) -> Result<Option<(u64, crate::traffic::TrafficScope)>, u16> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
@@ -784,6 +861,7 @@ mod tests {
             1440,
             crate::traffic::TrafficScope::All,
             original_end,
+            true,
             &mut output,
         )
         .unwrap();
@@ -898,6 +976,132 @@ mod tests {
                 Err(400)
             );
         }
+    }
+    /// Readers from before Antigravity reject a summary naming it, so only a
+    /// reader that names it receives its groups, over HTTP and over SSH.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_groups_reach_only_readers_that_name_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        let log = dir.path().join("logs/proxy.log");
+        let at = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let row = |service: &str, path: &str| {
+            json!({"timestamp":at, "event":"model_call_finished", "model_call_id":uuid::Uuid::new_v4().to_string(),
+                "request_id":uuid::Uuid::new_v4().to_string(), "service":service, "method":"POST", "path":path,
+                "account_id":"user@example.test", "status":"200"})
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(
+            &log,
+            row(
+                "antigravity",
+                "/antigravity/v1internal:streamGenerateContent",
+            ) + &row("codex", "/v1/responses"),
+        )
+        .unwrap();
+        let config = "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n";
+        std::fs::write(dir.path().join("config.yaml"), config).unwrap();
+        prepare_identity(dir.path()).unwrap();
+        let services = |summary: &Summary| {
+            let mut all: Vec<_> = summary
+                .groups
+                .iter()
+                .chain(
+                    summary
+                        .windows
+                        .iter()
+                        .chain(&summary.previous_windows)
+                        .flat_map(|w| &w.groups),
+                )
+                .map(|g| g.service)
+                .collect();
+            all.sort();
+            all.dedup();
+            all
+        };
+
+        let key = DataKey::new(KEY).unwrap();
+        let bytes = publish(
+            &Config::parse(config).unwrap(),
+            &log,
+            &key,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes)))));
+        for (extra, antigravity) in [
+            ("", false),
+            ("X-Coport-Window: 30:model\r\n", false),
+            ("X-Coport-Services: codex, antigravity\r\n", true),
+            (
+                "X-Coport-Services: antigravity\r\nX-Coport-Window: 30:model\r\n",
+                true,
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024 * 1024);
+            let (key, cache) = (DataKey::new(KEY).unwrap(), shared.clone());
+            let task = tokio::spawn(async move { handle(server, &key, cache).await });
+            client
+                .write_all(
+                    format!("GET /v1/summary HTTP/1.1\r\nHost: data\r\nAuthorization: Bearer {KEY}\r\n{extra}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            task.await.unwrap();
+            let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body = &response[split..];
+            let summary: Summary = serde_json::from_slice(body).unwrap();
+            summary.validate().unwrap();
+            assert_eq!(
+                services(&summary),
+                if antigravity {
+                    vec![Service::Codex, Service::Antigravity]
+                } else {
+                    vec![Service::Codex]
+                },
+                "{extra:?}"
+            );
+            assert_eq!(
+                body.windows(b"Antigravity".len())
+                    .any(|w| w == b"Antigravity"),
+                antigravity
+            );
+        }
+
+        for antigravity in [false, true] {
+            let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+            let mut output = Vec::new();
+            stream_summary_at(
+                dir.path(),
+                30,
+                crate::traffic::TrafficScope::Model,
+                end,
+                antigravity,
+                &mut output,
+            )
+            .unwrap();
+            for line in output.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let frame: Summary = serde_json::from_slice(line).unwrap();
+                frame.validate().unwrap();
+                assert_eq!(
+                    services(&frame).contains(&Service::Antigravity),
+                    antigravity
+                );
+                assert!(services(&frame).contains(&Service::Codex));
+            }
+            let summary = read_summary(dir.path(), antigravity).unwrap();
+            assert_eq!(
+                services(&summary).contains(&Service::Antigravity),
+                antigravity
+            );
+        }
+        assert!(names_antigravity(" Antigravity "));
+        assert!(!names_antigravity("antigravity-next,codex"));
     }
     #[tokio::test]
     async fn starting_data_listener_does_not_scan_logs_before_returning() {
@@ -1317,13 +1521,13 @@ mod ssh_summary_tests {
             }
         });
         let (client, status) = crate::daemon::tests::wait_for_daemon(&state);
-        let missing_default = read_summary(&state);
+        let missing_default = read_summary(&state, true);
         // A valid but different default configuration must not override the
         // live daemon's account mapping, nor its separate log path.
         std::fs::write(state.join("config.yaml"), "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        let wrong_default = read_summary(&state);
+        let wrong_default = read_summary(&state, true);
         std::fs::write(state.join("config.yaml"), "invalid: [").unwrap();
-        let invalid_default = read_summary(&state);
+        let invalid_default = read_summary(&state, true);
         client.stop().unwrap();
         daemon.join().unwrap().unwrap();
         assert_eq!(status.config_path, config_path);
@@ -1348,7 +1552,7 @@ mod ssh_summary_tests {
         crate::settings::create_private(&dir.path().join("config.yaml"),b"listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let node = prepare_identity(dir.path()).unwrap();
         let before = std::fs::read(dir.path().join("data-identity.key")).unwrap();
-        let summary = read_summary(dir.path()).unwrap();
+        let summary = read_summary(dir.path(), true).unwrap();
         summary.validate().unwrap();
         assert_eq!(summary.node_id, node);
         assert!(summary.groups.is_empty());

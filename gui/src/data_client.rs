@@ -145,7 +145,10 @@ async fn fetch_selected(
     }
     url.set_path("/v1/summary");
     let client = builder.build().map_err(|_| "Cannot create data client")?;
-    let mut request = client.get(url).bearer_auth(token);
+    let mut request = client
+        .get(url)
+        .bearer_auth(token)
+        .header(crate::data_api::SERVICES_HEADER, crate::data_api::SERVICES);
     if let Some((minutes, scope)) = selection {
         let scope = if scope == crate::traffic::TrafficScope::Model {
             "model"
@@ -1362,6 +1365,7 @@ mod tests {
                     let mut header = Vec::new();
                     while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.unwrap()); }
                     let header = String::from_utf8(header).unwrap().to_lowercase();
+                    assert!(header.contains("x-coport-services: antigravity"));
                     let body = if phase == 0 {
                         assert!(header.contains("x-coport-window: 1440:all"));
                         if peer == 1 { slow.notified().await; }

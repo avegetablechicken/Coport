@@ -239,6 +239,13 @@ minute. The selected and full snapshots each parse every log file once for their
 scopes and boundaries. A progressive refresh does not reconnect automatically
 when peers cannot align: it keeps the boundary most devices share and reports
 the others, which the next explicit refresh retries.
+Readers name the services they parse beyond Codex and Claude: HTTP with an
+`X-Coport-Services: antigravity` header, SSH by starting the helper through
+`/usr/bin/env COPORT_SUMMARY_SERVICES=antigravity`. Older devices ignore both.
+A device leaves Antigravity's groups out for a reader that does not name it, since
+readers from before Antigravity reject a whole snapshot naming an unknown service;
+such a reader therefore shows that device without its Antigravity traffic. A
+forced-command SSH key runs its own command, so it also omits them.
 Once all twelve views are cached, range/category switches are immediate.
 Background failures retain statistics already displayed. The first Devices visit
 after the app starts refreshes once; later page entry, periodic refresh and

@@ -1881,6 +1881,7 @@ mod tests {
                         dir.path(),
                         30,
                         TrafficScope::Model,
+                        true,
                         &mut frames,
                     )
                     .unwrap();
