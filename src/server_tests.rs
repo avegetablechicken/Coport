@@ -5242,3 +5242,60 @@ async fn antigravity_token_refresh_routes_like_codex_and_learns_its_id_token_acc
     assert!(token.requests.try_recv().is_err());
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
+
+/// The Antigravity rows `startup_log` writes for `config`.
+async fn antigravity_startup_rows(config: &str) -> Vec<(String, serde_json::Value)> {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("proxy.log");
+    let config = Config::parse(&format!(
+        "listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n{config}"
+    ))
+    .unwrap();
+    Server::new(config, Arc::new(Logger::new(path.clone())))
+        .startup_log()
+        .await;
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["service"] == "antigravity")
+        .map(|row| {
+            (
+                row["event"].as_str().unwrap().to_owned(),
+                row["reason"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// As for Claude, startup reports whether Antigravity's saved login is in the
+/// OS credential store; a section without routes, or without the saved
+/// login, reads nothing.
+#[tokio::test]
+async fn startup_reports_whether_antigravity_has_its_saved_login() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let rows = antigravity_startup_rows;
+    let routed = "antigravity:\n  routing:\n    account:\n      default: none\n";
+    crate::antigravity::set_test_login("startup-access", "startup-refresh");
+    assert_eq!(
+        rows(routed).await,
+        [("current_route".to_owned(), serde_json::Value::Null)]
+    );
+    // An unusable item, not a failing read: failed reads cool down for
+    // every test reading the item.
+    crate::keychain::set_test_entry("gemini", "antigravity", Some("{}"));
+    assert_eq!(
+        rows(routed).await,
+        [(
+            "route_unavailable".to_owned(),
+            "Invalid Antigravity login in the OS credential store.".into()
+        )]
+    );
+    assert!(rows("").await.is_empty());
+    assert!(
+        rows("antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    fallback: none\n")
+            .await
+            .is_empty()
+    );
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}

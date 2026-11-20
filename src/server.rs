@@ -577,6 +577,26 @@ impl Server {
                 fields,
             );
         }
+        // As Claude's: whether the saved login is in the OS credential store.
+        let antigravity = &self.config.antigravity;
+        if antigravity.enabled() && antigravity.saved_login {
+            let check = antigravity.check_credentials().await;
+            let mut fields = json!({"service": "antigravity"})
+                .as_object()
+                .unwrap()
+                .clone();
+            if let Err(error) = &check {
+                fields.insert("reason".into(), json!(error.message));
+            }
+            self.logger.write(
+                if check.is_ok() {
+                    "current_route"
+                } else {
+                    "route_unavailable"
+                },
+                fields,
+            );
+        }
     }
     async fn handle(
         self: Arc<Self>,
