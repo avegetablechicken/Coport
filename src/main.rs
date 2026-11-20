@@ -115,6 +115,9 @@ async fn run(args: Args) -> Result<()> {
         ))
         .with_codex_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
             state.join(coport::refresh_routes::CODEX_FILE),
+        ))
+        .with_antigravity_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
+            state.join(coport::refresh_routes::ANTIGRAVITY_FILE),
         ));
     if let Some(proxy) = credential_proxy {
         println!(

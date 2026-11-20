@@ -15,16 +15,27 @@ pub fn is_model_endpoint(method: &str, raw: &str) -> bool {
         .strip_prefix("/codex/")
         .or_else(|| raw.strip_prefix("/anthropic/"))
         .or_else(|| raw.strip_prefix("/claude/"))
+        .or_else(|| raw.strip_prefix("/antigravity/"))
         .unwrap_or(raw)
         .trim_start_matches('/');
-    let url = url::Url::parse(path).ok();
+    // Only explicit upstream targets are URLs; `v1internal:x` would parse as one.
+    let url = (path.starts_with("https://") || path.starts_with("http://"))
+        .then(|| url::Url::parse(path).ok())
+        .flatten();
     let path = url
         .as_ref()
         .map(|u| u.path())
         .unwrap_or(path)
         .trim_matches('/');
     let ends = |suffix: &str| path == suffix || path.ends_with(&format!("/{suffix}"));
+    // Gemini methods, as Cloud Code's `v1internal:streamGenerateContent`.
+    let gemini = path
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.rsplit_once(':'))
+        .is_some_and(|(_, method)| matches!(method, "generateContent" | "streamGenerateContent"));
     match method {
+        "POST" if gemini => true,
         "POST" => [
             "responses",
             "responses/compact",
@@ -54,6 +65,8 @@ struct Envelope {
     #[serde(default, deserialize_with = "deserialize_usage")]
     usage: Option<Usage>,
     error: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    gemini: Gemini,
 }
 #[derive(Default, Deserialize)]
 struct Metadata {
@@ -62,6 +75,49 @@ struct Metadata {
     #[serde(default, deserialize_with = "deserialize_usage")]
     usage: Option<Usage>,
     incomplete_details: Option<IncompleteDetails>,
+    /// Cloud Code wraps a Gemini response in `response`.
+    #[serde(flatten)]
+    gemini: Gemini,
+}
+/// A Gemini response (or stream chunk): its candidates, usage and model.
+#[derive(Default, Deserialize)]
+struct Gemini {
+    #[serde(default, deserialize_with = "lenient")]
+    candidates: Option<Vec<Candidate>>,
+    #[serde(rename = "usageMetadata", default, deserialize_with = "lenient")]
+    usage: Option<GeminiUsage>,
+    #[serde(rename = "modelVersion", default, deserialize_with = "lenient")]
+    model: Option<String>,
+    #[serde(rename = "responseId", default, deserialize_with = "lenient")]
+    response_id: Option<String>,
+}
+impl Gemini {
+    fn present(&self) -> bool {
+        self.candidates.is_some() || self.usage.is_some() || self.model.is_some()
+    }
+    /// The first candidate's finish reason; unspecified is none.
+    fn finish_reason(&self) -> Option<&str> {
+        self.candidates
+            .iter()
+            .flatten()
+            .find_map(|c| c.finish_reason.as_deref())
+            .filter(|r| !r.is_empty() && *r != "FINISH_REASON_UNSPECIFIED")
+    }
+}
+#[derive(Default, Deserialize)]
+struct Candidate {
+    #[serde(rename = "finishReason", default, deserialize_with = "lenient")]
+    finish_reason: Option<String>,
+}
+/// Gemini usage: the prompt count includes cached content, and output is
+/// split into candidates and thoughts.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUsage {
+    prompt_token_count: Option<u64>,
+    candidates_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
+    cached_content_token_count: Option<u64>,
 }
 #[derive(Default, Deserialize)]
 struct IncompleteDetails {
@@ -91,6 +147,14 @@ fn deserialize_usage<'de, D: serde::Deserializer<'de>>(
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
+/// Malformed optional metadata is skipped, not an unreadable event.
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 fn field(fields: &mut Map<String, Value>, key: &str, value: impl ToString) {
     fields.insert(key.into(), json!(value.to_string()));
 }
@@ -106,11 +170,21 @@ impl Envelope {
             .or_else(|| terminal(&self.kind).and(self.id.as_deref()))
             .filter(|s| safe_label(s))
     }
+    /// The Gemini part: Cloud Code's wrapped response, else the event itself.
+    fn gemini(&self) -> &Gemini {
+        self.response
+            .as_ref()
+            .map(|r| &r.gemini)
+            .filter(|g| g.present())
+            .unwrap_or(&self.gemini)
+    }
     fn apply(&self, fields: &mut Map<String, Value>) {
         let meta = self.response.as_ref().or(self.message.as_ref());
+        let gemini = self.gemini();
         if let Some(model) = meta
             .and_then(|r| r.model.as_deref())
             .or(self.model.as_deref())
+            .or(gemini.model.as_deref())
             .filter(|s| safe_label(s))
         {
             field(fields, "model", model);
@@ -118,6 +192,7 @@ impl Envelope {
         if let Some(id) = self
             .response_id()
             .or_else(|| meta.and_then(|m| m.id.as_deref()))
+            .or(gemini.response_id.as_deref())
             .filter(|s| safe_label(s))
         {
             field(fields, "response_id", id);
@@ -148,6 +223,22 @@ impl Envelope {
                 ),
             ] {
                 // Usage events are snapshots, not deltas; do not sum repeated snapshots.
+                if let Some(value) = value {
+                    field(fields, key, value);
+                }
+            }
+        } else if let Some(usage) = &gemini.usage {
+            // As OpenAI counts them: input includes cached tokens and output
+            // includes reasoning.
+            let output = match (usage.candidates_token_count, usage.thoughts_token_count) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            };
+            for (key, value) in [
+                ("input_tokens", usage.prompt_token_count),
+                ("output_tokens", output),
+                ("cached_input_tokens", usage.cached_content_token_count),
+            ] {
                 if let Some(value) = value {
                     field(fields, key, value);
                 }
@@ -548,6 +639,26 @@ fn observe_event(event: Envelope, log: &mut HttpObservation) {
         && !log.fields.contains_key("first_token_ms")
     {
         log.field("first_token_ms", log.started.elapsed().as_millis());
+    }
+    let gemini = event.gemini();
+    if gemini.candidates.is_some() {
+        if !log.fields.contains_key("model_outcome") {
+            log.field("model_outcome", "running");
+        }
+        if !log.fields.contains_key("first_token_ms") {
+            log.field("first_token_ms", log.started.elapsed().as_millis());
+        }
+        if let Some(reason) = gemini.finish_reason().filter(|r| safe_label(r)) {
+            let truncated = reason == "MAX_TOKENS";
+            log.field(
+                "model_outcome",
+                if truncated { "incomplete" } else { "finished" },
+            );
+            log.field("model_finish_reason", reason);
+            if truncated {
+                log.field("incomplete_reason", "max_tokens");
+            }
+        }
     }
     if let Some(outcome) = terminal(&event.kind).or(event.error.as_ref().map(|_| "failed")) {
         log.field("model_outcome", outcome);
@@ -1469,6 +1580,50 @@ mod tests {
             &mut log,
         );
         assert_eq!(log.fields["model_outcome"], "failed");
+    }
+    #[test]
+    fn gemini_methods_and_responses_are_model_calls() {
+        for target in [
+            "/antigravity/v1internal:streamGenerateContent?alt=sse",
+            "/antigravity/v1internal:generateContent",
+            "/antigravity/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            "/v1beta/models/gemini-3-pro:generateContent",
+        ] {
+            assert!(is_model_endpoint("POST", target), "{target}");
+            assert!(!is_model_endpoint("GET", target), "{target}");
+        }
+        for target in [
+            "/antigravity/v1internal:loadCodeAssist",
+            "/antigravity/v1internal:countTokens",
+            "/antigravity/v1internal:generateContentX",
+        ] {
+            assert!(!is_model_endpoint("POST", target), "{target}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_at(&dir.path().join("proxy.log"));
+        // An unwrapped, non-streaming Gemini response cut short by its limit.
+        let mut observer = HttpObserver::new(false, None, &mut log);
+        observer.feed(
+            br#"{"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2},"modelVersion":"gemini-x"}"#,
+            &mut log,
+        );
+        observer.finish(&mut log);
+        assert_eq!(log.fields["model_outcome"], "incomplete");
+        assert_eq!(log.fields["incomplete_reason"], "max_tokens");
+        assert_eq!(log.fields["input_tokens"], "9");
+        assert_eq!(log.fields["output_tokens"], "2");
+        assert_eq!(log.fields["model"], "gemini-x");
+        assert!(!log.fields.contains_key("cached_input_tokens"));
+        // Malformed usage does not hide the finish.
+        let mut log = log_at(&dir.path().join("other.log"));
+        let mut observer = HttpObserver::new(true, None, &mut log);
+        observer.feed(
+            b"data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":\"bad\"}}\n\n",
+            &mut log,
+        );
+        observer.finish(&mut log);
+        assert_eq!(log.fields["model_outcome"], "finished");
+        assert!(!log.fields.contains_key("input_tokens"));
     }
     fn compress(encoding: &str, body: &[u8]) -> Vec<u8> {
         use std::io::Write;

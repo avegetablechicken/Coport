@@ -53,6 +53,7 @@ impl Server {
         let sources = match service {
             Service::Codex => self.config.codex.account_sources(),
             Service::Claude => self.config.claude.account_sources(),
+            Service::Antigravity => return None,
         };
         let mut found = None;
         for (_, source) in sources {
@@ -264,13 +265,18 @@ async fn refresh_lock(snapshot: &Snapshot, deadline: Deadline) -> Result<Option<
 }
 
 fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> {
+    if service == Service::Antigravity {
+        return Err(Error::config(
+            "Antigravity renews its own login; Coport does not refresh it.",
+        ));
+    }
     let refresh =
         credentials::refresh(value, service).ok_or(Error::config("Login has no refresh token."))?;
     let mut request = reqwest::Request::new(
         hyper::Method::POST,
         Url::parse(match service {
             Service::Codex => TOKEN_REFRESH_UPSTREAM,
-            Service::Claude => crate::claude::TOKEN_REFRESH_UPSTREAM,
+            Service::Claude | Service::Antigravity => crate::claude::TOKEN_REFRESH_UPSTREAM,
         })
         .unwrap(),
     );
@@ -296,6 +302,7 @@ fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> 
                 .finish();
             ("application/x-www-form-urlencoded", body)
         }
+        Service::Antigravity => unreachable!("rejected above"),
         Service::Claude => {
             let scopes: Vec<_> = value["claudeAiOauth"]["scopes"]
                 .as_array()
@@ -336,6 +343,11 @@ fn merge_tokens(service: Service, original: &Value, payload: &Value) -> Result<V
     }
     let mut updated = original.clone();
     match service {
+        Service::Antigravity => {
+            return Err(Error::config(
+                "Antigravity renews its own login; Coport does not refresh it.",
+            ));
+        }
         Service::Codex => {
             // Do not allow an unexpected response to switch the routed account.
             if crate::identity::Identity::from_token(access).is_some_and(|id| {

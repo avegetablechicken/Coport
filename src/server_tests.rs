@@ -47,6 +47,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
         "auth.openai.com".into(),
         "platform.claude.com".into(),
         "api.anthropic.com".into(),
+        "daily-cloudcode-pa.googleapis.com".into(),
+        "cloudcode-pa.googleapis.com".into(),
+        "www.googleapis.com".into(),
+        "oauth2.googleapis.com".into(),
         "localhost".into(),
     ])
     .unwrap();
@@ -184,6 +188,23 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     io.write_all(format!("HTTP/1.1 200 OK\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
                     io.write_all(&body).await.unwrap();
                 }
+                else if request.starts_with("GET /oauth2/v2/userinfo ") {
+                    let body = r#"{"id":"1","email":"remote@example.invalid","verified_email":true}"#;
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                else if response_mode=="google_token" {
+                    // Google's refresh response: no new refresh token; its ID token names the account.
+                    let body = r#"{"access_token":"renewed-access","expires_in":3599,"scope":"openid","token_type":"Bearer","id_token":"h.eyJlbWFpbCI6InJlbW90ZUBleGFtcGxlLmludmFsaWQiLCJzdWIiOiIxIn0.s"}"#;
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                else if response_mode=="gemini_sse" {
+                    // Cloud Code's stream: Gemini chunks wrapped in `response`, usage last.
+                    let body = concat!(
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"private-output\"}]}}],\"modelVersion\":\"gemini-test\",\"responseId\":\"gemini-response\"},\"traceId\":\"t\"}\r\n\r\n",
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":3,\"cachedContentTokenCount\":4,\"totalTokenCount\":20},\"modelVersion\":\"gemini-test\",\"responseId\":\"gemini-response\"},\"traceId\":\"t\"}\r\n\r\n",
+                    );
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
                 else if response_mode=="redirect" { io.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); }
                 else {
                     io.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close, x-hop\r\nx-hop: remove-me\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nD\r\ndata: first\n\n\r\n").await.unwrap(); io.flush().await.unwrap();
@@ -220,6 +241,14 @@ async fn running(config: &str) -> Running {
 }
 /// `running`, after `seed` prepares the TLS directory, e.g. with a stored CA.
 async fn running_with_tls(config: &str, seed: impl FnOnce(&std::path::Path)) -> Running {
+    running_with_server(config, seed, |server| server).await
+}
+/// `running_with_tls`, after `customize` adds state to the server.
+async fn running_with_server(
+    config: &str,
+    seed: impl FnOnce(&std::path::Path),
+    customize: impl FnOnce(Server) -> Server,
+) -> Running {
     let temp = tempfile::tempdir().unwrap();
     seed(&temp.path().join("tls"));
     let logger = Arc::new(Logger::new(temp.path().join("proxy.log")));
@@ -238,7 +267,7 @@ async fn running_with_tls(config: &str, seed: impl FnOnce(&std::path::Path)) -> 
     let credential_proxy =
         crate::credential_proxy::CredentialProxy::prepare(&config, &temp.path().join("tls"))
             .unwrap();
-    let mut server = Server::new(config, logger);
+    let mut server = customize(Server::new(config, logger));
     if let Some(proxy) = credential_proxy {
         server = server.with_credential_proxy(proxy);
     }
@@ -4631,4 +4660,532 @@ async fn claude_auto_rotation_registers_the_new_token_for_manual_renewal() {
         assert!(received[0].starts_with("GET /api/oauth/profile "));
         assert!(received[0].contains("authorization: Bearer new-access"));
     }
+}
+
+/// The log's first record of `event`, once written.
+async fn first_record(running: &Running, event: &str) -> serde_json::Value {
+    let path = running._temp.path().join("proxy.log");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            running.server.logger.flush().unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            if let Some(row) = raw
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|row| row["event"] == event)
+            {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no {event}: {}",
+            std::fs::read_to_string(&path).unwrap_or_default()
+        )
+    })
+}
+
+// Cloud Code hosts are reached only through the loopback fixture proxy; no
+// Google host, real login or credential store is contacted.
+#[tokio::test]
+async fn antigravity_saved_login_streams_through_its_route_and_records_gemini_usage() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+    let token = crate::antigravity::TEST_SAVED_TOKEN;
+    let mut fixture = fixture("http", "gemini_sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!(
+        "proxies:\n  selected: {endpoint}\nantigravity:\n  routing:\n    account:\n      default: selected\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let response = http()
+        .post(format!(
+            "{}/antigravity/v1internal:streamGenerateContent?alt=sse",
+            running.url
+        ))
+        .bearer_auth(token)
+        .header("cookie", "private-cookie")
+        .body(r#"{"model":"gemini-request","project":"p","request":{"contents":"PRIVATE PROMPT"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("private-output") && body.contains("usageMetadata"));
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(connect.starts_with("CONNECT daily-cloudcode-pa.googleapis.com:443 "));
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(forwarded.starts_with("POST /v1internal:streamGenerateContent?alt=sse HTTP/1.1"));
+    assert!(forwarded.contains(&format!("authorization: Bearer {token}")));
+    assert!(!forwarded.contains("private-cookie"));
+    assert!(forwarded.ends_with("\"PRIVATE PROMPT\"}}"));
+    let call = first_record(&running, "model_call_finished").await;
+    assert_eq!(call["service"], "antigravity");
+    assert_eq!(call["account_label"], "default");
+    assert_eq!(call["credential_match"], "configured");
+    assert_eq!(call["proxy"], "selected");
+    assert_eq!(call["model"], "gemini-test");
+    assert_eq!(call["response_id"], "gemini-response");
+    assert_eq!(call["model_finish_reason"], "STOP");
+    // Input includes cached tokens; output includes thoughts.
+    assert_eq!(call["input_tokens"], "12");
+    assert_eq!(call["output_tokens"], "8");
+    assert_eq!(call["cached_input_tokens"], "4");
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(!raw.contains(token) && !raw.contains("PRIVATE PROMPT"));
+
+    // Another token, a foreign host and an unconfigured section send nothing.
+    let other = http()
+        .post(format!(
+            "{}/antigravity/v1internal:loadCodeAssist",
+            running.url
+        ))
+        .bearer_auth("other-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 401);
+    let foreign = http()
+        .post(format!(
+            "{}/antigravity/https://example.com/v1internal:loadCodeAssist",
+            running.url
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 502);
+    assert!(fixture.requests.try_recv().is_err());
+    let unconfigured = running_with_tls("", |_| {}).await;
+    let response = http()
+        .post(format!(
+            "{}/antigravity/v1internal:loadCodeAssist",
+            unconfigured.url
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn antigravity_other_accounts_are_named_through_the_probe_then_routed_and_cached() {
+    let mut lookup = fixture("http", "sse").await;
+    let mut payload = fixture("http", "gemini_sse").await;
+    let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let running = running(&format!(
+        "proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    account:\n      Remote@Example.invalid: selected\n    account_probe: lookup\n"
+    ))
+    .await;
+    trust(&running, &lookup, &lookup_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+    for (token, expect_lookup) in [("first-secret", true), ("first-secret", false)] {
+        let response = http()
+            .post(format!(
+                "{}/antigravity/https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+                running.url
+            ))
+            .bearer_auth(token)
+            .body("private-payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        if expect_lookup {
+            let connect = lookup.requests.recv().await.unwrap();
+            assert!(connect.starts_with("CONNECT www.googleapis.com:443 "));
+            let request = lookup.requests.recv().await.unwrap();
+            assert!(request.starts_with("GET /oauth2/v2/userinfo HTTP/1.1"));
+            assert!(request.contains(&format!("authorization: Bearer {token}")));
+            assert!(!request.contains("private-payload"));
+        }
+        assert!(lookup.requests.try_recv().is_err());
+        let connect = payload.requests.recv().await.unwrap();
+        assert!(connect.starts_with("CONNECT cloudcode-pa.googleapis.com:443 "));
+        let request = payload.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /v1internal:generateContent HTTP/1.1"));
+        assert!(request.ends_with("private-payload"));
+    }
+    assert_eq!(running.server.antigravity_profiles.lock().unwrap().len(), 1);
+    let call = first_record(&running, "model_call_finished").await;
+    assert_eq!(call["account_id"], "remote@example.invalid");
+    assert_eq!(call["account_label"], "Remote@Example.invalid");
+    assert_eq!(call["credential_match"], "configured");
+    assert_eq!(call["profile_proxy"], "lookup");
+}
+
+/// The lookup of `token`'s account, and nothing more, reached `lookup`.
+fn expect_lookup(lookup: &mut Fixture, token: &str) {
+    let connect = lookup.requests.try_recv().unwrap();
+    assert!(connect.starts_with("CONNECT www.googleapis.com:443 "));
+    let request = lookup.requests.try_recv().unwrap();
+    assert!(request.starts_with("GET /oauth2/v2/userinfo HTTP/1.1"));
+    assert!(request.contains(&format!("authorization: Bearer {token}")));
+    assert!(lookup.requests.try_recv().is_err());
+}
+/// A Cloud Code request with `token` reached `payload`.
+async fn expect_payload(payload: &mut Fixture, token: &str) {
+    let connect = payload.requests.recv().await.unwrap();
+    assert!(connect.starts_with("CONNECT daily-cloudcode-pa.googleapis.com:443 "));
+    let request = payload.requests.recv().await.unwrap();
+    assert!(request.contains(&format!("authorization: Bearer {token}")));
+}
+/// A request to Antigravity's scope with `token`, which must succeed.
+async fn antigravity_request(running: &Running, token: &str) {
+    let response = http()
+        .post(format!(
+            "{}/antigravity/v1internal:generateContent",
+            running.url
+        ))
+        .bearer_auth(token)
+        .body("private-payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn antigravity_saved_login_is_named_once_per_login_across_renewals_and_restarts() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let mut lookup = fixture("http", "sse").await;
+    let mut payload = fixture("http", "gemini_sse").await;
+    let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let state = tempfile::tempdir().unwrap();
+    let file = state.path().join(crate::refresh_routes::ANTIGRAVITY_FILE);
+    let config = format!(
+        "proxies:\n  lookup: {lookup_endpoint}\n  selected: {payload_endpoint}\nantigravity:\n  routing:\n    account:\n      Remote@Example.invalid: selected\n      other@example.invalid: none\n    account_probe: lookup\n"
+    );
+    let start = || {
+        running_with_server(
+            &config,
+            |_| {},
+            |server| {
+                server.with_antigravity_refresh_routes(crate::refresh_routes::RefreshRoutes::load(
+                    file.clone(),
+                ))
+            },
+        )
+    };
+    let running = start().await;
+    trust(&running, &lookup, &lookup_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+
+    crate::antigravity::set_test_login("first-access", "login-refresh");
+    // Until a lookup names it, the saved login's route is unknown.
+    let states = running.server.account_route_states().await;
+    assert!(
+        states[2].values().all(|state| *state == "unknown"),
+        "{states:?}"
+    );
+    antigravity_request(&running, "first-access").await;
+    expect_lookup(&mut lookup, "first-access");
+    expect_payload(&mut payload, "first-access").await;
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(!saved.contains("login-refresh") && !saved.contains("first-access"));
+    let states = running.server.account_route_states().await;
+    assert_eq!(states[2]["Remote@Example.invalid"], "active");
+    assert_eq!(states[2]["other@example.invalid"], "inactive");
+    let labels = running.server.cached_traffic_credential_labels().await;
+    assert_eq!(
+        labels[&(
+            "Antigravity".to_owned(),
+            "remote@example.invalid".to_owned()
+        )],
+        "Remote@Example.invalid"
+    );
+
+    // A renewed access token of the same login needs no lookup.
+    crate::antigravity::set_test_login("renewed-access", "login-refresh");
+    antigravity_request(&running, "renewed-access").await;
+    expect_payload(&mut payload, "renewed-access").await;
+    assert!(lookup.requests.try_recv().is_err());
+
+    // Nor after a restart, with an empty identity cache.
+    drop(running);
+    let restarted = start().await;
+    trust(&restarted, &lookup, &lookup_endpoint);
+    trust(&restarted, &payload, &payload_endpoint);
+    crate::antigravity::set_test_login("restarted-access", "login-refresh");
+    antigravity_request(&restarted, "restarted-access").await;
+    expect_payload(&mut payload, "restarted-access").await;
+    assert!(lookup.requests.try_recv().is_err());
+    let call = first_record(&restarted, "model_call_finished").await;
+    assert_eq!(call["account_id"], "remote@example.invalid");
+    assert_eq!(call["account_label"], "Remote@Example.invalid");
+    assert!(call.get("profile_proxy").is_none());
+    // Statistics label the learned account from the saved routes alone.
+    let labels = restarted.server.cached_traffic_credential_labels().await;
+    assert_eq!(
+        labels[&(
+            "Antigravity".to_owned(),
+            "remote@example.invalid".to_owned()
+        )],
+        "Remote@Example.invalid"
+    );
+    assert_eq!(
+        labels[&("Antigravity".to_owned(), "other@example.invalid".to_owned())],
+        "other@example.invalid"
+    );
+
+    // Another login is looked up anew, not taken for the learned account.
+    crate::antigravity::set_test_login("switched-access", "switched-refresh");
+    antigravity_request(&restarted, "switched-access").await;
+    expect_lookup(&mut lookup, "switched-access");
+    expect_payload(&mut payload, "switched-access").await;
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+#[tokio::test]
+async fn antigravity_background_discovery_needs_an_explicit_probe_and_backs_off_failures() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    crate::antigravity::set_test_login("background-access", "background-refresh");
+    // A fallback route alone does not authorize a lookup.
+    let mut silent = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", silent.addr.port());
+    let quiet = running(&format!(
+        "proxies:\n  lookup: {endpoint}\nantigravity:\n  routing:\n    account:\n      remote@example.invalid: none\n    fallback: lookup\n"
+    ))
+    .await;
+    trust(&quiet, &silent, &endpoint);
+    quiet.server.traffic_credential_labels().await;
+    assert!(silent.requests.try_recv().is_err());
+    // The saved login without a known account routes by fallback.
+    assert_eq!(
+        quiet.server.account_route_states().await[2]["remote@example.invalid"],
+        "inactive"
+    );
+
+    // Without Antigravity account routes, states read no login at all.
+    let unconfigured = running("").await;
+    let reads = crate::keychain::test_loads("gemini");
+    assert!(unconfigured.server.account_route_states().await[2].is_empty());
+    assert_eq!(crate::keychain::test_loads("gemini"), reads);
+
+    let mut failing = fixture("http", "status_401").await;
+    let endpoint = format!("http://127.0.0.1:{}", failing.addr.port());
+    let config = format!(
+        "proxies:\n  lookup: {endpoint}\nantigravity:\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n"
+    );
+    let failed = running_with_tls(&config, |_| {}).await;
+    trust(&failed, &failing, &endpoint);
+    failed.server.traffic_credential_labels().await;
+    assert!(
+        failing
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT www.googleapis.com")
+    );
+    assert!(
+        failing
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /oauth2/v2/userinfo ")
+    );
+    assert_eq!(
+        failed.server.account_route_states().await[2]["remote@example.invalid"],
+        "probe_failed"
+    );
+    // A failure is not retried at once.
+    failed.server.traffic_credential_labels().await;
+    assert!(failing.requests.try_recv().is_err());
+
+    let mut lookup = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let running = running(&config.replace(
+        &format!("{}", failing.addr.port()),
+        &format!("{}", lookup.addr.port()),
+    ))
+    .await;
+    trust(&running, &lookup, &endpoint);
+    let labels = running.server.traffic_credential_labels().await;
+    assert_eq!(
+        labels[&(
+            "Antigravity".to_owned(),
+            "remote@example.invalid".to_owned()
+        )],
+        "remote@example.invalid"
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT www.googleapis.com")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /oauth2/v2/userinfo ")
+    );
+    // Learned for the login: requests and later discovery need no lookup.
+    assert_eq!(
+        running.server.account_route_states().await[2]["remote@example.invalid"],
+        "active"
+    );
+    running.server.traffic_credential_labels().await;
+    assert!(lookup.requests.try_recv().is_err());
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+/// Antigravity's refresh of `refresh` through the explicit token URL.
+async fn antigravity_refresh(running: &Running, refresh: &str, client: &str) -> reqwest::Response {
+    http()
+        .post(format!(
+            "{}/antigravity/https://oauth2.googleapis.com/token",
+            running.url
+        ))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "client_id={client}&client_secret=public&grant_type=refresh_token&refresh_token={refresh}"
+        ))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn antigravity_token_refresh_routes_like_codex_and_learns_its_id_token_account() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let client = crate::antigravity::CLIENT_ID;
+    let mut token = fixture("http", "google_token").await;
+    let mut payload = fixture("http", "gemini_sse").await;
+    let token_endpoint = format!("http://127.0.0.1:{}", token.addr.port());
+    let payload_endpoint = format!("http://127.0.0.1:{}", payload.addr.port());
+    let state = tempfile::tempdir().unwrap();
+    let file = state.path().join(crate::refresh_routes::ANTIGRAVITY_FILE);
+    let config = |file_only: bool| {
+        format!(
+            "proxies:\n  login: {token_endpoint}\n  account: {payload_endpoint}\nantigravity:\n  account_auth_file_only: {file_only}\n  routing:\n    account:\n      default: login\n      remote@example.invalid: account\n"
+        )
+    };
+    let start = |file_only: bool| {
+        let config = config(file_only);
+        let file = file.clone();
+        async move {
+            running_with_server(
+                &config,
+                |_| {},
+                |server| {
+                    server.with_antigravity_refresh_routes(
+                        crate::refresh_routes::RefreshRoutes::load(file),
+                    )
+                },
+            )
+            .await
+        }
+    };
+    let running = start(true).await;
+    trust(&running, &token, &token_endpoint);
+    trust(&running, &payload, &payload_endpoint);
+    crate::antigravity::set_test_login("saved-access", "saved-refresh");
+
+    // The saved login's refresh takes its route, `default` while unnamed.
+    let response = antigravity_refresh(&running, "saved-refresh", client).await;
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("renewed-access"));
+    assert!(
+        token
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT oauth2.googleapis.com:443 ")
+    );
+    let forwarded = token.requests.recv().await.unwrap();
+    assert!(forwarded.starts_with("POST /token HTTP/1.1"));
+    assert!(forwarded.contains("accept-encoding: identity"));
+    assert!(forwarded.ends_with("refresh_token=saved-refresh"));
+    let refresh = first_record(&running, "request_finished").await;
+    assert_eq!(refresh["service"], "antigravity");
+    assert_eq!(refresh["account_label"], "default");
+    assert_eq!(refresh["credential_match"], "configured");
+
+    // Its ID token named the account: requests now take its route, with no lookup.
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("remote@example.invalid") && !saved.contains("saved-refresh"));
+    antigravity_request(&running, "saved-access").await;
+    expect_payload(&mut payload, "saved-access").await;
+
+    // Refused before any connection: another Google client, an unknown
+    // refresh token, another method or another path on the token host.
+    assert_eq!(
+        antigravity_refresh(
+            &running,
+            "saved-refresh",
+            "gcloud.apps.googleusercontent.com"
+        )
+        .await
+        .status(),
+        403
+    );
+    assert_eq!(
+        antigravity_refresh(&running, "unknown-refresh", client)
+            .await
+            .status(),
+        403
+    );
+    let get = http()
+        .get(format!(
+            "{}/antigravity/https://oauth2.googleapis.com/token",
+            running.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 405);
+    let other = http()
+        .post(format!(
+            "{}/antigravity/https://oauth2.googleapis.com/tokeninfo",
+            running.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 404);
+    assert!(token.requests.try_recv().is_err());
+    assert!(payload.requests.try_recv().is_err());
+
+    // With account_auth_file_only: false, a learned refresh token that is no
+    // longer the saved login's still takes its account's route.
+    drop(running);
+    crate::antigravity::set_test_login("switched-access", "switched-refresh");
+    let open = start(false).await;
+    trust(&open, &token, &token_endpoint);
+    trust(&open, &payload, &payload_endpoint);
+    let response = antigravity_refresh(&open, "saved-refresh", client).await;
+    assert_eq!(response.status(), 200);
+    assert!(
+        payload
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT oauth2.googleapis.com:443 ")
+    );
+    assert!(
+        payload
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /token HTTP/1.1")
+    );
+    assert!(token.requests.try_recv().is_err());
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }

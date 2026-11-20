@@ -15,7 +15,7 @@ enum Kind {
 type Getter = fn(&Config) -> Value;
 
 /// Configuration values the Settings page may change, as dotted YAML keys.
-const EDITABLE: [(&str, Kind, Getter); 12] = [
+const EDITABLE: [(&str, Kind, Getter); 13] = [
     ("auto_refresh_access_token", Kind::Flag, |c| {
         json!(c.auto_refresh_access_token)
     }),
@@ -46,6 +46,9 @@ const EDITABLE: [(&str, Kind, Getter); 12] = [
     }),
     ("codex.account_auth_file_only", Kind::Flag, |c| {
         json!(c.codex.account_auth_file_only)
+    }),
+    ("antigravity.account_auth_file_only", Kind::Flag, |c| {
+        json!(c.antigravity.account_auth_file_only)
     }),
     ("claude.account_auth_file_only", Kind::Flag, |c| {
         json!(c.claude.account_auth_file_only)
@@ -304,6 +307,19 @@ mod tests {
                 )
             );
             assert_eq!(Config::parse(&out).unwrap().websocket.read_seconds, 1200.0);
+        }
+        // An Antigravity section the file lacks is added, in the file's newlines.
+        for newline in ["\n", "\r\n"] {
+            let base = BASE.replace('\n', newline);
+            let out =
+                set_scalar(&base, &["antigravity", "account_auth_file_only"], "false").unwrap();
+            assert!(out.starts_with(&base));
+            if newline == "\r\n" {
+                assert!(!out.replace("\r\n", "").contains('\n'));
+            }
+            let config = Config::parse(&out).unwrap();
+            assert!(!config.antigravity.account_auth_file_only);
+            assert!(!config.antigravity.enabled());
         }
         let out = set_scalar(EXAMPLE, &["claude", "account_auth_file_only"], "false").unwrap();
         let config = Config::parse(&out).unwrap();

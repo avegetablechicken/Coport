@@ -91,7 +91,10 @@ pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 mod credential_checks;
 #[path = "relay.rs"]
 mod relay;
+pub use antigravity_forward::AntigravityProfiles;
 pub use credential_checks::CredentialReport;
+#[path = "server_antigravity.rs"]
+mod antigravity_forward;
 #[path = "server_transport.rs"]
 mod transport;
 #[path = "websocket_relay.rs"]
@@ -114,6 +117,9 @@ pub struct Server {
     clients: Mutex<HashMap<String, reqwest::Client>>,
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
+    antigravity_profiles: AntigravityProfiles,
+    antigravity_refresh_routes:
+        Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
     codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
@@ -137,6 +143,8 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
+            antigravity_profiles: Default::default(),
+            antigravity_refresh_routes: Default::default(),
             refresh_routes: Default::default(),
             codex_refresh_routes: Default::default(),
             auto_refresh: Default::default(),
@@ -186,7 +194,11 @@ impl Server {
     /// warning that the local OAuth metadata did not match.
     pub async fn account_route_states(
         &self,
-    ) -> [std::collections::BTreeMap<String, &'static str>; 2] {
+    ) -> [std::collections::BTreeMap<String, &'static str>; 3] {
+        let [codex, claude] = self.claude_route_states().await;
+        [codex, claude, self.antigravity_route_states().await]
+    }
+    async fn claude_route_states(&self) -> [std::collections::BTreeMap<String, &'static str>; 2] {
         let mut states = self.config.account_route_states().await;
         if !states[1].values().any(|state| *state == "unknown") {
             return states;
@@ -259,6 +271,7 @@ impl Server {
         &self,
     ) -> std::collections::BTreeMap<(String, String), String> {
         let mut labels = self.config.local_traffic_credential_labels().await;
+        self.cached_antigravity_labels(&mut labels);
         if let Ok(profiles) = self.claude_profiles.lock() {
             for (_, identity) in profiles.values() {
                 if let Some(label) = crate::identity::routing_account_label(
@@ -281,10 +294,12 @@ impl Server {
         let mut labels = self.config.local_traffic_credential_labels().await;
         // Background identity discovery requires explicit consent to probing.
         // A payload fallback route is not authorization for a profile request.
+        let _discovery = self.discovery.lock().await;
+        self.cached_antigravity_labels(&mut labels);
+        self.discover_antigravity_label(&mut labels).await;
         let Some(proxy) = self.config.claude.routing.account_probe.as_ref() else {
             return labels;
         };
-        let _discovery = self.discovery.lock().await;
         for (source, account) in self.config.claude.account_sources() {
             if account.claude_identity().is_some_and(|identity| {
                 labels.contains_key(&("Claude".into(), identity.account_id))
@@ -817,6 +832,12 @@ impl Server {
         }
         if incoming.method() == "CONNECT" {
             return Err(Error::new(400, "Invalid CONNECT request."));
+        }
+        if service == Service::Antigravity {
+            if websocket {
+                return Err(Error::new(400, "Antigravity does not use WebSockets."));
+            }
+            return self.forward_antigravity(incoming, target, log).await;
         }
         // `service` was decided from this target by `Config::request_service`.
         let claude = service == Service::Claude;
@@ -1378,9 +1399,14 @@ impl Server {
         // The refresh token it replaces names the account even where the
         // routing does not map it.
         Ok(if claude {
-            self.learn_refresh_route(response, self.refresh_routes.clone(), learned)
+            self.learn_refresh_route(response, self.refresh_routes.clone(), learned, None)
         } else {
-            self.learn_refresh_route(response, self.codex_refresh_routes.clone(), codex_identity)
+            self.learn_refresh_route(
+                response,
+                self.codex_refresh_routes.clone(),
+                codex_identity,
+                None,
+            )
         })
     }
 
@@ -1391,6 +1417,7 @@ impl Server {
         upstream: reqwest::Response,
         routes: Arc<crate::refresh_routes::RefreshRoutes<A>>,
         previous: Option<A>,
+        sent: Option<String>,
     ) -> reqwest::Response {
         const LIMIT: usize = 65536;
         let mut response = hyper::Response::builder()
@@ -1419,7 +1446,9 @@ impl Server {
                 yield Ok(bytes);
             }
             if whole {
-                if let Err(error) = routes.learn_response(&seen, previous.as_ref()) {
+                if let Err(error) =
+                    routes.learn_response_for(&seen, sent.as_deref(), previous.as_ref())
+                {
                     logger.write(
                         "refresh_route_unsaved",
                         [("reason".to_owned(), error.to_string().into())]

@@ -1,10 +1,12 @@
 //! Claude and Codex logins by refresh token, learned from the token responses
 //! the proxy relays. A refresh request carries nothing else that names its
 //! account, and a refresh token cannot be looked up upstream; the response
-//! names the account its new refresh token belongs to. Only a SHA-256 digest
+//! names the account its new refresh token belongs to. Antigravity's saved
+//! login keeps its refresh token while its access tokens rotate, so the
+//! account a lookup named for it is kept the same way. Only a SHA-256 digest
 //! of each refresh token is kept, so neither memory nor the file holds a
 //! credential.
-use crate::{claude::ClaudeIdentity, identity::Identity};
+use crate::{antigravity::AntigravityIdentity, claude::ClaudeIdentity, identity::Identity};
 use std::{
     collections::HashMap,
     io::Write,
@@ -17,6 +19,7 @@ use std::{
 /// The files, beside the configuration, that keep learned routes across restarts.
 pub const FILE: &str = "claude-refresh-routes.json";
 pub const CODEX_FILE: &str = "codex-refresh-routes.json";
+pub const ANTIGRAVITY_FILE: &str = "antigravity-refresh-routes.json";
 
 /// The account a learned refresh token routes as.
 pub trait Account: Clone + Send + 'static {
@@ -61,6 +64,22 @@ impl Account for Identity {
     }
     fn usernames(&self) -> &[String] {
         &self.usernames
+    }
+}
+/// An Antigravity account, keyed by email, is learned from Google's token
+/// responses, whose ID token names it, or from a lookup.
+impl Account for AntigravityIdentity {
+    fn named_by(response: &serde_json::Value) -> Option<Self> {
+        Self::token_response(response)
+    }
+    fn learned(account_id: String, _: Vec<String>) -> Self {
+        Self { email: account_id }
+    }
+    fn account_id(&self) -> &str {
+        &self.email
+    }
+    fn usernames(&self) -> &[String] {
+        &[]
     }
 }
 /// A login rotates its refresh token on every renewal; a client may still
@@ -113,6 +132,17 @@ impl<A: Account> RefreshRoutes<A> {
             routes: Mutex::new(routes),
             account: PhantomData,
         }
+    }
+
+    /// Every learned account, for display labels.
+    pub fn identities(&self) -> Vec<A> {
+        let Ok(routes) = self.routes.lock() else {
+            return Vec::new();
+        };
+        routes
+            .values()
+            .map(|learned| A::learned(learned.account_id.clone(), learned.usernames.clone()))
+            .collect()
     }
 
     pub fn identity(&self, refresh_token: &str) -> Option<A> {
@@ -181,11 +211,22 @@ impl<A: Account> RefreshRoutes<A> {
     /// belongs to the account it names, else to `previous`, the account of
     /// the refresh token it replaces.
     pub fn learn_response(&self, body: &[u8], previous: Option<&A>) -> std::io::Result<bool> {
+        self.learn_response_for(body, None, previous)
+    }
+    /// `learn_response`, where a response without a new refresh token, as
+    /// Google's, keeps `sent`, the refresh token it renewed.
+    pub fn learn_response_for(
+        &self,
+        body: &[u8],
+        sent: Option<&str>,
+        previous: Option<&A>,
+    ) -> std::io::Result<bool> {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
             return Ok(false);
         };
         let Some(refresh_token) = value["refresh_token"]
             .as_str()
+            .or(sent)
             .filter(|token| crate::identity::valid_token(token))
         else {
             return Ok(false);
@@ -226,6 +267,27 @@ mod tests {
         let learned = routes.identity("refresh-secret").unwrap();
         assert_eq!(learned.account_id, "acct-1");
         assert_eq!(learned.usernames, ["one@example.invalid"]);
+        assert!(routes.identity("other").is_none());
+    }
+
+    #[test]
+    fn google_responses_keep_the_sent_refresh_token_and_name_it_by_id_token() {
+        let routes = RefreshRoutes::<AntigravityIdentity>::default();
+        // {"email":"remote@example.invalid","sub":"1"}
+        let body = br#"{"access_token":"a","id_token":"h.eyJlbWFpbCI6InJlbW90ZUBleGFtcGxlLmludmFsaWQiLCJzdWIiOiIxIn0.s"}"#;
+        assert!(routes.learn_response_for(body, Some("sent"), None).unwrap());
+        assert_eq!(
+            routes.identity("sent").unwrap().email,
+            "remote@example.invalid"
+        );
+        // Without a sent token, as for Codex and Claude, nothing is learned.
+        assert!(!routes.learn_response(body, None).unwrap());
+        // Nor without an account: no ID token and no previous one.
+        assert!(
+            !routes
+                .learn_response_for(br#"{"access_token":"a"}"#, Some("other"), None)
+                .unwrap()
+        );
         assert!(routes.identity("other").is_none());
     }
 

@@ -130,6 +130,8 @@ struct Raw {
     codex: Codex,
     #[serde(default)]
     claude: crate::claude::Claude,
+    #[serde(default)]
+    antigravity: crate::antigravity::Antigravity,
     listen_port: u16,
     #[serde(default)]
     allow_external_access: bool,
@@ -206,6 +208,7 @@ const RETIRED_TOP_LEVEL: [&str; 11] = [
 pub struct Config {
     pub codex: Codex,
     pub claude: crate::claude::Claude,
+    pub antigravity: crate::antigravity::Antigravity,
     pub listen_port: u16,
     pub allow_external_access: bool,
     /// Refresh saved OAuth logins after a model request returns HTTP 401.
@@ -268,6 +271,7 @@ impl Config {
         let c = Self {
             codex,
             claude: raw.claude,
+            antigravity: raw.antigravity,
             listen_port: raw.listen_port,
             allow_external_access: raw.allow_external_access,
             auto_refresh_access_token: raw.auto_refresh_access_token,
@@ -312,6 +316,7 @@ impl Config {
         }
 
         self.claude.validate(self)?;
+        self.antigravity.validate(self)?;
         validate_directories(&self.codex.homes)?;
         if self.codex.routing.account_probe.is_some() {
             return Err(Error::config(

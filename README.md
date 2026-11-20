@@ -22,6 +22,8 @@ background service, and as a menu bar / tray app.
 
 - Per-credential routing for Codex and Claude Code: ChatGPT/Claude logins, API Keys, Codex
   providers, Claude settings files and explicit upstream URLs
+- Antigravity (Google AI Pro) Cloud Code requests routed by Google login, with Gemini token
+  usage in Activity
 - Logins read where the CLIs keep them (`auth.json`, `.credentials.json` or the OS credential
   store), refreshed per request
 - HTTP, HTTPS and SOCKS5 outbound proxies with authentication and ordered, health-checked

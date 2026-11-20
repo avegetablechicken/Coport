@@ -91,6 +91,12 @@ test('groups by service with one hue each and keeps unidentified last', () => {
   assert.deepEqual(groups[0].slices.map((s) => [s.name, s.value, s.color ?? null]), [['c', 20, 'var(--codex-1)'], ['a', 10, 'var(--codex-2)'], ['Unidentified', 50, null]]);
   assert.deepEqual(groups[1].slices.map((s) => s.color), ['var(--claude-1)']);
 });
+test('Antigravity accounts form their own group in its hue after the other apps', () => {
+  const { shareGroups } = setup();
+  const groups = shareGroups([credential('g@example.com', 40, 'Antigravity'), credential('b', 30, 'Claude'), credential('c', 20)], requests);
+  assert.deepEqual(plain(groups.map((g) => [g.service, g.value])), [['Codex', 20], ['Claude', 30], ['Antigravity', 40]]);
+  assert.deepEqual(groups[2].slices.map((s) => s.color), ['var(--antigravity-1)']);
+});
 test('keeps every sizable credential and folds only tiny ones into Others', () => {
   const { shareGroups } = setup();
   // Six large credentials all keep their slice; there is no fixed count.

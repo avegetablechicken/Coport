@@ -848,6 +848,19 @@ impl Config {
                 }
             }
         }
+        // Antigravity's records name their route in `account_label`.
+        let antigravity = &self.antigravity.routing;
+        for name in antigravity.account.keys() {
+            labels.insert(("Antigravity".into(), name.clone()), name.clone());
+        }
+        for (name, choice) in [
+            ("account_fallback", &antigravity.account_fallback),
+            ("fallback", &antigravity.fallback),
+        ] {
+            if choice.is_some() {
+                labels.insert(("Antigravity".into(), name.into()), name.into());
+            }
+        }
         for (service, routing) in [
             ("Codex", &self.codex.routing),
             ("Claude", &self.claude.routing),

@@ -25,6 +25,7 @@ pub struct Core {
     account_probe: Option<std::sync::Arc<coport_gui::tasks::Tasks>>,
     /// Outlives `account_probe`, which is rebuilt for each configuration.
     claude_profiles: coport::server::ClaudeProfiles,
+    antigravity_profiles: coport::server::AntigravityProfiles,
     /// Last account activation; kept across config changes until replaced.
     account_states: Option<AccountStates>,
     account_states_error: Option<String>,
@@ -125,6 +126,7 @@ impl Core {
             config: ConfigCache::default(),
             account_probe: None,
             claude_profiles: Default::default(),
+            antigravity_profiles: Default::default(),
             account_states: None,
             account_states_error: None,
             account_states_pending: false,
@@ -285,7 +287,8 @@ impl Core {
                     self.config_path(),
                     self.loaded_config()?.clone(),
                 )
-                .with_claude_profiles(self.claude_profiles.clone()),
+                .with_claude_profiles(self.claude_profiles.clone())
+                .with_antigravity_profiles(self.antigravity_profiles.clone()),
             ));
         }
         self.account_probe.clone()
@@ -438,6 +441,7 @@ impl Core {
             urls: Urls {
                 claude: format!("{base}/anthropic"),
                 codex: format!("{base}/v1"),
+                antigravity: format!("{base}/antigravity"),
                 chatgpt: format!("https://127.0.0.1:{port}/backend-api"),
                 ca_certificate: coport::local_tls::dir_for(&self.config_path())
                     .join(coport::local_tls::CA_FILE)
@@ -673,6 +677,16 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             |selector| describe::claude_api_key(config, selector),
             |selector| config.claude.api_key_kind(selector).unwrap_or("unknown"),
         ),
+        // Antigravity routes accounts only.
+        antigravity: service(
+            vec![("upstream", config.antigravity.base_url.clone())],
+            config.antigravity.account_auth_file_only,
+            false,
+            &config.antigravity.routing,
+            false,
+            |_| None,
+            |_| "unknown",
+        ),
     }
 }
 
@@ -779,9 +793,13 @@ pub(crate) type AccountStates = coport_gui::tasks::AccountStates;
 impl Snapshot {
     pub fn set_account_route_states(&mut self, states: AccountStates) {
         if let Some(details) = &mut self.config.details {
-            for (service, states) in [&mut details.codex, &mut details.claude]
-                .into_iter()
-                .zip(states)
+            for (service, states) in [
+                &mut details.codex,
+                &mut details.claude,
+                &mut details.antigravity,
+            ]
+            .into_iter()
+            .zip(states)
             {
                 for route in &mut service.account_routes {
                     route.activation = states.get(&route.selector).cloned();
@@ -818,6 +836,8 @@ struct Urls {
     base: String,
     claude: String,
     codex: String,
+    /// Antigravity's `CLOUD_CODE_URL`.
+    antigravity: String,
     /// Codex 0.156+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
     chatgpt: String,
     ca_certificate: String,
@@ -844,6 +864,7 @@ struct ConfigDetails {
     proxies: Vec<ProxyDto>,
     codex: ServiceDto,
     claude: ServiceDto,
+    antigravity: ServiceDto,
 }
 
 #[derive(Serialize)]
@@ -1214,6 +1235,7 @@ mod tests {
             base: "http://127.0.0.1:8787".into(),
             claude: "claude".into(),
             codex: "codex".into(),
+            antigravity: "antigravity".into(),
             chatgpt: "chatgpt".into(),
             ca_certificate: "/tls/ca.pem".into(),
             proxy_ca_certificate: "/tls/proxy-ca.pem".into(),
@@ -1222,7 +1244,7 @@ mod tests {
         // The panel's setup snippets read `urls.caCertificate` and `urls.proxyCaCertificate`.
         assert_eq!(urls["caCertificate"], "/tls/ca.pem");
         assert_eq!(urls["proxyCaCertificate"], "/tls/proxy-ca.pem");
-        for key in ["base", "claude", "codex", "chatgpt"] {
+        for key in ["base", "claude", "codex", "antigravity", "chatgpt"] {
             assert!(urls[key].is_string());
         }
     }

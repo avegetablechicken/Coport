@@ -73,6 +73,17 @@ claude:
   # If omitted, account_fallback, then fallback, supplies the lookup proxy.
   # With true, unmatched tokens are rejected even when a fallback exists.
 
+# Antigravity (agy: CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity) routes
+# its Cloud Code requests by the login saved in the OS credential store
+# (gemini/antigravity). Accounts only; see docs/configuration.md#antigravity.
+# antigravity:
+#   base_url: "https://daily-cloudcode-pa.googleapis.com"
+#   account_auth_file_only: true # false: name other tokens via Google userinfo.
+#   routing:
+#     account:
+#       default: us # The saved login; "you@gmail.com" keys need its email.
+#     # account_probe: us # Google account lookup before the route is known.
+
 # Omit API Key entries unless configured. To enable them, add under routing:
 # codex.routing.api_key.OPENAI_API_KEY: us
 # claude.routing.api_key.ANTHROPIC_API_KEY: claude_official

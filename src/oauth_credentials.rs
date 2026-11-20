@@ -65,12 +65,16 @@ pub(crate) async fn load(source: &AccountSource, service: Service) -> Result<(St
     match service {
         Service::Codex => crate::identity::saved_auth_store(dir).await,
         Service::Claude => crate::claude::saved_credentials_store(dir).await,
+        Service::Antigravity => Err(Error::config(
+            "Antigravity renews its own login; Coport does not refresh it.",
+        )),
     }
 }
 pub(crate) fn access(value: &Value, service: Service) -> Option<&str> {
     match service {
         Service::Codex => value["tokens"]["access_token"].as_str(),
         Service::Claude => value["claudeAiOauth"]["accessToken"].as_str(),
+        Service::Antigravity => None,
     }
     .filter(|s| crate::identity::valid_token(s))
 }
@@ -78,6 +82,7 @@ pub(crate) fn refresh(value: &Value, service: Service) -> Option<&str> {
     match service {
         Service::Codex => value["tokens"]["refresh_token"].as_str(),
         Service::Claude => value["claudeAiOauth"]["refreshToken"].as_str(),
+        Service::Antigravity => None,
     }
     .filter(|s| crate::identity::valid_token(s))
 }

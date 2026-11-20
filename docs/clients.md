@@ -196,11 +196,11 @@ To route proxy-port clients by credential, as for base URL clients, enable
 connect_credential_routing: true # Default false; restart to apply.
 ```
 
-CONNECT requests to the API hosts that the `codex` and `claude` sections route by
-credential are then answered locally instead of tunnelled: the client's TLS is
-terminated with a certificate from a second private CA, `tls/proxy-ca.pem` (with
-an owner-only `tls/proxy-ca-key.pem`), and each request inside is handled exactly
-like the explicit URL form `/anthropic/https://<host>/...` or
+CONNECT requests to the API hosts that the `codex`, `claude` and `antigravity`
+sections route by credential are then answered locally instead of tunnelled: the
+client's TLS is terminated with a certificate from a second private CA,
+`tls/proxy-ca.pem` (with an owner-only `tls/proxy-ca-key.pem`), and each request
+inside is handled exactly like the explicit URL form `/anthropic/https://<host>/...` or
 `/codex/https://<host>/...`. Account, API Key and URL routes, fallbacks, OAuth
 refresh and WebSocket upgrades therefore select the outbound proxy as they do for
 base URL clients, and unmatched credentials are rejected before any outbound
@@ -214,6 +214,7 @@ connection. These hosts are decrypted:
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Either, for each URL route | that route's host and port, including public IPv4 addresses |
+| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com` and `oauth2.googleapis.com`, as `/antigravity/https://<host>/...` |
 
 A host routed by both services uses the unprefixed `/https://` form and its usual
 conflict rules. Destination discovery reads local provider/settings definitions
@@ -418,3 +419,66 @@ hostname/IP identity. On Linux, supply a self-signed API certificate through the
 service's `SSL_CERT_FILE` CA bundle (include the system CAs), and restart. Other
 platforms use their native certificate stores. Linux builds vendor OpenSSL and
 require a C toolchain, make and Perl; no system libssl runtime is needed. No settings-directory discovery or disabled TLS verification is needed.
+
+## Connect Antigravity
+
+Antigravity (Google AI Pro) sends its model and agent requests to Google's
+Cloud Code API (`daily-cloudcode-pa.googleapis.com`, falling back to
+`cloudcode-pa.googleapis.com`) with the Google login's access token. Configure
+an `antigravity` section as shown in [Configuration](configuration.md#antigravity),
+then point the Antigravity CLI (`agy`) at the local listener:
+
+```sh
+CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity agy
+```
+
+Use your configured `listen_port`. The `/antigravity` prefix is removed before
+forwarding to `antigravity.base_url`, so `/antigravity/v1internal:loadCodeAssist`
+reaches `https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` by
+default. Explicit targets such as
+`/antigravity/https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`
+may name only `base_url` or one of the two Cloud Code hosts; any other host is
+rejected before any outbound connection. Requests are plain HTTP/1.1 JSON and
+server-sent events, forwarded unchanged except for hop-by-hop headers and
+cookies. `agy` ignores `CLOUD_CODE_URL` while an enterprise gateway is
+configured.
+
+`POST` requests to `:generateContent` and `:streamGenerateContent` are model
+calls: the request's model, the response's `modelVersion` and `responseId`, the
+finish reason (`MAX_TOKENS` is recorded as incomplete) and the Gemini usage
+appear in the request log and in Activity. As for OpenAI, input tokens are the
+whole prompt (`promptTokenCount`, cached content included), cached input is
+`cachedContentTokenCount`, and output adds `thoughtsTokenCount` to
+`candidatesTokenCount`.
+
+`CLOUD_CODE_URL` moves only Cloud Code requests; `agy` has no setting for its
+token endpoint, and reaches it and other Google services directly, or through
+`HTTPS_PROXY`.
+
+As for Codex and Claude, Antigravity's token refresh is routed by Coport when
+it arrives through [the proxy port](#credential-routing-on-the-proxy-port) or at
+the explicit URL `/antigravity/https://oauth2.googleapis.com/token`:
+
+- Only `POST` with Antigravity's `client_id` and a `refresh_token` is served.
+  The endpoint serves every Google client, so another client's token request
+  (such as a `gcloud` started from an Antigravity terminal that inherited
+  `HTTPS_PROXY`) is refused with 403 before any connection; run those clients
+  without this proxy. A sign-in's code exchange has no `refresh_token` and is
+  refused with 400, as for Codex and Claude, so sign in without the proxy port.
+  Other paths on the host return 404.
+- The saved login's refresh token takes its account's route (`default` until
+  its email is known). With `antigravity.account_auth_file_only: false`, a
+  refresh token learned earlier takes its account's route, else
+  `account_fallback`, then `fallback`; otherwise any other refresh token is
+  refused with 403.
+- The response is relayed unchanged. Its ID token names the account, which is
+  learned for the refresh token the request renewed, as Codex's learned refresh
+  routes are, so later requests of that login need no account lookup.
+
+Coport never refreshes or writes the Antigravity login itself.
+
+With [proxy port credential routing](#credential-routing-on-the-proxy-port), the
+two Cloud Code hosts, `antigravity.base_url` and `oauth2.googleapis.com` are
+decrypted instead, for a client started with `HTTPS_PROXY` that trusts the proxy
+CA. Every other CONNECT is refused, so its other Google hosts are not reachable
+through the proxy port.

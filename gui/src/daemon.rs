@@ -117,7 +117,9 @@ enum Response {
     Status(Box<Status>),
     Stopped,
     Probe(crate::proxy::Probe),
-    AccountStates([std::collections::BTreeMap<String, String>; 2]),
+    /// Codex, Claude, then Antigravity. A list, so a daemon that reports
+    /// fewer apps still answers; the missing ones have no states.
+    AccountStates(Vec<std::collections::BTreeMap<String, String>>),
     CredentialReports(Vec<coport::server::CredentialReport>),
     CredentialLabels(Vec<((String, String), String)>),
     Recorded,
@@ -264,14 +266,12 @@ impl Client {
         }
     }
 
-    pub async fn account_states(
-        &self,
-    ) -> io::Result<[std::collections::BTreeMap<String, String>; 2]> {
+    pub async fn account_states(&self) -> io::Result<crate::tasks::AccountStates> {
         match self
             .request_async(Action::AccountStates, Duration::from_secs(60))
             .await?
         {
-            Response::AccountStates(states) => Ok(states),
+            Response::AccountStates(states) => Ok(crate::tasks::account_states(states)),
             _ => Err(io::Error::other("Unexpected daemon account response")),
         }
     }
@@ -604,7 +604,7 @@ async fn handle_control(
                 None => Response::Error("Proxy is not in the running daemon configuration; restart the daemon after changing proxies.".into()),
             },
             Action::CredentialReports => Response::CredentialReports(server.credential_reports().await),
-            Action::AccountStates => Response::AccountStates(server.account_route_states().await.map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect())),
+            Action::AccountStates => Response::AccountStates(server.account_route_states().await.into_iter().map(|states| states.into_iter().map(|(key, value)| (key, value.to_owned())).collect()).collect()),
             Action::CachedCredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
             // Legacy statistics readers must obey the same no-network contract.
             Action::CredentialLabels => Response::CredentialLabels(server.cached_traffic_credential_labels().await.into_iter().collect()),
@@ -719,6 +719,9 @@ async fn serve_until(
         ))
         .with_codex_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
             dir.join(coport::refresh_routes::CODEX_FILE),
+        ))
+        .with_antigravity_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
+            dir.join(coport::refresh_routes::ANTIGRAVITY_FILE),
         ));
     if let Some(proxy) = credential_proxy {
         server = server.with_credential_proxy(proxy);
@@ -900,7 +903,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let reports = client.credential_reports().await.unwrap();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Codex", "Claude", "Antigravity"]
+        );
         assert!(reports.iter().all(|report| report.ok));
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();

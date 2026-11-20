@@ -112,6 +112,7 @@ impl Entry {
             // Token refreshes were once logged as `*_auth`.
             Some("codex" | "codex_auth") => Some(Service::Codex),
             Some("claude" | "claude_auth") => Some(Service::Claude),
+            Some("antigravity") => Some(Service::Antigravity),
             // "connect": tunnels, before they stopped naming a service.
             Some(_) => None,
             None if self.get("method") == Some("CONNECT") => None,

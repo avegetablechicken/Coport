@@ -32,6 +32,7 @@ pub fn codex_target(target: &str) -> &str {
 pub enum Service {
     Codex,
     Claude,
+    Antigravity,
 }
 impl Service {
     /// The logged `service` value.
@@ -39,6 +40,7 @@ impl Service {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
         }
     }
     /// The name statistics show.
@@ -46,18 +48,23 @@ impl Service {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
 
-/// Scoped targets and token refreshes decide the app first, then URL routes,
-/// then Claude's own paths; anything else is Codex. `url_route` matches the
+/// Antigravity's scope, then other scoped targets and token refreshes decide
+/// the app first, then URL routes, then Claude's own paths; anything else is
+/// Codex. `url_route` matches the
 /// unscoped target against configured URL routes, given whether it was
 /// scoped to Claude.
 fn service_of<E>(
     target: &str,
     url_route: impl FnOnce(&str, bool) -> std::result::Result<Option<Service>, E>,
 ) -> std::result::Result<Service, E> {
+    if crate::antigravity::target(target).is_some() {
+        return Ok(Service::Antigravity);
+    }
     let codex_scoped = target.starts_with("/codex/https://");
     let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
     let target = codex_target(target);

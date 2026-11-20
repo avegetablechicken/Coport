@@ -26,7 +26,7 @@
   --teal: #30b0c7;
   --indigo: #5856d6;
   --brown: #a2845e;
-  /* Traffic share hues: Codex teal after OpenQuota, Claude orange; fainter shades rank lower. */
+  /* Traffic share hues: Codex teal after OpenQuota, Claude orange, Antigravity blue; fainter shades rank lower. */
   --codex-1: #10a37f;
   --codex-2: #74cda8;
   --codex-3: #9fdacc;
@@ -35,6 +35,11 @@
   --claude-2: #f28a5c;
   --claude-3: #f7b292;
   --claude-4: #fbd2c0;
+  /* Antigravity blue, after Copool's mark. */
+  --antigravity-1: #1c7df1;
+  --antigravity-2: #6aa8f5;
+  --antigravity-3: #9fc6f8;
+  --antigravity-4: #cfe2fb;
   /* Unidentified traffic has no hue, but must still read on the block. */
   --share-unidentified: rgba(0, 0, 0, 0.08);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
@@ -1271,6 +1276,7 @@ details.disclosure[open] summary svg {
 .connect-app .service-mark { width: 14px; height: 14px; }
 .claude-mark { --service-icon: url("icons/claude.svg"); }
 .codex-mark { --service-icon: url("icons/codex.svg"); }
+.antigravity-mark { --service-icon: url("icons/antigravity.svg"); }
 
 /* Routing shares available width; compact long proxy labels before identities. */
 .routing-service + .routing-service { margin-top: 8px; }

@@ -1,5 +1,5 @@
 //! Credential routing for proxy-port clients. A CONNECT to an API host that
-//! the codex or claude section routes by credential is decrypted with the
+//! the codex, claude or antigravity section routes by credential is decrypted with the
 //! proxy CA; each request inside then takes the explicit upstream URL form,
 //! so it is matched and forwarded exactly like a base URL request.
 use crate::{Error, Result, config::Config};
@@ -112,7 +112,7 @@ fn hosts(scopes: &BTreeMap<(String, u16), String>) -> Result<BTreeSet<String>> {
     let hosts: BTreeSet<String> = scopes.keys().map(|(host, _)| host.clone()).collect();
     if hosts.is_empty() {
         return Err(Error::config(
-            "connect_credential_routing requires codex or claude routes.",
+            "connect_credential_routing requires codex, claude or antigravity routes.",
         ));
     }
     Ok(hosts)
@@ -175,6 +175,15 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         .filter(|k| crate::url_routing::is_url_selector(k))
     {
         add(&url(key)?, "/codex/");
+    }
+    if config.antigravity.enabled() {
+        for origin in config.antigravity.origins() {
+            add(&url(origin)?, "/antigravity/");
+        }
+        add(
+            &url(crate::antigravity::TOKEN_REFRESH_UPSTREAM)?,
+            "/antigravity/",
+        );
     }
     // Resolve configured provider definitions, not credentials or active profiles.
     // One unavailable home must not hide routes from the other configured homes.
@@ -276,6 +285,37 @@ mod tests {
             Some("/anthropic/https://182.92.106.196:6060")
         );
         assert_eq!(scopes.len(), 6);
+    }
+
+    #[test]
+    fn antigravity_routes_decrypt_every_cloud_code_endpoint() {
+        let routes = scopes(&config(
+            "antigravity:\n  base_url: https://cloudcode.example.com:8443\n  routing:\n    account: {default: none}\n",
+        ))
+        .unwrap();
+        let get = |host: &str, port| routes.get(&(host.to_owned(), port)).map(String::as_str);
+        assert_eq!(
+            get("daily-cloudcode-pa.googleapis.com", 443),
+            Some("/antigravity/https://daily-cloudcode-pa.googleapis.com")
+        );
+        assert_eq!(
+            get("cloudcode-pa.googleapis.com", 443),
+            Some("/antigravity/https://cloudcode-pa.googleapis.com")
+        );
+        assert_eq!(
+            get("cloudcode.example.com", 8443),
+            Some("/antigravity/https://cloudcode.example.com:8443")
+        );
+        // As Codex's and Claude's, its token endpoint is decrypted too; Google's
+        // sign-in and account hosts are not.
+        assert_eq!(
+            get("oauth2.googleapis.com", 443),
+            Some("/antigravity/https://oauth2.googleapis.com")
+        );
+        assert_eq!(routes.len(), 4);
+        // A probe route alone routes nothing.
+        let probe_only = config("antigravity:\n  routing:\n    account_probe: none\n");
+        assert!(scopes(&probe_only).unwrap().is_empty());
     }
 
     #[test]

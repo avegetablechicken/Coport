@@ -3,11 +3,20 @@ use crate::daemon;
 use coport::{
     config::Config,
     logger::Logger,
-    server::{ClaudeProfiles, Server},
+    server::{AntigravityProfiles, ClaudeProfiles, Server},
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-pub type AccountStates = [BTreeMap<String, String>; 2];
+/// Account route states of Codex, Claude and Antigravity.
+pub type AccountStates = [BTreeMap<String, String>; 3];
+/// States as a daemon lists them; an app it does not report has none.
+pub fn account_states(listed: Vec<BTreeMap<String, String>>) -> AccountStates {
+    let mut states = AccountStates::default();
+    for (slot, listed) in states.iter_mut().zip(listed) {
+        *slot = listed;
+    }
+    states
+}
 pub type CredentialLabels = BTreeMap<(String, String), String>;
 
 pub struct Tasks {
@@ -16,6 +25,7 @@ pub struct Tasks {
     config: Config,
     local: tokio::sync::Mutex<Option<Arc<Server>>>,
     claude_profiles: ClaudeProfiles,
+    antigravity_profiles: AntigravityProfiles,
 }
 
 impl Tasks {
@@ -26,6 +36,7 @@ impl Tasks {
             config,
             local: Default::default(),
             claude_profiles: Default::default(),
+            antigravity_profiles: Default::default(),
         }
     }
 
@@ -33,6 +44,11 @@ impl Tasks {
     /// not repeat their profile lookups.
     pub fn with_claude_profiles(mut self, profiles: ClaudeProfiles) -> Self {
         self.claude_profiles = profiles;
+        self
+    }
+    /// Likewise for Antigravity's Google account lookups.
+    pub fn with_antigravity_profiles(mut self, profiles: AntigravityProfiles) -> Self {
+        self.antigravity_profiles = profiles;
         self
     }
 
@@ -87,7 +103,11 @@ impl Tasks {
     /// never probes upstream or runs a login shell.
     pub async fn account_states(&self) -> Result<AccountStates, String> {
         // Only file-only mode reports activation.
-        if !self.config.codex.account_auth_file_only && !self.config.claude.account_auth_file_only {
+        let antigravity = &self.config.antigravity;
+        if !self.config.codex.account_auth_file_only
+            && !self.config.claude.account_auth_file_only
+            && !(antigravity.account_auth_file_only && !antigravity.routing.account.is_empty())
+        {
             return Ok(Default::default());
         }
         if let Some((client, status)) = self.backend_status(false).await? {
@@ -117,7 +137,15 @@ impl Tasks {
                                 self.directory.join("logs/account-probes.jsonl"),
                             )),
                         )
-                        .with_claude_profiles(self.claude_profiles.clone()),
+                        .with_claude_profiles(self.claude_profiles.clone())
+                        .with_antigravity_profiles(self.antigravity_profiles.clone())
+                        // The daemon's learned Antigravity accounts, when it is absent.
+                        .with_antigravity_refresh_routes(
+                            coport::refresh_routes::RefreshRoutes::load(
+                                self.directory
+                                    .join(coport::refresh_routes::ANTIGRAVITY_FILE),
+                            ),
+                        ),
                     )
                 })
                 .clone()
@@ -159,13 +187,32 @@ impl Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_daemon_listing_fewer_apps_leaves_the_others_without_states() {
+        let codex = BTreeMap::from([("default".to_owned(), "active".to_owned())]);
+        let claude = BTreeMap::from([("me".to_owned(), "inactive".to_owned())]);
+        let states = account_states(vec![codex.clone(), claude.clone()]);
+        assert_eq!(states, [codex.clone(), claude.clone(), BTreeMap::new()]);
+        let antigravity = BTreeMap::from([("default".to_owned(), "active".to_owned())]);
+        let listed = vec![
+            codex.clone(),
+            claude.clone(),
+            antigravity.clone(),
+            BTreeMap::new(),
+        ];
+        assert_eq!(account_states(listed), [codex, claude, antigravity]);
+    }
+
     #[tokio::test]
     async fn credential_checks_fall_back_only_when_daemon_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let tasks = Tasks::new(dir.path().into(), dir.path().join("config.yaml"), config);
         let reports = tasks.credential_reports().await.unwrap();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Codex", "Claude", "Antigravity"]
+        );
         assert!(reports.iter().all(|report| report.ok));
         assert!(tasks.local.lock().await.is_some());
     }

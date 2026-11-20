@@ -98,12 +98,14 @@ pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
         let accent = match service {
             Service::Claude => [0.929, 0.553, 0.424, 1.0],
             Service::Codex => [0.384, 0.792, 0.765, 1.0],
+            Service::Antigravity => [0.416, 0.659, 0.961, 1.0],
         };
         ([1.0, 1.0, 1.0, 1.0], accent)
     } else {
         let accent = match service {
             Service::Claude => [0.851, 0.467, 0.341, 1.0],
             Service::Codex => [0.200, 0.580, 0.565, 1.0],
+            Service::Antigravity => [0.110, 0.490, 0.945, 1.0],
         };
         ([0.0, 0.0, 0.0, 0.85], accent)
     };
@@ -692,7 +694,7 @@ mod tests {
         // At rest a colored frame matches the template drawn in the light bar's
         // ink, so swapping between them does not jump.
         let template = template(44, Status::Running);
-        for service in [Service::Claude, Service::Codex] {
+        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
             let rest = beacon(44, Turn::REST, service, false);
             for (t, c) in template.chunks(4).zip(rest.chunks(4)) {
                 assert!((t[3] as f32 * 0.85 - c[3] as f32).abs() <= 1.0);
@@ -706,12 +708,15 @@ mod tests {
             [px[y + x], px[y + x + 1], px[y + x + 2]]
         };
         for dark in [false, true] {
-            let (claude, codex) = (
+            let (claude, codex, antigravity) = (
                 lantern(Service::Claude, dark),
                 lantern(Service::Codex, dark),
+                lantern(Service::Antigravity, dark),
             );
             assert!(claude[0] > claude[2] + 40, "{claude:?}");
             assert!(codex[2] > codex[0] + 40, "{codex:?}");
+            // Antigravity's blue leans further from red than Codex's teal.
+            assert!(antigravity[2] > antigravity[1] + 30, "{antigravity:?}");
         }
         assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
     }

@@ -43,7 +43,8 @@ claude:
     #   ANTHROPIC_API_KEY: claude_official
 ```
 
-Either service section can be omitted. Within each section:
+Either service section can be omitted. An optional `antigravity` section routes
+Antigravity's Google logins; see [Antigravity](#antigravity). Within each section:
 
 | Field | Purpose |
 | --- | --- |
@@ -55,7 +56,7 @@ Either service section can be omitted. Within each section:
 | `routing.account.<label>` | Proxy choice for that account source |
 | `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, or Claude settings name |
 | `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
-| `routing.account_probe` | Claude OAuth account identity probe route; omitted uses `account_fallback`, then `fallback` |
+| `routing.account_probe` | Claude OAuth or Antigravity Google account identity probe route; omitted uses `account_fallback`, then `fallback` |
 | `routing.fallback` | Default proxy choice for unmatched API Key and account requests |
 
 `routing.fallback` replaces `routing.api_key_fallback`; rename the old key when
@@ -281,6 +282,72 @@ namespace are rejected. The two services never use each other's fallbacks.
 Codex alone supports `codex.routing.mcp_fallback` for public OpenAI documentation
 MCP. Omitted/null/`none` means direct MCP access. Explicit matched routes take
 priority. Account/API fallbacks default to rejection when omitted/null.
+
+### Antigravity
+
+The `antigravity` section routes the Cloud Code requests of Antigravity (see
+[Connect Antigravity](clients.md#connect-antigravity)) by the Google login they
+carry. It has account routes only:
+
+```yaml
+antigravity:
+  base_url: "https://daily-cloudcode-pa.googleapis.com" # Default.
+  saved_login: true # Default: read Antigravity's saved login.
+  account_auth_file_only: true # Default.
+  routing:
+    account:
+      default: us # The saved login.
+      # "you@gmail.com": jp # Its email, when known, takes priority.
+    # account_probe: us # Google account lookup, see below.
+    # account_fallback: us
+    # fallback: us
+```
+
+Antigravity and `agy` keep their login in one item of the OS credential store,
+service `gemini` and account `antigravity`, as written by go-keyring: on macOS
+the Keychain generic password (its JSON wrapped as `go-keyring-base64:`), on
+Windows the generic credential `gemini:antigravity`, on Linux the Secret
+Service item of that service and user name. With `saved_login`, it is read for
+each request; a request whose Bearer token is that login's access token is the
+saved login. Antigravity renews the token itself and saves the new one there.
+The macOS Keychain asks once whether Coport may read the item.
+
+The saved login takes the route of its email, then `default`, then
+`account_fallback`, then `fallback`. Antigravity's own login records no email,
+so only `default` and the fallbacks apply to it unless the login was saved by
+Copool (which records `id_token_email`), its first token refresh through Coport
+names it (see [Connect Antigravity](clients.md#connect-antigravity)), or an
+explicit `account_probe` names it: with `account_probe`, a saved login without
+an email is looked up once, as below, before its first request or refresh is
+sent. The account found is learned for the
+login's refresh token, which stays the same while Antigravity renews its access
+token: like Claude's and Codex's learned refresh routes, only a SHA-256 digest of
+the refresh token is kept, with the email, in `antigravity-refresh-routes.json`
+beside the configuration (the desktop app's data directory for `coportd`), so
+renewed tokens and restarts need no new lookup. Another login (a different
+refresh token) is looked up anew and never takes a learned account. With
+`account_probe`, the credential monitor also names the saved login in the
+background, as for Claude: failures are retried after 10 minutes, and a fallback
+route alone never authorizes a lookup. Email routes match regardless of case. API
+Key routes and `mcp_fallback` are not supported.
+
+As for Codex and Claude with `account_auth_file_only: true`, the desktop app's
+routing page marks the saved login's route active and the others inactive; while
+an explicit `account_probe` has yet to name the login, every route is unknown, or
+"probe failed" after a failed lookup. Activity names Antigravity traffic by the
+route that carried it.
+
+With `account_auth_file_only: true`, any other token is rejected. With `false`,
+another token is named by `GET https://www.googleapis.com/oauth2/v2/userinfo`
+through `account_probe` (omitted: `account_fallback`, then `fallback`); only the
+Bearer token is sent, never the request or its headers. The returned email then
+selects its route, else `account_fallback`, then `fallback`; `default` stays the
+saved login's. Lookups follow the rules of the Claude profile lookup above:
+successful identities are cached per access token in memory (up to 128, least
+recently used evicted, shared by the desktop app across configuration reloads),
+failures are not cached and never forward the request, redirects
+are not followed, responses are limited to 64 KiB and lookups to 10 seconds.
+`saved_login: false` requires `account_auth_file_only: false`.
 
 ## Upstreams, proxies and ordered candidates
 

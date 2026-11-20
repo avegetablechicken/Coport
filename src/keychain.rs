@@ -29,7 +29,23 @@ pub(crate) async fn read(service: &str, account: &str) -> Result<Option<String>>
     let key = (service.to_owned(), account.to_owned());
     tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        read_blocking(key)
+        read_blocking(key, load)
+    })
+    .await
+    .unwrap_or(Err(()))
+    .map_err(|_| Error::config("Cannot read the OS credential store."))
+}
+
+/// An entry a Go program saved with go-keyring, as UTF-8 bytes: the same
+/// generic password on macOS and Secret Service item elsewhere, but on Windows
+/// the credential `service:account`, whose blob is not UTF-16. Reads share
+/// the gate and cooldown of [`read`].
+pub(crate) async fn read_go_keyring(service: &str, account: &str) -> Result<Option<String>> {
+    let gate = GATE.clone().lock_owned().await;
+    let key = (service.to_owned(), account.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        read_blocking(key, load_go_keyring)
     })
     .await
     .unwrap_or(Err(()))
@@ -47,7 +63,7 @@ pub(crate) async fn replace(
     let key = (service.to_owned(), account.to_owned());
     tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        let current = read_blocking(key.clone())?
+        let current = read_blocking(key.clone(), load)?
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         if current.as_ref() != Some(&expected) {
             return Err(());
@@ -81,7 +97,9 @@ fn save(service: &str, account: &str, value: &str) -> std::result::Result<(), ()
     Ok(())
 }
 
-fn read_blocking(key: Key) -> std::result::Result<Option<String>, ()> {
+type Loader = fn(&str, &str) -> std::result::Result<Option<String>, ()>;
+
+fn read_blocking(key: Key, load: Loader) -> std::result::Result<Option<String>, ()> {
     {
         let mut failures = FAILURES.lock().unwrap();
         failures.retain(|_, at| at.elapsed() < FAILURE_COOLDOWN);
@@ -115,6 +133,53 @@ fn load(service: &str, account: &str) -> std::result::Result<Option<String>, ()>
 ))]
 fn load(_: &str, _: &str) -> std::result::Result<Option<String>, ()> {
     Err(())
+}
+
+#[cfg(all(
+    not(test),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
+    #[cfg(target_os = "windows")]
+    let entry = keyring::Entry::new_with_target(&format!("{service}:{account}"), service, account);
+    #[cfg(not(target_os = "windows"))]
+    let entry = keyring::Entry::new(service, account);
+    match entry.map_err(|_| ())?.get_secret() {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ()),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+#[cfg(all(
+    not(test),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn load_go_keyring(_: &str, _: &str) -> std::result::Result<Option<String>, ()> {
+    Err(())
+}
+
+// Tests register go-keyring entries in the same map, and count their reads.
+#[cfg(test)]
+static GO_KEYRING_LOADS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
+    *GO_KEYRING_LOADS
+        .lock()
+        .unwrap()
+        .entry(service.to_owned())
+        .or_default() += 1;
+    load(service, account)
+}
+/// How often go-keyring entries of `service` were read.
+#[cfg(test)]
+pub(crate) fn test_loads(service: &str) -> usize {
+    GO_KEYRING_LOADS
+        .lock()
+        .unwrap()
+        .get(service)
+        .copied()
+        .unwrap_or(0)
 }
 
 // Tests never touch the real store; they register entries here instead.

@@ -138,7 +138,7 @@ function toast(text) {
 
 // Original provider SVGs copied from OpenQuota; CSS masks apply the GUI theme color.
 function serviceMark(service) {
-  const name = { Claude: "claude", Codex: "codex" }[service];
+  const name = { Claude: "claude", Codex: "codex", Antigravity: "antigravity" }[service];
   return name ? `<span class="service-mark ${name}-mark" aria-hidden="true"></span>` : "";
 }
 
@@ -828,10 +828,11 @@ function connectBlock() {
   return block(
     "Connect",
     "",
-    `${row("Claude Code", "Claude", s.urls.claude)}${row("Codex", "Codex", s.urls.codex)}
+    `${row("Claude Code", "Claude", s.urls.claude)}${row("Codex", "Codex", s.urls.codex)}${row("Antigravity", "Antigravity", s.urls.antigravity)}
      <details class="disclosure" id="setup-snippets" ${ui.snippetsOpen ? "open" : ""}><summary>${ICON.chevron}Setup snippets</summary>
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Top of ~/.codex/config.toml, then restart Codex. Codex 0.156+ requires an HTTPS chatgpt_base_url", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
+       ${snippet("Antigravity CLI (agy): environment, so its Cloud Code requests come here", `CLOUD_CODE_URL=${s.urls.antigravity}`)}
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
        ${ui.snap.config.details?.editable?.connect_credential_routing ? `
        ${snippet("Proxy port instead of base URLs: environment for Claude Code and Codex, which keep their original API URLs", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
@@ -1056,7 +1057,7 @@ function routingBlock() {
   };
   const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
   const credentialError = s.credentialError ? `<div class="placeholder">Credential checks unavailable: ${esc(s.credentialError)}</div>` : "";
-  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude));
+  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude) + section("Antigravity", d.antigravity));
 }
 
 // ---------------------------------------------------------------- activity
@@ -1316,7 +1317,7 @@ function modelTokenStats(stats, scope) {
   return `<div class="strip">${stat(input, tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
 
-const SHARE_SERVICES = ["Codex", "Claude"];
+const SHARE_SERVICES = ["Codex", "Claude", "Antigravity"];
 const SHARE_SHADES = 4;
 /// The smallest part of the ring a sector is drawn at, so it stays hoverable;
 /// credentials below it fold into Others.
@@ -1345,7 +1346,7 @@ function maskAccountName(name) {
   return name;
 }
 
-/// Credentials grouped by app, Codex then Claude, each group in its hue; traffic
+/// Credentials grouped by app, Codex, Claude, then Antigravity, each group in its hue; traffic
 /// has no other service. `measure` gives a credential's amount, or null when it
 /// is unknown. The two largest of a service always keep their slice; past them
 /// a credential under SHARE_MIN of the whole ring folds into "Others", when at
@@ -2261,7 +2262,8 @@ function configSettings() {
     "",
     `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
      ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
-     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}`
+     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}
+     ${flag("antigravity.account_auth_file_only", "Antigravity: saved login only", "When off, accepts other Google logins and looks up their email.")}`
   )}`;
 }
 
