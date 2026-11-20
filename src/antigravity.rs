@@ -338,8 +338,8 @@ impl Antigravity {
         origins
     }
 
-    /// The saved login, read for each request: Antigravity renews its token
-    /// itself and saves the new one in the same item.
+    /// The saved login as the credential store holds it now: Antigravity
+    /// renews its token itself and saves the new one in the same item.
     pub(crate) async fn saved(&self) -> Result<Option<Login>> {
         if !self.saved_login {
             return Ok(None);
@@ -348,6 +348,31 @@ impl Antigravity {
             .await?
             .as_deref()
             .and_then(parse_login))
+    }
+
+    /// The saved login for a request: a recent read when `matches` accepts
+    /// it, so requests with the current token start no `security` process,
+    /// else the item as it is now.
+    async fn saved_for(&self, matches: impl Fn(&Login) -> bool) -> (Option<Login>, bool) {
+        /// Bounds how long a login Antigravity replaced may still match.
+        const RECENT: std::time::Duration = std::time::Duration::from_secs(30);
+        if !self.saved_login {
+            return (None, false);
+        }
+        let recent = crate::keychain::read_go_keyring_recent(SERVICE, ACCOUNT, RECENT)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(parse_login)
+            .filter(|login| matches(login));
+        if recent.is_some() {
+            return (recent, false);
+        }
+        match self.saved().await {
+            Ok(login) => (login, false),
+            Err(_) => (None, true),
+        }
     }
 
     fn mapped_choice(&self, identity: &AntigravityIdentity) -> Option<&Choice> {
@@ -412,10 +437,7 @@ impl Antigravity {
             .and_then(|v| v.strip_prefix("Bearer "))
             .filter(|s| valid_token(s))
             .ok_or(Error::new(401, "Antigravity requires a Bearer token."))?;
-        let (login, unavailable) = match self.saved().await {
-            Ok(login) => (login, false),
-            Err(_) => (None, true),
-        };
+        let (login, unavailable) = self.saved_for(|login| login.access_token == token).await;
         let route = |proxy: &Choice,
                      identity: Option<AntigravityIdentity>,
                      matched_login: bool,
@@ -501,10 +523,9 @@ impl Antigravity {
         refresh_token: &str,
         learned: &RefreshRoutes<AntigravityIdentity>,
     ) -> Result<RefreshRoute> {
-        let (login, unavailable) = match self.saved().await {
-            Ok(login) => (login, false),
-            Err(_) => (None, true),
-        };
+        let (login, unavailable) = self
+            .saved_for(|login| login.refresh_token.as_deref() == Some(refresh_token))
+            .await;
         if let Some(login) =
             login.filter(|login| login.refresh_token.as_deref() == Some(refresh_token))
         {
@@ -931,5 +952,43 @@ mod tests {
 
     fn token_renews(renewed: &RenewedTokens, token: &str, login: &Login) -> bool {
         renewed.get(token).is_some_and(|r| r.renews(login))
+    }
+
+    // Requests with the saved login's current token reuse a recent read, so
+    // they start no `security` process; any other token reads the item again
+    // at once, so Antigravity's renewal applies to its next request.
+    #[tokio::test]
+    async fn the_current_token_reuses_a_recent_read_and_others_read_the_item_again() {
+        let _login = TEST_LOGIN.lock().await;
+        set_test_login("current-access", "saved-refresh");
+        let learned = RefreshRoutes::default();
+        let renewed = RenewedTokens::default();
+        let settings = config("antigravity:\n  routing:\n    account:\n      default: us\n");
+        let resolve = |token: &'static str| {
+            let (settings, learned, renewed) = (&settings, &learned, &renewed);
+            async move {
+                settings
+                    .antigravity
+                    .resolve(&headers(token), learned, renewed)
+                    .await
+            }
+        };
+        let loads = crate::keychain::test_loads(SERVICE);
+        for _ in 0..3 {
+            assert!(resolve("current-access").await.unwrap().matched_login);
+        }
+        assert_eq!(crate::keychain::test_loads(SERVICE), loads + 1);
+
+        // Antigravity renews and saves its token, unknown to the recent read.
+        let renewed_login =
+            json!({"token": {"access_token": "next-access", "refresh_token": "saved-refresh"}});
+        crate::keychain::write_test_entry_elsewhere(SERVICE, ACCOUNT, &renewed_login.to_string());
+        assert!(resolve("next-access").await.unwrap().matched_login);
+        assert_eq!(crate::keychain::test_loads(SERVICE), loads + 2);
+        // The replaced token no longer matches once the item was read again.
+        assert_eq!(resolve("current-access").await.err().unwrap().status, 401);
+        assert!(resolve("next-access").await.unwrap().matched_login);
+        assert_eq!(crate::keychain::test_loads(SERVICE), loads + 3);
+        set_test_login(TEST_SAVED_TOKEN, "saved-refresh");
     }
 }

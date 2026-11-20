@@ -45,12 +45,39 @@ pub(crate) async fn read_go_keyring(service: &str, account: &str) -> Result<Opti
     let key = (service.to_owned(), account.to_owned());
     tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        read_blocking(key, load_go_keyring)
+        let value = read_blocking(key.clone(), load_go_keyring)?;
+        if let Ok(mut recent) = RECENT.lock() {
+            recent.insert(key, (Instant::now(), value.clone()));
+        }
+        Ok(value)
     })
     .await
     .unwrap_or(Err(()))
     .map_err(|_| Error::config("Cannot read the OS credential store."))
 }
+
+/// [`read_go_keyring`], answered from its last successful read when that is
+/// at most `max_age` old.
+pub(crate) async fn read_go_keyring_recent(
+    service: &str,
+    account: &str,
+    max_age: Duration,
+) -> Result<Option<String>> {
+    let key = (service.to_owned(), account.to_owned());
+    let recent = RECENT
+        .lock()
+        .ok()
+        .and_then(|recent| recent.get(&key).cloned())
+        .filter(|(at, _)| at.elapsed() <= max_age);
+    match recent {
+        Some((_, value)) => Ok(value),
+        None => read_go_keyring(service, account).await,
+    }
+}
+
+/// The last successful go-keyring read of each entry, and when it was made.
+type Recent = BTreeMap<Key, (Instant, Option<String>)>;
+static RECENT: LazyLock<Mutex<Recent>> = LazyLock::new(Default::default);
 
 /// Compare and replace under the same gate as reads; never log credential values.
 pub(crate) async fn replace(
@@ -135,10 +162,72 @@ fn load(_: &str, _: &str) -> std::result::Result<Option<String>, ()> {
     Err(())
 }
 
-#[cfg(all(
-    not(test),
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+/// On macOS go-keyring reads and writes through `/usr/bin/security`, and each
+/// write replaces the item's partition list with the writer's: a write by
+/// Antigravity locks out any app reading it itself, and one by such an app
+/// locks out Antigravity, each then facing a Keychain prompt. Read the same
+/// way, so the item stays Apple's tool's for everyone.
+#[cfg(all(not(test), target_os = "macos"))]
+fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
+    use std::io::Read;
+    /// errSecItemNotFound, as `security` reports it.
+    const NOT_FOUND: i32 = 44;
+    /// Long enough to answer a Keychain prompt, so none is left hanging.
+    const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+    let mut child = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|_| ())? {
+            Some(status) => break status,
+            None if started.elapsed() > PROMPT_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(())?
+        .read_to_end(&mut output)
+        .map_err(|_| ())?;
+    match status.code() {
+        Some(0) => secret_line(output).map(Some),
+        Some(NOT_FOUND) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// The secret `security find-generic-password -w` printed: as text, or as
+/// hex when it is not plain ASCII, as an unwrapped login with non-ASCII text
+/// stored by another app is. A login is JSON or `go-keyring-base64:…`, never
+/// hex digits alone.
+#[cfg(any(test, target_os = "macos"))]
+fn secret_line(mut output: Vec<u8>) -> std::result::Result<String, ()> {
+    if output.last() == Some(&b'\n') {
+        output.pop();
+    }
+    let digits = output.strip_prefix(b"0x").unwrap_or(&output);
+    if !digits.is_empty() && digits.len() % 2 == 0 && digits.iter().all(u8::is_ascii_hexdigit) {
+        output = digits
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap_or(""), 16))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| ())?;
+    }
+    String::from_utf8(output).map_err(|_| ())
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "windows")))]
 fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
     #[cfg(target_os = "windows")]
     let entry = keyring::Entry::new_with_target(&format!("{service}:{account}"), service, account);
@@ -209,18 +298,80 @@ fn load(service: &str, account: &str) -> std::result::Result<Option<String>, ()>
     }
 }
 
-/// Store `value` for an entry; `None` makes reading it fail as a locked store would.
+/// Replace an entry as another process would, unknown to a recent read.
 #[cfg(test)]
-pub(crate) fn set_test_entry(service: &str, account: &str, value: Option<&str>) {
+pub(crate) fn write_test_entry_elsewhere(service: &str, account: &str, value: &str) {
     TEST_ENTRIES
         .lock()
         .unwrap()
-        .insert((service.into(), account.into()), value.map(String::from));
+        .insert((service.into(), account.into()), Some(value.into()));
+}
+
+/// Store `value` for an entry; `None` makes reading it fail as a locked store would.
+#[cfg(test)]
+pub(crate) fn set_test_entry(service: &str, account: &str, value: Option<&str>) {
+    let key: Key = (service.into(), account.into());
+    // As if the entry had been written since it was last read.
+    RECENT.lock().unwrap().remove(&key);
+    TEST_ENTRIES
+        .lock()
+        .unwrap()
+        .insert(key, value.map(String::from));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_prints_the_secret_on_one_line() {
+        assert_eq!(
+            secret_line(b"go-keyring-base64:e30=\n".to_vec()).unwrap(),
+            "go-keyring-base64:e30="
+        );
+        // Only the newline `security` adds is removed.
+        assert_eq!(secret_line(b"{} \n\n".to_vec()).unwrap(), "{} \n");
+        assert_eq!(secret_line(b"{}".to_vec()).unwrap(), "{}");
+        assert!(secret_line(vec![0xff, b'\n']).is_err());
+        // Not plain ASCII: printed as hex, with or without `0x`.
+        let login = r#"{"id_token_email":"李@example.com"}"#;
+        let hex: String = login.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(secret_line(format!("{hex}\n").into_bytes()).unwrap(), login);
+        assert_eq!(
+            secret_line(format!("0x{hex}\n").into_bytes()).unwrap(),
+            login
+        );
+        assert!(secret_line(b"0x\n".to_vec()).unwrap() == "0x");
+    }
+
+    #[tokio::test]
+    async fn recent_go_keyring_reads_are_reused_until_they_age_or_the_entry_changes() {
+        let (service, account) = ("keychain-test-recent", "login");
+        set_test_entry(service, account, Some("first"));
+        let long = Duration::from_secs(60);
+        let read = || read_go_keyring_recent(service, account, long);
+        assert_eq!(read().await.unwrap().as_deref(), Some("first"));
+        let loads = test_loads(service);
+        // Written elsewhere: a recent read still answers, until it ages.
+        write_test_entry_elsewhere(service, account, "second");
+        assert_eq!(read().await.unwrap().as_deref(), Some("first"));
+        assert_eq!(test_loads(service), loads);
+        assert_eq!(
+            read_go_keyring_recent(service, account, Duration::ZERO)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
+        // A fresh read always reads, and is what recent reads reuse next.
+        write_test_entry_elsewhere(service, account, "third");
+        assert_eq!(
+            read_go_keyring(service, account).await.unwrap().as_deref(),
+            Some("third")
+        );
+        assert_eq!(read().await.unwrap().as_deref(), Some("third"));
+        assert_eq!(test_loads(service), loads + 2);
+    }
 
     #[tokio::test]
     async fn missing_entries_are_not_failures_but_failures_cool_down() {

@@ -315,7 +315,13 @@ Coport relayed: apps that renew the login themselves, such as Copool and
 OpenQuota, may keep the new token without saving it in the item. Such tokens
 are kept in memory as SHA-256 digests until their `expires_in` (at most 64),
 and stop counting as the saved login once the item holds another refresh token.
-The macOS Keychain asks once whether Coport may read the item.
+On macOS Coport reads the item through `/usr/bin/security`, as go-keyring
+does: each write replaces the item's partition list with the writer's, so an
+app that reads it directly is locked out after Antigravity's next write, and
+Antigravity after such an app's. A read with the saved login's current token
+reuses the last read for up to 30 seconds; any other token reads the item
+again. Until the item is next written through `/usr/bin/security`, one Keychain
+prompt may appear.
 
 The saved login takes the route of its email, then `default`, then
 `account_fallback`, then `fallback`. Antigravity's own login records no email,
