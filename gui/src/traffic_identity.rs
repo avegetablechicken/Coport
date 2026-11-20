@@ -200,7 +200,12 @@ impl Identities {
         labels: &BTreeMap<(String, String), String>,
     ) -> Option<Resolution> {
         // Account identities remain separate even when they use the same API.
-        if entry.get("account_id").is_some_and(|id| !id.is_empty()) {
+        // Antigravity routes Google logins only: a record without an account
+        // (a saved login whose email is not known yet) still names its
+        // account route, never an API configuration.
+        if service == coport::routing::Service::Antigravity.label()
+            || entry.get("account_id").is_some_and(|id| !id.is_empty())
+        {
             return None;
         }
         let logged = entry.get("provider").unwrap_or_default();

@@ -3342,6 +3342,59 @@ mod tests {
         assert!(groups.contains_key(&(Service::Claude, "user@example.test".into())));
     }
 
+    /// Antigravity routes Google logins only. A saved login whose email is not
+    /// known yet logs no account, and is still named by its account route,
+    /// never matched against API configurations by its Cloud Code origin.
+    #[tokio::test]
+    async fn antigravity_records_without_an_account_keep_their_route() {
+        let base = "https://daily-cloudcode-pa.googleapis.com";
+        for (routes, provider, label, expected) in [
+            ("account: {default: none}", "default", "default", "default"),
+            ("fallback: none", "default", "fallback", "fallback"),
+            (
+                "account: {'user@example.test': none}\n    account_fallback: none",
+                "antigravity-account",
+                "user@example.test",
+                "user@example.test",
+            ),
+        ] {
+            let config = coport::config::Config::parse(&format!(
+                "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    {routes}\n"
+            ))
+            .unwrap();
+            let labels = config.local_traffic_credential_labels().await;
+            let identities = Identities::from_config(&config, &[]);
+            let mut fields = serde_json::json!({"service": "antigravity", "provider": provider,
+                "account_label": label, "upstream_base_url": base});
+            if provider == "antigravity-account" {
+                fields["account_id"] = "user@example.test".into();
+            }
+            let e = Entry {
+                seq: 0,
+                time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)),
+                event: "request_finished".into(),
+                fields: serde_json::from_value(fields).unwrap(),
+            };
+            let resolved = identities.resolve(&e, "Antigravity", &labels);
+            assert!(resolved.is_none(), "{routes}");
+            let mut groups = BTreeMap::new();
+            aggregate(
+                &mut groups,
+                &e,
+                e.service().unwrap(),
+                Span {
+                    start: 0,
+                    end: 1_800_000,
+                    bucket_minutes: 1,
+                },
+                &labels,
+                resolved,
+            );
+            let group = &groups[&(Service::Antigravity, expected.to_owned())];
+            assert!(group.source_counts.is_empty(), "{routes}");
+        }
+    }
+
     #[test]
     fn restores_old_ids_from_logged_routing_names_across_history() {
         let dir = tempfile::tempdir().unwrap();
