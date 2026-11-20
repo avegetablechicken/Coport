@@ -331,8 +331,8 @@ pub async fn replace_proxy_ca(app: AppHandle) -> Result<Option<bool>> {
         coport::credential_proxy::CredentialProxy::replace_ca(
             &config,
             &coport::local_tls::dir_for(&config_path),
-            |path| {
-                trusted = platform::trust_certificate(path)?;
+            |path, probe| {
+                trusted = platform::trust_certificate(path, probe)?;
                 Ok(())
             },
         )

@@ -811,6 +811,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "security-framework 3.7.0",
  "serde_yaml_ng",
  "tauri",
  "tauri-build",

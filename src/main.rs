@@ -80,7 +80,7 @@ async fn run(args: Args) -> Result<()> {
     }
     let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
     if args.replace_proxy_ca {
-        coport::credential_proxy::CredentialProxy::replace_ca(&config, &tls_dir, |_| Ok(()))
+        coport::credential_proxy::CredentialProxy::replace_ca(&config, &tls_dir, |_, _| Ok(()))
             .map_err(|_| Error::config("Cannot replace the proxy port certificate."))?;
         println!(
             "Replaced the proxy CA; trust {} and restart coport.",

@@ -59,12 +59,13 @@ impl CredentialProxy {
     }
 
     /// Replace the proxy CA with one for every origin `config` routes by
-    /// credential, once `trust` accepts its certificate file. Takes effect on
-    /// the next start.
+    /// credential, once `trust` accepts its certificate file and probe
+    /// certificate (see `local_tls::replace_proxy_ca`). Takes effect on the
+    /// next start.
     pub fn replace_ca(
         config: &Config,
         tls_dir: &Path,
-        trust: impl FnOnce(&Path) -> std::io::Result<()>,
+        trust: impl FnOnce(&Path, Option<&crate::local_tls::ProxyCaProbe>) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let hosts = scopes(config)
             .and_then(|scopes| hosts(&scopes))
@@ -387,7 +388,7 @@ mod tests {
         assert!(proxy.destination("182.92.106.196", 6060).is_none());
         assert!(proxy.destination("api.anthropic.com", 443).is_some());
         assert!(!proxy.ca_unrestricted());
-        let refused = CredentialProxy::replace_ca(&grown, dir.path(), |_| {
+        let refused = CredentialProxy::replace_ca(&grown, dir.path(), |_, _| {
             Err(std::io::Error::other("cancelled"))
         });
         assert!(refused.is_err());
@@ -395,7 +396,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(proxy.uncovered(), ["182.92.106.196:6060"]);
-        CredentialProxy::replace_ca(&grown, dir.path(), |_| Ok(())).unwrap();
+        CredentialProxy::replace_ca(&grown, dir.path(), |_, _| Ok(())).unwrap();
         let proxy = CredentialProxy::prepare(&grown, dir.path())
             .unwrap()
             .unwrap();

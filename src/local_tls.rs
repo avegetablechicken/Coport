@@ -105,19 +105,43 @@ pub fn proxy_acceptors(dir: &Path, hosts: &BTreeSet<String>) -> Result<ProxyCa> 
     })
 }
 
+/// A serving certificate from a staged proxy CA, so a trust step can check
+/// that clients accept it as they would the proxy's own.
+pub struct ProxyCaProbe {
+    /// A host the CA permits, preferring a DNS name.
+    pub host: String,
+    /// The DER certificate for `host`, issued by the staged CA.
+    pub leaf: Vec<u8>,
+}
+
 /// Create a proxy CA for `hosts` and install it once `trust` accepts its
-/// staged certificate file; the replaced pair is moved to `BACKUP_DIR`. If
+/// staged certificate file and a probe certificate it issued (`None` when
+/// it permits no host); the replaced pair is moved to `BACKUP_DIR`. If
 /// `trust` fails, the current CA stays in place and in use.
 pub fn replace_proxy_ca(
     dir: &Path,
     hosts: &BTreeSet<String>,
-    trust: impl FnOnce(&Path) -> std::io::Result<()>,
+    trust: impl FnOnce(&Path, Option<&ProxyCaProbe>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let key = KeyPair::generate().map_err(std::io::Error::other)?;
     let cert = proxy_ca_params(hosts)
         .self_signed(&key)
         .map_err(std::io::Error::other)?;
+    let probe = hosts
+        .iter()
+        .find(|host| host.parse::<std::net::IpAddr>().is_err())
+        .or_else(|| hosts.first())
+        .map(|host| {
+            let issuer = Issuer::new(proxy_ca_params(hosts), &key);
+            let leaf = leaf(host, "coport proxy", &issuer)
+                .map_err(|e| std::io::Error::other(e.message))?;
+            Ok::<_, std::io::Error>(ProxyCaProbe {
+                host: host.clone(),
+                leaf: leaf.cert[0].to_vec(),
+            })
+        })
+        .transpose()?;
     let mut staged = tempfile::Builder::new()
         .prefix("proxy-ca.pending.")
         .suffix(".pem")
@@ -125,7 +149,7 @@ pub fn replace_proxy_ca(
     staged.write_all(cert.pem().as_bytes())?;
     staged.as_file().sync_all()?;
     // Not locked meanwhile: the user may take long to answer a trust prompt.
-    trust(staged.path())?;
+    trust(staged.path(), probe.as_ref())?;
     let _lock = CreationLock::acquire(&dir.join(CA_LOCK_FILE), Duration::from_secs(30))?;
     back_up(dir, &PROXY)?;
     persist(
@@ -649,6 +673,54 @@ mod tests {
         server.await.unwrap() && connected.is_ok()
     }
 
+    /// Whether a client trusting only `ca_pem` accepts `leaf` for `host`.
+    fn issued_by(ca_pem: &[u8], leaf: &[u8], host: &str) -> bool {
+        use rustls::client::danger::ServerCertVerifier;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca_pem).unwrap())
+            .unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        verifier
+            .verify_server_cert(
+                &CertificateDer::from(leaf.to_vec()),
+                &[],
+                &rustls::pki_types::ServerName::try_from(host.to_owned()).unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn a_replacement_probe_falls_back_to_an_ip_and_is_absent_without_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = None;
+        let _ = replace_proxy_ca(dir.path(), &hosts(&["182.92.106.196"]), |path, probe| {
+            let probe = probe.unwrap();
+            assert!(issued_by(
+                &std::fs::read(path).unwrap(),
+                &probe.leaf,
+                &probe.host
+            ));
+            seen = Some(probe.host.clone());
+            Err(std::io::Error::other("cancelled"))
+        });
+        assert_eq!(seen.as_deref(), Some("182.92.106.196"));
+        let mut absent = false;
+        let _ = replace_proxy_ca(dir.path(), &BTreeSet::new(), |_, probe| {
+            absent = probe.is_none();
+            Err(std::io::Error::other("cancelled"))
+        });
+        assert!(absent);
+        assert!(!dir.path().join(PROXY_CA_FILE).exists());
+    }
+
     // A configuration gaining upstreams once replaced the trusted CA, and every
     // client still trusting it failed for the hosts it had always covered.
     #[tokio::test]
@@ -707,17 +779,24 @@ mod tests {
         let grown = hosts(&["chatgpt.com", "182.92.106.196"]);
         // A refused trust prompt changes nothing and leaves no staged file.
         let mut offered = Vec::new();
-        let refused = replace_proxy_ca(dir.path(), &grown, |path| {
+        let mut probe_host = None;
+        let refused = replace_proxy_ca(dir.path(), &grown, |path, probe| {
             offered = std::fs::read(path).unwrap();
+            let probe = probe.unwrap();
+            // A client trusting the offered CA accepts the probe for its host,
+            // a DNS name ahead of the IP address that sorts first.
+            assert!(issued_by(&offered, &probe.leaf, &probe.host));
+            probe_host = Some(probe.host.clone());
             Err(std::io::Error::other("cancelled"))
         });
+        assert_eq!(probe_host.as_deref(), Some("chatgpt.com"));
         assert!(refused.is_err());
         assert_ne!(offered, cert);
         assert_eq!(std::fs::read(dir.path().join(PROXY_CA_FILE)).unwrap(), cert);
         assert_eq!(files(dir.path()), before);
         assert!(!dir.path().join(BACKUP_DIR).exists());
         // Once trusted, the offered certificate is installed and covers every host.
-        replace_proxy_ca(dir.path(), &grown, |path| {
+        replace_proxy_ca(dir.path(), &grown, |path, _| {
             offered = std::fs::read(path).unwrap();
             Ok(())
         })
@@ -754,7 +833,7 @@ mod tests {
             assert_eq!(mode(&dir.path().join(PROXY_CA_KEY_FILE)) & 0o077, 0);
         }
         // A further replacement keeps both earlier pairs.
-        replace_proxy_ca(dir.path(), &hosts(&["api.anthropic.com"]), |_| Ok(())).unwrap();
+        replace_proxy_ca(dir.path(), &hosts(&["api.anthropic.com"]), |_, _| Ok(())).unwrap();
         let kept = backups(dir.path());
         assert_eq!(kept.len(), 4);
         assert!(kept.iter().any(|(_, data)| *data == cert));

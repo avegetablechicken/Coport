@@ -236,7 +236,9 @@ their CONNECT is refused with that reason, while base URLs and the hosts the CA
 covers keep working. The GUI warns on the Proxy card and offers **Replace &
 Trust**, which adds a new CA covering every host to your trust store (macOS asks
 for your login password, Windows shows a security warning; on Linux trust it
-yourself) before installing it, then restarts the proxy; **Keep Current CA**
+yourself) before installing it, then restarts the proxy. On macOS the new CA is
+installed only once macOS verifies a certificate it issued, offline, as clients
+do; otherwise the current CA stays in use and the error is shown; **Keep Current CA**
 reduces the warning to a note until the uncovered hosts change. The CLI prints
 the same warning, and `coport --config <path> --replace-proxy-ca` replaces the
 CA. A CA created before IP constraints is kept the same way and reported as not
@@ -452,8 +454,15 @@ whole prompt (`promptTokenCount`, cached content included), cached input is
 `candidatesTokenCount`.
 
 `CLOUD_CODE_URL` moves only Cloud Code requests; `agy` has no setting for its
-token endpoint, and reaches it and other Google services directly, or through
-`HTTPS_PROXY`.
+token endpoint, and reaches it and other Google services directly. Where Google
+is reachable only through an outbound proxy, those requests stall every turn
+unless Antigravity also gets that proxy, so start it with both; `NO_PROXY`
+keeps the local listener direct:
+
+```sh
+HTTPS_PROXY=http://127.0.0.1:<proxy-port> NO_PROXY=127.0.0.1,localhost \
+CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity agy
+```
 
 As for Codex and Claude, Antigravity's token refresh is routed by Coport when
 it arrives through [the proxy port](#credential-routing-on-the-proxy-port) or at

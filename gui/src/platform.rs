@@ -51,29 +51,28 @@ pub fn edit(path: &Path) {
 
 /// Adds a CA certificate to the user's trust store once the system confirms
 /// it (macOS asks for the login password, Windows shows a security warning).
-/// Returns false where no user trust store is managed: the user trusts it.
-pub fn trust_certificate(path: &Path) -> std::io::Result<bool> {
+/// On macOS the result counts only once `probe`, a certificate the CA issued,
+/// verifies as clients verify it. Returns false where no user trust store is
+/// managed: the user trusts it.
+pub fn trust_certificate(
+    path: &Path,
+    probe: Option<&coport::local_tls::ProxyCaProbe>,
+) -> std::io::Result<bool> {
     #[cfg(target_os = "macos")]
-    let mut command = {
-        // User trust settings in the default (login) keychain; no admin rights.
-        let mut command = Command::new("/usr/bin/security");
-        command.args(["add-trusted-cert", "-r", "trustRoot"]);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("certutil");
-        command.args(["-user", "-addstore", "Root"]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = path;
-        Ok(false)
+        let home =
+            dirs::home_dir().ok_or_else(|| std::io::Error::other("The home folder is unknown."))?;
+        ca_trust::install(path, &home)?;
+        ca_trust::verify(probe)?;
+        Ok(true)
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     {
-        let output = command.arg(path).output()?;
+        let _ = probe;
+        let output = Command::new("certutil")
+            .args(["-user", "-addstore", "Root"])
+            .arg(path)
+            .output()?;
         if output.status.success() {
             return Ok(true);
         }
@@ -86,6 +85,144 @@ pub fn trust_certificate(path: &Path) -> std::io::Result<bool> {
             "" => "The certificate was not trusted.".to_owned(),
             reason => reason.to_owned(),
         }))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (path, probe);
+        Ok(false)
+    }
+}
+
+/// The proxy CA in the user's macOS trust store, through Security framework
+/// calls whose errors are returned rather than a tool's exit status.
+#[cfg(target_os = "macos")]
+mod ca_trust {
+    use coport::local_tls::ProxyCaProbe;
+    use security_framework::{
+        certificate::SecCertificate,
+        os::macos::keychain::SecKeychain,
+        policy::SecPolicy,
+        secure_transport::SslProtocolSide,
+        trust::SecTrust,
+        trust_settings::{Domain, TrustSettings},
+    };
+    use std::path::{Path, PathBuf};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    /// errSecDuplicateItem: the keychain already holds the certificate.
+    const DUPLICATE_ITEM: i32 = -25299;
+
+    fn failed(error: security_framework::base::Error) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+
+    /// The login keychain under `home`.
+    pub fn login_keychain(home: &Path) -> PathBuf {
+        home.join("Library/Keychains/login.keychain-db")
+    }
+
+    /// Store the CA in the PEM file at `path` in the login keychain and trust
+    /// it as a root for this user; macOS asks for the login password. A CA
+    /// left out of every keychain is never found while clients build a chain,
+    /// whatever its trust settings say.
+    pub fn install(path: &Path, home: &Path) -> std::io::Result<()> {
+        let der = CertificateDer::from_pem_file(path)
+            .map_err(|_| std::io::Error::other("Cannot read the new proxy CA."))?;
+        let cert = SecCertificate::from_der(&der).map_err(failed)?;
+        let keychain = SecKeychain::open(login_keychain(home)).map_err(failed)?;
+        match cert.add_to_keychain(Some(keychain)) {
+            Err(error) if error.code() != DUPLICATE_ITEM => return Err(failed(error)),
+            _ => {}
+        }
+        TrustSettings::new(Domain::User)
+            .set_trust_settings_always(&cert)
+            .map_err(failed)
+    }
+
+    /// Fails unless macOS accepts `probe` as clients would. The trust
+    /// settings call has reported success while trustd refused the change
+    /// (errSecMissingEntitlement), so success alone proves nothing.
+    pub fn verify(probe: Option<&ProxyCaProbe>) -> std::io::Result<()> {
+        if probe.is_none_or(accepts) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "The system still does not trust the certificate.",
+            ))
+        }
+    }
+
+    /// Whether macOS accepts the probe for its host as TLS clients do: the
+    /// issuing CA must be found in a keychain and trusted, since only the
+    /// probe itself is supplied. Never fetches anything from the network.
+    pub fn accepts(probe: &ProxyCaProbe) -> bool {
+        let Ok(leaf) = SecCertificate::from_der(&probe.leaf) else {
+            return false;
+        };
+        let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(&probe.host));
+        let Ok(mut trust) = SecTrust::create_with_certificates(&[leaf], &[policy]) else {
+            return false;
+        };
+        trust.set_network_fetch_allowed(false).is_ok() && trust.evaluate_with_error().is_ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Replace & Trust once installed a CA that was reported as trusted
+        // but no keychain held, and every proxy-port client failed.
+        #[test]
+        fn a_ca_the_system_does_not_trust_is_never_installed() {
+            let dir = tempfile::tempdir().unwrap();
+            let hosts: std::collections::BTreeSet<String> =
+                ["182.92.106.196", "cloudcode-pa.googleapis.com"]
+                    .map(String::from)
+                    .into();
+            let mut probed = None;
+            let result = coport::local_tls::replace_proxy_ca(dir.path(), &hosts, |_, probe| {
+                let probe = probe.unwrap();
+                probed = Some(probe.host.clone());
+                // As if installing it had reported success.
+                verify(Some(probe))
+            });
+            assert_eq!(probed.as_deref(), Some("cloudcode-pa.googleapis.com"));
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "The system still does not trust the certificate."
+            );
+            assert!(!dir.path().join(coport::local_tls::PROXY_CA_FILE).exists());
+        }
+
+        #[test]
+        fn the_ca_is_stored_in_the_login_keychain() {
+            assert_eq!(
+                login_keychain(Path::new("/Users/someone")),
+                Path::new("/Users/someone/Library/Keychains/login.keychain-db")
+            );
+        }
+
+        #[test]
+        fn a_malformed_probe_is_not_accepted_and_no_probe_is_not_checked() {
+            let probe = ProxyCaProbe {
+                host: "chatgpt.com".into(),
+                leaf: b"not a certificate".to_vec(),
+            };
+            assert!(!accepts(&probe));
+            assert!(verify(Some(&probe)).is_err());
+            assert!(verify(None).is_ok());
+        }
+
+        // Only a file that is no certificate is tried here: anything else
+        // would change the user's keychain and trust settings.
+        #[test]
+        fn an_unreadable_certificate_is_not_installed() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ca.pem");
+            std::fs::write(&path, "not a certificate").unwrap();
+            let error = install(&path, dir.path()).unwrap_err();
+            assert_eq!(error.to_string(), "Cannot read the new proxy CA.");
+        }
     }
 }
 
