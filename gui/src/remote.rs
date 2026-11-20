@@ -128,14 +128,18 @@ fn summary_command(binary: &str) -> String {
 }
 
 /// A summary command naming the services this reader parses, which older
-/// helpers ignore (see [`crate::data_api::SERVICES_ENV`]). `env` comes from
-/// a fixed path and accepts the assignment under any login shell.
+/// helpers ignore (see [`crate::data_api::SERVICES_ENV`]). `command` is
+/// `'<binary>' <args>` or the discovery `/bin/sh -c '<script>'`; its first
+/// word becomes `$0` of a fixed `/bin/sh`, which sets the variable and execs
+/// the command unchanged. `env` would instead read a path containing `=` as
+/// another assignment.
 fn reader(command: &str) -> String {
-    format!(
-        "/usr/bin/env {}={} {command}",
+    let set = format!(
+        "{}={} exec \"$0\" \"$@\"",
         crate::data_api::SERVICES_ENV,
         crate::data_api::SERVICES
-    )
+    );
+    format!("/bin/sh -c {} {command}", quote(&set))
 }
 
 pub(crate) fn helper_command(binary: &str, operation: &str) -> String {
@@ -767,6 +771,43 @@ mod tests {
         // This fixture models older installations with only a path record.
         std::fs::remove_file(dir.join("summary-helper")).unwrap();
         (home, dir, binary)
+    }
+
+    /// An explicit path may contain `=`, which `env` would read as an
+    /// assignment; the reader's service list still reaches the helper.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_paths_with_equals_signs_receive_the_service_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("opt/coport=1 ' $x/coportd");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &binary,
+            b"#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$COPORT_SUMMARY_SERVICES\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = binary.to_str().unwrap();
+        for (command, args) in [
+            (summary_command(binary), "--summary"),
+            (
+                reader(&format!(
+                    "{} --summary-stream --window 30 model",
+                    quote(binary)
+                )),
+                "--summary-stream --window 30 model",
+            ),
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, format!("{args}|antigravity\n").into_bytes());
+        }
     }
 
     #[cfg(unix)]

@@ -241,12 +241,15 @@ scopes and boundaries. A progressive refresh does not reconnect automatically
 when peers cannot align: it keeps the boundary most devices share and reports
 the others, which the next explicit refresh retries.
 Readers name the services they parse beyond Codex and Claude: HTTP with an
-`X-Coport-Services: antigravity` header, SSH by starting the helper through
-`/usr/bin/env COPORT_SUMMARY_SERVICES=antigravity`. Older devices ignore both.
+`X-Coport-Services: antigravity` header, SSH by starting the helper with
+`COPORT_SUMMARY_SERVICES=antigravity` set through the destination's `/bin/sh`,
+which explicit executable paths now need as discovery already did. Older devices
+ignore both.
 A device leaves Antigravity's groups out for a reader that does not name it, since
 readers from before Antigravity reject a whole snapshot naming an unknown service;
 such a reader therefore shows that device without its Antigravity traffic. A
-forced-command SSH key runs its own command, so it also omits them.
+forced-command SSH key runs its own command, so it also omits them unless that
+command sets the variable (see below).
 Once all twelve views are cached, range/category switches are immediate.
 Background failures retain statistics already displayed. The first Devices visit
 after the app starts refreshes once; later page entry, periodic refresh and
@@ -291,6 +294,9 @@ For the SSH route, create a dedicated read-only SSH key restricted on the server
 to the summary command, for example an `authorized_keys` entry beginning with
 `restrict,command="/absolute/path/to/coportd --summary"`. This prevents that key
 from running management commands, shells, PTYs, or port/agent/X11 forwarding.
+Such a key's command ignores the reader's service list; to include Antigravity's
+traffic, set it there: `command="COPORT_SUMMARY_SERVICES=antigravity /absolute/path/to/coportd --summary"`.
+Only a reader that parses Antigravity should use that key.
 The service creates its private identity during startup; summary requests only
 read existing identity, configuration and processed log results.
 
