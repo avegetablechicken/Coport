@@ -97,6 +97,15 @@ target/release/coport-gui
 ./scripts/bundle_macos.sh                   # macOS: target/Coport.app
 ```
 
+The macOS bundle script signs the app and its bundled `coportd` with a local
+Apple Development certificate when available, falling back to ad-hoc signing.
+Set `COPORT_SIGN_IDENTITY` (or `APPLE_SIGNING_IDENTITY`) to a certificate name or
+SHA-1 to select it explicitly; `-` forces ad-hoc signing. With the same signing
+identity and bundle identifiers, existing Keychain authorization can survive
+rebuilds. The first signed build may still require “Always Allow”; this does not
+bypass authorization or provide notarization. This applies to the bundled app
+and daemon, not binaries launched directly from `target/release`.
+
 On Linux, the panel uses Copool's frosted backdrop: a blurred snapshot of the
 screen taken before opening on X11, with the GNOME wallpaper as a fallback on
 Wayland. The backdrop stays fixed while the panel is open; if neither source is

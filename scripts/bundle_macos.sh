@@ -3,6 +3,12 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+if [ "$(uname -s)" != Darwin ]; then
+    echo 'This script requires macOS.' >&2
+    exit 1
+fi
+identity=$(python3 scripts/macos_signing.py "${COPORT_SIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:-}}")
+printf 'Signing identity: %s\n' "$identity"
 cargo build --locked --release -p coport-gui
 
 output="target/Coport.app"
@@ -49,8 +55,13 @@ EOF
 
 # Do not publish an incomplete bundle or hide signing failures.
 plutil -lint "$app/Contents/Info.plist"
-codesign --force --deep --sign - "$app"
+# Sign nested code first, with its own stable identifier, then the app.
+codesign --force --sign "$identity" --identifier io.github.coport.daemon "$app/Contents/MacOS/coportd"
+codesign --force --sign "$identity" "$app"
 codesign --verify --deep --strict "$app"
+codesign --verify --strict "$app/Contents/MacOS/coportd"
+codesign -dv "$app"
+codesign -dv "$app/Contents/MacOS/coportd"
 rm -rf "$output"
 mv "$app" "$output"
 echo "Built $output"
