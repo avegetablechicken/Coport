@@ -828,14 +828,14 @@ function connectBlock() {
   return block(
     "Connect",
     "",
-    `${row("Claude", "Claude", s.urls.claude)}${row("Codex", "Codex", s.urls.codex)}${row("Antigravity", "Antigravity", s.urls.antigravity)}
+    `${row("Codex", "Codex", s.urls.codex)}${row("Claude", "Claude", s.urls.claude)}${row("Antigravity", "Antigravity", s.urls.antigravity)}
      <details class="disclosure" id="setup-snippets" ${ui.snippetsOpen ? "open" : ""}><summary>${ICON.chevron}Setup snippets</summary>
-       ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Top of ~/.codex/config.toml, then restart Codex. Codex 0.156+ requires an HTTPS chatgpt_base_url", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
-       ${snippet("Antigravity CLI (agy): environment, so its Cloud Code requests come here", `CLOUD_CODE_URL=${s.urls.antigravity}`)}
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
+       ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
+       ${snippet("Antigravity CLI (agy): environment, so its Cloud Code requests come here", `CLOUD_CODE_URL=${s.urls.antigravity}`)}
        ${ui.snap.config.details?.editable?.connect_credential_routing ? `
-       ${snippet("Proxy port instead of base URLs: environment for Claude and Codex, which keep their original API URLs", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
+       ${snippet("Proxy port instead of base URLs: environment for Codex and Claude, which keep their original API URLs", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
      </details>`
   );
 }
