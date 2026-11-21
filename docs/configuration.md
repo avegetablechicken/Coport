@@ -357,9 +357,12 @@ route alone never authorizes a lookup. Email routes match regardless of case.
 URLs. A name, such as `GEMINI_API_KEY`, selects the key that variable holds:
 it is read from Coport's environment, else from your login shell, as for
 Claude's environment selectors (`agy` has no settings file that holds its key,
-so there is no named settings form). A key it matches goes to
-`api_key_base_url`, as Codex's API Keys go to `base_url.api_key`; any other key
-takes `fallback`, else is rejected with 401, and a key two names hold is
+so there is no named settings form). A key it matches goes to the upstream its
+request names after `/antigravity/` (`/antigravity/https://relay.example.com/...`,
+as a Claude settings file's key goes to that file's upstream), checked as a URL
+route's is; a request naming none goes to `api_key_base_url`, as Codex's API
+Keys go to `base_url.api_key`. Any other key takes `fallback`, which reaches
+`api_key_base_url` alone, else is rejected with 401, and a key two names hold is
 refused with 409. A URL is matched as
 [Codex API URL routes](clients.md#codex-api-url-routes) are and forwards any
 key to that upstream; one naming a Cloud Code host, `base_url` or

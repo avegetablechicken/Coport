@@ -547,29 +547,36 @@ impl Antigravity {
     /// token past its account route.
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
         crate::config::validate_upstream(&self.api_key_base_url)?;
-        let google: Vec<Url> = self
-            .origins()
-            .into_iter()
-            .chain([TOKEN_REFRESH_UPSTREAM])
-            .filter_map(|origin| Url::parse(origin).ok())
-            .collect();
         for (selector, choice) in &self.routing.api_key {
             if crate::url_routing::is_url_selector(selector) {
-                let url = crate::url_routing::validate_upstream(selector)?;
-                if google.iter().any(|origin| {
-                    origin.host_str() == url.host_str()
-                        && origin.port_or_known_default() == url.port_or_known_default()
-                }) {
-                    return Err(Error::config(
-                        "Antigravity API key routes cannot name a Cloud Code or Google token host.",
-                    ));
-                }
+                self.api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
             } else {
                 crate::config::validate_env(selector)?;
             }
             config.validate_choice(choice)?;
         }
         crate::url_routing::validate_routes(&self.routing.api_key)
+    }
+
+    /// Refuses a Gemini API upstream on a Cloud Code or Google token host:
+    /// those stay routed by login, so a key route cannot carry a login's
+    /// token past its account route.
+    fn api_upstream(&self, url: &Url) -> Result<()> {
+        let google = self
+            .origins()
+            .into_iter()
+            .chain([TOKEN_REFRESH_UPSTREAM])
+            .filter_map(|origin| Url::parse(origin).ok());
+        for origin in google {
+            if origin.host_str() == url.host_str()
+                && origin.port_or_known_default() == url.port_or_known_default()
+            {
+                return Err(Error::config(
+                    "Antigravity API key routes cannot name a Cloud Code or Google token host.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Environment variable selectors, as opposed to URL routes.
@@ -594,8 +601,8 @@ impl Antigravity {
         }
     }
 
-    /// The upstream a selector forwards to, as Claude's `api_key_upstream`;
-    /// none for URL routes, whose requests name it.
+    /// The upstream a selector forwards to when its request names none, as
+    /// Claude's `api_key_upstream`; none for URL routes, whose requests name it.
     pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
         (!crate::url_routing::is_url_selector(selector)).then_some(self.api_key_base_url.as_str())
     }
@@ -631,15 +638,46 @@ impl Antigravity {
     /// The route of a Gemini API key sent in `x-goog-api-key` or `key` (a
     /// Bearer token is a Google login), as Claude's `x-api-key`: the
     /// environment variable selector whose value it is, else `fallback`.
+    /// A named key goes to the upstream its `target` names, if any.
     pub(crate) async fn resolve_api_key(
         &self,
         key: String,
         credential: ApiCredential,
+        target: &str,
     ) -> Result<ApiRoute> {
-        self.resolve_api_key_with(key, credential, |name| async move {
-            crate::identity::environment_key_with_shell(&name, true).await
-        })
-        .await
+        let route = self
+            .resolve_api_key_with(key, credential, |name| async move {
+                crate::identity::environment_key_with_shell(&name, true).await
+            })
+            .await?;
+        self.named_upstream(route, target)
+    }
+
+    /// A named key goes where its request names, as a Claude settings
+    /// file's key goes to that file's upstream: agy's `GOOGLE_GEMINI_BASE_URL`
+    /// may be `<Coport>/antigravity/https://relay.example.com/antigravity`,
+    /// with no `api_key_base_url` set. A key `fallback` carries, which any
+    /// client may send, reaches `api_key_base_url` alone. The upstream is
+    /// checked as a URL route's is, and reached with the platform's TLS.
+    fn named_upstream(&self, mut route: ApiRoute, target: &str) -> Result<ApiRoute> {
+        if !route.configured || !(target.starts_with("/https://") || target.starts_with("/http://"))
+        {
+            return Ok(route);
+        }
+        let named =
+            Url::parse(&target[1..]).map_err(|_| Error::config("Invalid explicit upstream."))?;
+        let base = Url::parse(&self.api_key_base_url).ok();
+        if base.is_some_and(|base| {
+            base.host_str() == named.host_str()
+                && base.port_or_known_default() == named.port_or_known_default()
+        }) {
+            return Ok(route);
+        }
+        let origin = named.origin().ascii_serialization();
+        self.api_upstream(&crate::url_routing::validate_upstream(&origin)?)?;
+        route.upstream = origin;
+        route.custom_upstream = true;
+        Ok(route)
     }
 
     async fn resolve_api_key_with<F, Fut>(
@@ -1308,6 +1346,66 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(shared.status, 409);
+    }
+
+    #[tokio::test]
+    async fn a_named_key_goes_to_the_upstream_its_request_names_as_claudes_settings() {
+        // No api_key_base_url: Google's stays the default, as Codex's and
+        // Claude's base URLs name their official APIs.
+        let config = config(
+            "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    api_key:\n      RELAY_GEMINI_KEY: none\n    fallback: jp\n",
+        );
+        let ag = &config.antigravity;
+        let lookup = |_: String| async { Ok("relay-key".to_owned()) };
+        let named = |key: &str| {
+            let key = key.to_owned();
+            async move {
+                ag.resolve_api_key_with(key, ApiCredential::Header, lookup)
+                    .await
+                    .unwrap()
+            }
+        };
+        let relay = "/https://182.92.106.196:6060/antigravity/v1beta/models/g:streamGenerateContent?alt=sse";
+        let route = ag.named_upstream(named("relay-key").await, relay).unwrap();
+        assert_eq!(route.selector, "RELAY_GEMINI_KEY");
+        assert_eq!(route.upstream, "https://182.92.106.196:6060");
+        assert!(route.configured && route.custom_upstream);
+        assert_eq!(
+            route.url(relay).unwrap().as_str(),
+            "https://182.92.106.196:6060/antigravity/v1beta/models/g:streamGenerateContent?alt=sse"
+        );
+        // An origin-form target, or one naming api_key_base_url, stays there.
+        for target in [
+            "/v1beta/models",
+            "/https://generativelanguage.googleapis.com/v1beta/models",
+        ] {
+            let route = ag.named_upstream(named("relay-key").await, target).unwrap();
+            assert_eq!(route.upstream, DEFAULT_API_BASE, "{target}");
+            assert!(!route.custom_upstream, "{target}");
+        }
+        // As URL routes: public HTTPS only, and never a login's host.
+        for target in [
+            "/http://182.92.106.196:6060/antigravity/v1beta/models",
+            "/https://127.0.0.1:6060/antigravity/v1beta/models",
+            "/https://10.0.0.2/antigravity/v1beta/models",
+            "/https://relay.local/antigravity/v1beta/models",
+            "/https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            "/https://oauth2.googleapis.com/token",
+        ] {
+            assert!(
+                ag.named_upstream(named("relay-key").await, target).is_err(),
+                "{target}"
+            );
+        }
+        // A key `fallback` carries reaches only api_key_base_url.
+        let fallback = ag
+            .resolve_api_key_with("any-key".into(), ApiCredential::Header, lookup)
+            .await
+            .unwrap();
+        assert!(!fallback.configured);
+        let route = ag.named_upstream(fallback, relay).unwrap();
+        assert_eq!(route.upstream, DEFAULT_API_BASE);
+        assert!(route.url(relay).is_err());
     }
 
     #[test]

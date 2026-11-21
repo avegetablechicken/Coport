@@ -4975,14 +4975,30 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
         }
         assert!(!forwarded.to_lowercase().contains("authorization"));
     }
-    // Another host than the API base, and an ambiguous key, send nothing.
-    let other_host = send(
+    // A named key goes to the upstream its request names, through its own
+    // route, as a Claude settings file's key goes to that file's upstream.
+    let elsewhere = send(
         format!("/antigravity/https://other.invalid/gemini{model}"),
         Some(named.clone()),
     )
     .await
     .unwrap();
-    assert_ne!(other_host.status(), 200);
+    let _ = elsewhere.text().await;
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(
+        connect.starts_with("CONNECT other.invalid:443 "),
+        "{connect}"
+    );
+    while fixture.requests.try_recv().is_ok() {}
+    // A key `fallback` carries reaches only the API base, and an ambiguous
+    // key goes nowhere: neither sends anything.
+    let fallback_elsewhere = send(
+        format!("/antigravity/https://other.invalid/gemini{model}?key={OTHER}"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(fallback_elsewhere.status(), 200);
     let twice = send(
         format!("/antigravity{model}?key={OTHER}"),
         Some(named.clone()),

@@ -79,13 +79,13 @@ claude:
 # by key or upstream URL; see docs/configuration.md#antigravity.
 # antigravity:
 #   base_url: "https://daily-cloudcode-pa.googleapis.com"
-#   api_key_base_url: "https://generativelanguage.googleapis.com" # Named keys.
+#   api_key_base_url: "https://generativelanguage.googleapis.com" # Default upstream.
 #   account_auth_file_only: true # false: name other tokens via Google userinfo.
 #   routing:
 #     account:
 #       default: us # The saved login; "you@gmail.com" keys need its email.
 #     # api_key:
-#     #   GEMINI_API_KEY: us # Its value, with .../antigravity as the base URL.
+#     #   GEMINI_API_KEY: us # Its value; base URL .../antigravity, or a relay's after it.
 #     #   "relay.example.com/antigravity": us # .../antigravity/https://relay.example.com/antigravity
 #     # account_probe: us # Google account lookup before the route is known.
 

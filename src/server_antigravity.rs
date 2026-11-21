@@ -50,7 +50,9 @@ impl Server {
                 crate::antigravity::api_credential(incoming.headers(), api_target)?
                     .filter(|(_, credential)| *credential != ApiCredential::Bearer)
             {
-                let route = settings.resolve_api_key(key, credential).await?;
+                let route = settings
+                    .resolve_api_key(key, credential, api_target)
+                    .await?;
                 return self
                     .forward_antigravity_api(incoming, api_target, route, log)
                     .await;

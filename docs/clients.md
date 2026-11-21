@@ -506,29 +506,37 @@ both from its environment only; `--settings` and `settings.json` accept neither.
 As for Claude, a key is routed by name or by upstream URL.
 
 **By name.** Name the variable that holds the key; the key it holds selects the
-route, and requests go to `api_key_base_url` (Google's Gemini API by default; a
-relay's root, such as a Sub2api `/antigravity` endpoint, works too):
+route. A relay is named in `GOOGLE_GEMINI_BASE_URL` itself, after Coport's
+address, as Claude's `ANTHROPIC_BASE_URL` names one
+(`http://127.0.0.1:8787/https://relay.example.com`); a request naming no
+upstream goes to `api_key_base_url`, Google's Gemini API unless set, as Codex's
+and Claude's base URLs name their official APIs:
 
 ```yaml
 antigravity:
-  api_key_base_url: "https://relay.example.com/antigravity" # Default: Google.
   routing:
     api_key:
-      GEMINI_API_KEY: jp
+      RELAY_GEMINI_KEY: jp
     # fallback: us # Any other key; omitted: rejected with 401.
 ```
 
 ```sh
-GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/antigravity GEMINI_API_KEY=<key> agy
+# Through Coport to a Sub2api relay:
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/antigravity/https://relay.example.com/antigravity \
+GEMINI_API_KEY="$RELAY_GEMINI_KEY" agy
+# Through Coport to Google's Gemini API:
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/antigravity GEMINI_API_KEY="$RELAY_GEMINI_KEY" agy
 ```
 
 Any variable name works, and several names may each select their own route.
 As for Claude's environment selectors, each value is read from Coport's own
 environment, else from your login shell (cached for 30 seconds), so a key
 exported in your shell profile is found even by the desktop app. A key two
-names hold is refused with 409. The explicit form
-`/antigravity/https://<api_key_base_url host>/...` works too; another host is
-rejected before any connection.
+names hold is refused with 409. The upstream a request names is checked as a
+URL route's is (public HTTPS, never a Cloud Code or Google token host) and
+reached with the platform's TLS. A key only `fallback` carries, which any
+client may send, reaches `api_key_base_url` alone; another upstream is rejected
+before any connection.
 
 **By URL.** Declare the upstream itself:
 
