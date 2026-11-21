@@ -51,6 +51,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
         "cloudcode-pa.googleapis.com".into(),
         "www.googleapis.com".into(),
         "oauth2.googleapis.com".into(),
+        "aicode.googleapis.com".into(),
         "localhost".into(),
     ])
     .unwrap();
@@ -4771,6 +4772,86 @@ async fn antigravity_saved_login_streams_through_its_route_and_records_gemini_us
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+}
+
+// agy's account lookup and AI Code flags, named by `USER_INFO_OVERRIDE_URL`
+// and `AICODE_ENDPOINT_URL`, take the saved login's route as its Cloud Code
+// requests; only the loopback fixture proxy is reached.
+#[tokio::test]
+async fn antigravity_login_endpoints_take_the_saved_logins_route() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+    let token = crate::antigravity::TEST_SAVED_TOKEN;
+    let mut fixture = fixture("http", "gemini_sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!(
+        "proxies:\n  selected: {endpoint}\nantigravity:\n  routing:\n    account:\n      default: selected\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    for (url, host, line) in [
+        (
+            crate::antigravity::USERINFO_URL,
+            "www.googleapis.com",
+            "GET /oauth2/v2/userinfo HTTP/1.1",
+        ),
+        (
+            crate::antigravity::AICODE_FETCH_CONFIG,
+            "aicode.googleapis.com",
+            "GET /v1alpha:fetchConfig HTTP/1.1",
+        ),
+    ] {
+        let response = http()
+            .get(format!("{}/antigravity/{url}", running.url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{url}");
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(
+            connect.starts_with(&format!("CONNECT {host}:443 ")),
+            "{connect}"
+        );
+        let forwarded = fixture.requests.recv().await.unwrap();
+        assert!(forwarded.starts_with(line), "{forwarded}");
+        assert!(forwarded.contains(&format!("authorization: Bearer {token}")));
+    }
+    let userinfo = http()
+        .get(format!(
+            "{}/antigravity/{}",
+            running.url,
+            crate::antigravity::USERINFO_URL
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(userinfo.contains("remote@example.invalid"));
+    fixture.requests.recv().await.unwrap();
+    fixture.requests.recv().await.unwrap();
+    // Other paths on their hosts, and other tokens, send nothing.
+    for (path, auth, status) in [
+        ("https://www.googleapis.com/drive/v3/files", token, 502),
+        ("https://aicode.googleapis.com/v1alpha:other", token, 502),
+        (crate::antigravity::USERINFO_URL, "other-token", 401),
+    ] {
+        let response = http()
+            .get(format!("{}/antigravity/{path}", running.url))
+            .bearer_auth(auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    // They are not model calls, and the log keeps no token.
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(!raw.contains("model_call_finished") && !raw.contains(token));
 }
 
 // agy's Gemini API key requests (`modelProvider: "gemini"`) reach a relay

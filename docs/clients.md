@@ -432,16 +432,22 @@ an `antigravity` section as shown in [Configuration](configuration.md#antigravit
 then point the Antigravity CLI (`agy`) at the local listener:
 
 ```sh
-CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity agy
+CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity \
+USER_INFO_OVERRIDE_URL=http://127.0.0.1:8787/antigravity/https://www.googleapis.com/oauth2/v2/userinfo \
+AICODE_ENDPOINT_URL=http://127.0.0.1:8787/antigravity/https://aicode.googleapis.com \
+agy
 ```
 
+or export the three variables from your shell profile; `agy` reads them only
+from its environment.
 Use your configured `listen_port`. The `/antigravity` prefix is removed before
 forwarding to `antigravity.base_url.account`, so `/antigravity/v1internal:loadCodeAssist`
 reaches `https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` by
 default. Explicit targets such as
 `/antigravity/https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`
-may name only `base_url` or one of the two Cloud Code hosts; any other host is
-rejected before any outbound connection. Requests are plain HTTP/1.1 JSON and
+may name only `base_url`, one of the two Cloud Code hosts or one of the two
+login endpoints below; any other target is rejected before any outbound
+connection. Requests are plain HTTP/1.1 JSON and
 server-sent events, forwarded unchanged except for hop-by-hop headers and
 cookies. `agy` ignores `CLOUD_CODE_URL` while an enterprise gateway is
 configured.
@@ -454,11 +460,22 @@ whole prompt (`promptTokenCount`, cached content included), cached input is
 `cachedContentTokenCount`, and output adds `thoughtsTokenCount` to
 `candidatesTokenCount`.
 
-`CLOUD_CODE_URL` moves only Cloud Code requests; `agy` has no setting for its
-token endpoint, and reaches it and other Google services directly. Where Google
-is reachable only through an outbound proxy, those requests stall every turn
-unless Antigravity also gets that proxy, so start it with both; `NO_PROXY`
-keeps the local listener direct:
+As it starts, `agy` also waits on two other Google endpoints with its login:
+the account lookup of its eligibility check
+(`https://www.googleapis.com/oauth2/v2/userinfo`, full URL in
+`USER_INFO_OVERRIDE_URL`) and AI Code's feature flags
+(`https://aicode.googleapis.com/v1alpha:fetchConfig`, base in
+`AICODE_ENDPOINT_URL`). Where Google is unreachable directly, each stalls
+until its connection times out, about 30 seconds, and a refused lookup ends
+the session, so name both through Coport as above: they take the login's route
+as its Cloud Code requests do. Only those two paths are served on their hosts;
+any other is rejected before any outbound connection.
+
+`agy` has no setting for its token endpoint, and reaches it and other Google
+services, such as its telemetry, directly. Where Google is reachable only
+through an outbound proxy and those requests must succeed too, start
+Antigravity with that proxy as well; `NO_PROXY` keeps the local listener
+direct:
 
 ```sh
 HTTPS_PROXY=http://127.0.0.1:<proxy-port> NO_PROXY=127.0.0.1,localhost \

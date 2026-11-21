@@ -26,6 +26,14 @@ pub const CLOUD_CODE_ORIGINS: [&str; 2] = [
 ];
 /// Names the Google account of an access token.
 pub const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+/// AI Code's feature flags, which agy fetches with its login as it starts.
+pub const AICODE_FETCH_CONFIG: &str = "https://aicode.googleapis.com/v1alpha:fetchConfig";
+/// The Google endpoints besides Cloud Code that agy calls with its login and
+/// waits on as it starts: the account lookup of its eligibility check and AI
+/// Code's flags. Its `USER_INFO_OVERRIDE_URL` and `AICODE_ENDPOINT_URL` may
+/// name them in the `/antigravity` scope, where they take the login's route
+/// as its Cloud Code requests do; other paths on their hosts are refused.
+pub const LOGIN_ENDPOINTS: [&str; 2] = [USERINFO_URL, AICODE_FETCH_CONFIG];
 /// Where Antigravity renews its login, as Codex's and Claude's token endpoints.
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://oauth2.googleapis.com/token";
 /// SHA-256 of Antigravity's OAuth client ID; the token endpoint serves every
@@ -1259,9 +1267,17 @@ impl Antigravity {
     }
 
     /// The upstream URL of a target inside the `/antigravity` scope: a path
-    /// under `base_url.account`, or an explicit Cloud Code URL.
+    /// under `base_url.account`, an explicit Cloud Code URL, or exactly one of
+    /// `LOGIN_ENDPOINTS`.
     pub fn url(&self, target: &str) -> Result<Url> {
         if target.starts_with("/https://") || target.starts_with("/http://") {
+            if let Some(url) = LOGIN_ENDPOINTS.into_iter().find_map(|endpoint| {
+                crate::routing::upstream_url(endpoint, target, false)
+                    .ok()
+                    .filter(|url| url.path() == Url::parse(endpoint).unwrap().path())
+            }) {
+                return Ok(url);
+            }
             let host = Url::parse(&target[1..])
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
@@ -1275,7 +1291,7 @@ impl Antigravity {
                         == host
                 })
                 .ok_or(Error::config(
-                    "Explicit Antigravity upstream must be a Cloud Code endpoint.",
+                    "Explicit Antigravity upstream must be a Cloud Code or login endpoint.",
                 ))?;
             return crate::routing::upstream_url(base, target, false);
         }
@@ -1859,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn targets_stay_on_cloud_code_endpoints() {
+    fn targets_stay_on_cloud_code_and_login_endpoints() {
         let config = config("");
         let ag = &config.antigravity;
         assert_eq!(target("/antigravity/v1internal:x"), Some("/v1internal:x"));
@@ -1876,7 +1892,27 @@ mod tests {
                 .as_str(),
             "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
         );
+        // agy's `USER_INFO_OVERRIDE_URL` and `AICODE_ENDPOINT_URL`, exactly.
+        for endpoint in LOGIN_ENDPOINTS {
+            assert_eq!(ag.url(&format!("/{endpoint}")).unwrap().as_str(), endpoint);
+        }
+        assert_eq!(
+            ag.url("/https://WWW.googleapis.com:443/oauth2/v2/userinfo?alt=json")
+                .unwrap()
+                .as_str(),
+            "https://www.googleapis.com/oauth2/v2/userinfo?alt=json"
+        );
         for invalid in [
+            "/https://www.googleapis.com/oauth2/v2/userinfo/x",
+            "/https://www.googleapis.com/oauth2/v2/userinfox",
+            "/https://www.googleapis.com/oauth2/v2/",
+            "/https://www.googleapis.com/drive/v3/files",
+            "/https://www.googleapis.com/oauth2/v2/userinfo/../../drive/v3/files",
+            "/http://www.googleapis.com/oauth2/v2/userinfo",
+            "/https://user@www.googleapis.com/oauth2/v2/userinfo",
+            "/https://www.googleapis.com:8443/oauth2/v2/userinfo",
+            "/https://aicode.googleapis.com/v1alpha:other",
+            "/https://aicode.googleapis.com/v1alpha:fetchConfig#x",
             "/https://example.com/v1internal:loadCodeAssist",
             "/http://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
             "/https://user@cloudcode-pa.googleapis.com/v1internal:x",
