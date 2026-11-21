@@ -1,5 +1,5 @@
 //! Access to CLI logins kept in the OS credential store. Writes only occur
-//! for explicitly enabled OAuth rotation.
+//! for explicitly enabled OAuth rotation, and only replace existing entries.
 use crate::{Error, Result};
 use std::{
     collections::BTreeMap,
@@ -101,6 +101,127 @@ pub(crate) async fn replace(
     .unwrap_or(Err(()))
     .map_err(|_| Error::config("Cannot save refreshed login in the OS credential store."))
 }
+/// Compare and replace a go-keyring entry under the same gate as reads:
+/// `swap` gives the secret to write for the one the entry holds, or none to
+/// leave it. A missing entry is never created.
+pub(crate) async fn replace_go_keyring(
+    service: &str,
+    account: &str,
+    swap: impl FnOnce(&str) -> Option<String> + Send + 'static,
+) -> Result<()> {
+    let gate = GATE.clone().lock_owned().await;
+    let key = (service.to_owned(), account.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        let current = read_blocking(key.clone(), load_go_keyring)?.ok_or(())?;
+        let updated = swap(&current).ok_or(())?;
+        let saved = save_go_keyring(&key.0, &key.1, &updated);
+        if let Ok(mut recent) = RECENT.lock() {
+            // A failed write leaves the entry unknown: read it again.
+            match saved {
+                Ok(()) => recent.insert(key, (Instant::now(), Some(updated))),
+                Err(()) => recent.remove(&key),
+            };
+        }
+        saved
+    })
+    .await
+    .unwrap_or(Err(()))
+    .map_err(|_| Error::config("Cannot save refreshed login in the OS credential store."))
+}
+
+/// Writes a go-keyring entry as go-keyring does on macOS: through
+/// `/usr/bin/security`, so that its partition list stays Apple's tool's and
+/// neither Antigravity nor any app reading the entry through the tool faces
+/// a Keychain prompt after the write. The secret goes over stdin, never in
+/// the tool's arguments: as text when it needs no quoting (go-keyring's
+/// `go-keyring-base64:` form), otherwise as hex, which no quoting can alter.
+#[cfg(all(not(test), target_os = "macos"))]
+fn save_go_keyring(service: &str, account: &str, value: &str) -> std::result::Result<(), ()> {
+    use std::io::{Read, Write};
+    /// The longest line `security -i` reads.
+    const MAX_LINE: usize = 4095;
+    const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=:_.-".contains(&b))
+    };
+    if !plain(service) || !plain(account) {
+        return Err(());
+    }
+    let secret = if plain(value) {
+        format!("-w {value}")
+    } else {
+        let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("-X {hex}")
+    };
+    let command = format!("add-generic-password -U -s {service} -a {account} {secret}\n");
+    if command.len() > MAX_LINE {
+        return Err(());
+    }
+    let mut child = std::process::Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| ())?;
+    // Closing stdin ends the tool's session after the one command.
+    let written = child
+        .stdin
+        .take()
+        .ok_or(())
+        .and_then(|mut stdin| stdin.write_all(command.as_bytes()).map_err(|_| ()));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|_| ())? {
+            Some(status) => break status,
+            None if started.elapsed() > PROMPT_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let mut errors = String::new();
+    child
+        .stderr
+        .take()
+        .ok_or(())?
+        .read_to_string(&mut errors)
+        .map_err(|_| ())?;
+    // `security -i` may exit successfully after a failed command; its errors
+    // go to stderr, with its prompt.
+    if written.is_err() || !status.success() || !errors.replace("security>", "").trim().is_empty() {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "windows")))]
+fn save_go_keyring(service: &str, account: &str, value: &str) -> std::result::Result<(), ()> {
+    go_keyring_entry(service, account)?
+        .set_secret(value.as_bytes())
+        .map_err(|_| ())
+}
+
+#[cfg(all(
+    not(test),
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn save_go_keyring(_: &str, _: &str, _: &str) -> std::result::Result<(), ()> {
+    Err(())
+}
+
+#[cfg(test)]
+fn save_go_keyring(service: &str, account: &str, value: &str) -> std::result::Result<(), ()> {
+    write_test_entry_elsewhere(service, account, value);
+    Ok(())
+}
+
 #[cfg(all(
     not(test),
     any(target_os = "macos", target_os = "linux", target_os = "windows")

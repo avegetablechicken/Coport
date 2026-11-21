@@ -106,29 +106,9 @@ pub(crate) struct Login {
 }
 /// A credential store item's login; none when it holds no access token.
 pub(crate) fn parse_login(raw: &str) -> Option<Login> {
-    let text = raw.trim().trim_start_matches('\u{feff}').trim();
-    let text = match text.strip_prefix(WRAPPED) {
-        Some(encoded) => String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?,
-        None => text.to_owned(),
-    };
-    let document: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
-    let object = document.as_object()?;
-    let token = object
-        .get("token")
-        .and_then(Value::as_object)
-        .unwrap_or(object);
-    let access_token = ["access_token", "accessToken"]
-        .iter()
-        .find_map(|key| token.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|token| valid_token(token))?
-        .to_owned();
-    let refresh_token = ["refresh_token", "refreshToken"]
-        .iter()
-        .find_map(|key| token.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|token| valid_token(token))
-        .map(str::to_owned);
+    let (document, _) = decode_item(raw)?;
+    let access_token = access_token(&document)?.to_owned();
+    let refresh_token = refresh_token(&document).map(str::to_owned);
     // Copool records the email of its own sign-ins; Antigravity's do not.
     let identity = [
         "/id_token_email",
@@ -146,6 +126,154 @@ pub(crate) fn parse_login(raw: &str) -> Option<Login> {
         identity,
     })
 }
+
+/// A credential store item's login document, and whether the item wraps it
+/// as go-keyring does on macOS.
+pub(crate) fn decode_item(raw: &str) -> Option<(Value, bool)> {
+    let text = raw.trim().trim_start_matches('\u{feff}').trim();
+    let (text, wrapped) = match text.strip_prefix(WRAPPED) {
+        Some(encoded) => (
+            String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok()?,
+            true,
+        ),
+        None => (text.to_owned(), false),
+    };
+    let document = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    Some((document, wrapped))
+}
+/// The item's secret for a login document, wrapped as `decode_item` found it.
+pub(crate) fn encode_item(document: &Value, wrapped: bool) -> String {
+    let json = document.to_string();
+    if wrapped {
+        format!("{WRAPPED}{}", STANDARD.encode(json))
+    } else {
+        json
+    }
+}
+
+const ACCESS_KEYS: [&str; 2] = ["access_token", "accessToken"];
+const REFRESH_KEYS: [&str; 2] = ["refresh_token", "refreshToken"];
+const EXPIRY_KEYS: [&str; 3] = ["expiry", "expires_at", "expiresAt"];
+
+/// Where a login document keeps its tokens: its `token` object, as Go's
+/// oauth2 token in agy's item, else itself.
+fn token(document: &Value) -> Option<&serde_json::Map<String, Value>> {
+    let object = document.as_object()?;
+    Some(
+        object
+            .get("token")
+            .and_then(Value::as_object)
+            .unwrap_or(object),
+    )
+}
+fn token_field<'a>(document: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    let token = token(document)?;
+    keys.iter()
+        .find_map(|key| token.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|token| valid_token(token))
+}
+pub(crate) fn access_token(document: &Value) -> Option<&str> {
+    token_field(document, &ACCESS_KEYS)
+}
+pub(crate) fn refresh_token(document: &Value) -> Option<&str> {
+    token_field(document, &REFRESH_KEYS)
+}
+
+/// Puts a renewal's tokens in a login document under the keys and forms it
+/// already uses, as Copool does: a numeric expiry keeps its unit, any other
+/// becomes RFC 3339 in UTC, as Go writes it.
+pub(crate) fn apply_renewal(
+    document: &mut Value,
+    access: &str,
+    expires_in: u64,
+    refresh: Option<&str>,
+) -> Result<()> {
+    let nested = document.get("token").is_some_and(Value::is_object);
+    let object = document
+        .as_object_mut()
+        .ok_or(Error::config("Invalid Antigravity login."))?;
+    let token = if nested {
+        object["token"].as_object_mut().unwrap()
+    } else {
+        object
+    };
+    let key = |keys: [&'static str; 2], token: &serde_json::Map<String, Value>| {
+        keys.into_iter()
+            .find(|key| token.contains_key(*key))
+            .unwrap_or(keys[0])
+    };
+    let access_key = key(ACCESS_KEYS, token);
+    token.insert(access_key.into(), access.into());
+    if let Some(refresh) = refresh {
+        let refresh_key = key(REFRESH_KEYS, token);
+        token.insert(refresh_key.into(), refresh.into());
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let expires_at = now.saturating_add(expires_in.min(i64::MAX as u64) as i64);
+    let expiry_key = EXPIRY_KEYS
+        .into_iter()
+        .find(|key| token.contains_key(*key))
+        .unwrap_or(EXPIRY_KEYS[0]);
+    let expiry = match token.get(expiry_key).and_then(Value::as_i64) {
+        Some(n) if n > 100_000_000_000 => expires_at.saturating_mul(1000).into(),
+        Some(_) => expires_at.into(),
+        None => time::OffsetDateTime::from_unix_timestamp(expires_at)
+            .ok()
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .ok_or(Error::config("Invalid Antigravity login expiry."))?
+            .into(),
+    };
+    token.insert(expiry_key.into(), expiry);
+    // Antigravity also keeps the token's lifetime.
+    if token.contains_key("expires_in") {
+        token.insert("expires_in".into(), expires_in.into());
+    }
+    Ok(())
+}
+
+/// Antigravity's OAuth client secret, which Google requires of its refreshes.
+/// It is an installed app's: `agy` ships it, so it is public and confers no
+/// access by itself (Copool and OpenQuota send the same).
+pub(crate) const CLIENT_SECRET: &str = "antigravity-client-secret";
+
+/// The form a refresh of `refresh_token` sends with Antigravity's client.
+pub(crate) fn refresh_form(refresh_token: &str, client_secret: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("client_secret", client_secret)
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh_token)
+        .finish()
+}
+
+/// The saved login's document and the item it is kept in, to renew it in
+/// place. `recent` accepts a read at most 30 seconds old, as requests are
+/// matched with.
+pub(crate) async fn saved_document(
+    recent: bool,
+) -> Result<(crate::oauth_credentials::Store, Value)> {
+    let raw = if recent {
+        crate::keychain::read_go_keyring_recent(SERVICE, ACCOUNT, RECENT).await?
+    } else {
+        crate::keychain::read_go_keyring(SERVICE, ACCOUNT).await?
+    }
+    .ok_or(Error::config(
+        "No Antigravity login in the OS credential store.",
+    ))?;
+    let (document, _) = decode_item(&raw)
+        .filter(|(document, _)| access_token(document).is_some())
+        .ok_or(Error::config(
+            "Invalid Antigravity login in the OS credential store.",
+        ))?;
+    let store = crate::oauth_credentials::Store::GoKeyring(SERVICE.into(), ACCOUNT.into());
+    Ok((store, document))
+}
+/// Bounds how long a login Antigravity replaced may still match.
+const RECENT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn digest(token: &str) -> String {
     ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
@@ -354,8 +482,6 @@ impl Antigravity {
     /// it, so requests with the current token start no `security` process,
     /// else the item as it is now.
     async fn saved_for(&self, matches: impl Fn(&Login) -> bool) -> (Option<Login>, bool) {
-        /// Bounds how long a login Antigravity replaced may still match.
-        const RECENT: std::time::Duration = std::time::Duration::from_secs(30);
         if !self.saved_login {
             return (None, false);
         }
@@ -699,6 +825,49 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn renewals_keep_the_documents_keys_and_forms() {
+        let mut nested = json!({"token": {"access_token": "a", "refresh_token": "r", "expiry": "2026-01-01T00:00:00.5+08:00", "expires_in": 1}, "other": 1});
+        apply_renewal(&mut nested, "b", 3600, None).unwrap();
+        assert_eq!(nested["token"]["access_token"], "b");
+        assert_eq!(nested["token"]["refresh_token"], "r");
+        assert_eq!(nested["token"]["expires_in"], 3600);
+        assert_eq!(nested["other"], 1);
+        let expiry = nested["token"]["expiry"].as_str().unwrap();
+        assert!(expiry.ends_with('Z') && !expiry.contains('.'), "{expiry}");
+        let mut flat =
+            json!({"accessToken": "a", "refreshToken": "r", "expiresAt": 1_000_000_000_000_i64});
+        apply_renewal(&mut flat, "b", 60, Some("s")).unwrap();
+        assert_eq!(flat["accessToken"], "b");
+        assert_eq!(flat["refreshToken"], "s");
+        assert!(flat.get("access_token").is_none() && flat.get("expires_in").is_none());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let at = flat["expiresAt"].as_i64().unwrap();
+        assert!((now + 60) * 1000 <= at && at <= (now + 61) * 1000);
+        let mut seconds = json!({"access_token": "a", "expires_at": 5});
+        apply_renewal(&mut seconds, "b", 60, None).unwrap();
+        assert!((now + 60..=now + 61).contains(&seconds["expires_at"].as_i64().unwrap()));
+        assert!(apply_renewal(&mut json!([]), "b", 60, None).is_err());
+    }
+
+    #[test]
+    fn items_keep_their_wrapping() {
+        let document = json!({"token": {"access_token": "a", "refresh_token": "r"}});
+        for wrapped in [true, false] {
+            let raw = encode_item(&document, wrapped);
+            assert_eq!(raw.starts_with(WRAPPED), wrapped);
+            assert_eq!(decode_item(&raw), Some((document.clone(), wrapped)));
+        }
+        let form: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(refresh_form("r&=", "s").as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(form["refresh_token"], "r&=");
+        assert_eq!(form["client_id"], CLIENT_ID);
+        assert_eq!(form["client_secret"], "s");
+        assert_eq!(form["grant_type"], "refresh_token");
     }
 
     #[test]

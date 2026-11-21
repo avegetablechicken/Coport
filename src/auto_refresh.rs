@@ -22,7 +22,9 @@ struct Attempt {
 }
 #[derive(Clone)]
 pub(super) struct Snapshot {
-    source: AccountSource,
+    /// The configured directory of a Codex or Claude login; none for
+    /// Antigravity's one saved login.
+    source: Option<AccountSource>,
     store: Store,
     service: Service,
     value: Value,
@@ -31,7 +33,68 @@ fn fingerprint(service: Service, token: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
     format!("{}:{:02x?}", service.name(), digest.as_ref())
 }
+/// What renewing a request's login needs: its saved login and a copy of the
+/// request to send again.
+pub(super) struct Renewal {
+    snapshot: Snapshot,
+    retry: reqwest::Request,
+    claude_identity: Option<crate::claude::ClaudeIdentity>,
+}
+impl Renewal {
+    pub(super) fn new(
+        snapshot: Option<Snapshot>,
+        request: &reqwest::Request,
+        claude_identity: Option<crate::claude::ClaudeIdentity>,
+    ) -> Option<Self> {
+        Some(Self {
+            snapshot: snapshot?,
+            retry: request.try_clone()?,
+            claude_identity,
+        })
+    }
+}
 impl Server {
+    /// On an upstream 401, renews the request's saved login and sends the
+    /// request once more with the new token; any other response, or one
+    /// whose renewal fails, is returned as it came.
+    pub(super) async fn retry_after_renewal(
+        &self,
+        response: reqwest::Response,
+        renewal: Option<Renewal>,
+        choice: &Choice,
+        native_tls: bool,
+        deadline: Deadline,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        let Some(mut renewal) = renewal.filter(|_| response.status() == 401) else {
+            return Ok(response);
+        };
+        let renewed = self
+            .renew_access(
+                &renewal.snapshot,
+                choice,
+                renewal.claude_identity.as_ref(),
+                deadline,
+                log,
+            )
+            .await;
+        match renewed {
+            Ok(token) => {
+                let headers = renewal.retry.headers_mut();
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+                // OAuth routes always use Authorization, never an API key.
+                headers.remove("x-api-key");
+                drop(response);
+                self.send_via(choice, renewal.retry, native_tls, deadline, log)
+                    .await
+            }
+            Err(error) => {
+                log.field("oauth_refresh", "failed");
+                log.field("oauth_refresh_reason", error.message);
+                Ok(response)
+            }
+        }
+    }
     pub(super) async fn refreshed_alias(&self, service: Service, token: &str) -> Option<String> {
         let key = fingerprint(service, token);
         let snapshot = self
@@ -43,7 +106,9 @@ impl Server {
             .cloned()?;
         // An external logout, rotation, backend change or account switch revokes
         // this alias. Never silently follow a directory into a different login.
-        let (store, value) = credentials::load(&snapshot.source, service).await.ok()?;
+        let (store, value) = credentials::load(snapshot.source.as_ref(), service, true)
+            .await
+            .ok()?;
         if store != snapshot.store || value != snapshot.value {
             return None;
         }
@@ -53,11 +118,22 @@ impl Server {
         let sources = match service {
             Service::Codex => self.config.codex.account_sources(),
             Service::Claude => self.config.claude.account_sources(),
-            Service::Antigravity => return None,
+            Service::Antigravity => {
+                let (store, value) = credentials::load(None, service, true).await.ok()?;
+                return (self.config.antigravity.saved_login
+                    && credentials::access(&value, service) == Some(token)
+                    && credentials::refresh(&value, service).is_some())
+                .then_some(Snapshot {
+                    source: None,
+                    store,
+                    service,
+                    value,
+                });
+            }
         };
         let mut found = None;
         for (_, source) in sources {
-            let Ok((store, value)) = credentials::load(&source, service).await else {
+            let Ok((store, value)) = credentials::load(Some(&source), service, false).await else {
                 continue;
             };
             if credentials::access(&value, service) == Some(token)
@@ -67,7 +143,7 @@ impl Server {
                     return None;
                 }
                 found = Some(Snapshot {
-                    source,
+                    source: Some(source),
                     store,
                     service,
                     value,
@@ -129,7 +205,8 @@ impl Server {
         } else {
             deadline
         };
-        let (store, current) = credentials::load(&snapshot.source, snapshot.service).await?;
+        let (store, current) =
+            credentials::load(snapshot.source.as_ref(), snapshot.service, false).await?;
         if store != snapshot.store {
             return Err(Error::config("Login storage changed during request."));
         }
@@ -160,7 +237,8 @@ impl Server {
             .headers_mut()
             .insert("accept", "application/json".parse().unwrap());
         attempt.failed = Some((generation.clone(), Instant::now(), false));
-        let mut refresh_log = RequestLog { logger: self.logger.clone(), fields: json!({"request_id":uuid::Uuid::new_v4().to_string(), "service":snapshot.service.name(), "method":"POST", "path":"/oauth/token", "reason":"automatic_oauth_refresh"}).as_object().unwrap().clone(), started:Instant::now(), status:0, bytes:0, outcome:"oauth_refresh_finished" };
+        let path = request.url().path().to_owned();
+        let mut refresh_log = RequestLog { logger: self.logger.clone(), fields: json!({"request_id":uuid::Uuid::new_v4().to_string(), "service":snapshot.service.name(), "method":"POST", "path":path, "reason":"automatic_oauth_refresh"}).as_object().unwrap().clone(), started:Instant::now(), status:0, bytes:0, outcome:"oauth_refresh_finished" };
         let response = self
             .send_via(choice, request, false, deadline, &mut refresh_log)
             .await?;
@@ -196,7 +274,8 @@ impl Server {
         // login) are kept, and the new tokens merged into them: dropping them
         // would leave only the spent token saved. A login whose refresh token
         // changed meanwhile belongs to someone else and is never overwritten.
-        let (active_store, active) = credentials::load(&snapshot.source, snapshot.service).await?;
+        let (active_store, active) =
+            credentials::load(snapshot.source.as_ref(), snapshot.service, false).await?;
         if active_store != store || credentials::refresh(&active, snapshot.service) != Some(refresh)
         {
             return Err(Error::config("Saved login changed during refresh."));
@@ -217,6 +296,21 @@ impl Server {
                         );
                     }
                 }
+            }
+        }
+        if snapshot.service == Service::Antigravity {
+            // The ID token names the account. Google keeps the refresh token;
+            // should it issue another, the account learned for the old one
+            // carries over.
+            let token = credentials::refresh(&updated, Service::Antigravity).unwrap_or(refresh);
+            let identity = crate::antigravity::AntigravityIdentity::token_response(&payload)
+                .or_else(|| {
+                    (token != refresh)
+                        .then(|| self.antigravity_refresh_routes.identity(refresh))
+                        .flatten()
+                });
+            if let Some(identity) = identity {
+                self.learn_antigravity_login(token, &identity);
             }
         }
         store.replace(&active, &updated).await?;
@@ -251,7 +345,8 @@ const LOCK_WAIT: Duration = if cfg!(test) {
 /// directory. Taken only for renewals this server starts: a refresh it
 /// relays may come from Claude Code holding this very lock.
 async fn refresh_lock(snapshot: &Snapshot, deadline: Deadline) -> Result<Option<RefreshLock>> {
-    let (Service::Claude, AccountSource::Directory(dir)) = (snapshot.service, &snapshot.source)
+    let (Service::Claude, Some(AccountSource::Directory(dir))) =
+        (snapshot.service, &snapshot.source)
     else {
         return Ok(None);
     };
@@ -265,18 +360,14 @@ async fn refresh_lock(snapshot: &Snapshot, deadline: Deadline) -> Result<Option<
 }
 
 fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> {
-    if service == Service::Antigravity {
-        return Err(Error::config(
-            "Antigravity renews its own login; Coport does not refresh it.",
-        ));
-    }
     let refresh =
         credentials::refresh(value, service).ok_or(Error::config("Login has no refresh token."))?;
     let mut request = reqwest::Request::new(
         hyper::Method::POST,
         Url::parse(match service {
             Service::Codex => TOKEN_REFRESH_UPSTREAM,
-            Service::Claude | Service::Antigravity => crate::claude::TOKEN_REFRESH_UPSTREAM,
+            Service::Claude => crate::claude::TOKEN_REFRESH_UPSTREAM,
+            Service::Antigravity => crate::antigravity::TOKEN_REFRESH_UPSTREAM,
         })
         .unwrap(),
     );
@@ -302,7 +393,10 @@ fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> 
                 .finish();
             ("application/x-www-form-urlencoded", body)
         }
-        Service::Antigravity => unreachable!("rejected above"),
+        Service::Antigravity => (
+            "application/x-www-form-urlencoded",
+            crate::antigravity::refresh_form(refresh, crate::antigravity::CLIENT_SECRET),
+        ),
         Service::Claude => {
             let scopes: Vec<_> = value["claudeAiOauth"]["scopes"]
                 .as_array()
@@ -344,9 +438,13 @@ fn merge_tokens(service: Service, original: &Value, payload: &Value) -> Result<V
     let mut updated = original.clone();
     match service {
         Service::Antigravity => {
-            return Err(Error::config(
-                "Antigravity renews its own login; Coport does not refresh it.",
-            ));
+            let lifetime = payload["expires_in"].as_u64().unwrap_or(3600);
+            crate::antigravity::apply_renewal(
+                &mut updated,
+                access,
+                lifetime,
+                payload["refresh_token"].as_str(),
+            )?;
         }
         Service::Codex => {
             // Do not allow an unexpected response to switch the routed account.

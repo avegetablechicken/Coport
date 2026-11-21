@@ -29,7 +29,7 @@ impl Server {
 
     pub(super) async fn forward_antigravity(
         &self,
-        incoming: Request<Incoming>,
+        mut incoming: Request<Incoming>,
         target: &str,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
@@ -47,6 +47,30 @@ impl Server {
                 ));
             }
             return self.forward_antigravity_refresh(incoming, log).await;
+        }
+        // As for Codex and Claude: only the saved login's model calls renew it.
+        let auto_refresh = self.config.auto_refresh_access_token
+            && settings.saved_login
+            && crate::model_calls::is_model_endpoint(incoming.method().as_str(), target);
+        let rotation_guard = if auto_refresh {
+            Some(self.auto_refresh.rotation.read().await)
+        } else {
+            None
+        };
+        if auto_refresh {
+            if let Some(token) = incoming
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+            {
+                if let Some(current) = self.refreshed_alias(Service::Antigravity, token).await {
+                    incoming.headers_mut().insert(
+                        "authorization",
+                        format!("Bearer {current}").parse().unwrap(),
+                    );
+                }
+            }
         }
         let mut route = settings
             .resolve(
@@ -78,6 +102,13 @@ impl Server {
             log.field("account_label", label);
         }
         log.field("credential_match", credential_match(route.configured));
+        let refresh_snapshot = if auto_refresh && route.matched_login {
+            self.refresh_snapshot(Service::Antigravity, &route.token)
+                .await
+        } else {
+            None
+        };
+        drop(rotation_guard);
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
         if log.fields.contains_key("model_call_id") {
@@ -94,7 +125,11 @@ impl Server {
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
         let deadline = Deadline::new(self.config.request_timeout_seconds);
-        self.send_via(&route.proxy, request, false, deadline, log)
+        let renewal = auto_refresh::Renewal::new(refresh_snapshot, &request, None);
+        let response = self
+            .send_via(&route.proxy, request, false, deadline, log)
+            .await?;
+        self.retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
             .await
     }
 
@@ -194,7 +229,11 @@ impl Server {
 
     /// Keeps the account a lookup named for the saved login. A failure to
     /// save it is logged; the request goes on.
-    fn learn_antigravity_login(&self, refresh_token: &str, identity: &AntigravityIdentity) {
+    pub(super) fn learn_antigravity_login(
+        &self,
+        refresh_token: &str,
+        identity: &AntigravityIdentity,
+    ) {
         if let Err(error) = self
             .antigravity_refresh_routes
             .learn(refresh_token, identity)

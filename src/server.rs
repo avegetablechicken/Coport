@@ -1162,41 +1162,16 @@ impl Server {
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
         let deadline = Deadline::new(self.config.request_timeout_seconds);
-        let retry = refresh_snapshot.as_ref().and_then(|_| request.try_clone());
+        let renewal = auto_refresh::Renewal::new(
+            refresh_snapshot,
+            &request,
+            claude_route.as_ref().and_then(|r| r.identity.clone()),
+        );
         let response = self
             .send_via(&choice, request, native_tls, deadline, log)
             .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            if let (Some(snapshot), Some(mut retry)) = (refresh_snapshot, retry) {
-                match self
-                    .renew_access(
-                        &snapshot,
-                        &choice,
-                        claude_route.as_ref().and_then(|r| r.identity.as_ref()),
-                        deadline,
-                        log,
-                    )
-                    .await
-                {
-                    Ok(token) => {
-                        retry
-                            .headers_mut()
-                            .insert("authorization", format!("Bearer {token}").parse().unwrap());
-                        // OAuth routes always use Authorization, never an API key.
-                        retry.headers_mut().remove("x-api-key");
-                        drop(response);
-                        return self
-                            .send_via(&choice, retry, native_tls, deadline, log)
-                            .await;
-                    }
-                    Err(error) => {
-                        log.field("oauth_refresh", "failed");
-                        log.field("oauth_refresh_reason", error.message);
-                    }
-                }
-            }
-        }
-        Ok(response)
+        self.retry_after_renewal(response, renewal, &choice, native_tls, deadline, log)
+            .await
     }
 
     /// CONNECT is served only for destinations decrypted and routed by credential.

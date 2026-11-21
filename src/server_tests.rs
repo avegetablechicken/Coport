@@ -102,7 +102,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     io.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
                 }
                 else if response_mode.starts_with("auto_") {
-                    let refresh = request.starts_with("POST /oauth/token ") || request.starts_with("POST /v1/oauth/token ");
+                    let refresh = request.starts_with("POST /oauth/token ") || request.starts_with("POST /v1/oauth/token ") || request.starts_with("POST /token ");
                     if refresh && response_mode == "auto_wait" { ready.notified().await; }
                     let (status, body) = if refresh {
                         match response_mode {
@@ -5297,5 +5297,159 @@ async fn startup_reports_whether_antigravity_has_its_saved_login() {
             .await
             .is_empty()
     );
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+/// Antigravity's saved login as agy's go-keyring keeps it on macOS.
+fn antigravity_wrapped_login() -> String {
+    use base64::Engine;
+    let document = json!({"token": {"access_token": "access-secret", "token_type": "Bearer", "refresh_token": "refresh-secret", "expiry": "2026-01-01T00:00:00Z", "expires_in": 3599}, "auth_method": "consumer"});
+    format!(
+        "go-keyring-base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(document.to_string())
+    )
+}
+async fn antigravity_saved_item() -> String {
+    crate::keychain::read_go_keyring("gemini", "antigravity")
+        .await
+        .unwrap()
+        .unwrap()
+}
+async fn antigravity_auto_setup(enabled: bool, mode: &'static str) -> (Running, Fixture) {
+    crate::keychain::set_test_entry("gemini", "antigravity", Some(&antigravity_wrapped_login()));
+    let fixture = fixture("http", mode).await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!(
+        "auto_refresh_access_token: {enabled}\nproxies:\n  selected: {endpoint}\nantigravity:\n  routing:\n    account:\n      default: selected\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    (running, fixture)
+}
+async fn antigravity_call(running: &Running, path: &str) -> reqwest::Response {
+    http()
+        .post(format!("{}/antigravity/v1internal:{path}", running.url))
+        .bearer_auth("access-secret")
+        .header("cookie", "private-cookie")
+        .body("model-body")
+        .send()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn auto_refresh_renews_antigravity_in_its_item_once_and_in_its_own_form() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let (running, mut fixture) = antigravity_auto_setup(true, "auto_success").await;
+    let (one, two) = tokio::join!(
+        antigravity_call(&running, "generateContent"),
+        antigravity_call(&running, "streamGenerateContent?alt=sse")
+    );
+    assert_eq!(one.status(), 200);
+    assert_eq!(two.status(), 200);
+    // The old token now names the renewed login.
+    let again = antigravity_call(&running, "generateContent").await;
+    assert_eq!(again.text().await.unwrap(), "model-result");
+    let item = antigravity_saved_item().await;
+    let (saved, wrapped) = crate::antigravity::decode_item(&item).unwrap();
+    assert!(wrapped);
+    let token = &saved["token"];
+    assert_eq!(token["access_token"], "new-access");
+    assert_eq!(token["refresh_token"], "new-refresh");
+    assert_eq!(token["token_type"], "Bearer");
+    assert_eq!(token["expires_in"], 3600);
+    assert_eq!(saved["auth_method"], "consumer");
+    // RFC 3339 in UTC to the second, as Go writes it, an hour ahead.
+    let at = |seconds: i64| {
+        time::OffsetDateTime::from_unix_timestamp(
+            time::OffsetDateTime::now_utc().unix_timestamp() + seconds,
+        )
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+    };
+    let expiry = token["expiry"].as_str().unwrap();
+    assert!(
+        at(3540).as_str() < expiry && expiry <= at(3600).as_str(),
+        "{expiry}"
+    );
+    let requests = take_requests(&mut fixture);
+    let refreshes: Vec<_> = requests
+        .iter()
+        .filter(|r| r.starts_with("POST /token "))
+        .collect();
+    assert_eq!(refreshes.len(), 1, "{requests:?}");
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(refreshes[0].split("\r\n\r\n").nth(1).unwrap().as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(form["client_id"], crate::antigravity::CLIENT_ID);
+    assert_eq!(form["client_secret"], crate::antigravity::CLIENT_SECRET);
+    assert_eq!(form["grant_type"], "refresh_token");
+    assert_eq!(form["refresh_token"], "refresh-secret");
+    for forbidden in [
+        "access-secret",
+        "private-cookie",
+        "authorization:",
+        "model-body",
+    ] {
+        assert!(!refreshes[0].contains(forbidden), "{forbidden}");
+    }
+    // Every retry carries the original body and the renewed token.
+    let retried: Vec<_> = requests
+        .iter()
+        .filter(|r| r.contains("authorization: Bearer new-access"))
+        .collect();
+    assert_eq!(retried.len(), 3, "{requests:?}");
+    assert!(retried.iter().all(|r| r.ends_with("model-body")));
+    running.server.logger.flush().unwrap();
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(log.contains("\"oauth_refresh\":\"succeeded\""));
+    assert!(log.contains("\"path\":\"/token\""));
+    for secret in [
+        "access-secret",
+        "refresh-secret",
+        "new-access",
+        "new-refresh",
+    ] {
+        assert!(!log.contains(secret), "{secret}");
+    }
+    // Another sign-in revokes the old token's alias.
+    crate::antigravity::set_test_login("switched-access", "switched-refresh");
+    assert_eq!(
+        antigravity_call(&running, "generateContent").await.status(),
+        401
+    );
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+#[tokio::test]
+async fn auto_refresh_of_antigravity_is_opt_in_for_model_calls_and_stops_once_rejected() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let (running, mut fixture) = antigravity_auto_setup(false, "auto_success").await;
+    assert_eq!(
+        antigravity_call(&running, "generateContent").await.status(),
+        401
+    );
+    assert_eq!(take_requests(&mut fixture).len(), 1);
+    assert_eq!(antigravity_saved_item().await, antigravity_wrapped_login());
+    let (running, mut fixture) = antigravity_auto_setup(true, "auto_success").await;
+    for _ in 0..2 {
+        let response = antigravity_call(&running, "loadCodeAssist").await;
+        assert_eq!(response.status(), 401);
+    }
+    assert_eq!(take_requests(&mut fixture).len(), 2);
+    assert_eq!(antigravity_saved_item().await, antigravity_wrapped_login());
+    let (running, mut fixture) = antigravity_auto_setup(true, "auto_rejected").await;
+    for _ in 0..2 {
+        let response = antigravity_call(&running, "generateContent").await;
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.text().await.unwrap(), "original-unauthorized");
+    }
+    let requests = take_requests(&mut fixture);
+    let refreshes = requests
+        .iter()
+        .filter(|r| r.starts_with("POST /token "))
+        .count();
+    assert_eq!(refreshes, 1, "{requests:?}");
+    assert_eq!(antigravity_saved_item().await, antigravity_wrapped_login());
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }

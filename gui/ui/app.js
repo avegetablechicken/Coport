@@ -2260,7 +2260,7 @@ function configSettings() {
   ${block(
     "Subscription Logins",
     "",
-    `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a Codex or Claude login expires, retries the request once and saves the updated login. Antigravity renews its own. Restart the proxy to apply.")}
+    `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a Codex, Claude or Antigravity login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
      ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
      ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}
      ${flag("antigravity.account_auth_file_only", "Antigravity: saved login only", "When off, accepts other Google logins and looks up their email.")}`

@@ -311,7 +311,9 @@ Service item of that service and user name, read from the Secret Service itself
 rather than from a kernel keyring copy, which would miss Antigravity's later
 writes. With `saved_login`, it is read for
 each request; a request whose Bearer token is that login's access token is the
-saved login. Antigravity renews the token itself and saves the new one there.
+saved login. Antigravity renews the token itself and saves the new one there, as
+does Coport with `auto_refresh_access_token` (see
+[Automatic OAuth renewal](#automatic-oauth-renewal)).
 So is an access token issued by a refresh of the login's refresh token that
 Coport relayed: apps that renew the login themselves, such as Copool and
 OpenQuota, may keep the new token without saving it in the item. Such tokens
@@ -537,12 +539,10 @@ with HTTP 401) trigger renewal. Usage reads, Settings, Devices, API keys, and to
 without a saved refresh token do not trigger renewal. Errors inside an already-open
 WebSocket or SSE stream are not replayed.
 
-Antigravity is never renewed this way: it renews its login itself, and Coport only
-routes those refreshes (see [Antigravity](#antigravity)).
-
-After an upstream HTTP 401, Coport refreshes the matched saved Codex/Claude login
-through that account's configured transport, saves rotated credentials to the original
-file or OS credential store, and retries the buffered request once. It preserves other
+After an upstream HTTP 401, Coport refreshes the matched saved Codex, Claude or
+Antigravity login through that account's configured transport, saves rotated
+credentials to the original file or OS credential store, and retries the buffered
+request once. It preserves other
 credential fields, including edits made while the refresh ran, and never overwrites a
 login whose refresh token changed meanwhile (another renewal or an account switch).
 
@@ -565,3 +565,16 @@ original 401. In-memory aliases allow callers still holding the old access
 token to use the rotated login; aliases are bounded, disappear on proxy restart, and
 are revoked when the saved login changes externally or is removed. Clients should still
 reload their saved login after rotation.
+
+Antigravity's saved login (with `saved_login`) is renewed as Antigravity and Copool
+renew it: at `oauth2.googleapis.com/token`, with Antigravity's OAuth client. Tokens of
+other Google accounts carry no saved refresh token and are not renewed. The new tokens
+are written to the credential store item in the form it had: go-keyring's
+`go-keyring-base64:` wrapping, its key names, and its expiry as RFC 3339 in UTC or in
+the same numeric unit. On macOS the item is written through `/usr/bin/security`, as
+go-keyring writes it, so neither Antigravity nor Coport faces a Keychain prompt after
+the write; the login travels over the tool's stdin, never in its arguments. An item
+that no longer exists is never recreated. Google keeps the refresh token across
+renewals, so Antigravity renewing the same login meanwhile spends nothing, and no lock
+is taken; Antigravity's own refreshes through the proxy are still only routed (see
+[Antigravity](#antigravity)).
