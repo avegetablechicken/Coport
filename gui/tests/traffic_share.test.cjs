@@ -698,3 +698,12 @@ test('a reset while reading discards the old result and reads again', async () =
   assert.equal((await read).requests, 2);
   assert.equal(ui.localTrafficViews['30:all'].requests, 2);
 });
+test('Account names start after the longest service name, Antigravity', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  const rule = css.match(/\.traffic-identity \{[^}]*grid-template-columns: ([^;]+);/)[1];
+  // The service column grows with its content and never starts narrower than
+  // the 16px mark, 4px gap and "Antigravity" at 11px (about 57px on macOS).
+  const first = rule.match(/^minmax\((\d+)px, max-content\)/);
+  assert.ok(first, `service column must grow with its content: ${rule}`);
+  assert.ok(Number(first[1]) >= 16 + 4 + 57, `service column too narrow: ${rule}`);
+});
