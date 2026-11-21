@@ -100,14 +100,16 @@ impl Config {
             let claude = self.claude.url_route_matches(target)?;
             let codex = !claude_scoped
                 && crate::url_routing::match_route(&self.codex.routing.api_key, target)?.is_some();
-            match (claude, codex) {
-                (true, true) => Err(Error::new(
+            let antigravity = !claude_scoped && self.antigravity.url_route_matches(target)?;
+            match (claude, codex, antigravity) {
+                (true, false, false) => Ok(Some(Service::Claude)),
+                (false, true, false) => Ok(Some(Service::Codex)),
+                (false, false, true) => Ok(Some(Service::Antigravity)),
+                (false, false, false) => Ok(None),
+                _ => Err(Error::new(
                     409,
-                    "API upstream is configured for both apps; use /codex/https:// or /anthropic/https://.",
+                    "API upstream is configured for several apps; use /codex/https://, /anthropic/https:// or /antigravity/https://.",
                 )),
-                (true, false) => Ok(Some(Service::Claude)),
-                (false, true) => Ok(Some(Service::Codex)),
-                (false, false) => Ok(None),
             }
         })
     }
@@ -653,7 +655,7 @@ mod tests {
 
     #[test]
     fn every_request_target_belongs_to_one_app() {
-        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\n").unwrap();
+        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\n      'https://shared.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\nantigravity:\n  routing:\n    api_key:\n      relay.invalid/antigravity: none\n      gateway.invalid/v1beta: none\n      shared.invalid/v1: none\n").unwrap();
         let cases = [
             ("/v1/responses", Service::Codex),
             ("/backend-api/wham/usage", Service::Codex),
@@ -706,16 +708,42 @@ mod tests {
                 .unwrap(),
             Service::Codex
         );
-        assert_eq!(
-            config
-                .request_service("/https://both.invalid/v1/models")
-                .unwrap_err()
-                .status,
-            409
-        );
+        // Antigravity's API routes also serve unscoped targets, as on the
+        // proxy port; a path another app routes on the same host stays its.
+        for target in [
+            "/https://relay.invalid/antigravity/v1beta/models/g:generateContent",
+            "/https://gateway.invalid/v1beta/models/g:generateContent",
+        ] {
+            assert_eq!(
+                config.request_service(target).unwrap(),
+                Service::Antigravity,
+                "{target}"
+            );
+        }
+        for target in [
+            "/https://both.invalid/v1/models",
+            // Codex and Antigravity both route shared.invalid/v1.
+            "/https://shared.invalid/v1/messages",
+        ] {
+            assert_eq!(
+                config.request_service(target).unwrap_err().status,
+                409,
+                "{target}"
+            );
+        }
         for (target, service) in [
             ("/codex/https://both.invalid/v1/models", Service::Codex),
             ("/anthropic/https://both.invalid/v1/models", Service::Claude),
+            ("/codex/https://shared.invalid/v1/messages", Service::Codex),
+            (
+                "/antigravity/https://shared.invalid/v1/messages",
+                Service::Antigravity,
+            ),
+            // Claude's scope never considers another app's URL routes.
+            (
+                "/anthropic/https://relay.invalid/antigravity/v1beta/models/g:generateContent",
+                Service::Claude,
+            ),
         ] {
             assert_eq!(config.request_service(target).unwrap(), service, "{target}");
         }

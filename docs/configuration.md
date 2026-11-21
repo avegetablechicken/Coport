@@ -44,17 +44,19 @@ claude:
 ```
 
 Either service section can be omitted. An optional `antigravity` section routes
-Antigravity's Google logins; see [Antigravity](#antigravity). Within each section:
+Antigravity's Google logins and Gemini API key upstreams; see
+[Antigravity](#antigravity). Within each section:
 
 | Field | Purpose |
 | --- | --- |
 | `base_url` | Claude: one upstream root for both OAuth and API Keys |
 | `base_url.account` | Codex: ChatGPT account upstream |
 | `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1` |
+| `api_key_base_url` | Antigravity: Gemini API upstream; defaults to `https://generativelanguage.googleapis.com` |
 | `codex.homes` / `claude.config_dirs` | Lists of directories allowed for local credential discovery |
 | `auth_env` | Alternative: environment variable containing the account access token |
 | `routing.account.<label>` | Proxy choice for that account source |
-| `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, or Claude settings name |
+| `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, Claude settings name, or API upstream URL (Antigravity takes variable names and URLs) |
 | `routing.account_fallback` | Proxy choice for an account without an explicit mapping |
 | `routing.account_probe` | Claude OAuth or Antigravity Google account identity probe route; omitted uses `account_fallback`, then `fallback` |
 | `routing.fallback` | Default proxy choice for unmatched API Key and account requests |
@@ -287,11 +289,13 @@ priority. Account/API fallbacks default to rejection when omitted/null.
 
 The `antigravity` section routes the Cloud Code requests of Antigravity (see
 [Connect Antigravity](clients.md#connect-antigravity)) by the Google login they
-carry. It has account routes only:
+carry, and `agy`'s Gemini API key requests by their key or the upstream URL
+they name:
 
 ```yaml
 antigravity:
   base_url: "https://daily-cloudcode-pa.googleapis.com" # Default.
+  api_key_base_url: "https://generativelanguage.googleapis.com" # Default.
   saved_login: true # Default: read Antigravity's saved login.
   account_auth_file_only: true # Default.
   routing:
@@ -301,6 +305,9 @@ antigravity:
     # account_probe: us # Google account lookup, see below.
     # account_fallback: us
     # fallback: us
+    # api_key:
+    #   GEMINI_API_KEY: jp # The key this variable holds, see below.
+    #   "relay.example.com/antigravity": jp # A Gemini API upstream.
 ```
 
 Antigravity and `agy` keep their login in one item of the OS credential store,
@@ -343,8 +350,22 @@ renewed tokens and restarts need no new lookup. Another login (a different
 refresh token) is looked up anew and never takes a learned account. With
 `account_probe`, the credential monitor also names the saved login in the
 background, as for Claude: failures are retried after 10 minutes, and a fallback
-route alone never authorizes a lookup. Email routes match regardless of case. API
-Key routes and `mcp_fallback` are not supported.
+route alone never authorizes a lookup. Email routes match regardless of case.
+`mcp_fallback` is not supported.
+
+`routing.api_key` takes, as Claude's, environment variable names and upstream
+URLs. A name, such as `GEMINI_API_KEY`, selects the key that variable holds:
+it is read from Coport's environment, else from your login shell, as for
+Claude's environment selectors (`agy` has no settings file that holds its key,
+so there is no named settings form). A key it matches goes to
+`api_key_base_url`, as Codex's API Keys go to `base_url.api_key`; any other key
+takes `fallback`, else is rejected with 401, and a key two names hold is
+refused with 409. A URL is matched as
+[Codex API URL routes](clients.md#codex-api-url-routes) are and forwards any
+key to that upstream; one naming a Cloud Code host, `base_url` or
+`oauth2.googleapis.com` is rejected, so a login's token always takes its
+account route. Neither needs a saved login; see
+[Gemini API keys](clients.md#gemini-api-keys).
 
 As for Codex and Claude with `account_auth_file_only: true`, the desktop app's
 routing page marks the saved login's route active and the others inactive; while

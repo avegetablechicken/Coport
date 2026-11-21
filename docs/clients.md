@@ -213,11 +213,12 @@ connection. These hosts are decrypted:
 | Codex, with non-URL API Key routes or `fallback` | `codex.base_url.api_key` |
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
-| Either, for each URL route | that route's host and port, including public IPv4 addresses |
+| Any, for each URL route | that route's host and port, including public IPv4 addresses |
 | Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com` and `oauth2.googleapis.com`, as `/antigravity/https://<host>/...` |
+| Antigravity, with named API Key routes or `fallback` | `antigravity.api_key_base_url`, as `/antigravity/https://<host>/...` |
 
-A host routed by both services uses the unprefixed `/https://` form and its usual
-conflict rules. Destination discovery reads local provider/settings definitions
+A host routed by more than one service uses the unprefixed `/https://` form and
+its usual conflict rules. Destination discovery reads local provider/settings definitions
 at startup without resolving credentials or contacting upstreams. Restart after changing those
 upstream addresses. Unavailable definitions contribute no destinations; valid
 definitions in other configured homes still apply. All other destinations are
@@ -493,3 +494,69 @@ two Cloud Code hosts, `antigravity.base_url` and `oauth2.googleapis.com` are
 decrypted instead, for a client started with `HTTPS_PROXY` that trusts the proxy
 CA. Every other CONNECT is refused, so its other Google hosts are not reachable
 through the proxy port.
+
+### Gemini API keys
+
+With `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`
+(or `agy --settings '{"modelProvider":"gemini"}'` for one session), `agy` skips
+the Google login and sends Gemini API requests,
+`POST <base>/v1beta/models/<model>:streamGenerateContent?alt=sse`, with
+`GEMINI_API_KEY` in `x-goog-api-key` to `GOOGLE_GEMINI_BASE_URL`. `agy` reads
+both from its environment only; `--settings` and `settings.json` accept neither.
+As for Claude, a key is routed by name or by upstream URL.
+
+**By name.** Name the variable that holds the key; the key it holds selects the
+route, and requests go to `api_key_base_url` (Google's Gemini API by default; a
+relay's root, such as a Sub2api `/antigravity` endpoint, works too):
+
+```yaml
+antigravity:
+  api_key_base_url: "https://relay.example.com/antigravity" # Default: Google.
+  routing:
+    api_key:
+      GEMINI_API_KEY: jp
+    # fallback: us # Any other key; omitted: rejected with 401.
+```
+
+```sh
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/antigravity GEMINI_API_KEY=<key> agy
+```
+
+Any variable name works, and several names may each select their own route.
+As for Claude's environment selectors, each value is read from Coport's own
+environment, else from your login shell (cached for 30 seconds), so a key
+exported in your shell profile is found even by the desktop app. A key two
+names hold is refused with 409. The explicit form
+`/antigravity/https://<api_key_base_url host>/...` works too; another host is
+rejected before any connection.
+
+**By URL.** Declare the upstream itself:
+
+```yaml
+antigravity:
+  routing:
+    api_key:
+      "relay.example.com/antigravity": jp
+```
+
+```sh
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787/antigravity/https://relay.example.com/antigravity \
+GEMINI_API_KEY=<key> agy
+```
+
+URL routes match as [Codex API URL routes](#codex-api-url-routes) do (scheme
+and path optional, longest path wins, the path is not rewritten), take any key,
+and take precedence over names; a target on any other host is rejected before
+any outbound connection.
+
+A Gemini API key is the request's `x-goog-api-key` or `key` query parameter, as
+`agy` sends it; a URL route also takes `Authorization: Bearer`, which elsewhere
+stays a Google login routed as above. More than one key is refused with 400. The
+key is forwarded where it came, for the upstream to validate; Coport makes no
+account lookup and stores nothing. Records name the route by its variable or
+URL (`fallback` as `antigravity-api-key-fallback`), never the key (the query is
+not logged), and model calls record Gemini usage as above. Neither form needs
+`CLOUD_CODE_URL`, a saved login or an account route. With
+[proxy port credential routing](#credential-routing-on-the-proxy-port),
+`api_key_base_url` (with a name or `fallback`) and each URL route's host are
+decrypted too, as `/antigravity/https://<host>/...`.

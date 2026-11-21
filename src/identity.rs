@@ -690,6 +690,24 @@ impl Config {
                 }
             }
         }
+        // Antigravity's named keys, as Claude's environment selectors.
+        let antigravity = &self.antigravity;
+        for name in antigravity.routing.api_key.keys() {
+            let Some(upstream) = antigravity.api_key_upstream(name) else {
+                continue;
+            };
+            let Ok(token) = environment_key_with_shell(name, false).await else {
+                continue;
+            };
+            if let Some(reference) = shared_api_reference("Antigravity", upstream, &token) {
+                result.push(TrafficProviderReference {
+                    service: "Antigravity".into(),
+                    name: name.clone(),
+                    upstream: upstream.into(),
+                    reference,
+                });
+            }
+        }
         result
     }
     /// Local route activation, not upstream token validity. Archived logins are
@@ -850,7 +868,8 @@ impl Config {
         }
         // Antigravity's records name their route in `account_label`.
         let antigravity = &self.antigravity.routing;
-        for name in antigravity.account.keys() {
+        // API key routes name theirs in `provider`, as Codex's and Claude's.
+        for name in antigravity.account.keys().chain(antigravity.api_key.keys()) {
             labels.insert(("Antigravity".into(), name.clone()), name.clone());
         }
         for (name, choice) in [
@@ -860,6 +879,15 @@ impl Config {
             if choice.is_some() {
                 labels.insert(("Antigravity".into(), name.into()), name.into());
             }
+        }
+        if antigravity.fallback.is_some() {
+            labels.insert(
+                (
+                    "Antigravity".into(),
+                    crate::antigravity::API_KEY_FALLBACK.into(),
+                ),
+                "fallback".into(),
+            );
         }
         for (service, routing) in [
             ("Codex", &self.codex.routing),

@@ -1,9 +1,10 @@
 //! Antigravity's Cloud Code requests: routed by the Google login they carry,
-//! forwarded unchanged otherwise. Account lookups, their caches, route states
-//! and statistics labels follow Claude's.
+//! forwarded unchanged otherwise; and its Gemini API key requests, routed by
+//! their key or upstream URL. Account lookups, their caches, route states and
+//! statistics labels follow Claude's.
 use super::*;
 use crate::{
-    antigravity::{Antigravity, AntigravityIdentity},
+    antigravity::{Antigravity, AntigravityIdentity, ApiCredential, ApiRoute},
     refresh_routes::RefreshRoutes,
 };
 use std::collections::BTreeMap;
@@ -34,11 +35,31 @@ impl Server {
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         let settings = &self.config.antigravity;
+        // An unprefixed target is Antigravity's only through an API key route.
+        let scoped = crate::antigravity::target(target);
+        let api_target = scoped.unwrap_or(target);
+        if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
+            return self
+                .forward_antigravity_api(incoming, api_target, route, log)
+                .await;
+        }
+        // A key in `x-goog-api-key` or `key` is a Gemini API key, routed as
+        // Claude's `x-api-key`; a Bearer token stays a Google login.
+        if settings.serves_api_keys() {
+            if let Some((key, credential)) =
+                crate::antigravity::api_credential(incoming.headers(), api_target)?
+                    .filter(|(_, credential)| *credential != ApiCredential::Bearer)
+            {
+                let route = settings.resolve_api_key(key, credential).await?;
+                return self
+                    .forward_antigravity_api(incoming, api_target, route, log)
+                    .await;
+            }
+        }
         if !settings.enabled() {
             return Err(Error::new(404, "Antigravity routing is not configured."));
         }
-        let rest = crate::antigravity::target(target)
-            .ok_or(Error::config("Unroutable Antigravity request target."))?;
+        let rest = scoped.ok_or(Error::config("Unroutable Antigravity request target."))?;
         if crate::antigravity::token_host(rest) {
             if !crate::antigravity::token_refresh(rest) {
                 return Err(Error::new(
@@ -130,6 +151,47 @@ impl Server {
             .send_via(&route.proxy, request, false, deadline, log)
             .await?;
         self.retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
+            .await
+    }
+
+    /// A Gemini API request, as Codex's and Claude's API key requests: no
+    /// account lookup, and its key is relayed where it came, for the upstream
+    /// to validate.
+    async fn forward_antigravity_api(
+        &self,
+        incoming: Request<Incoming>,
+        target: &str,
+        route: ApiRoute,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        let url = route.url(target)?;
+        log.field("provider", &route.selector);
+        log.field("upstream_base_url", &route.upstream);
+        if let Some(reference) =
+            crate::identity::shared_api_reference("Antigravity", &route.upstream, &route.key)
+        {
+            log.field("credential_ref", reference);
+        }
+        log.field("credential_match", credential_match(route.configured));
+        let (parts, body) = incoming.into_parts();
+        let bytes = read_body(body).await?;
+        if log.fields.contains_key("model_call_id") {
+            crate::model_calls::observe_request(&bytes, log);
+        }
+        let mut headers = filtered_headers(&parts.headers);
+        if route.credential == ApiCredential::Bearer {
+            headers.insert(
+                "authorization",
+                format!("Bearer {}", route.key)
+                    .parse()
+                    .map_err(|_| Error::new(401, "Invalid credential."))?,
+            );
+        }
+        let mut request = reqwest::Request::new(parts.method, url);
+        *request.headers_mut() = headers;
+        *request.body_mut() = Some(bytes.into());
+        let deadline = Deadline::new(self.config.request_timeout_seconds);
+        self.send_via(&route.proxy, request, route.custom_upstream, deadline, log)
             .await
     }
 

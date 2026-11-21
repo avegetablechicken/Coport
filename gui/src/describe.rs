@@ -41,6 +41,11 @@ pub fn claude_api_key(config: &Config, selector: &str) -> Option<String> {
     }
 }
 
+/// A named key's Gemini API base; URL routes name their own.
+pub fn antigravity_api_key(config: &Config, selector: &str) -> Option<String> {
+    config.antigravity.api_key_upstream(selector).map(display)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

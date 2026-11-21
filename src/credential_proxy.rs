@@ -177,6 +177,19 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     {
         add(&url(key)?, "/codex/");
     }
+    // As Codex's API Key base: named keys and `fallback` reach the Gemini API.
+    if config.antigravity.serves_api_keys() {
+        add(&url(&config.antigravity.api_key_base_url)?, "/antigravity/");
+    }
+    for key in config
+        .antigravity
+        .routing
+        .api_key
+        .keys()
+        .filter(|k| crate::url_routing::is_url_selector(k))
+    {
+        add(&url(key)?, "/antigravity/");
+    }
     if config.antigravity.enabled() {
         for origin in config.antigravity.origins() {
             add(&url(origin)?, "/antigravity/");
@@ -317,6 +330,49 @@ mod tests {
         // A probe route alone routes nothing.
         let probe_only = config("antigravity:\n  routing:\n    account_probe: none\n");
         assert!(scopes(&probe_only).unwrap().is_empty());
+        // API key routes decrypt only their own hosts; a host Codex also
+        // routes stays unprefixed for the explicit URL rules.
+        let api = scopes(&config(
+            "codex:\n  homes: []\n  routing:\n    api_key:\n      shared.example.com/v1: none\nantigravity:\n  routing:\n    api_key:\n      relay.example.com:8443/antigravity: none\n      shared.example.com/v1beta: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            api,
+            BTreeMap::from([
+                (
+                    ("relay.example.com".to_owned(), 8443),
+                    "/antigravity/https://relay.example.com:8443".to_owned()
+                ),
+                (
+                    ("shared.example.com".to_owned(), 443),
+                    "/https://shared.example.com".to_owned()
+                ),
+            ])
+        );
+        // As Codex's API Key base, a named key or `fallback` adds the Gemini
+        // API base.
+        for routing in [
+            "    api_key:\n      GEMINI_API_KEY: none\n",
+            "    fallback: none\n",
+        ] {
+            let routes = scopes(&config(&format!(
+                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://gemini.example.com/v1beta\n  routing:\n{routing}"
+            )))
+            .unwrap();
+            assert_eq!(
+                routes.get(&("gemini.example.com".to_owned(), 443)),
+                Some(&"/antigravity/https://gemini.example.com".to_owned()),
+                "{routing}"
+            );
+        }
+        let defaults = scopes(&config(
+            "antigravity:\n  routing:\n    api_key:\n      GEMINI_API_KEY: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            defaults.keys().collect::<Vec<_>>(),
+            [&("generativelanguage.googleapis.com".to_owned(), 443)]
+        );
     }
 
     #[test]

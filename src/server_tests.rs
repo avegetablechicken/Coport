@@ -4773,6 +4773,267 @@ async fn antigravity_saved_login_streams_through_its_route_and_records_gemini_us
     assert_eq!(response.status(), 404);
 }
 
+// agy's Gemini API key requests (`modelProvider: "gemini"`) reach a relay
+// through the loopback fixture proxy; no relay, Google host or login is used.
+#[tokio::test]
+async fn antigravity_api_key_routes_relay_the_key_as_sent_through_their_route() {
+    const KEY: &str = "AIzaSyFakeGeminiKey-0123456789abcdefXYZ";
+    let mut fixture = fixture("http", "gemini_sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    // No account route, saved login or fallback: only the API route.
+    let running = running(&format!(
+        "proxies:\n  selected: {endpoint}\nantigravity:\n  saved_login: false\n  routing:\n    api_key:\n      upstream.invalid/antigravity: selected\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let model = "/antigravity/v1beta/models/gemini-x:streamGenerateContent";
+    let send = |path: String, key: Option<(&'static str, String)>| {
+        let mut request = http()
+            .post(format!("{}{path}", running.url))
+            .header("cookie", "private-cookie")
+            .body(r#"{"contents":[{"parts":[{"text":"PRIVATE PROMPT"}]}]}"#);
+        if let Some((name, value)) = key {
+            request = request.header(name, value);
+        }
+        request.send()
+    };
+    // As agy sends it: x-goog-api-key, relayed in place.
+    let response = send(
+        format!("/antigravity/https://upstream.invalid{model}?alt=sse"),
+        Some(("x-goog-api-key", KEY.into())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("usageMetadata"));
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(connect.starts_with("CONNECT upstream.invalid:443 "));
+    assert!(!connect.contains(KEY));
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(forwarded.starts_with(&format!("POST {model}?alt=sse HTTP/1.1")));
+    assert!(forwarded.contains(&format!("x-goog-api-key: {KEY}")));
+    assert!(!forwarded.to_lowercase().contains("authorization"));
+    assert!(!forwarded.contains("private-cookie"));
+    assert!(forwarded.ends_with("\"PRIVATE PROMPT\"}]}]}"));
+    let call = first_record(&running, "model_call_finished").await;
+    assert_eq!(call["service"], "antigravity");
+    assert_eq!(call["provider"], "upstream.invalid/antigravity");
+    assert_eq!(
+        call["upstream_base_url"],
+        "https://upstream.invalid/antigravity"
+    );
+    assert_eq!(call["proxy"], "selected");
+    assert_eq!(call["credential_match"], "unmatched");
+    assert_eq!(
+        call["credential_ref"].as_str(),
+        crate::identity::shared_api_reference(
+            "Antigravity",
+            "https://upstream.invalid/antigravity",
+            KEY
+        )
+        .as_deref()
+    );
+    assert_eq!(call["model"], "gemini-test");
+    assert_eq!(call["input_tokens"], "12");
+    assert_eq!(call["output_tokens"], "8");
+    assert!(call.get("account_id").is_none() && call.get("account_label").is_none());
+
+    // A Bearer key, and the unscoped form a proxy-port client sends.
+    let response = send(
+        format!("/https://upstream.invalid{model}"),
+        Some(("authorization", format!("Bearer {KEY}"))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT upstream.invalid:443 ")
+    );
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(forwarded.starts_with(&format!("POST {model} HTTP/1.1")));
+    assert!(forwarded.contains(&format!("authorization: Bearer {KEY}")));
+    assert!(!forwarded.contains("x-goog-api-key"));
+    // A key in the query stays there, unlogged.
+    let response = send(
+        format!("/antigravity/https://upstream.invalid{model}?key={KEY}"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+    fixture.requests.recv().await.unwrap();
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(forwarded.starts_with(&format!("POST {model}?key={KEY} HTTP/1.1")));
+    assert!(!forwarded.to_lowercase().contains("authorization"));
+
+    // No key, two keys, another host, path or port, and a Cloud Code target
+    // without a login route send nothing.
+    for (path, key, status) in [
+        (
+            format!("/antigravity/https://upstream.invalid{model}"),
+            None,
+            401,
+        ),
+        (
+            format!("/antigravity/https://upstream.invalid{model}?key={KEY}"),
+            Some(("x-goog-api-key", KEY.to_owned())),
+            400,
+        ),
+        (
+            format!("/antigravity/https://other.invalid{model}"),
+            Some(("x-goog-api-key", KEY.to_owned())),
+            404,
+        ),
+        (
+            "/antigravity/https://upstream.invalid/other/v1beta/models/g:generateContent".into(),
+            Some(("x-goog-api-key", KEY.to_owned())),
+            404,
+        ),
+        (
+            format!("/antigravity/https://upstream.invalid:8443{model}"),
+            Some(("x-goog-api-key", KEY.to_owned())),
+            404,
+        ),
+        (
+            "/antigravity/v1internal:generateContent".into(),
+            Some(("authorization", format!("Bearer {KEY}"))),
+            404,
+        ),
+    ] {
+        let response = send(path.clone(), key).await.unwrap();
+        assert_eq!(response.status(), status, "{path}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(!raw.contains(KEY) && !raw.contains("PRIVATE PROMPT"));
+}
+
+// As Claude's environment selectors: a key named by a variable takes its
+// route to `api_key_base_url`, another `fallback`. `cargo test` sets
+// `CARGO_PKG_NAME` in this process, so no variable is set and no login shell
+// runs; the relay is the loopback fixture.
+#[tokio::test]
+async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
+    let named = std::env::var("CARGO_PKG_NAME").expect("cargo test sets CARGO_PKG_NAME");
+    const OTHER: &str = "other-gemini-key";
+    let mut fixture = fixture("http", "gemini_sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!(
+        "proxies:\n  named: {endpoint}\n  spare: {endpoint}\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://upstream.invalid/gemini\n  routing:\n    api_key:\n      CARGO_PKG_NAME: named\n    fallback: spare\n"
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let model = "/v1beta/models/gemini-x:streamGenerateContent";
+    let send = |path: String, key: Option<String>| {
+        let mut request = http()
+            .post(format!("{}{path}", running.url))
+            .body(r#"{"contents":[{"parts":[{"text":"PRIVATE PROMPT"}]}]}"#);
+        if let Some(key) = key {
+            request = request.header("x-goog-api-key", key);
+        }
+        request.send()
+    };
+    // agy pointed at /antigravity sends origin-form requests.
+    for (path, key, forwarded_path) in [
+        (
+            format!("/antigravity{model}?alt=sse"),
+            Some(named.clone()),
+            format!("/gemini{model}?alt=sse"),
+        ),
+        (
+            format!("/antigravity{model}?key={OTHER}"),
+            None,
+            format!("/gemini{model}?key={OTHER}"),
+        ),
+        // The explicit form may name the API base.
+        (
+            format!("/antigravity/https://upstream.invalid/gemini{model}"),
+            Some(named.clone()),
+            format!("/gemini{model}"),
+        ),
+    ] {
+        let response = send(path.clone(), key.clone()).await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        response.text().await.unwrap();
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(connect.starts_with("CONNECT upstream.invalid:443 "));
+        let forwarded = fixture.requests.recv().await.unwrap();
+        assert!(
+            forwarded.starts_with(&format!("POST {forwarded_path} HTTP/1.1")),
+            "{forwarded}"
+        );
+        if let Some(key) = key {
+            assert!(forwarded.contains(&format!("x-goog-api-key: {key}")));
+        }
+        assert!(!forwarded.to_lowercase().contains("authorization"));
+    }
+    // Another host than the API base, and an ambiguous key, send nothing.
+    let other_host = send(
+        format!("/antigravity/https://other.invalid/gemini{model}"),
+        Some(named.clone()),
+    )
+    .await
+    .unwrap();
+    assert_ne!(other_host.status(), 200);
+    let twice = send(
+        format!("/antigravity{model}?key={OTHER}"),
+        Some(named.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(twice.status(), 400);
+    assert!(fixture.requests.try_recv().is_err());
+
+    let log = running._temp.path().join("proxy.log");
+    let (raw, calls) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            running.server.logger.flush().unwrap();
+            let raw = std::fs::read_to_string(&log).unwrap_or_default();
+            let calls: Vec<serde_json::Value> = raw
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|row| row["event"] == "model_call_finished")
+                .collect();
+            if calls.len() >= 3 {
+                return (raw, calls);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.len(), 3);
+    for call in &calls {
+        assert_eq!(call["service"], "antigravity");
+        assert_eq!(call["upstream_base_url"], "https://upstream.invalid/gemini");
+        assert_eq!(call["input_tokens"], "12");
+    }
+    let named_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call["provider"] == "CARGO_PKG_NAME")
+        .collect();
+    assert_eq!(named_calls.len(), 2);
+    for call in named_calls {
+        assert_eq!(call["proxy"], "named");
+        assert_eq!(call["credential_match"], "configured");
+    }
+    let fallback = calls
+        .iter()
+        .find(|call| call["provider"] == crate::antigravity::API_KEY_FALLBACK)
+        .unwrap();
+    assert_eq!(fallback["proxy"], "spare");
+    assert_eq!(fallback["credential_match"], "unmatched");
+    assert!(!raw.contains(OTHER) && !raw.contains("PRIVATE PROMPT"));
+}
+
 #[tokio::test]
 async fn antigravity_other_accounts_are_named_through_the_probe_then_routed_and_cached() {
     let mut lookup = fixture("http", "sse").await;

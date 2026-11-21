@@ -36,6 +36,10 @@ const SERVICE: &str = "gemini";
 const ACCOUNT: &str = "antigravity";
 const WRAPPED: &str = "go-keyring-base64:";
 
+/// The Gemini API `agy` sends API key requests to without
+/// `GOOGLE_GEMINI_BASE_URL`.
+pub const DEFAULT_API_BASE: &str = "https://generativelanguage.googleapis.com";
+
 fn default_base() -> String {
     DEFAULT_BASE.into()
 }
@@ -45,6 +49,9 @@ fn default_base() -> String {
 pub struct Antigravity {
     /// Cloud Code root that origin-form requests go to.
     pub base_url: String,
+    /// Gemini API root that API key requests matched by name or `fallback`
+    /// go to, as Codex's `base_url.api_key`.
+    pub api_key_base_url: String,
     /// Read Antigravity's login from the OS credential store to match tokens.
     pub saved_login: bool,
     /// Reject tokens other than the saved login's instead of naming their
@@ -56,6 +63,7 @@ impl Default for Antigravity {
     fn default() -> Self {
         Self {
             base_url: default_base(),
+            api_key_base_url: DEFAULT_API_BASE.into(),
             saved_login: true,
             account_auth_file_only: true,
             routing: Routing::default(),
@@ -380,6 +388,81 @@ pub struct AntigravityRoute {
     pub configured: bool,
 }
 
+/// How a Gemini API key request routes: by its configured upstream URL.
+pub struct ApiRoute {
+    /// The `routing.api_key` key, which records name.
+    pub selector: String,
+    pub proxy: Choice,
+    pub upstream: String,
+    pub key: String,
+    pub credential: ApiCredential,
+    /// The key is a named one, not one a URL route or `fallback` carries.
+    pub configured: bool,
+    /// A URL route's upstream, reached with the platform's TLS as Codex's.
+    pub custom_upstream: bool,
+}
+impl ApiRoute {
+    /// The upstream URL of an origin-form or explicit target.
+    pub fn url(&self, target: &str) -> Result<Url> {
+        if target.starts_with("/https://") || target.starts_with("/http://") {
+            return crate::routing::upstream_url(&self.upstream, target, false);
+        }
+        if !target.starts_with('/') || target.starts_with("//") {
+            return Err(Error::config("Invalid Antigravity request target."));
+        }
+        let explicit = format!("/{}{target}", self.upstream.trim_end_matches('/'));
+        crate::routing::upstream_url(&self.upstream, &explicit, false)
+    }
+}
+/// Where a request carried its Gemini API key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiCredential {
+    Header,
+    Bearer,
+    Query,
+}
+/// The route name records give an API key `fallback` carried, as Claude's
+/// `claude-api-key-fallback`.
+pub const API_KEY_FALLBACK: &str = "antigravity-api-key-fallback";
+
+/// A request's Gemini API key, where the Gemini API accepts one:
+/// `x-goog-api-key`, a Bearer header or the `key` query parameter. None
+/// without any; more than one is refused.
+pub(crate) fn api_credential(
+    headers: &HeaderMap,
+    target: &str,
+) -> Result<Option<(String, ApiCredential)>> {
+    let header = headers
+        .get("x-goog-api-key")
+        .map(|v| v.to_str().ok().map(str::to_owned));
+    let bearer = headers.get("authorization").map(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned)
+    });
+    let query = target.split_once('?').and_then(|(_, query)| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name == "key")
+            .map(|(_, value)| Some(value.into_owned()))
+    });
+    let (key, credential) = match (header, bearer, query) {
+        (Some(key), None, None) => (key, ApiCredential::Header),
+        (None, Some(key), None) => (key, ApiCredential::Bearer),
+        (None, None, Some(key)) => (key, ApiCredential::Query),
+        (None, None, None) => return Ok(None),
+        _ => {
+            return Err(Error::new(
+                400,
+                "Supply the Gemini API key once: x-goog-api-key, Bearer or key.",
+            ));
+        }
+    };
+    key.filter(|key| valid_token(key))
+        .map(|key| Some((key, credential)))
+        .ok_or(Error::new(401, "Invalid Gemini API key."))
+}
+
 /// How a refresh routes: as `AntigravityRoute`, by its refresh token.
 pub struct RefreshRoute {
     pub proxy: Choice,
@@ -430,11 +513,10 @@ impl Antigravity {
 
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
         validate_upstream(&self.base_url)?;
-        if !self.routing.api_key.is_empty() || self.routing.mcp_fallback.is_some() {
-            return Err(Error::config(
-                "Antigravity routes accounts only; api_key and mcp_fallback are not supported.",
-            ));
+        if self.routing.mcp_fallback.is_some() {
+            return Err(Error::config("Antigravity does not support mcp_fallback."));
         }
+        self.validate_api_routes(config)?;
         if self.account_auth_file_only && !self.saved_login && self.enabled() {
             return Err(Error::config(
                 "Antigravity file-only account routing requires saved_login.",
@@ -455,6 +537,170 @@ impl Antigravity {
         .flatten()
         {
             config.validate_choice(choice)?;
+        }
+        Ok(())
+    }
+
+    /// As Claude's: an API key route names an environment variable whose
+    /// value is the key, such as `GEMINI_API_KEY`, or an upstream URL. Google's
+    /// own hosts stay routed by login, so a URL route cannot carry a login's
+    /// token past its account route.
+    fn validate_api_routes(&self, config: &Config) -> Result<()> {
+        crate::config::validate_upstream(&self.api_key_base_url)?;
+        let google: Vec<Url> = self
+            .origins()
+            .into_iter()
+            .chain([TOKEN_REFRESH_UPSTREAM])
+            .filter_map(|origin| Url::parse(origin).ok())
+            .collect();
+        for (selector, choice) in &self.routing.api_key {
+            if crate::url_routing::is_url_selector(selector) {
+                let url = crate::url_routing::validate_upstream(selector)?;
+                if google.iter().any(|origin| {
+                    origin.host_str() == url.host_str()
+                        && origin.port_or_known_default() == url.port_or_known_default()
+                }) {
+                    return Err(Error::config(
+                        "Antigravity API key routes cannot name a Cloud Code or Google token host.",
+                    ));
+                }
+            } else {
+                crate::config::validate_env(selector)?;
+            }
+            config.validate_choice(choice)?;
+        }
+        crate::url_routing::validate_routes(&self.routing.api_key)
+    }
+
+    /// Environment variable selectors, as opposed to URL routes.
+    fn key_selectors(&self) -> impl Iterator<Item = (&String, &Choice)> {
+        self.routing
+            .api_key
+            .iter()
+            .filter(|(selector, _)| !crate::url_routing::is_url_selector(selector))
+    }
+
+    /// Whether API keys without a URL route are served: by name or `fallback`.
+    pub(crate) fn serves_api_keys(&self) -> bool {
+        self.routing.fallback.is_some() || self.key_selectors().next().is_some()
+    }
+
+    /// Display classification, as Codex's and Claude's `api_key_kind`.
+    pub fn api_key_kind(&self, selector: &str) -> &'static str {
+        if crate::url_routing::is_url_selector(selector) {
+            "gateway"
+        } else {
+            "api_key"
+        }
+    }
+
+    /// The upstream a selector forwards to, as Claude's `api_key_upstream`;
+    /// none for URL routes, whose requests name it.
+    pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
+        (!crate::url_routing::is_url_selector(selector)).then_some(self.api_key_base_url.as_str())
+    }
+
+    /// Whether an API key route serves this unprefixed target.
+    pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
+        Ok(crate::url_routing::match_route(&self.routing.api_key, target)?.is_some())
+    }
+
+    /// The URL route of an explicit target, as for Codex and Claude: any key,
+    /// forwarded as sent, for the upstream to validate.
+    pub(crate) fn api_route(&self, headers: &HeaderMap, target: &str) -> Result<Option<ApiRoute>> {
+        let Some((selector, proxy)) =
+            crate::url_routing::match_route(&self.routing.api_key, target)?
+        else {
+            return Ok(None);
+        };
+        let (key, credential) = api_credential(headers, target)?.ok_or(Error::new(
+            401,
+            "Antigravity API routes require a Gemini API key.",
+        ))?;
+        Ok(Some(ApiRoute {
+            selector: selector.into(),
+            proxy: proxy.clone(),
+            upstream: crate::url_routing::validate_upstream(selector)?.into(),
+            key,
+            credential,
+            configured: false,
+            custom_upstream: true,
+        }))
+    }
+
+    /// The route of a Gemini API key sent in `x-goog-api-key` or `key` (a
+    /// Bearer token is a Google login), as Claude's `x-api-key`: the
+    /// environment variable selector whose value it is, else `fallback`.
+    pub(crate) async fn resolve_api_key(
+        &self,
+        key: String,
+        credential: ApiCredential,
+    ) -> Result<ApiRoute> {
+        self.resolve_api_key_with(key, credential, |name| async move {
+            crate::identity::environment_key_with_shell(&name, true).await
+        })
+        .await
+    }
+
+    async fn resolve_api_key_with<F, Fut>(
+        &self,
+        key: String,
+        credential: ApiCredential,
+        lookup: F,
+    ) -> Result<ApiRoute>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
+        let mut matches = Vec::new();
+        let mut unavailable = false;
+        for (name, proxy) in self.key_selectors() {
+            match lookup(name.clone()).await {
+                Ok(value) if value == key => matches.push((name, proxy)),
+                Ok(_) => {}
+                Err(_) => unavailable = true,
+            }
+        }
+        if matches.len() > 1 {
+            return Err(Error::new(
+                409,
+                "Antigravity credential matches multiple routes.",
+            ));
+        }
+        let (selector, proxy, configured) = if let Some((name, proxy)) = matches.pop() {
+            (name.clone(), proxy.clone(), true)
+        } else if let Some(proxy) = &self.routing.fallback {
+            (API_KEY_FALLBACK.into(), proxy.clone(), false)
+        } else if unavailable {
+            return Err(Error::config(
+                "No matching Antigravity route; credential source unavailable.",
+            ));
+        } else {
+            return Err(Error::new(
+                401,
+                "Antigravity API key does not match a configured route.",
+            ));
+        };
+        Ok(ApiRoute {
+            selector,
+            proxy,
+            upstream: self.api_key_base_url.clone(),
+            key,
+            credential,
+            configured,
+            custom_upstream: false,
+        })
+    }
+
+    /// As Claude's: each named key is readable and names one route.
+    async fn check_api_keys(&self) -> Result<()> {
+        let mut keys = std::collections::HashSet::new();
+        for (name, _) in self.key_selectors() {
+            if !keys.insert(crate::identity::environment_key_with_shell(name, true).await?) {
+                return Err(Error::config(
+                    "Multiple Antigravity routes have the same credential.",
+                ));
+            }
         }
         Ok(())
     }
@@ -775,8 +1021,10 @@ impl Antigravity {
         crate::routing::upstream_url(&self.base_url, &explicit, false)
     }
 
-    /// Whether this saved login can be read, for credential checks.
+    /// Whether named API keys and the saved login can be read, for
+    /// credential checks.
     pub async fn check_credentials(&self) -> Result<()> {
+        self.check_api_keys().await?;
         if !self.saved_login || !self.enabled() {
             return Ok(());
         }
@@ -912,8 +1160,21 @@ mod tests {
         assert!(parsed.antigravity.saved_login && parsed.antigravity.account_auth_file_only);
         assert!(parsed.antigravity.enabled());
         assert!(!config("").antigravity.enabled());
+        assert_eq!(parsed.antigravity.api_key_base_url, DEFAULT_API_BASE);
         for invalid in [
-            "antigravity:\n  routing:\n    api_key:\n      KEY: us\n",
+            // Selectors are environment variable names or URLs.
+            "antigravity:\n  routing:\n    api_key:\n      GEMINI API KEY: us\n",
+            "antigravity:\n  routing:\n    api_key:\n      1GEMINI_API_KEY: us\n",
+            "antigravity:\n  routing:\n    api_key:\n      GEMINI_API_KEY: missing\n",
+            "antigravity:\n  api_key_base_url: http://gemini.example\n",
+            "antigravity:\n  routing:\n    api_key:\n      relay.example.com: missing\n",
+            "antigravity:\n  routing:\n    api_key:\n      http://relay.example.com: us\n",
+            "antigravity:\n  routing:\n    api_key:\n      relay.example.com: us\n      'https://relay.example.com/': jp\n",
+            // Google's hosts stay routed by login.
+            "antigravity:\n  routing:\n    api_key:\n      cloudcode-pa.googleapis.com/v1beta: us\n",
+            "antigravity:\n  routing:\n    api_key:\n      'https://daily-cloudcode-pa.googleapis.com': us\n",
+            "antigravity:\n  routing:\n    api_key:\n      oauth2.googleapis.com: us\n",
+            "antigravity:\n  base_url: https://cloudcode.example\n  routing:\n    api_key:\n      cloudcode.example/v1beta: us\n",
             "antigravity:\n  routing:\n    mcp_fallback: us\n",
             "antigravity:\n  routing:\n    account:\n      default: missing\n",
             "antigravity:\n  routing:\n    account_probe: missing\n",
@@ -931,6 +1192,226 @@ mod tests {
         }
         config(
             "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    fallback: us\n",
+        );
+        // API key routes need no login and do not enable login routing.
+        let api = config(
+            "antigravity:\n  saved_login: false\n  routing:\n    api_key:\n      relay.example.com/antigravity: us\n      '182.92.106.196:6060': none\n",
+        );
+        assert!(!api.antigravity.enabled());
+        // URL routes alone serve no unrouted key; a named key or `fallback` do.
+        assert!(!api.antigravity.serves_api_keys());
+        let named = config(
+            "antigravity:\n  saved_login: false\n  api_key_base_url: https://relay.example.com/antigravity\n  routing:\n    api_key:\n      GEMINI_API_KEY: us\n      relay.example.com/other: jp\n",
+        );
+        let ag = &named.antigravity;
+        assert!(!ag.enabled() && ag.serves_api_keys());
+        assert_eq!(
+            ag.api_key_upstream("GEMINI_API_KEY"),
+            Some("https://relay.example.com/antigravity")
+        );
+        assert_eq!(ag.api_key_upstream("relay.example.com/other"), None);
+        assert_eq!(ag.api_key_kind("GEMINI_API_KEY"), "api_key");
+        assert_eq!(ag.api_key_kind("relay.example.com/other"), "gateway");
+        let fallback = config(
+            "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    fallback: us\n",
+        );
+        assert!(fallback.antigravity.serves_api_keys());
+    }
+
+    #[tokio::test]
+    async fn named_api_keys_route_by_value_then_fallback_as_claudes() {
+        let routes = "    api_key:\n      GEMINI_API_KEY: us\n      OTHER_GEMINI_KEY: jp\n      UNSET_GEMINI_KEY: none\n";
+        let with = |fallback: &str| {
+            config(&format!(
+                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://relay.example.com/antigravity\n  routing:\n{routes}{fallback}"
+            ))
+        };
+        // The values an environment would hold, never this process's.
+        let lookup = |name: String| async move {
+            match name.as_str() {
+                "GEMINI_API_KEY" => Ok("first-key".to_owned()),
+                "OTHER_GEMINI_KEY" => Ok("second-key".to_owned()),
+                _ => Err(Error::config(
+                    "API Key environment variable is unavailable.",
+                )),
+            }
+        };
+        let config = with("    fallback: none\n");
+        let ag = &config.antigravity;
+        let route = ag
+            .resolve_api_key_with("second-key".into(), ApiCredential::Header, lookup)
+            .await
+            .unwrap();
+        assert_eq!(route.selector, "OTHER_GEMINI_KEY");
+        assert_eq!(route.proxy.names(), ["jp"]);
+        assert_eq!(route.upstream, "https://relay.example.com/antigravity");
+        assert!(route.configured && !route.custom_upstream);
+        assert_eq!(
+            route
+                .url("/v1beta/models/g:streamGenerateContent?alt=sse")
+                .unwrap()
+                .as_str(),
+            "https://relay.example.com/antigravity/v1beta/models/g:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            route
+                .url("/https://relay.example.com/antigravity/v1beta/models")
+                .unwrap()
+                .as_str(),
+            "https://relay.example.com/antigravity/v1beta/models"
+        );
+        for target in [
+            "/https://other.example.com/antigravity/v1beta/models",
+            "/https://relay.example.com/elsewhere/v1beta/models",
+            "//relay.example.com/x",
+            "/a/../../x",
+        ] {
+            assert!(route.url(target).is_err(), "{target}");
+        }
+        // An unknown key takes `fallback`, which records do not count as
+        // configured.
+        let route = ag
+            .resolve_api_key_with("unknown-key".into(), ApiCredential::Query, lookup)
+            .await
+            .unwrap();
+        assert_eq!(route.selector, API_KEY_FALLBACK);
+        assert_eq!(route.proxy.names(), ["none"]);
+        assert!(!route.configured);
+        // Without `fallback`: unknown with every source read, else an
+        // unavailable source is reported.
+        let config = with("");
+        let unknown = config
+            .antigravity
+            .resolve_api_key_with(
+                "unknown-key".into(),
+                ApiCredential::Header,
+                |name| async move { lookup(name).await.or(Ok("unrelated".into())) },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(unknown.status, 401);
+        let unavailable = config
+            .antigravity
+            .resolve_api_key_with("unknown-key".into(), ApiCredential::Header, lookup)
+            .await
+            .err()
+            .unwrap();
+        assert_ne!(unavailable.status, 401);
+        // Two names holding one key are ambiguous, as for Claude.
+        let shared = config
+            .antigravity
+            .resolve_api_key_with("first-key".into(), ApiCredential::Header, |_| async {
+                Ok("first-key".to_owned())
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(shared.status, 409);
+    }
+
+    #[test]
+    fn only_x_goog_api_key_and_key_are_gemini_api_keys_unless_a_url_route_matches() {
+        let mut header = HeaderMap::new();
+        header.insert("x-goog-api-key", "header-key".parse().unwrap());
+        assert_eq!(
+            api_credential(&header, "/v1beta/models").unwrap(),
+            Some(("header-key".into(), ApiCredential::Header))
+        );
+        assert_eq!(
+            api_credential(&HeaderMap::new(), "/v1beta/models?alt=sse&key=q").unwrap(),
+            Some(("q".into(), ApiCredential::Query))
+        );
+        assert_eq!(
+            api_credential(&headers("login"), "/v1internal:x").unwrap(),
+            Some(("login".into(), ApiCredential::Bearer))
+        );
+        assert_eq!(
+            api_credential(&HeaderMap::new(), "/v1internal:x").unwrap(),
+            None
+        );
+        // `api_key`, which Sub2api retired, is not a key.
+        assert_eq!(
+            api_credential(&HeaderMap::new(), "/v1beta/models?api_key=q").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn api_key_routes_take_one_key_where_agy_or_another_client_sends_it() {
+        let config = config(
+            "antigravity:\n  routing:\n    api_key:\n      relay.example.com/antigravity: us\n      relay.example.com/antigravity/v1beta: [jp, us]\n",
+        );
+        let ag = &config.antigravity;
+        let target =
+            "/https://relay.example.com/antigravity/v1beta/models/g:streamGenerateContent?alt=sse";
+        let mut header = HeaderMap::new();
+        header.insert("x-goog-api-key", "header-key".parse().unwrap());
+        let route = ag.api_route(&header, target).unwrap().unwrap();
+        assert_eq!(
+            (route.key.as_str(), route.credential),
+            ("header-key", ApiCredential::Header)
+        );
+        // The longest matching path wins.
+        assert_eq!(route.selector, "relay.example.com/antigravity/v1beta");
+        assert_eq!(route.proxy.names(), ["jp", "us"]);
+        assert_eq!(
+            route.upstream,
+            "https://relay.example.com/antigravity/v1beta"
+        );
+        let route = ag
+            .api_route(&headers("bearer-key"), target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (route.key.as_str(), route.credential),
+            ("bearer-key", ApiCredential::Bearer)
+        );
+        let query = "/https://relay.example.com/antigravity/v1/models?alt=json&key=query%2Dkey";
+        let route = ag.api_route(&HeaderMap::new(), query).unwrap().unwrap();
+        assert_eq!(
+            (
+                route.key.as_str(),
+                route.credential,
+                route.selector.as_str()
+            ),
+            (
+                "query-key",
+                ApiCredential::Query,
+                "relay.example.com/antigravity"
+            )
+        );
+        for (headers, target, status) in [
+            (HeaderMap::new(), target, 401),
+            (headers("has space"), target, 401),
+            (
+                headers("bearer-key"),
+                &format!("{target}&key=query-key")[..],
+                400,
+            ),
+        ] {
+            assert_eq!(
+                ag.api_route(&headers, target).err().unwrap().status,
+                status,
+                "{target}"
+            );
+        }
+        let mut both = headers("bearer-key");
+        both.insert("x-goog-api-key", "header-key".parse().unwrap());
+        assert_eq!(ag.api_route(&both, target).err().unwrap().status, 400);
+        // Other hosts, ports, paths and Cloud Code targets are not API routes.
+        for other in [
+            "/https://relay.example.com/other/v1beta/models/g:generateContent",
+            "/https://relay.example.com:8443/antigravity/v1beta/models/g:generateContent",
+            "/https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            "/v1internal:generateContent",
+        ] {
+            assert!(ag.api_route(&header, other).unwrap().is_none(), "{other}");
+        }
+        assert!(ag.url_route_matches(target).unwrap());
+        assert!(
+            !ag.url_route_matches("/v1beta/models/g:generateContent")
+                .unwrap()
         );
     }
 

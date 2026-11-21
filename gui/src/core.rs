@@ -677,15 +677,21 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             |selector| describe::claude_api_key(config, selector),
             |selector| config.claude.api_key_kind(selector).unwrap_or("unknown"),
         ),
-        // Antigravity routes accounts only.
+        // Antigravity's API keys are environment variables or upstream URLs.
         antigravity: service(
-            vec![("upstream", config.antigravity.base_url.clone())],
+            vec![
+                ("upstream", config.antigravity.base_url.clone()),
+                (
+                    "apiKeyUpstream",
+                    config.antigravity.api_key_base_url.clone(),
+                ),
+            ],
             config.antigravity.account_auth_file_only,
             false,
             &config.antigravity.routing,
             false,
-            |_| None,
-            |_| "unknown",
+            |selector| describe::antigravity_api_key(config, selector),
+            |selector| config.antigravity.api_key_kind(selector),
         ),
     }
 }
