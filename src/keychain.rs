@@ -227,13 +227,23 @@ fn secret_line(mut output: Vec<u8>) -> std::result::Result<String, ()> {
     String::from_utf8(output).map_err(|_| ())
 }
 
+/// go-keyring's entry: on Windows the credential `service:account`; on Linux
+/// the Secret Service item with these attributes, read there directly. The
+/// default Linux entry would answer from a kernel keyring copy it makes on
+/// its first read, and so miss every later write of the Go program.
 #[cfg(all(not(test), any(target_os = "linux", target_os = "windows")))]
-fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
+fn go_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, ()> {
     #[cfg(target_os = "windows")]
     let entry = keyring::Entry::new_with_target(&format!("{service}:{account}"), service, account);
     #[cfg(not(target_os = "windows"))]
-    let entry = keyring::Entry::new(service, account);
-    match entry.map_err(|_| ())?.get_secret() {
+    let entry = keyring::secret_service::SsCredential::new_with_no_target(service, account)
+        .map(|credential| keyring::Entry::new_with_credential(Box::new(credential)));
+    entry.map_err(|_| ())
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "windows")))]
+fn load_go_keyring(service: &str, account: &str) -> std::result::Result<Option<String>, ()> {
+    match go_keyring_entry(service, account)?.get_secret() {
         Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ()),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err(()),

@@ -307,7 +307,9 @@ Antigravity and `agy` keep their login in one item of the OS credential store,
 service `gemini` and account `antigravity`, as written by go-keyring: on macOS
 the Keychain generic password (its JSON wrapped as `go-keyring-base64:`), on
 Windows the generic credential `gemini:antigravity`, on Linux the Secret
-Service item of that service and user name. With `saved_login`, it is read for
+Service item of that service and user name, read from the Secret Service itself
+rather than from a kernel keyring copy, which would miss Antigravity's later
+writes. With `saved_login`, it is read for
 each request; a request whose Bearer token is that login's access token is the
 saved login. Antigravity renews the token itself and saves the new one there.
 So is an access token issued by a refresh of the login's refresh token that
