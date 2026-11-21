@@ -214,8 +214,8 @@ connection. These hosts are decrypted:
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Any, for each URL route | that route's host and port, including public IPv4 addresses |
-| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com` and `oauth2.googleapis.com`, as `/antigravity/https://<host>/...` |
-| Antigravity, with named API Key routes or `fallback` | `antigravity.api_key_base_url`, as `/antigravity/https://<host>/...` |
+| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com` and `oauth2.googleapis.com`, as `/antigravity/https://<host>/...` |
+| Antigravity, with named API Key routes or `fallback` | `antigravity.base_url.api_key`, as `/antigravity/https://<host>/...` |
 
 A host routed by more than one service uses the unprefixed `/https://` form and
 its usual conflict rules. Destination discovery reads local provider/settings definitions
@@ -436,7 +436,7 @@ CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity agy
 ```
 
 Use your configured `listen_port`. The `/antigravity` prefix is removed before
-forwarding to `antigravity.base_url`, so `/antigravity/v1internal:loadCodeAssist`
+forwarding to `antigravity.base_url.account`, so `/antigravity/v1internal:loadCodeAssist`
 reaches `https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` by
 default. Explicit targets such as
 `/antigravity/https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`
@@ -490,7 +490,7 @@ the explicit URL `/antigravity/https://oauth2.googleapis.com/token`:
 Coport never refreshes or writes the Antigravity login itself.
 
 With [proxy port credential routing](#credential-routing-on-the-proxy-port), the
-two Cloud Code hosts, `antigravity.base_url` and `oauth2.googleapis.com` are
+two Cloud Code hosts, `antigravity.base_url.account` and `oauth2.googleapis.com` are
 decrypted instead, for a client started with `HTTPS_PROXY` that trusts the proxy
 CA. Every other CONNECT is refused, so its other Google hosts are not reachable
 through the proxy port.
@@ -509,7 +509,7 @@ As for Claude, a key is routed by name or by upstream URL.
 route. A relay is named in `GOOGLE_GEMINI_BASE_URL` itself, after Coport's
 address, as Claude's `ANTHROPIC_BASE_URL` names one
 (`http://127.0.0.1:8787/https://relay.example.com`); a request naming no
-upstream goes to `api_key_base_url`, Google's Gemini API unless set, as Codex's
+upstream goes to `base_url.api_key`, Google's Gemini API unless set, as Codex's
 and Claude's base URLs name their official APIs:
 
 ```yaml
@@ -535,7 +535,7 @@ exported in your shell profile is found even by the desktop app. A key two
 names hold is refused with 409. The upstream a request names is checked as a
 URL route's is (public HTTPS, never a Cloud Code or Google token host) and
 reached with the platform's TLS. A key only `fallback` carries, which any
-client may send, reaches `api_key_base_url` alone; another upstream is rejected
+client may send, reaches `base_url.api_key` alone; another upstream is rejected
 before any connection.
 
 **By URL.** Declare the upstream itself:
@@ -566,5 +566,5 @@ URL (`fallback` as `antigravity-api-key-fallback`), never the key (the query is
 not logged), and model calls record Gemini usage as above. Neither form needs
 `CLOUD_CODE_URL`, a saved login or an account route. With
 [proxy port credential routing](#credential-routing-on-the-proxy-port),
-`api_key_base_url` (with a name or `fallback`) and each URL route's host are
+`base_url.api_key` (with a name or `fallback`) and each URL route's host are
 decrypted too, as `/antigravity/https://<host>/...`.

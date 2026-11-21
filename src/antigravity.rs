@@ -19,7 +19,7 @@ use url::Url;
 /// The Cloud Code endpoint Antigravity answers from first.
 pub const DEFAULT_BASE: &str = "https://daily-cloudcode-pa.googleapis.com";
 /// Every Cloud Code origin Antigravity sends to. An explicit target may name
-/// one of these or `base_url`, nothing else.
+/// one of these or `base_url.account`, nothing else.
 pub const CLOUD_CODE_ORIGINS: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
@@ -43,15 +43,35 @@ pub const DEFAULT_API_BASE: &str = "https://generativelanguage.googleapis.com";
 fn default_base() -> String {
     DEFAULT_BASE.into()
 }
+fn default_api_base() -> String {
+    DEFAULT_API_BASE.into()
+}
+
+/// Antigravity's upstreams, written as Codex's `base_url`.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bases {
+    /// Cloud Code root that a Google login's origin-form requests go to.
+    #[serde(default = "default_base")]
+    pub account: String,
+    /// Gemini API root that API key requests go to when they name no
+    /// upstream, as Codex's `base_url.api_key`.
+    #[serde(default = "default_api_base")]
+    pub api_key: String,
+}
+impl Default for Bases {
+    fn default() -> Self {
+        Self {
+            account: default_base(),
+            api_key: default_api_base(),
+        }
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Antigravity {
-    /// Cloud Code root that origin-form requests go to.
-    pub base_url: String,
-    /// Gemini API root that API key requests matched by name or `fallback`
-    /// go to, as Codex's `base_url.api_key`.
-    pub api_key_base_url: String,
+    pub base_url: Bases,
     /// Read Antigravity's login from the OS credential store to match tokens.
     pub saved_login: bool,
     /// Reject tokens other than the saved login's instead of naming their
@@ -62,8 +82,7 @@ pub struct Antigravity {
 impl Default for Antigravity {
     fn default() -> Self {
         Self {
-            base_url: default_base(),
-            api_key_base_url: DEFAULT_API_BASE.into(),
+            base_url: Bases::default(),
             saved_login: true,
             account_auth_file_only: true,
             routing: Routing::default(),
@@ -512,7 +531,7 @@ impl Antigravity {
     }
 
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
-        validate_upstream(&self.base_url)?;
+        validate_upstream(&self.base_url.account)?;
         if self.routing.mcp_fallback.is_some() {
             return Err(Error::config("Antigravity does not support mcp_fallback."));
         }
@@ -546,7 +565,7 @@ impl Antigravity {
     /// own hosts stay routed by login, so a URL route cannot carry a login's
     /// token past its account route.
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
-        crate::config::validate_upstream(&self.api_key_base_url)?;
+        crate::config::validate_upstream(&self.base_url.api_key)?;
         for (selector, choice) in &self.routing.api_key {
             if crate::url_routing::is_url_selector(selector) {
                 self.api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
@@ -604,7 +623,7 @@ impl Antigravity {
     /// The upstream a selector forwards to when its request names none, as
     /// Claude's `api_key_upstream`; none for URL routes, whose requests name it.
     pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
-        (!crate::url_routing::is_url_selector(selector)).then_some(self.api_key_base_url.as_str())
+        (!crate::url_routing::is_url_selector(selector)).then_some(self.base_url.api_key.as_str())
     }
 
     /// Whether an API key route serves this unprefixed target.
@@ -656,8 +675,8 @@ impl Antigravity {
     /// A named key goes where its request names, as a Claude settings
     /// file's key goes to that file's upstream: agy's `GOOGLE_GEMINI_BASE_URL`
     /// may be `<Coport>/antigravity/https://relay.example.com/antigravity`,
-    /// with no `api_key_base_url` set. A key `fallback` carries, which any
-    /// client may send, reaches `api_key_base_url` alone. The upstream is
+    /// with no `base_url.api_key` set. A key `fallback` carries, which any
+    /// client may send, reaches `base_url.api_key` alone. The upstream is
     /// checked as a URL route's is, and reached with the platform's TLS.
     fn named_upstream(&self, mut route: ApiRoute, target: &str) -> Result<ApiRoute> {
         if !route.configured || !(target.starts_with("/https://") || target.starts_with("/http://"))
@@ -666,7 +685,7 @@ impl Antigravity {
         }
         let named =
             Url::parse(&target[1..]).map_err(|_| Error::config("Invalid explicit upstream."))?;
-        let base = Url::parse(&self.api_key_base_url).ok();
+        let base = Url::parse(&self.base_url.api_key).ok();
         if base.is_some_and(|base| {
             base.host_str() == named.host_str()
                 && base.port_or_known_default() == named.port_or_known_default()
@@ -722,7 +741,7 @@ impl Antigravity {
         Ok(ApiRoute {
             selector,
             proxy,
-            upstream: self.api_key_base_url.clone(),
+            upstream: self.base_url.api_key.clone(),
             key,
             credential,
             configured,
@@ -745,7 +764,7 @@ impl Antigravity {
 
     /// Origins proxy-port clients send Antigravity's requests to.
     pub(crate) fn origins(&self) -> Vec<&str> {
-        let mut origins = vec![self.base_url.as_str()];
+        let mut origins = vec![self.base_url.account.as_str()];
         origins.extend(CLOUD_CODE_ORIGINS);
         origins
     }
@@ -1032,7 +1051,7 @@ impl Antigravity {
     }
 
     /// The upstream URL of a target inside the `/antigravity` scope: a path
-    /// under `base_url`, or an explicit Cloud Code URL.
+    /// under `base_url.account`, or an explicit Cloud Code URL.
     pub fn url(&self, target: &str) -> Result<Url> {
         if target.starts_with("/https://") || target.starts_with("/http://") {
             let host = Url::parse(&target[1..])
@@ -1055,8 +1074,8 @@ impl Antigravity {
         if !target.starts_with('/') || target.starts_with("//") {
             return Err(Error::config("Invalid Antigravity request target."));
         }
-        let explicit = format!("/{}{target}", self.base_url.trim_end_matches('/'));
-        crate::routing::upstream_url(&self.base_url, &explicit, false)
+        let explicit = format!("/{}{target}", self.base_url.account.trim_end_matches('/'));
+        crate::routing::upstream_url(&self.base_url.account, &explicit, false)
     }
 
     /// Whether named API keys and the saved login can be read, for
@@ -1194,17 +1213,26 @@ mod tests {
     #[test]
     fn configuration_validates_routes_and_sources() {
         let parsed = config("antigravity:\n  routing:\n    account:\n      default: us\n");
-        assert_eq!(parsed.antigravity.base_url, DEFAULT_BASE);
+        assert_eq!(parsed.antigravity.base_url.account, DEFAULT_BASE);
         assert!(parsed.antigravity.saved_login && parsed.antigravity.account_auth_file_only);
         assert!(parsed.antigravity.enabled());
         assert!(!config("").antigravity.enabled());
-        assert_eq!(parsed.antigravity.api_key_base_url, DEFAULT_API_BASE);
+        assert_eq!(parsed.antigravity.base_url.api_key, DEFAULT_API_BASE);
+        // Either base may be given alone; the other keeps its default.
+        let one = config(
+            "antigravity:\n  base_url:\n    api_key: https://relay.example.com/antigravity\n",
+        );
+        assert_eq!(one.antigravity.base_url.account, DEFAULT_BASE);
+        assert_eq!(
+            one.antigravity.base_url.api_key,
+            "https://relay.example.com/antigravity"
+        );
         for invalid in [
             // Selectors are environment variable names or URLs.
             "antigravity:\n  routing:\n    api_key:\n      GEMINI API KEY: us\n",
             "antigravity:\n  routing:\n    api_key:\n      1GEMINI_API_KEY: us\n",
             "antigravity:\n  routing:\n    api_key:\n      GEMINI_API_KEY: missing\n",
-            "antigravity:\n  api_key_base_url: http://gemini.example\n",
+            "antigravity:\n  base_url:\n    api_key: http://gemini.example\n",
             "antigravity:\n  routing:\n    api_key:\n      relay.example.com: missing\n",
             "antigravity:\n  routing:\n    api_key:\n      http://relay.example.com: us\n",
             "antigravity:\n  routing:\n    api_key:\n      relay.example.com: us\n      'https://relay.example.com/': jp\n",
@@ -1212,13 +1240,17 @@ mod tests {
             "antigravity:\n  routing:\n    api_key:\n      cloudcode-pa.googleapis.com/v1beta: us\n",
             "antigravity:\n  routing:\n    api_key:\n      'https://daily-cloudcode-pa.googleapis.com': us\n",
             "antigravity:\n  routing:\n    api_key:\n      oauth2.googleapis.com: us\n",
-            "antigravity:\n  base_url: https://cloudcode.example\n  routing:\n    api_key:\n      cloudcode.example/v1beta: us\n",
+            "antigravity:\n  base_url:\n    account: https://cloudcode.example\n  routing:\n    api_key:\n      cloudcode.example/v1beta: us\n",
             "antigravity:\n  routing:\n    mcp_fallback: us\n",
             "antigravity:\n  routing:\n    account:\n      default: missing\n",
             "antigravity:\n  routing:\n    account_probe: missing\n",
             "antigravity:\n  saved_login: false\n  routing:\n    fallback: us\n",
-            "antigravity:\n  base_url: http://cloudcode.example\n",
+            "antigravity:\n  base_url:\n    account: http://cloudcode.example\n",
             "antigravity:\n  unknown: true\n",
+            // `base_url` is written as Codex's, with no flat form.
+            "antigravity:\n  base_url: https://daily-cloudcode-pa.googleapis.com\n",
+            "antigravity:\n  api_key_base_url: https://generativelanguage.googleapis.com\n",
+            "antigravity:\n  base_url:\n    gemini: https://generativelanguage.googleapis.com\n",
         ] {
             assert!(
                 Config::parse(&format!(
@@ -1239,7 +1271,7 @@ mod tests {
         // URL routes alone serve no unrouted key; a named key or `fallback` do.
         assert!(!api.antigravity.serves_api_keys());
         let named = config(
-            "antigravity:\n  saved_login: false\n  api_key_base_url: https://relay.example.com/antigravity\n  routing:\n    api_key:\n      GEMINI_API_KEY: us\n      relay.example.com/other: jp\n",
+            "antigravity:\n  saved_login: false\n  base_url:\n    api_key: https://relay.example.com/antigravity\n  routing:\n    api_key:\n      GEMINI_API_KEY: us\n      relay.example.com/other: jp\n",
         );
         let ag = &named.antigravity;
         assert!(!ag.enabled() && ag.serves_api_keys());
@@ -1261,7 +1293,7 @@ mod tests {
         let routes = "    api_key:\n      GEMINI_API_KEY: us\n      OTHER_GEMINI_KEY: jp\n      UNSET_GEMINI_KEY: none\n";
         let with = |fallback: &str| {
             config(&format!(
-                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://relay.example.com/antigravity\n  routing:\n{routes}{fallback}"
+                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  base_url:\n    api_key: https://relay.example.com/antigravity\n  routing:\n{routes}{fallback}"
             ))
         };
         // The values an environment would hold, never this process's.
@@ -1350,7 +1382,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_named_key_goes_to_the_upstream_its_request_names_as_claudes_settings() {
-        // No api_key_base_url: Google's stays the default, as Codex's and
+        // No base_url.api_key: Google's stays the default, as Codex's and
         // Claude's base URLs name their official APIs.
         let config = config(
             "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    api_key:\n      RELAY_GEMINI_KEY: none\n    fallback: jp\n",
@@ -1374,7 +1406,7 @@ mod tests {
             route.url(relay).unwrap().as_str(),
             "https://182.92.106.196:6060/antigravity/v1beta/models/g:streamGenerateContent?alt=sse"
         );
-        // An origin-form target, or one naming api_key_base_url, stays there.
+        // An origin-form target, or one naming base_url.api_key, stays there.
         for target in [
             "/v1beta/models",
             "/https://generativelanguage.googleapis.com/v1beta/models",
@@ -1397,7 +1429,7 @@ mod tests {
                 "{target}"
             );
         }
-        // A key `fallback` carries reaches only api_key_base_url.
+        // A key `fallback` carries reaches only base_url.api_key.
         let fallback = ag
             .resolve_api_key_with("any-key".into(), ApiCredential::Header, lookup)
             .await

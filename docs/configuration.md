@@ -50,9 +50,8 @@ Antigravity's Google logins and Gemini API key upstreams; see
 | Field | Purpose |
 | --- | --- |
 | `base_url` | Claude: one upstream root for both OAuth and API Keys |
-| `base_url.account` | Codex: ChatGPT account upstream |
-| `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1` |
-| `api_key_base_url` | Antigravity: Gemini API upstream; defaults to `https://generativelanguage.googleapis.com` |
+| `base_url.account` | Codex: ChatGPT account upstream. Antigravity: Cloud Code upstream of its Google login; defaults to `https://daily-cloudcode-pa.googleapis.com` |
+| `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1`. Antigravity: Gemini API upstream of keys whose request names none; defaults to `https://generativelanguage.googleapis.com` |
 | `codex.homes` / `claude.config_dirs` | Lists of directories allowed for local credential discovery |
 | `auth_env` | Alternative: environment variable containing the account access token |
 | `routing.account.<label>` | Proxy choice for that account source |
@@ -294,8 +293,9 @@ they name:
 
 ```yaml
 antigravity:
-  base_url: "https://daily-cloudcode-pa.googleapis.com" # Default.
-  api_key_base_url: "https://generativelanguage.googleapis.com" # Default.
+  base_url: # As Codex's; both are the defaults.
+    account: "https://daily-cloudcode-pa.googleapis.com"
+    api_key: "https://generativelanguage.googleapis.com"
   saved_login: true # Default: read Antigravity's saved login.
   account_auth_file_only: true # Default.
   routing:
@@ -360,9 +360,9 @@ Claude's environment selectors (`agy` has no settings file that holds its key,
 so there is no named settings form). A key it matches goes to the upstream its
 request names after `/antigravity/` (`/antigravity/https://relay.example.com/...`,
 as a Claude settings file's key goes to that file's upstream), checked as a URL
-route's is; a request naming none goes to `api_key_base_url`, as Codex's API
+route's is; a request naming none goes to `base_url.api_key`, as Codex's API
 Keys go to `base_url.api_key`. Any other key takes `fallback`, which reaches
-`api_key_base_url` alone, else is rejected with 401, and a key two names hold is
+`base_url.api_key` alone, else is rejected with 401, and a key two names hold is
 refused with 409. A URL is matched as
 [Codex API URL routes](clients.md#codex-api-url-routes) are and forwards any
 key to that upstream; one naming a Cloud Code host, `base_url` or

@@ -78,8 +78,9 @@ claude:
 # (gemini/antigravity), and its Gemini API key requests (GOOGLE_GEMINI_BASE_URL)
 # by key or upstream URL; see docs/configuration.md#antigravity.
 # antigravity:
-#   base_url: "https://daily-cloudcode-pa.googleapis.com"
-#   api_key_base_url: "https://generativelanguage.googleapis.com" # Default upstream.
+#   base_url: # As Codex's.
+#     account: "https://daily-cloudcode-pa.googleapis.com" # Google login.
+#     api_key: "https://generativelanguage.googleapis.com" # Keys naming no upstream.
 #   account_auth_file_only: true # false: name other tokens via Google userinfo.
 #   routing:
 #     account:

@@ -4917,7 +4917,7 @@ async fn antigravity_api_key_routes_relay_the_key_as_sent_through_their_route() 
 }
 
 // As Claude's environment selectors: a key named by a variable takes its
-// route to `api_key_base_url`, another `fallback`. `cargo test` sets
+// route to `base_url.api_key`, another `fallback`. `cargo test` sets
 // `CARGO_PKG_NAME` in this process, so no variable is set and no login shell
 // runs; the relay is the loopback fixture.
 #[tokio::test]
@@ -4927,7 +4927,7 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
     let mut fixture = fixture("http", "gemini_sse").await;
     let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
     let running = running(&format!(
-        "proxies:\n  named: {endpoint}\n  spare: {endpoint}\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://upstream.invalid/gemini\n  routing:\n    api_key:\n      CARGO_PKG_NAME: named\n    fallback: spare\n"
+        "proxies:\n  named: {endpoint}\n  spare: {endpoint}\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  base_url:\n    api_key: https://upstream.invalid/gemini\n  routing:\n    api_key:\n      CARGO_PKG_NAME: named\n    fallback: spare\n"
     ))
     .await;
     trust(&running, &fixture, &endpoint);

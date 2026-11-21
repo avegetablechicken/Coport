@@ -680,10 +680,10 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
         // Antigravity's API keys are environment variables or upstream URLs.
         antigravity: service(
             vec![
-                ("upstream", config.antigravity.base_url.clone()),
+                ("upstream", config.antigravity.base_url.account.clone()),
                 (
                     "apiKeyUpstream",
-                    config.antigravity.api_key_base_url.clone(),
+                    config.antigravity.base_url.api_key.clone(),
                 ),
             ],
             config.antigravity.account_auth_file_only,

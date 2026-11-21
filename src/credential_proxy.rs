@@ -179,7 +179,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     }
     // As Codex's API Key base: named keys and `fallback` reach the Gemini API.
     if config.antigravity.serves_api_keys() {
-        add(&url(&config.antigravity.api_key_base_url)?, "/antigravity/");
+        add(&url(&config.antigravity.base_url.api_key)?, "/antigravity/");
     }
     for key in config
         .antigravity
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn antigravity_routes_decrypt_every_cloud_code_endpoint() {
         let routes = scopes(&config(
-            "antigravity:\n  base_url: https://cloudcode.example.com:8443\n  routing:\n    account: {default: none}\n",
+            "antigravity:\n  base_url:\n    account: https://cloudcode.example.com:8443\n  routing:\n    account: {default: none}\n",
         ))
         .unwrap();
         let get = |host: &str, port| routes.get(&(host.to_owned(), port)).map(String::as_str);
@@ -356,7 +356,7 @@ mod tests {
             "    fallback: none\n",
         ] {
             let routes = scopes(&config(&format!(
-                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  api_key_base_url: https://gemini.example.com/v1beta\n  routing:\n{routing}"
+                "antigravity:\n  saved_login: false\n  account_auth_file_only: false\n  base_url:\n    api_key: https://gemini.example.com/v1beta\n  routing:\n{routing}"
             )))
             .unwrap();
             assert_eq!(
