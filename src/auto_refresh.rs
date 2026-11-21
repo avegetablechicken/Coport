@@ -196,6 +196,11 @@ impl Server {
             .or_default()
             .clone();
         let mut attempt = deadline.run(gate.lock()).await?;
+        // Found before the login's lock is taken: it may read agy's executable.
+        let antigravity = match snapshot.service {
+            Service::Antigravity => Some(crate::antigravity::oauth_client().await?),
+            _ => None,
+        };
         // Claude Code and other renewers of this login take the same lock and
         // reread the login inside it, so one refresh token is spent only once.
         let lock = refresh_lock(snapshot, deadline).await?;
@@ -231,7 +236,7 @@ impl Server {
         if lock.as_ref().is_some_and(RefreshLock::compromised) {
             return Err(Error::config("Login refresh lock was taken over."));
         }
-        let mut request = refresh_request(snapshot.service, &current)?;
+        let mut request = refresh_request(snapshot.service, &current, antigravity.as_ref())?;
         // Never send incoming model headers, cookies or its access token here.
         request
             .headers_mut()
@@ -359,7 +364,11 @@ async fn refresh_lock(snapshot: &Snapshot, deadline: Deadline) -> Result<Option<
     }
 }
 
-fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> {
+fn refresh_request(
+    service: Service,
+    value: &Value,
+    antigravity: Option<&crate::antigravity::OAuthClient>,
+) -> Result<reqwest::Request> {
     let refresh =
         credentials::refresh(value, service).ok_or(Error::config("Login has no refresh token."))?;
     let mut request = reqwest::Request::new(
@@ -395,7 +404,10 @@ fn refresh_request(service: Service, value: &Value) -> Result<reqwest::Request> 
         }
         Service::Antigravity => (
             "application/x-www-form-urlencoded",
-            crate::antigravity::refresh_form(refresh, crate::antigravity::CLIENT_SECRET),
+            crate::antigravity::refresh_form(
+                refresh,
+                antigravity.ok_or(Error::config("Antigravity's OAuth client is unknown."))?,
+            ),
         ),
         Service::Claude => {
             let scopes: Vec<_> = value["claudeAiOauth"]["scopes"]

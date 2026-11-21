@@ -28,9 +28,18 @@ pub const CLOUD_CODE_ORIGINS: [&str; 2] = [
 pub const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 /// Where Antigravity renews its login, as Codex's and Claude's token endpoints.
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://oauth2.googleapis.com/token";
-/// Antigravity's OAuth client; the token endpoint serves every Google client,
-/// and only this one's refreshes are routed.
-pub const CLIENT_ID: &str = "antigravity-client.apps.googleusercontent.com";
+/// SHA-256 of Antigravity's OAuth client ID; the token endpoint serves every
+/// Google client, and only this one's refreshes are routed.
+const CLIENT_ID_SHA256: &str = "bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea";
+/// SHA-256 of Antigravity's OAuth client secret, which Google requires of its
+/// refreshes.
+const CLIENT_SECRET_SHA256: &str =
+    "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60";
+/// The client tests stand in for Antigravity's.
+#[cfg(test)]
+pub(crate) const TEST_CLIENT_ID: &str = "test-client.apps.googleusercontent.com";
+#[cfg(test)]
+pub(crate) const TEST_CLIENT_SECRET: &str = "test-client-secret";
 /// The credential store item of Antigravity's login.
 const SERVICE: &str = "gemini";
 const ACCOUNT: &str = "antigravity";
@@ -262,16 +271,202 @@ pub(crate) fn apply_renewal(
     Ok(())
 }
 
-/// Antigravity's OAuth client secret, which Google requires of its refreshes.
-/// It is an installed app's: `agy` ships it, so it is public and confers no
-/// access by itself (Copool and OpenQuota send the same).
-pub(crate) const CLIENT_SECRET: &str = "antigravity-client-secret";
+/// Antigravity's OAuth client. It is an installed app's: `agy` ships it, so it
+/// is public and confers no access by itself (Copool and OpenQuota send the
+/// same). This source names it only by digest; the proxy learns it from a
+/// refresh Antigravity sends through it, else from the `agy` executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OAuthClient {
+    pub id: String,
+    pub secret: String,
+}
+
+static CLIENT: std::sync::Mutex<Option<OAuthClient>> = std::sync::Mutex::new(None);
+static SHIPPED_CLIENT: tokio::sync::OnceCell<Option<OAuthClient>> =
+    tokio::sync::OnceCell::const_new();
+
+fn sha256_hex(value: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, value)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether `id` is Antigravity's OAuth client ID.
+pub(crate) fn is_client_id(id: &str) -> bool {
+    #[cfg(test)]
+    if id == TEST_CLIENT_ID {
+        return true;
+    }
+    sha256_hex(id.as_bytes()) == CLIENT_ID_SHA256
+}
+
+fn is_client_secret(secret: &str) -> bool {
+    #[cfg(test)]
+    if secret == TEST_CLIENT_SECRET {
+        return true;
+    }
+    sha256_hex(secret.as_bytes()) == CLIENT_SECRET_SHA256
+}
+
+/// Antigravity's client as a token request sends it, if it does.
+fn sent_client(body: &[u8]) -> Option<OAuthClient> {
+    let id = form_field(body, "client_id").filter(|id| is_client_id(id))?;
+    let secret = form_field(body, "client_secret").filter(|s| is_client_secret(s))?;
+    Some(OAuthClient { id, secret })
+}
+
+/// Keeps Antigravity's client from a refresh it sent through the proxy.
+pub(crate) fn learn_client(body: &[u8]) {
+    if let Some(client) = sent_client(body) {
+        *CLIENT.lock().unwrap() = Some(client);
+    }
+}
+
+/// Antigravity's client for the proxy's own refreshes: as Antigravity last
+/// sent it, else as the `agy` on `PATH` ships it, read once per process.
+pub(crate) async fn oauth_client() -> Result<OAuthClient> {
+    if let Some(client) = CLIENT.lock().unwrap().clone() {
+        return Ok(client);
+    }
+    SHIPPED_CLIENT
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(shipped_client)
+                .await
+                .ok()
+                .flatten()
+        })
+        .await
+        .clone()
+        .ok_or(Error::config(
+            "Antigravity's OAuth client is unknown until agy refreshes its login through the proxy.",
+        ))
+}
+
+/// The ID and secret with Antigravity's digests among those the installed
+/// `agy` carries.
+fn shipped_client() -> Option<OAuthClient> {
+    // Tests never read an installed agy.
+    if cfg!(test) {
+        return None;
+    }
+    agy_files().into_iter().find_map(|file| {
+        let file = std::fs::File::open(file).ok()?;
+        scan_client(file, CLIENT_ID_SHA256, CLIENT_SECRET_SHA256)
+    })
+}
+
+/// The files that may hold `agy`'s client: the `agy` found on `PATH` (or in a
+/// usual install directory), else, for a launcher script such as Homebrew's,
+/// the files it names.
+fn agy_files() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let names: &[&str] = if cfg!(windows) {
+        &["agy.exe", "agy.cmd", "agy"]
+    } else {
+        &["agy"]
+    };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    // A daemon may start with a minimal PATH.
+    if !cfg!(windows) {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+        dirs.extend(dirs::home_dir().map(|home| home.join(".local/bin")));
+    }
+    let Some(found) = dirs
+        .iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|path| path.is_file())
+    else {
+        return Vec::new();
+    };
+    let found = std::fs::canonicalize(&found).unwrap_or(found);
+    let script = std::fs::metadata(&found).is_ok_and(|m| m.len() < 64 * 1024);
+    if !script {
+        return vec![found];
+    }
+    let text = std::fs::read_to_string(&found).unwrap_or_default();
+    let named: Vec<PathBuf> = text
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .collect();
+    if named.is_empty() { vec![found] } else { named }
+}
+
+/// The longest candidate a scan considers, and the overlap between the
+/// chunks it reads.
+const CANDIDATE_LIMIT: usize = 128;
+/// How Google's OAuth client IDs end and their secrets begin.
+const ID_SUFFIX: &str = ".apps.googleusercontent.com";
+const SECRET_PREFIX: &str = "GOCSPX-";
+
+/// The OAuth client with digests `id_digest` and `secret_digest` among the
+/// strings `reader` holds. Binaries pack strings without separators, so
+/// every length around a client ID's suffix or a secret's prefix is tried.
+fn scan_client(
+    mut reader: impl std::io::Read,
+    id_digest: &str,
+    secret_digest: &str,
+) -> Option<OAuthClient> {
+    let (mut id, mut secret) = (None, None);
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0; 1 << 20];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+        let matches = |candidate: &[u8], digest: &str| {
+            (sha256_hex(candidate) == digest)
+                .then(|| String::from_utf8(candidate.to_vec()).ok())
+                .flatten()
+        };
+        for at in 0..buffer.len() {
+            if id.is_none() && buffer[at..].starts_with(ID_SUFFIX.as_bytes()) {
+                let end = at + ID_SUFFIX.len();
+                let start = buffer[..at]
+                    .iter()
+                    .rev()
+                    .take(CANDIDATE_LIMIT - ID_SUFFIX.len())
+                    .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || **b == b'-')
+                    .count();
+                id = (at - start..at).find_map(|from| matches(&buffer[from..end], id_digest));
+            }
+            if secret.is_none() && buffer[at..].starts_with(SECRET_PREFIX.as_bytes()) {
+                let tail = buffer[at + SECRET_PREFIX.len()..]
+                    .iter()
+                    .take(CANDIDATE_LIMIT - SECRET_PREFIX.len())
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+                    .count();
+                let base = at + SECRET_PREFIX.len();
+                secret = (1..=tail).find_map(|len| matches(&buffer[at..base + len], secret_digest));
+            }
+        }
+        if let (Some(id), Some(secret)) = (&id, &secret) {
+            return Some(OAuthClient {
+                id: id.clone(),
+                secret: secret.clone(),
+            });
+        }
+        let keep = buffer.len().min(CANDIDATE_LIMIT);
+        buffer.drain(..buffer.len() - keep);
+    }
+    None
+}
 
 /// The form a refresh of `refresh_token` sends with Antigravity's client.
-pub(crate) fn refresh_form(refresh_token: &str, client_secret: &str) -> String {
+pub(crate) fn refresh_form(refresh_token: &str, client: &OAuthClient) -> String {
     url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("client_secret", client_secret)
+        .append_pair("client_id", &client.id)
+        .append_pair("client_secret", &client.secret)
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .finish()
@@ -505,14 +700,14 @@ pub fn token_host(target: &str) -> bool {
 pub fn token_refresh(target: &str) -> bool {
     target.strip_prefix('/') == Some(TOKEN_REFRESH_UPSTREAM)
 }
-/// A token request's `client_id`, from a form or JSON body.
-pub(crate) fn client_id(body: &[u8]) -> Option<String> {
+/// A token request's field `name`, from a form or JSON body.
+pub(crate) fn form_field(body: &[u8], name: &str) -> Option<String> {
     serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|v| v["client_id"].as_str().map(String::from))
+        .and_then(|v| v[name].as_str().map(String::from))
         .or_else(|| {
             url::form_urlencoded::parse(body)
-                .find(|(k, _)| k == "client_id")
+                .find(|(k, _)| k == name)
                 .map(|(_, v)| v.into_owned())
         })
 }
@@ -1178,14 +1373,93 @@ mod tests {
             assert_eq!(raw.starts_with(WRAPPED), wrapped);
             assert_eq!(decode_item(&raw), Some((document.clone(), wrapped)));
         }
+        let client = OAuthClient {
+            id: "i".into(),
+            secret: "s&".into(),
+        };
         let form: std::collections::HashMap<String, String> =
-            url::form_urlencoded::parse(refresh_form("r&=", "s").as_bytes())
+            url::form_urlencoded::parse(refresh_form("r&=", &client).as_bytes())
                 .into_owned()
                 .collect();
         assert_eq!(form["refresh_token"], "r&=");
-        assert_eq!(form["client_id"], CLIENT_ID);
-        assert_eq!(form["client_secret"], "s");
+        assert_eq!(form["client_id"], "i");
+        assert_eq!(form["client_secret"], "s&");
         assert_eq!(form["grant_type"], "refresh_token");
+    }
+
+    #[test]
+    fn only_a_refresh_with_antigravitys_id_and_secret_teaches_its_client() {
+        let client = OAuthClient {
+            id: TEST_CLIENT_ID.into(),
+            secret: TEST_CLIENT_SECRET.into(),
+        };
+        let form = format!("client_id={TEST_CLIENT_ID}&client_secret={TEST_CLIENT_SECRET}");
+        assert_eq!(sent_client(form.as_bytes()), Some(client.clone()));
+        let json = json!({"client_id": TEST_CLIENT_ID, "client_secret": TEST_CLIENT_SECRET});
+        assert_eq!(sent_client(json.to_string().as_bytes()), Some(client));
+        for body in [
+            format!("client_id={TEST_CLIENT_ID}&client_secret=other"),
+            format!(
+                "client_id=other.apps.googleusercontent.com&client_secret={TEST_CLIENT_SECRET}"
+            ),
+            format!("client_id={TEST_CLIENT_ID}"),
+        ] {
+            assert_eq!(sent_client(body.as_bytes()), None, "{body}");
+        }
+        // Only the digests name the real client.
+        assert!(!is_client_id("other.apps.googleusercontent.com"));
+        assert_eq!(sha256_hex(b"abc").len(), 64);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_scan_finds_the_client_with_the_digests_among_packed_strings() {
+        // Fakes in the shapes of Google's, built so no source line has one.
+        let id = format!("123456-fake{}{ID_SUFFIX}", "x".repeat(28));
+        let secret = format!("{SECRET_PREFIX}fake_{}-9", "Y".repeat(22));
+        let (id_digest, secret_digest) = (sha256_hex(id.as_bytes()), sha256_hex(secret.as_bytes()));
+        let expected = OAuthClient {
+            id: id.clone(),
+            secret: secret.clone(),
+        };
+        // Strings packed without separators, beside decoys of the same shapes.
+        let packed = |filler: usize| {
+            let mut data = vec![0u8; filler];
+            data.extend_from_slice(format!("{SECRET_PREFIX}decoy{}", "D".repeat(23)).as_bytes());
+            data.extend_from_slice(format!("{secret}abc").as_bytes());
+            data.extend(std::iter::repeat_n(7u8, filler));
+            data.extend_from_slice(format!("99-decoy{ID_SUFFIX}").as_bytes());
+            data.extend_from_slice(format!("xyz{id}more").as_bytes());
+            data
+        };
+        for filler in [0, 5, (1 << 20) - 40, (1 << 20) - 3] {
+            let data = packed(filler);
+            assert_eq!(
+                scan_client(&data[..], &id_digest, &secret_digest),
+                Some(expected.clone()),
+                "{filler}"
+            );
+            // Both are needed.
+            assert_eq!(scan_client(&data[..], &id_digest, &id_digest), None);
+        }
+        // Across the chunks a reader returns a few bytes at a time.
+        struct Trickle<'a>(&'a [u8]);
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(buf.len()).min(5);
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let data = packed(300);
+        assert_eq!(
+            scan_client(Trickle(&data), &id_digest, &secret_digest),
+            Some(expected)
+        );
     }
 
     #[test]

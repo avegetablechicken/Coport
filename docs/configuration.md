@@ -591,7 +591,12 @@ are revoked when the saved login changes externally or is removed. Clients shoul
 reload their saved login after rotation.
 
 Antigravity's saved login (with `saved_login`) is renewed as Antigravity and Copool
-renew it: at `oauth2.googleapis.com/token`, with Antigravity's OAuth client. Tokens of
+renew it: at `oauth2.googleapis.com/token`, with Antigravity's OAuth client. Coport
+names that client only by its SHA-256 digests: it takes the ID and secret from the last
+refresh Antigravity sent through the proxy, else from the `agy` executable on `PATH`
+(or in `/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin`, following a launcher
+script such as Homebrew's), read once per process. While neither is available, a
+renewal is not attempted and the original 401 is returned. Tokens of
 other Google accounts carry no saved refresh token and are not renewed. The new tokens
 are written to the credential store item in the form it had: go-keyring's
 `go-keyring-base64:` wrapping, its key names, and its expiry as RFC 3339 in UTC or in

@@ -5343,7 +5343,8 @@ async fn antigravity_refresh(running: &Running, refresh: &str, client: &str) -> 
         ))
         .header("content-type", "application/x-www-form-urlencoded")
         .body(format!(
-            "client_id={client}&client_secret=public&grant_type=refresh_token&refresh_token={refresh}"
+            "client_id={client}&client_secret={}&grant_type=refresh_token&refresh_token={refresh}",
+            crate::antigravity::TEST_CLIENT_SECRET
         ))
         .send()
         .await
@@ -5356,7 +5357,7 @@ async fn antigravity_refresh(running: &Running, refresh: &str, client: &str) -> 
 #[tokio::test]
 async fn an_access_token_a_relayed_refresh_issued_for_the_saved_login_is_that_login() {
     let _login = crate::antigravity::TEST_LOGIN.lock().await;
-    let client = crate::antigravity::CLIENT_ID;
+    let client = crate::antigravity::TEST_CLIENT_ID;
     let token = fixture("http", "google_token").await;
     let mut payload = fixture("http", "gemini_sse").await;
     let token_endpoint = format!("http://127.0.0.1:{}", token.addr.port());
@@ -5406,7 +5407,7 @@ async fn an_access_token_a_relayed_refresh_issued_for_the_saved_login_is_that_lo
 #[tokio::test]
 async fn antigravity_token_refresh_routes_like_codex_and_learns_its_id_token_account() {
     let _login = crate::antigravity::TEST_LOGIN.lock().await;
-    let client = crate::antigravity::CLIENT_ID;
+    let client = crate::antigravity::TEST_CLIENT_ID;
     let mut token = fixture("http", "google_token").await;
     let mut payload = fixture("http", "gemini_sse").await;
     let token_endpoint = format!("http://127.0.0.1:{}", token.addr.port());
@@ -5607,6 +5608,15 @@ async fn antigravity_saved_item() -> String {
         .unwrap()
 }
 async fn antigravity_auto_setup(enabled: bool, mode: &'static str) -> (Running, Fixture) {
+    // As a refresh agy sent through the proxy teaches it.
+    crate::antigravity::learn_client(
+        format!(
+            "client_id={}&client_secret={}",
+            crate::antigravity::TEST_CLIENT_ID,
+            crate::antigravity::TEST_CLIENT_SECRET
+        )
+        .as_bytes(),
+    );
     crate::keychain::set_test_entry("gemini", "antigravity", Some(&antigravity_wrapped_login()));
     let fixture = fixture("http", mode).await;
     let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
@@ -5673,8 +5683,11 @@ async fn auto_refresh_renews_antigravity_in_its_item_once_and_in_its_own_form() 
         url::form_urlencoded::parse(refreshes[0].split("\r\n\r\n").nth(1).unwrap().as_bytes())
             .into_owned()
             .collect();
-    assert_eq!(form["client_id"], crate::antigravity::CLIENT_ID);
-    assert_eq!(form["client_secret"], crate::antigravity::CLIENT_SECRET);
+    assert_eq!(form["client_id"], crate::antigravity::TEST_CLIENT_ID);
+    assert_eq!(
+        form["client_secret"],
+        crate::antigravity::TEST_CLIENT_SECRET
+    );
     assert_eq!(form["grant_type"], "refresh_token");
     assert_eq!(form["refresh_token"], "refresh-secret");
     for forbidden in [

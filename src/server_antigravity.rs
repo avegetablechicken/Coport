@@ -215,12 +215,16 @@ impl Server {
         let bytes = read_body(body).await?;
         // The endpoint serves every Google client; only Antigravity's is
         // routed, so another's credential never leaves through its proxy.
-        if crate::antigravity::client_id(&bytes).as_deref() != Some(crate::antigravity::CLIENT_ID) {
+        if !crate::antigravity::form_field(&bytes, "client_id")
+            .is_some_and(|id| crate::antigravity::is_client_id(&id))
+        {
             return Err(Error::new(
                 403,
                 "Only Antigravity's token refresh is routed; run other Google clients without this proxy.",
             ));
         }
+        // Its client then serves the proxy's own renewals of the saved login.
+        crate::antigravity::learn_client(&bytes);
         let token = crate::routing::refresh_token(&bytes)
             .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
         let settings = &self.config.antigravity;
