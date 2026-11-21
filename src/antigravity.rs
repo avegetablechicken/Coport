@@ -524,6 +524,19 @@ pub fn target(target: &str) -> Option<&str> {
         .filter(|rest| rest.starts_with('/'))
 }
 
+/// An Antigravity target with the `//` of the upstream it names: agy joins
+/// its `GOOGLE_GEMINI_BASE_URL` with each request's path collapsing `//`, so
+/// `<Coport>/antigravity/https://relay.example.com/antigravity` arrives as
+/// `/https:/relay.example.com/antigravity/…`.
+pub fn named_upstream_target(rest: &str) -> std::borrow::Cow<'_, str> {
+    for scheme in ["/https:/", "/http:/"] {
+        if let Some(after) = rest.strip_prefix(scheme).filter(|a| !a.starts_with('/')) {
+            return format!("{scheme}/{after}").into();
+        }
+    }
+    rest.into()
+}
+
 impl Antigravity {
     /// Whether any request is routed: an account route or a fallback.
     pub fn enabled(&self) -> bool {
@@ -1543,6 +1556,32 @@ mod tests {
             !ag.url_route_matches("/v1beta/models/g:generateContent")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn a_named_upstream_gets_back_the_slash_agy_collapses() {
+        for (sent, named) in [
+            (
+                "/https:/182.92.106.196:6060/antigravity/v1beta/models",
+                "/https://182.92.106.196:6060/antigravity/v1beta/models",
+            ),
+            (
+                "/http:/relay.example.com/v1beta/models",
+                "/http://relay.example.com/v1beta/models",
+            ),
+            // Already whole, or naming no upstream: as sent.
+            (
+                "/https://relay.example.com/v1beta/models",
+                "/https://relay.example.com/v1beta/models",
+            ),
+            (
+                "/v1beta/models/g:streamGenerateContent",
+                "/v1beta/models/g:streamGenerateContent",
+            ),
+            ("/https:relay", "/https:relay"),
+        ] {
+            assert_eq!(named_upstream_target(sent), named, "{sent}");
+        }
     }
 
     #[test]

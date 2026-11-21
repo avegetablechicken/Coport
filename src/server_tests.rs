@@ -4990,6 +4990,20 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
         "{connect}"
     );
     while fixture.requests.try_recv().is_ok() {}
+    // As agy sends it: its base URL's `//` collapsed into the path.
+    let collapsed = send(
+        format!("/antigravity/https:/other.invalid/gemini{model}"),
+        Some(named.clone()),
+    )
+    .await
+    .unwrap();
+    let _ = collapsed.text().await;
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(
+        connect.starts_with("CONNECT other.invalid:443 "),
+        "{connect}"
+    );
+    while fixture.requests.try_recv().is_ok() {}
     // A key `fallback` carries reaches only the API base, and an ambiguous
     // key goes nowhere: neither sends anything.
     let fallback_elsewhere = send(

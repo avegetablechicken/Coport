@@ -536,7 +536,9 @@ names hold is refused with 409. The upstream a request names is checked as a
 URL route's is (public HTTPS, never a Cloud Code or Google token host) and
 reached with the platform's TLS. A key only `fallback` carries, which any
 client may send, reaches `base_url.api_key` alone; another upstream is rejected
-before any connection.
+before any connection. `agy` collapses the `//` of `GOOGLE_GEMINI_BASE_URL`
+when it joins each request's path, so `/antigravity/https:/relay.example.com/…`
+arrives; Coport puts the slash back, under `/antigravity/` only.
 
 **By URL.** Declare the upstream itself:
 

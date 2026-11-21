@@ -36,8 +36,9 @@ impl Server {
     ) -> Result<reqwest::Response> {
         let settings = &self.config.antigravity;
         // An unprefixed target is Antigravity's only through an API key route.
-        let scoped = crate::antigravity::target(target);
-        let api_target = scoped.unwrap_or(target);
+        let scoped =
+            crate::antigravity::target(target).map(crate::antigravity::named_upstream_target);
+        let api_target = scoped.as_deref().unwrap_or(target);
         if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
             return self
                 .forward_antigravity_api(incoming, api_target, route, log)
@@ -61,7 +62,9 @@ impl Server {
         if !settings.enabled() {
             return Err(Error::new(404, "Antigravity routing is not configured."));
         }
-        let rest = scoped.ok_or(Error::config("Unroutable Antigravity request target."))?;
+        let rest = scoped
+            .as_deref()
+            .ok_or(Error::config("Unroutable Antigravity request target."))?;
         if crate::antigravity::token_host(rest) {
             if !crate::antigravity::token_refresh(rest) {
                 return Err(Error::new(
