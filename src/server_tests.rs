@@ -5277,6 +5277,61 @@ async fn antigravity_request(running: &Running, token: &str) {
     assert_eq!(response.status(), 200);
 }
 
+// The token rotation lock is shared by every service: a model call must not
+// hold it while its account is looked up, or a renewal waiting for it holds
+// up every other model call behind that remote request.
+#[tokio::test]
+async fn an_antigravity_account_lookup_holds_no_rotation_lock() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let mut lookup = fixture("http", "delayed_headers").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let running = running(&format!(
+        "auto_refresh_access_token: true\nproxies:\n  lookup: {endpoint}\nantigravity:\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n"
+    ))
+    .await;
+    trust(&running, &lookup, &endpoint);
+    crate::antigravity::set_test_login("unnamed-access", "unnamed-refresh");
+    let call = tokio::spawn(
+        http()
+            .post(format!(
+                "{}/antigravity/v1internal:generateContent",
+                running.url
+            ))
+            .bearer_auth("unnamed-access")
+            .body("private-payload")
+            .send(),
+    );
+    // The lookup is in flight, and is never answered.
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT www.googleapis.com:443 ")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /oauth2/v2/userinfo ")
+    );
+    let renewal = tokio::time::timeout(
+        Duration::from_secs(2),
+        running.server.auto_refresh.rotation.write(),
+    )
+    .await;
+    assert!(
+        renewal.is_ok(),
+        "the rotation lock is held across the lookup"
+    );
+    drop(renewal);
+    call.abort();
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
 #[tokio::test]
 async fn antigravity_saved_login_is_named_once_per_login_across_renewals_and_restarts() {
     let _login = crate::antigravity::TEST_LOGIN.lock().await;

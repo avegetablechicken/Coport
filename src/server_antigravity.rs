@@ -107,6 +107,15 @@ impl Server {
             .await?;
         // Validate the target before any account lookup.
         let url = settings.url(rest)?;
+        // Taken before the lookup, which changes the route's proxy alone: the
+        // shared rotation lock is not held across a remote request.
+        let refresh_snapshot = if auto_refresh && route.matched_login {
+            self.refresh_snapshot(Service::Antigravity, &route.token)
+                .await
+        } else {
+            None
+        };
+        drop(rotation_guard);
         if route.needs_profile {
             let identity = self
                 .antigravity_identity(&route.token, &route.proxy, log)
@@ -128,13 +137,6 @@ impl Server {
             log.field("account_label", label);
         }
         log.field("credential_match", credential_match(route.configured));
-        let refresh_snapshot = if auto_refresh && route.matched_login {
-            self.refresh_snapshot(Service::Antigravity, &route.token)
-                .await
-        } else {
-            None
-        };
-        drop(rotation_guard);
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
         if log.fields.contains_key("model_call_id") {
