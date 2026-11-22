@@ -489,8 +489,10 @@ mod unix {
         (!name.is_empty() && name.chars().count() <= 512).then_some(name)
     }
 
-    /// Claude Code's PID domain: one per host on macOS, and per machine ID
-    /// and PID namespace on Linux.
+    /// Claude Code's PID domain, `process.platform` first: one per host on
+    /// macOS, and per machine ID and PID namespace on Linux. Its macOS build
+    /// shows `darwin:` in the Linux branch too, as Bun inlines the build's
+    /// platform; the Linux build writes `linux:`.
     pub(super) fn pid_domain() -> String {
         static DOMAIN: OnceLock<String> = OnceLock::new();
         DOMAIN
@@ -502,7 +504,7 @@ mod unix {
                     let namespace = std::fs::read_link("/proc/self/ns/pid")
                         .map(|link| link.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    format!("darwin:{machine}:{namespace}")
+                    format!("linux:{machine}:{namespace}")
                 } else {
                     "darwin".to_owned()
                 }
@@ -813,7 +815,13 @@ mod tests {
             if cfg!(target_os = "macos") {
                 assert_eq!(raw["pidDomain"], "darwin");
             } else {
-                assert!(raw["pidDomain"].as_str().unwrap().starts_with("darwin:"));
+                let machine = fs::read_to_string("/etc/machine-id")
+                    .map(|id| id.trim().to_owned())
+                    .unwrap_or_default();
+                let namespace = fs::read_link("/proc/self/ns/pid")
+                    .map(|link| link.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                assert_eq!(raw["pidDomain"], format!("linux:{machine}:{namespace}"));
             }
             // `ps -o lstart=` in UTC, as Claude Code compares it.
             assert_eq!(
@@ -906,7 +914,7 @@ mod tests {
                 (
                     "another PID namespace",
                     dead_pid(),
-                    Box::new(|record| record["pidDomain"] = "darwin:other".into()),
+                    Box::new(|record| record["pidDomain"] = "linux:other".into()),
                 ),
                 (
                     "other locks",
