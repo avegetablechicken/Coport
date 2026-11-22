@@ -5027,6 +5027,11 @@ async fn antigravity_api_key_routes_relay_the_key_as_sent_through_their_route() 
             404,
         ),
         (
+            format!("/antigravity/https://upstream.invalid{model}?key={KEY}&key=other-gemini-key"),
+            None,
+            400,
+        ),
+        (
             format!("/antigravity/https://upstream.invalid:8443{model}"),
             Some(("x-goog-api-key", KEY.to_owned())),
             404,

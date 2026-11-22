@@ -663,11 +663,24 @@ pub(crate) fn api_credential(
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::to_owned)
     });
-    let query = target.split_once('?').and_then(|(_, query)| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .find(|(name, _)| name == "key")
-            .map(|(_, value)| Some(value.into_owned()))
-    });
+    // The query is forwarded as sent, so a repeated `key` might not be the
+    // one this route was chosen by.
+    let mut keys = target
+        .split_once('?')
+        .map(|(_, query)| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .filter(|(name, _)| name == "key")
+                .map(|(_, value)| Some(value.into_owned()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if keys.len() > 1 {
+        return Err(Error::new(
+            400,
+            "Supply the Gemini API key once: x-goog-api-key, Bearer or key.",
+        ));
+    }
+    let query = keys.pop();
     let (key, credential) = match (header, bearer, query) {
         (Some(key), None, None) => (key, ApiCredential::Header),
         (None, Some(key), None) => (key, ApiCredential::Bearer),
@@ -708,15 +721,16 @@ pub fn token_host(target: &str) -> bool {
 pub fn token_refresh(target: &str) -> bool {
     target.strip_prefix('/') == Some(TOKEN_REFRESH_UPSTREAM)
 }
-/// A token request's field `name`, from a form or JSON body.
+/// A token request's field `name`, from a form or JSON body; none when a
+/// form repeats it, as the body is forwarded as sent.
 pub(crate) fn form_field(body: &[u8], name: &str) -> Option<String> {
     serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v[name].as_str().map(String::from))
         .or_else(|| {
-            url::form_urlencoded::parse(body)
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.into_owned())
+            let mut values = url::form_urlencoded::parse(body).filter(|(k, _)| k == name);
+            let value = values.next()?.1.into_owned();
+            values.next().is_none().then_some(value)
         })
 }
 
@@ -1424,6 +1438,10 @@ mod tests {
                 "client_id=other.apps.googleusercontent.com&client_secret={TEST_CLIENT_SECRET}"
             ),
             format!("client_id={TEST_CLIENT_ID}"),
+            // The body is forwarded as sent: Google may read either field.
+            format!(
+                "client_id={TEST_CLIENT_ID}&client_id=other.apps.googleusercontent.com&client_secret={TEST_CLIENT_SECRET}"
+            ),
         ] {
             assert_eq!(sent_client(body.as_bytes()), None, "{body}");
         }
