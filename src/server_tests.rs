@@ -163,6 +163,13 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                         io.shutdown().await.unwrap();
                     }
                 }
+                else if response_mode == "location_once" && attempt == 0 {
+                    let body = r#"{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
+                    io.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                else if response_mode == "location_once" {
+                    io.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
                 else if response_mode=="oauth_json" {
                     let body = if request.starts_with("POST /v1/oauth/token ") {
                         r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#
@@ -6123,5 +6130,78 @@ async fn auto_refresh_of_antigravity_is_opt_in_for_model_calls_and_stops_once_re
         .count();
     assert_eq!(refreshes, 1, "{requests:?}");
     assert_eq!(antigravity_saved_item().await, antigravity_wrapped_login());
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+#[tokio::test]
+async fn antigravity_location_cooldown_disconnects_before_headers_and_only_delays_model_calls() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let (running, mut fixture) = antigravity_auto_setup(false, "location_once").await;
+    let call = |method: &str| {
+        http()
+            .post(format!("{}/antigravity/v1internal:{method}", running.url))
+            .bearer_auth("access-secret")
+            .body("model-body")
+            .send()
+    };
+    assert!(call("streamGenerateContent").await.is_err());
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1internal:streamGenerateContent ")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), call("generateContent"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        call("loadCodeAssist").await.unwrap().text().await.unwrap(),
+        "ok"
+    );
+    fixture.requests.recv().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1internal:loadCodeAssist ")
+    );
+    assert!(fixture.requests.try_recv().is_err());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(180)).await;
+    tokio::time::resume();
+    assert_eq!(
+        call("streamGenerateContent")
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "ok"
+    );
+    fixture.requests.recv().await.unwrap();
+    // The cancelled generateContent must never reach the upstream at expiry.
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1internal:streamGenerateContent ")
+    );
+    assert!(fixture.requests.try_recv().is_err());
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
