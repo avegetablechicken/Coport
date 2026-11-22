@@ -148,13 +148,9 @@ fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<
             over(&mut px, accent, glow * (1.0 - smoothstep(0.04, 0.22, r)));
         }
         let beams = lens.hits(gx, gy);
-        let beam = |px: &mut Rgba, hit: &Hit| {
-            over(
-                px,
-                tinted(turn.tint * (0.6 + 0.4 * hit.glow)),
-                hit.alpha * turn.tint,
-            );
-        };
+        // Beams fade in the app's color itself; mixed with the ink they would
+        // wash out, toward teal in the dark bar.
+        let beam = |px: &mut Rgba, hit: &Hit| over(px, accent, hit.alpha * turn.tint);
         // Beams behind the lantern pass under the tower, the rest over it.
         for hit in beams.iter().flatten().filter(|h| !h.front) {
             beam(&mut px, hit);
@@ -268,10 +264,6 @@ struct Lens {
 /// How one beam covers a point of the image.
 struct Hit {
     alpha: f32,
-    /// The flare of a beam seen end on, from 0 to 1; the menu bar glyph
-    /// tints with it.
-    #[cfg(any(target_os = "macos", test))]
-    glow: f32,
     /// Whether the beam passes in front of the tower here.
     front: bool,
 }
@@ -320,8 +312,6 @@ impl Lens {
             let fade = 1.0 - 0.6 * t;
             Some(Hit {
                 alpha: fade + (1.0 - fade) * glow,
-                #[cfg(any(target_os = "macos", test))]
-                glow,
                 front: span.depth > 0.0,
             })
         })
@@ -663,7 +653,7 @@ mod tests {
         let lens = Lens::new(PI / 2.0);
         let [flare, _] = lens.hits(LANTERN.0, LANTERN.1 + 0.05);
         let flare = flare.unwrap();
-        assert!(flare.front && flare.glow > 0.5);
+        assert!(flare.front && flare.alpha > 0.95);
         assert!(lens.hits(0.5 + 0.40, LANTERN.1).iter().all(Option::is_none));
         // The beam turning away passes behind the tower.
         assert!(
@@ -769,6 +759,30 @@ mod tests {
             let at = css.find(&key).unwrap() + key.len();
             let panel = u32::from_str_radix(&css[at..at + 6], 16).unwrap();
             assert_eq!(super::accent(service), panel, "{name}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_beams_shine_in_the_app_color() {
+        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+            let accent = super::accent(service);
+            let accent = [accent >> 16, (accent >> 8) & 0xff, accent & 0xff].map(|c| c as u8);
+            for dark in [false, true] {
+                let frame = beacon(44, Turn::at(0.3), service, dark);
+                // Solid beam pixels well clear of the tower.
+                let beams: Vec<_> = frame
+                    .chunks(4)
+                    .enumerate()
+                    .filter(|(i, px)| (i % 44).abs_diff(22) > 9 && px[3] > 128)
+                    .collect();
+                assert!(!beams.is_empty(), "{service:?}");
+                for (_, px) in beams {
+                    for (c, a) in px[..3].iter().zip(accent) {
+                        assert!(c.abs_diff(a) <= 2, "{service:?} dark={dark}: {px:?}");
+                    }
+                }
+            }
         }
     }
 
