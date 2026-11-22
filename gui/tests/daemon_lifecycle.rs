@@ -336,13 +336,22 @@ fn restart_replaces_daemon_and_stale_discovery_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
     let port = fixture(dir.path());
-    std::fs::write(dir.path().join("daemon.json"), b"stale invalid endpoint").unwrap();
+    let path = dir.path().join("daemon.json");
+    let stale = b"stale invalid endpoint";
+    std::fs::write(&path, stale).unwrap();
+    // Hold a discovery read open across publication to force the overlap.
+    let mut reader = std::fs::File::open(&path).unwrap();
     let mut gui = controller(dir.path());
-    gui.start(
+    gui.try_start(
         &dir.path().join("config.yaml"),
         dir.path().join("proxy.log"),
-    );
+    )
+    .expect("start with stale discovery");
     let first = gui.daemon_status().unwrap().pid;
+    let mut old = Vec::new();
+    reader.read_to_end(&mut old).unwrap();
+    assert_eq!(old, stale);
+    assert_eq!(daemon::Client::discover(dir.path()).unwrap().1.pid, first);
     gui.try_start(
         &dir.path().join("config.yaml"),
         dir.path().join("proxy.log"),

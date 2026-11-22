@@ -758,11 +758,14 @@ async fn serve_until(
             .await
     });
     logger.write("server_started", Default::default());
-    // Atomic, owner-only discovery file. Publish only after both listeners bind.
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.write_all(&serde_json::to_vec(&endpoint)?)?;
-    temp.as_file().sync_all()?;
-    temp.persist(&registration.path).map_err(|e| e.error)?;
+    // On Windows, std::fs::rename can replace a stale file that a discovery
+    // reader still has open. NamedTempFile::persist uses only MoveFileExW.
+    {
+        let staging = tempfile::tempdir_in(dir)?;
+        let staged = staging.path().join(ENDPOINT);
+        crate::settings::create_private(&staged, &serde_json::to_vec(&endpoint)?)?;
+        std::fs::rename(staged, &registration.path)?;
+    }
 
     let token: Arc<str> = endpoint.token.into();
     let status = Arc::new(Status {
