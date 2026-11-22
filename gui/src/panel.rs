@@ -78,15 +78,25 @@ pub fn present(app: &AppHandle, anchor: Option<Rect>, keyboard: bool) {
 /// space it was first shown in, and showing it switches back there.
 fn join_active_space(w: &WebviewWindow) {
     #[cfg(target_os = "macos")]
-    if let Ok(ns_window) = w.ns_window() {
-        use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
-        // SAFETY: Tauri returns the panel's NSWindow, used here on the main thread.
+    if let Ok(ns_window) = w.ns_window()
+        && !ns_window.is_null()
+        && objc2::MainThreadMarker::new().is_some()
+    {
+        use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior as Behavior};
+        // SAFETY: Tauri returns the panel's NSWindow, checked non-null and
+        // used here on the main thread.
         let ns_window = unsafe { &*ns_window.cast::<NSWindow>() };
+        // AppKit raises on behaviors that exclude each other, so their
+        // counterparts are cleared first.
+        let excluded = Behavior::MoveToActiveSpace
+            | Behavior::FullScreenPrimary
+            | Behavior::FullScreenNone
+            | Behavior::ParticipatesInCycle;
         ns_window.setCollectionBehavior(
-            ns_window.collectionBehavior()
-                | NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::IgnoresCycle,
+            (ns_window.collectionBehavior() & !excluded)
+                | Behavior::CanJoinAllSpaces
+                | Behavior::FullScreenAuxiliary
+                | Behavior::IgnoresCycle,
         );
     }
     #[cfg(not(target_os = "macos"))]
