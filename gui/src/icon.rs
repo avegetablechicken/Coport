@@ -34,11 +34,6 @@ const WHITE: Rgba = [1.0, 1.0, 1.0, 1.0];
 const GREEN: Rgba = [0.20, 0.78, 0.42, 1.0];
 const GREY: Rgba = [0.62, 0.64, 0.68, 1.0];
 const RED: Rgba = [0.94, 0.30, 0.30, 1.0];
-/// Antigravity's blue, the leading shade of its traffic share in the panel.
-/// Lighter shades wash out toward Codex's teal in the menu bar, so it is the
-/// same in both appearances.
-#[cfg(target_os = "macos")]
-const ANTIGRAVITY: Rgba = [0.110, 0.490, 0.945, 1.0];
 
 /// The water line: two sine periods across the bottom, thinning to its ends.
 const WAVE: Wave = Wave {
@@ -96,31 +91,37 @@ pub fn template(size: u32, status: Status) -> Vec<u8> {
 }
 
 /// A frame of the turn for the macOS menu bar. A colored image cannot be a
-/// template, so it is drawn in the bar's own ink for its appearance.
+/// template, so the tower is drawn in the bar's own ink for its appearance;
+/// the light keeps the app's color in either.
 #[cfg(target_os = "macos")]
 pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
-    let (ink, accent) = if dark {
-        let accent = match service {
-            Service::Claude => [0.929, 0.553, 0.424, 1.0],
-            Service::Codex => [0.384, 0.792, 0.765, 1.0],
-            Service::Antigravity => ANTIGRAVITY,
-        };
-        ([1.0, 1.0, 1.0, 1.0], accent)
+    let ink = if dark {
+        [1.0, 1.0, 1.0, 1.0]
     } else {
-        let accent = match service {
-            Service::Claude => [0.851, 0.467, 0.341, 1.0],
-            Service::Codex => [0.200, 0.580, 0.565, 1.0],
-            Service::Antigravity => ANTIGRAVITY,
-        };
-        ([0.0, 0.0, 0.0, 0.85], accent)
+        [0.0, 0.0, 0.0, 0.85]
     };
-    glyph(size, Status::Running, turn, ink, accent)
+    glyph(size, Status::Running, turn, ink, rgb(accent(service)))
+}
+
+/// The app's color: the leading shade of its traffic share in the panel.
+#[cfg(target_os = "macos")]
+fn accent(service: Service) -> u32 {
+    match service {
+        Service::Claude => 0xe8622c,
+        Service::Codex => 0x10a37f,
+        Service::Antigravity => 0x1c7df1,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rgb(hex: u32) -> Rgba {
+    let channel = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.0;
+    [channel(16), channel(8), channel(0), 1.0]
 }
 
 /// The menu bar lighthouse in `ink`, its light taking `accent` as the turn
-/// asks: the badge's clay sky for Claude, its teal sea for Codex, the panel's
-/// blue for Antigravity. Its beams fade in and out with the tint, so a
-/// lighthouse without model calls has none.
+/// asks. Its beams fade in and out with the tint, so a lighthouse without model
+/// calls has none.
 #[cfg(target_os = "macos")]
 fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<u8> {
     const SCALE: f32 = 0.88;
@@ -723,9 +724,12 @@ mod tests {
             assert!(codex[2] > codex[0] + 40, "{codex:?}");
             // Antigravity's blue leans further from red than Codex's teal.
             assert!(antigravity[2] > antigravity[1] + 30, "{antigravity:?}");
-            // In the dark bar light shades of blue wash toward Codex's teal.
-            if dark {
-                assert!(codex[1] > antigravity[1] + 60, "{codex:?} {antigravity:?}");
+        }
+        // The light keeps its color whatever the bar's appearance.
+        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+            let (light, dark) = (lantern(service, false), lantern(service, true));
+            for (l, d) in light.into_iter().zip(dark) {
+                assert!(l.abs_diff(d) <= 12, "{service:?}: {light:?} {dark:?}");
             }
         }
         assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
@@ -754,13 +758,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn menu_bar_antigravity_shines_in_the_panel_blue() {
+    fn menu_bar_light_takes_the_panel_color() {
         let css = include_str!("../ui/style.css");
-        let at = css.find("--antigravity-1: #").unwrap() + "--antigravity-1: #".len();
-        let hex = u32::from_str_radix(&css[at..at + 6], 16).unwrap();
-        let panel = [hex >> 16, (hex >> 8) & 0xff, hex & 0xff];
-        let menu_bar = super::ANTIGRAVITY.map(|c| (c * 255.0).round() as u32);
-        assert_eq!(menu_bar[..3], panel);
+        for (service, name) in [
+            (Service::Claude, "claude"),
+            (Service::Codex, "codex"),
+            (Service::Antigravity, "antigravity"),
+        ] {
+            let key = format!("--{name}-1: #");
+            let at = css.find(&key).unwrap() + key.len();
+            let panel = u32::from_str_radix(&css[at..at + 6], 16).unwrap();
+            assert_eq!(super::accent(service), panel, "{name}");
+        }
     }
 
     #[cfg(target_os = "macos")]
