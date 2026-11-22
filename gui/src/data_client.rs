@@ -3089,6 +3089,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_history_matches_known_accounts_in_devices_and_forwarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    account:\n      'Alice@Example.com': none\n").unwrap();
+        let log = dir.path().join("remote.log");
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let timestamp = chrono::DateTime::from_timestamp_millis(end - 60_000).unwrap();
+        let mut lines = String::new();
+        for (index, email) in [
+            "alice@example.com",
+            "ALICE@example.com",
+            "unknown@example.com",
+            "",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Historical records: no credential proof or extra identity fields.
+            let record = serde_json::json!({"timestamp":timestamp.to_rfc3339(), "event":"model_call_finished", "service":"antigravity", "model_call_id":format!("call-{index}"), "request_id":format!("request-{index}"), "account_id":email, "provider":"default", "status":"200", "received_bytes":"10", "input_tokens":"7", "output_tokens":"2"});
+            lines.push_str(&format!("{record}\n"));
+        }
+        std::fs::write(&log, &lines).unwrap();
+        let context = crate::traffic::ExportIdentities::from_config(&config);
+        let key = DataKey::new(KEY).unwrap();
+        let options = crate::traffic::ExportOptions {
+            end,
+            minutes: 30,
+            scope: crate::traffic::TrafficScope::Model,
+            limit: 24,
+        };
+        let groups = crate::traffic::export_window_limit(
+            crate::traffic::ReadSource::Path(&log),
+            &config,
+            &key,
+            options,
+            &context,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&groups).unwrap();
+        assert!(!serialized.contains("example.com"));
+        assert!(!serialized.contains("default"));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), lines);
+
+        // The reader knows the email from configuration only, with different case.
+        let local_log = dir.path().join("local.log");
+        std::fs::write(&local_log, "").unwrap();
+        let labels = config.local_traffic_credential_labels().await;
+        let merge = prepare_merge_range(config.clone(), local_log.clone(), labels.clone(), 30)
+            .await
+            .unwrap();
+        let mut device_groups = BTreeMap::new();
+        add_groups(
+            &mut device_groups,
+            &(BTreeMap::new(), BTreeMap::new()),
+            "remote",
+            &groups,
+            &merge.accounts,
+        );
+        let devices = traffic_view(&device_groups.into_values().collect::<Vec<_>>(), 30);
+        let remote = crate::remote_forward::RemoteWindow {
+            device_id: "remote".into(),
+            name: "Remote".into(),
+            fetched_at: 1,
+            error: None,
+            node_id: uuid::Uuid::new_v4().to_string(),
+            window: crate::data_api::Window {
+                minutes: 30,
+                scope: options.scope,
+                window_start: end - 30 * 60_000,
+                window_end: end,
+                bucket_minutes: 1,
+                groups,
+            },
+        };
+        let forwarded = forwarded_traffic(remote, config, local_log, labels)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&devices).unwrap(),
+            serde_json::to_value(&forwarded.traffic).unwrap()
+        );
+        let values = serde_json::to_value(devices).unwrap();
+        let credentials = values["credentials"].as_array().unwrap();
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials[0]["credential"], "Alice@Example.com");
+        assert_eq!(credentials[0]["requests"], 2);
+        assert_eq!(credentials[1]["credential"], "Unidentified");
+        assert_eq!(credentials[1]["requests"], 2);
+        assert_eq!(values["requests"], 4);
+    }
+
+    #[tokio::test]
     async fn a_summary_reused_from_forwarding_opens_no_connection() {
         if data_key_in_subprocess(
             "data_client::tests::a_summary_reused_from_forwarding_opens_no_connection",

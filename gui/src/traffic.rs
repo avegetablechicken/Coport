@@ -814,6 +814,20 @@ fn credential_name(
             .into_iter()
             .filter_map(|key| entry.get(key))
             .find_map(|name| labels.get(&(service.to_owned(), name.to_owned())).cloned())
+            .or_else(|| {
+                // Google routing treats email case-insensitively; traffic must
+                // do the same when a configured address has different casing.
+                if service != Service::Antigravity.label() {
+                    return None;
+                }
+                let account = entry.get("account_id").filter(|id| id.contains('@'))?;
+                let matches: BTreeSet<_> = labels
+                    .iter()
+                    .filter(|((s, id), _)| s == service && id.eq_ignore_ascii_case(account.trim()))
+                    .map(|(_, label)| label.clone())
+                    .collect();
+                (matches.len() == 1).then(|| matches.into_iter().next().unwrap())
+            })
             .unwrap_or_else(|| UNIDENTIFIED.into())
     })
 }

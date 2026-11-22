@@ -273,8 +273,15 @@ Unknown proxy/upstream references display **Unidentified proxy / Unidentified** 
 or modify local configuration. The server-private identity key is never exported.
 Random UUIDv4 account IDs additionally produce a service-separated SHA-256 reference.
 The receiver matches it only against accounts already known to its own configuration
-and uses its own display name. Emails, names, URLs and other guessable identifiers
-never produce a shared reference. Unknown accounts stay anonymous. This allows the
+and uses its own display name. Antigravity uses a separate, versioned SHA-256
+fingerprint of its Google account email (trimmed and ASCII case-folded), because
+its account IDs are emails rather than UUIDs. Gmail dots and plus aliases are not
+merged. Only an email already known locally restores a display name; route names
+such as `default` are not account identities. Historical records with an email
+also match when their summaries are regenerated. Email fingerprints are guessable
+from candidate addresses: they hide the literal email in transit, but do not
+provide the dictionary resistance of UUID references. Other services still reject
+email/name/URL references. Unknown accounts stay anonymous. This allows the
 same known account on multiple devices to merge without exporting IDs or labels.
 
 Statistics use local metadata and identities already observed by real requests.

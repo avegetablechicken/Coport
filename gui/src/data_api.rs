@@ -97,22 +97,43 @@ pub fn bucket_minutes(minutes: u64) -> Option<u64> {
         _ => None,
     }
 }
-/// Equality is supported only for random UUID account IDs (122 random bits),
-/// never emails, names or URLs that a reader could recover with a dictionary.
+/// Service-separated account equality, without exporting the account text.
+/// Antigravity identifies Google accounts by case-insensitive email, not UUID.
+/// Its email fingerprint permits guessing known candidate addresses; it is not
+/// an anonymization mechanism. Other services retain their UUID-only policy.
 pub fn account_reference(service: &str, account: &str) -> Option<String> {
+    if service == Service::Antigravity.label() && account.contains('@') {
+        let account = account.trim();
+        let (local, domain) = account.split_once('@')?;
+        if local.is_empty()
+            || domain.is_empty()
+            || domain.contains('@')
+            || account.len() > 320
+            || account.chars().any(|c| c.is_whitespace() || c.is_control())
+            || account.contains([':', '/', '\\', '?', '#'])
+        {
+            return None;
+        }
+        return Some(account_digest(&format!(
+            "coport-google-account-email-v1\0{service}\0{}",
+            account.to_ascii_lowercase()
+        )));
+    }
     let id = uuid::Uuid::parse_str(account).ok()?;
     if id.get_version() != Some(uuid::Version::Random) || id.get_variant() != uuid::Variant::RFC4122
     {
         return None;
     }
     let value = format!("coport-known-account-v1\0{service}\0{id}");
-    Some(
-        ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
+    Some(account_digest(&value))
+}
+
+fn account_digest(value: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 /// Every reader parses Codex and Claude groups; one from before Antigravity
 /// rejects a whole summary naming it. Readers therefore name the further
@@ -1337,6 +1358,40 @@ mod tests {
             "00000000-0000-1000-8000-000000000000",
         ] {
             assert!(account_reference("Codex", weak).is_none());
+        }
+    }
+    #[test]
+    fn google_email_references_are_normalized_and_service_specific() {
+        let reference = account_reference("Antigravity", "Alice@Example.com").unwrap();
+        assert_eq!(reference.len(), 64);
+        assert_eq!(
+            Some(reference.clone()),
+            account_reference("Antigravity", " alice@example.COM ")
+        );
+        for other in [
+            "bob@example.com",
+            "alice+tag@example.com",
+            "a.lice@example.com",
+        ] {
+            assert_ne!(
+                Some(reference.clone()),
+                account_reference("Antigravity", other)
+            );
+        }
+        for invalid in [
+            "default",
+            "fallback",
+            "",
+            "@example.com",
+            "alice@",
+            "a@@b",
+            "a b@c",
+            "a\n@b",
+        ] {
+            assert!(account_reference("Antigravity", invalid).is_none());
+        }
+        for service in ["Codex", "Claude"] {
+            assert!(account_reference(service, "alice@example.com").is_none());
         }
     }
     #[test]
