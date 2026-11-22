@@ -3,8 +3,8 @@ use crate::{
     config::{Choice, Config, redacted_endpoint},
     logger::{Logger, RequestLog},
     routing::{
-        MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query, query_url,
-        refresh_token, token_refresh, upstream_url,
+        MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
+        query_url, refresh_token, token_refresh, upstream_url,
     },
 };
 use bytes::{Buf, Bytes};
@@ -936,7 +936,6 @@ impl Server {
         } else {
             None
         };
-        let query = account_query(target);
         let auth = incoming
             .headers()
             .get("authorization")
@@ -1065,7 +1064,7 @@ impl Server {
                 .map_err(|_| Error::config("Invalid MCP request target."))?
         } else {
             let r = route.as_ref().unwrap();
-            if let Some(method) = query {
+            if let Some(method) = account_query_for_route(target, r.account_id.is_some()) {
                 if r.account_id.is_none() {
                     return Err(Error::new(
                         403,

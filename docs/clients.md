@@ -86,6 +86,9 @@ For matched ChatGPT credentials, `/responses`, `/v1/responses` and
 matched ChatGPT login. API Keys cannot read subscription limits or account
 profiles, or consume reset credits.
 
+For a matched ChatGPT login, Copool's fallback paths `/wham/usage` and
+`/api/codex/usage` also take the account's route to `GET /backend-api/wham/usage`.
+
 ChatGPT login refreshes can also use the saved account's proxy. Codex reads the
 refresh URL from the environment rather than `config.toml`:
 

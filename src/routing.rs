@@ -315,6 +315,13 @@ fn valid_target(target: &str) -> Result<()> {
 }
 /// Returns the only method allowed for a ChatGPT account endpoint.
 pub fn account_query(target: &str) -> Option<&'static str> {
+    account_query_for_route(target, true)
+}
+
+const USAGE_PATH: &str = "/backend-api/wham/usage";
+const USAGE_ALIASES: [&str; 2] = ["/wham/usage", "/api/codex/usage"];
+
+pub(crate) fn account_query_for_route(target: &str, account: bool) -> Option<&'static str> {
     let path = if target.starts_with("/https://") || target.starts_with("/http://") {
         Url::parse(&target[1..])
             .ok()
@@ -324,7 +331,8 @@ pub fn account_query(target: &str) -> Option<&'static str> {
         target.split('?').next().unwrap_or("").to_string()
     };
     match path.as_str() {
-        "/backend-api/wham/usage"
+        path if account && USAGE_ALIASES.contains(&path) => Some("GET"),
+        USAGE_PATH
         | "/backend-api/wham/profiles/me"
         | "/backend-api/wham/rate-limit-reset-credits" => Some("GET"),
         "/backend-api/wham/rate-limit-reset-credits/consume" => Some("POST"),
@@ -411,7 +419,13 @@ pub fn query_url(base: &str, target: &str) -> Result<Url> {
             "Account queries require a ChatGPT /backend-api upstream.",
         ));
     }
-    upstream_url(base, target, true)
+    // Validate explicit targets against the configured origin first. Copool's
+    // compatible usage paths live outside /backend-api on that same origin.
+    let mut url = upstream_url(&b.origin().ascii_serialization(), target, false)?;
+    if USAGE_ALIASES.contains(&url.path()) {
+        url.set_path(USAGE_PATH);
+    }
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -640,6 +654,27 @@ mod tests {
             Some("GET")
         );
         assert!(account_query("/backend-api/wham/profiles/other").is_none());
+        for alias in USAGE_ALIASES {
+            assert_eq!(account_query(alias), Some("GET"));
+            assert_eq!(account_query_for_route(alias, false), None);
+            for target in [
+                format!("{alias}?x=a%2Fb"),
+                format!("/https://chatgpt.com{alias}?x=a%2Fb"),
+            ] {
+                assert_eq!(
+                    query_url(b, &target).unwrap().as_str(),
+                    "https://chatgpt.com/backend-api/wham/usage?x=a%2Fb"
+                );
+            }
+            for origin in [
+                "https://other.invalid",
+                "http://chatgpt.com",
+                "https://chatgpt.com:8443",
+            ] {
+                assert!(query_url(b, &format!("/{origin}{alias}")).is_err());
+            }
+            assert!(account_query(&format!("{alias}/other")).is_none());
+        }
         assert!(query_url("https://api.openai.com/v1", "/backend-api/wham/usage").is_err());
         for t in [
             "//evil.com",

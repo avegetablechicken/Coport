@@ -3631,6 +3631,36 @@ async fn proxy_clients_reach_the_account_exit_with_a_loopback_base_url() {
     assert_eq!(finished["status"], "200");
     assert_eq!(finished["account_id"], "acct-1");
     assert_eq!(finished["proxy"], "selected");
+    // Copool tries these paths when the primary account usage request fails.
+    for fallback in ["/api/codex/usage", "/wham/usage"] {
+        let url = format!("http://{local}{fallback}?x=a%2Fb");
+        let response = client
+            .get(&url)
+            .bearer_auth("access-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT upstream.invalid:443")
+        );
+        let request = fixture.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /backend-api/wham/usage?x=a%2Fb "));
+        assert!(request.contains("chatgpt-account-id: acct-1"));
+        let denied = client
+            .post(&url)
+            .bearer_auth("access-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 405);
+        assert!(fixture.requests.try_recv().is_err());
+    }
 }
 
 // Copool's Claude usage through the proxy port before the proxy CA is
