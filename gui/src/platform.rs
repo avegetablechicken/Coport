@@ -62,8 +62,7 @@ pub fn trust_certificate(
     {
         let home =
             dirs::home_dir().ok_or_else(|| std::io::Error::other("The home folder is unknown."))?;
-        ca_trust::install(path, &home)?;
-        ca_trust::verify(probe)?;
+        ca_trust::install(path, &home, probe)?;
         Ok(true)
     }
     #[cfg(target_os = "windows")]
@@ -122,21 +121,30 @@ mod ca_trust {
     }
 
     /// Store the CA in the PEM file at `path` in the login keychain and trust
-    /// it as a root for this user; macOS asks for the login password. A CA
-    /// left out of every keychain is never found while clients build a chain,
-    /// whatever its trust settings say.
-    pub fn install(path: &Path, home: &Path) -> std::io::Result<()> {
+    /// it as a root for this user, then [`verify`] it; macOS asks for the
+    /// login password. A CA left out of every keychain is never found while
+    /// clients build a chain, whatever its trust settings say. A CA this call
+    /// added is removed again if it ends up untrusted, as when the password
+    /// prompt is cancelled, so retries leave no stray certificates behind.
+    pub fn install(path: &Path, home: &Path, probe: Option<&ProxyCaProbe>) -> std::io::Result<()> {
         let der = CertificateDer::from_pem_file(path)
             .map_err(|_| std::io::Error::other("Cannot read the new proxy CA."))?;
         let cert = SecCertificate::from_der(&der).map_err(failed)?;
         let keychain = SecKeychain::open(login_keychain(home)).map_err(failed)?;
-        match cert.add_to_keychain(Some(keychain)) {
-            Err(error) if error.code() != DUPLICATE_ITEM => return Err(failed(error)),
-            _ => {}
-        }
-        TrustSettings::new(Domain::User)
+        let added = match cert.add_to_keychain(Some(keychain)) {
+            Ok(()) => true,
+            Err(error) if error.code() == DUPLICATE_ITEM => false,
+            Err(error) => return Err(failed(error)),
+        };
+        let trusted = TrustSettings::new(Domain::User)
             .set_trust_settings_always(&cert)
             .map_err(failed)
+            .and_then(|()| verify(probe));
+        if trusted.is_err() && added {
+            // Best effort: the error that matters is the one returned.
+            let _ = cert.delete();
+        }
+        trusted
     }
 
     /// Fails unless macOS accepts `probe` as clients would. The trust
@@ -220,7 +228,7 @@ mod ca_trust {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ca.pem");
             std::fs::write(&path, "not a certificate").unwrap();
-            let error = install(&path, dir.path()).unwrap_err();
+            let error = install(&path, dir.path(), None).unwrap_err();
             assert_eq!(error.to_string(), "Cannot read the new proxy CA.");
         }
     }
