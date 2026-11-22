@@ -5526,8 +5526,11 @@ async fn an_access_token_a_relayed_refresh_issued_for_the_saved_login_is_that_lo
     assert_eq!(response.status(), 200);
     assert!(response.text().await.unwrap().contains("renewed-access"));
     // The client keeps the new token; the saved login still holds the old one.
+    // The recent read of that login answers for it, as for the saved token.
+    let reads = crate::keychain::test_loads("gemini");
     antigravity_request(&running, "renewed-access").await;
     expect_payload(&mut payload, "renewed-access").await;
+    assert_eq!(crate::keychain::test_loads("gemini"), reads);
     antigravity_request(&running, "saved-access").await;
     expect_payload(&mut payload, "saved-access").await;
     assert_eq!(status("other-access").await, 401);

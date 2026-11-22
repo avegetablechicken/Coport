@@ -1097,7 +1097,14 @@ impl Antigravity {
             .and_then(|v| v.strip_prefix("Bearer "))
             .filter(|s| valid_token(s))
             .ok_or(Error::new(401, "Antigravity requires a Bearer token."))?;
-        let (login, unavailable) = self.saved_for(|login| login.access_token == token).await;
+        // A token a relayed refresh issued for the saved login matches the
+        // recent read too, so its requests start no credential store read.
+        let renewed = renewed.get(token);
+        let (login, unavailable) = self
+            .saved_for(|login| {
+                login.access_token == token || renewed.as_ref().is_some_and(|r| r.renews(login))
+            })
+            .await;
         let route = |proxy: &Choice,
                      identity: Option<AntigravityIdentity>,
                      matched_login: bool,
@@ -1117,7 +1124,6 @@ impl Antigravity {
                 label: label.into(),
             })
         };
-        let renewed = renewed.get(token);
         // The saved login's current token, or one a relayed refresh issued
         // for its refresh token; the credential store's is checked first.
         if let Some(login) = login.filter(|login| {
