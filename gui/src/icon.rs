@@ -148,9 +148,10 @@ fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<
             over(&mut px, accent, glow * (1.0 - smoothstep(0.04, 0.22, r)));
         }
         let beams = lens.hits(gx, gy);
-        // Beams fade in the app's color itself; mixed with the ink they would
-        // wash out, toward teal in the dark bar.
-        let beam = |px: &mut Rgba, hit: &Hit| over(px, accent, hit.alpha * turn.tint);
+        // Beams are solid in the app's color itself, fading only with the
+        // turn: thinned toward their tips or mixed with the ink, they would
+        // darken or wash out against the bar and stray from the panel's color.
+        let beam = |px: &mut Rgba, _: &Hit| over(px, accent, turn.tint);
         // Beams behind the lantern pass under the tower, the rest over it.
         for hit in beams.iter().flatten().filter(|h| !h.front) {
             beam(&mut px, hit);
@@ -770,14 +771,18 @@ mod tests {
             let accent = [accent >> 16, (accent >> 8) & 0xff, accent & 0xff].map(|c| c as u8);
             for dark in [false, true] {
                 let frame = beacon(44, Turn::at(0.3), service, dark);
-                // Solid beam pixels well clear of the tower.
+                // Beam pixels well clear of the tower.
                 let beams: Vec<_> = frame
                     .chunks(4)
                     .enumerate()
-                    .filter(|(i, px)| (i % 44).abs_diff(22) > 9 && px[3] > 128)
+                    .filter(|(i, px)| (i % 44).abs_diff(22) > 9 && px[3] > 0)
+                    .map(|(_, px)| px)
                     .collect();
-                assert!(!beams.is_empty(), "{service:?}");
-                for (_, px) in beams {
+                // Mid-turn they are solid inside, translucent only at their
+                // anti-aliased edges, so the bar cannot darken them.
+                let solid: Vec<_> = beams.iter().filter(|px| px[3] == 255).collect();
+                assert!(solid.len() * 2 >= beams.len(), "{service:?} dark={dark}");
+                for px in solid {
                     for (c, a) in px[..3].iter().zip(accent) {
                         assert!(c.abs_diff(a) <= 2, "{service:?} dark={dark}: {px:?}");
                     }
