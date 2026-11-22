@@ -393,9 +393,19 @@ function focusName(el) {
   return [el.tagName, ...named.map((a) => `${a.name}=${a.value}`).sort()].join(" ");
 }
 
-/// The controls in `root` Tab stops on, in order.
+/// The controls in `root` Tab stops on, in order: not those inside a hidden
+/// element or a closed <details> other than its summary, which the panel
+/// does not render.
 function tabStops(root) {
-  return [...(root?.querySelectorAll(FOCUSABLE) ?? [])].filter((c) => !c.disabled && c.getAttribute("tabindex") !== "-1");
+  return [...(root?.querySelectorAll(FOCUSABLE) ?? [])].filter((c) => !c.disabled && c.getAttribute("tabindex") !== "-1" && rendered(c));
+}
+
+function rendered(c) {
+  if (c.closest("[hidden]")) return false;
+  for (let details = c.closest("details"); details; details = details.parentElement?.closest("details")) {
+    if (!details.open && !(c.tagName === "SUMMARY" && c.parentElement === details)) return false;
+  }
+  return true;
 }
 
 /// Where focus is among the panel's rebuilt parts: the page, the container,

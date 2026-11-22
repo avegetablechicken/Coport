@@ -15,19 +15,26 @@ const helpers = source.slice(from, to);
 
 let context;
 
-/// A control: `attrs` as written in the markup.
-function control(tagName, attrs = {}, { disabled = false } = {}) {
+/// A control: `attrs` as written in the markup; `hidden` when inside a
+/// hidden element, and `details` the <details> it is in, if any.
+function control(tagName, attrs = {}, { disabled = false, hidden = false, details = null } = {}) {
   const el = {
     tagName,
     disabled,
     isConnected: true,
     root: null,
+    parentElement: tagName === "SUMMARY" ? details : null,
     attributes: Object.entries(attrs).map(([name, value]) => ({ name, value: String(value) })),
     getAttribute: (name) => (name in attrs ? String(attrs[name]) : null),
-    closest: (selector) => (selector === "#top, #content" ? el.root : null),
+    closest: (selector) => ({ "#top, #content": el.root, "[hidden]": hidden ? {} : null, details })[selector] ?? null,
     focus() { context.document.activeElement = el; },
   };
   return el;
+}
+
+/// A <details>, inside `outer` if given.
+function details(open, outer = null) {
+  return { open, parentElement: outer && { closest: (selector) => (selector === "details" ? outer : null) } };
 }
 
 /// A rebuilt part of the panel holding `controls`; rebuilding detaches the
@@ -119,6 +126,25 @@ test("a control gone falls back to the tab stop in its place", () => {
   ];
   p.render();
   assert.equal(p.focused().getAttribute("data-setting"), "launch");
+});
+
+test("the fallback skips controls the panel does not render", () => {
+  let rows = settings()();
+  const p = panel("settings", back, () => rows);
+  p.parts.content.controls[1].focus();
+  const closed = details(false);
+  const inner = details(true, details(false));
+  rows = [
+    control("BUTTON", { "data-action": "probe", "data-name": "a" }),
+    control("INPUT", { id: "range-from" }, { hidden: true }),
+    control("INPUT", { id: "timeout" }, { details: closed }),
+    control("SUMMARY", { "data-device": "x" }, { details: inner }),
+    control("SUMMARY", { "data-device": "y" }, { details: closed }),
+    control("INPUT", { type: "checkbox", "data-setting": "launch" }),
+  ];
+  p.render();
+  // Not the hidden field in its place: the closed section's summary.
+  assert.equal(p.focused().getAttribute("data-device"), "y");
 });
 
 test("a menu button is found again though its items changed", () => {
