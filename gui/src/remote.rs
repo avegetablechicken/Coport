@@ -29,7 +29,13 @@ impl Device {
         {
             return Err("Use an SSH config alias or user@hostname.".into());
         }
-        if self.binary.len() > 4096 || self.binary.chars().any(char::is_control) {
+        // The path becomes `$0` of `exec "$0"`, where bash would read a
+        // leading `-` as an option; `exec --` is no fix, as dash 0.5.10
+        // (Ubuntu 20.04) then runs a command named `--`.
+        if self.binary.len() > 4096
+            || self.binary.starts_with('-')
+            || self.binary.chars().any(char::is_control)
+        {
             return Err("Provide the remote coportd executable path.".into());
         }
         Ok(())
@@ -750,6 +756,16 @@ mod tests {
             }
             .validate()
             .is_ok()
+        );
+        // The path becomes `$0` of the reader's `exec`.
+        assert!(
+            Device {
+                name: "test".into(),
+                host: "user@my-host".into(),
+                binary: "-c".into()
+            }
+            .validate()
+            .is_err()
         );
         assert_eq!(quote("/tmp/a'b"), "'/tmp/a'\\''b'");
     }
