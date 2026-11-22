@@ -150,11 +150,21 @@ impl Identities {
                 Err(_) => {}
             }
         }
+        let antigravity = &config.antigravity;
+        for name in antigravity.routing.api_key.keys() {
+            match antigravity.api_key_upstream(name) {
+                Some(base) => result.insert("Antigravity", base, name),
+                None => result.insert("Antigravity", &format_base(name), name),
+            }
+        }
         if config.codex.routing.fallback.is_some() {
             result.insert("Codex", &config.codex.base_url.api_key, "fallback");
         }
         if config.claude.routing.fallback.is_some() {
             result.insert("Claude", &config.claude.base_url, "fallback");
+        }
+        if antigravity.routing.fallback.is_some() {
+            result.insert("Antigravity", &antigravity.base_url.api_key, "fallback");
         }
         result.assignments = assignments
             .iter()
@@ -200,11 +210,12 @@ impl Identities {
         labels: &BTreeMap<(String, String), String>,
     ) -> Option<Resolution> {
         // Account identities remain separate even when they use the same API.
-        // Antigravity routes Google logins only: a record without an account
-        // (a saved login whose email is not known yet) still names its
-        // account route, never an API configuration.
-        if service == coport::routing::Service::Antigravity.label()
-            || entry.get("account_id").is_some_and(|id| !id.is_empty())
+        // An Antigravity login record without an account (a saved login whose
+        // email is not known yet) still names its account route, never an
+        // API configuration; only its Gemini API key records are matched.
+        if entry.get("account_id").is_some_and(|id| !id.is_empty())
+            || (service == coport::routing::Service::Antigravity.label()
+                && !antigravity_api_record(entry))
         {
             return None;
         }
@@ -235,6 +246,16 @@ impl Identities {
                 let name = labels
                     .get(&(service.to_owned(), logged.to_owned()))
                     .map_or(logged, String::as_str);
+                // A named Antigravity key goes to any upstream its request
+                // names, so its current name alone identifies it.
+                if service == coport::routing::Service::Antigravity.label()
+                    && let [base] = self.bases(service, name)[..]
+                {
+                    return Some(Resolution {
+                        label: self.label(service, base, name),
+                        source: None,
+                    });
+                }
                 match self.infer(service, name, source.base.as_deref(), labels) {
                     (label, None) => {
                         return Some(Resolution {
@@ -277,13 +298,7 @@ impl Identities {
         } else {
             Reason::Legacy
         };
-        let bases: Vec<_> = self
-            .names
-            .iter()
-            .filter(|((s, _), names)| s == service && names.contains(name))
-            .map(|((_, base), _)| base)
-            .collect();
-        match bases[..] {
+        match self.bases(service, name)[..] {
             [only] => (self.label(service, only, name), Some(reason)),
             [] if !name.is_empty()
                 && labels
@@ -330,6 +345,15 @@ impl Identities {
         Some(self.label(&provider.service, &base, &provider.name))
     }
 
+    /// The bases a current configuration of `service` named `name` uses.
+    fn bases(&self, service: &str, name: &str) -> Vec<&String> {
+        self.names
+            .iter()
+            .filter(|((s, _), names)| s == service && names.contains(name))
+            .map(|((_, base), _)| base)
+            .collect()
+    }
+
     fn label(&self, service: &str, base: &str, name: &str) -> String {
         // A selector can resolve to different bases in different configured homes.
         // Keep those bases distinct even though their current names coincide.
@@ -345,6 +369,22 @@ impl Identities {
             name.to_owned()
         }
     }
+}
+
+/// Whether an Antigravity record is a Gemini API key request rather than a
+/// Google login's: login records name their account route in
+/// `account_label`, or carry one of the login route sources as `provider`.
+fn antigravity_api_record(entry: &Entry) -> bool {
+    const LOGIN_SOURCES: [&str; 4] = [
+        "default",
+        "antigravity-account",
+        "antigravity-profile",
+        "antigravity-saved-token",
+    ];
+    entry.get("account_label").is_none_or(str::is_empty)
+        && entry
+            .get("provider")
+            .is_some_and(|provider| !provider.is_empty() && !LOGIN_SOURCES.contains(&provider))
 }
 
 fn format_base(name: &str) -> String {

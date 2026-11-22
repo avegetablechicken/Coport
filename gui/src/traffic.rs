@@ -3360,6 +3360,94 @@ mod tests {
     /// Antigravity routes Google logins only. A saved login whose email is not
     /// known yet logs no account, and is still named by its account route,
     /// never matched against API configurations by its Cloud Code origin.
+    /// Its Gemini API key records are matched as Claude's are.
+    #[tokio::test]
+    async fn antigravity_api_key_records_are_identified_and_reviewed_as_claudes() {
+        let api = "https://generativelanguage.googleapis.com";
+        let config = coport::config::Config::parse(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\nantigravity:\n  saved_login: false\n  account_auth_file_only: false\n  routing:\n    account: {'user@example.test': none}\n    api_key:\n      GEMINI_API_KEY: none\n      relay.example.com/gemini: none\n",
+        )
+        .unwrap();
+        let labels = config.local_traffic_credential_labels().await;
+        let entry = |fields: serde_json::Value| Entry {
+            seq: 0,
+            time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)),
+            event: "request_finished".into(),
+            fields: serde_json::from_value(fields).unwrap(),
+        };
+        let resolve = |identities: &Identities, provider: &str, base: &str| {
+            identities
+                .resolve(
+                    &entry(serde_json::json!({"service": "antigravity", "provider": provider, "upstream_base_url": base})),
+                    "Antigravity",
+                    &labels,
+                )
+                .map(|r| (r.label, r.source.map(|(source, reason)| (source.name, reason))))
+        };
+        let identities = Identities::from_config(&config, &[]);
+        let targets: Vec<_> = identities
+            .targets()
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap())
+            .filter(|t| t["service"] == "Antigravity")
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(targets, ["GEMINI_API_KEY", "relay.example.com/gemini"]);
+        // A named key, at its API base or an upstream its request named.
+        for base in [api, "https://relay.invalid"] {
+            assert_eq!(
+                resolve(&identities, "GEMINI_API_KEY", base),
+                Some(("GEMINI_API_KEY".into(), None))
+            );
+        }
+        assert_eq!(
+            resolve(
+                &identities,
+                "relay.example.com/gemini",
+                "https://relay.example.com/gemini"
+            ),
+            Some(("relay.example.com/gemini".into(), None))
+        );
+        // A renamed key at the same base is matched and reviewed.
+        assert_eq!(
+            resolve(&identities, "OLD_GEMINI_KEY", api),
+            Some((
+                "GEMINI_API_KEY".into(),
+                Some(("OLD_GEMINI_KEY".into(), Some(Reason::Renamed)))
+            ))
+        );
+        // The user's choice for it applies.
+        let assigned = Identities::from_config(
+            &config,
+            &[crate::traffic_identity::TrafficAssignment {
+                service: "Antigravity".into(),
+                name: "OLD_GEMINI_KEY".into(),
+                base: Some(api.into()),
+                target: Some(crate::traffic_identity::TrafficTarget {
+                    name: "relay.example.com/gemini".into(),
+                    base: "https://relay.example.com/gemini".into(),
+                }),
+            }],
+        );
+        assert_eq!(
+            resolve(&assigned, "OLD_GEMINI_KEY", api),
+            Some((
+                "relay.example.com/gemini".into(),
+                Some(("OLD_GEMINI_KEY".into(), None))
+            ))
+        );
+        // Login records stay with their account routes.
+        let base = "https://daily-cloudcode-pa.googleapis.com";
+        for provider in ["default", "antigravity-profile", "antigravity-account"] {
+            assert_eq!(resolve(&identities, provider, base), None, "{provider}");
+        }
+        let login = entry(
+            serde_json::json!({"service": "antigravity", "provider": "fallback",
+            "account_label": "fallback", "upstream_base_url": base}),
+        );
+        assert!(identities.resolve(&login, "Antigravity", &labels).is_none());
+    }
+
     #[tokio::test]
     async fn antigravity_records_without_an_account_keep_their_route() {
         let base = "https://daily-cloudcode-pa.googleapis.com";
