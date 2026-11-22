@@ -4469,7 +4469,14 @@ async fn auto_refresh_waits_for_claude_code_and_never_spends_the_token_it_renewe
         std::fs::create_dir(lock).unwrap();
     }
     let call = spawn_auto_model(&running, true);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Claude Code renews once the model call has been refused, while this
+    // server waits for its lock; a fixed delay raced both.
+    loop {
+        let request = fixture.requests.recv().await.unwrap();
+        if request.starts_with("POST /v1/messages") {
+            break;
+        }
+    }
     let renewed = json!({"other":"preserved","claudeAiOauth":{"accessToken":"code-access","refreshToken":"code-refresh","expiresAt":4102444800000u64}});
     std::fs::write(&file, renewed.to_string()).unwrap();
     for lock in locks.iter().rev() {
