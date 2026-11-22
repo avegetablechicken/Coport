@@ -1401,16 +1401,21 @@ mod tests {
         assert!(expiry.ends_with('Z') && !expiry.contains('.'), "{expiry}");
         let mut flat =
             json!({"accessToken": "a", "refreshToken": "r", "expiresAt": 1_000_000_000_000_i64});
+        let mut seconds = json!({"access_token": "a", "expires_at": 5});
+        // Sampled around the renewals, which may cross a second.
+        let before = time::OffsetDateTime::now_utc().unix_timestamp();
         apply_renewal(&mut flat, "b", 60, Some("s")).unwrap();
+        apply_renewal(&mut seconds, "b", 60, None).unwrap();
+        let after = time::OffsetDateTime::now_utc().unix_timestamp();
         assert_eq!(flat["accessToken"], "b");
         assert_eq!(flat["refreshToken"], "s");
         assert!(flat.get("access_token").is_none() && flat.get("expires_in").is_none());
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let at = flat["expiresAt"].as_i64().unwrap();
-        assert!((now + 60) * 1000 <= at && at <= (now + 61) * 1000);
-        let mut seconds = json!({"access_token": "a", "expires_at": 5});
-        apply_renewal(&mut seconds, "b", 60, None).unwrap();
-        assert!((now + 60..=now + 61).contains(&seconds["expires_at"].as_i64().unwrap()));
+        assert!(
+            (before + 60) * 1000 <= at && at <= (after + 60) * 1000,
+            "{at}"
+        );
+        assert!((before + 60..=after + 60).contains(&seconds["expires_at"].as_i64().unwrap()));
         assert!(apply_renewal(&mut json!([]), "b", 60, None).is_err());
     }
 
