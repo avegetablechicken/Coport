@@ -121,6 +121,18 @@ test("a control gone falls back to the tab stop in its place", () => {
   assert.equal(p.focused().getAttribute("data-setting"), "launch");
 });
 
+test("a menu button is found again though its items changed", () => {
+  let counts = [1, 2];
+  const menus = () => counts.map((n) => control("BUTTON", { type: "button", "data-menu": JSON.stringify([{ label: `${n} requests` }]) }));
+  let extra = [];
+  const p = panel("activity", back, () => [...extra, ...menus()]);
+  p.parts.content.controls[1].focus();
+  counts = [3, 4];
+  extra = [control("BUTTON", { "data-action": "new" })];
+  p.render();
+  assert.equal(p.focused().getAttribute("data-menu"), JSON.stringify([{ label: "4 requests" }]));
+});
+
 test("a field the render refocused itself keeps focus", () => {
   const p = panel("settings", back, () => [
     control("BUTTON", { "data-action": "probe", "data-name": "a" }),

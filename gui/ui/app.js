@@ -383,7 +383,7 @@ function render() {
 const FOCUSABLE = "button, select, input, textarea, summary, a[href], [tabindex]";
 /// Attributes that change with what a control shows rather than which one it
 /// is, as a toggle's state or a tooltip's text.
-const FOCUS_VOLATILE = new Set(["data-tip", "data-text", "data-enabled", "data-options", "data-seq", "data-morph"]);
+const FOCUS_VOLATILE = new Set(["data-tip", "data-text", "data-enabled", "data-options", "data-menu", "data-seq", "data-morph"]);
 
 /// Names a control by what it does rather than by node, so the same one can be
 /// found again after a render rebuilds the markup around it.
