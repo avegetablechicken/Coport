@@ -42,6 +42,7 @@ async fn read_request(io: &mut TestIo) -> std::io::Result<String> {
 async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
     let certified = rcgen::generate_simple_self_signed(vec![
         "upstream.invalid".into(),
+        "relay.invalid".into(),
         "182.92.106.196".into(),
         "developers.openai.com".into(),
         "auth.openai.com".into(),
@@ -5024,6 +5025,11 @@ async fn antigravity_api_key_routes_relay_the_key_as_sent_through_their_route() 
             400,
         ),
         (
+            format!("/antigravity/https://upstream.invalid{model}?key={KEY}&key=other-gemini-key"),
+            None,
+            400,
+        ),
+        (
             format!("/antigravity/https://other.invalid{model}"),
             Some(("x-goog-api-key", KEY.to_owned())),
             404,
@@ -5032,11 +5038,6 @@ async fn antigravity_api_key_routes_relay_the_key_as_sent_through_their_route() 
             "/antigravity/https://upstream.invalid/other/v1beta/models/g:generateContent".into(),
             Some(("x-goog-api-key", KEY.to_owned())),
             404,
-        ),
-        (
-            format!("/antigravity/https://upstream.invalid{model}?key={KEY}&key=other-gemini-key"),
-            None,
-            400,
         ),
         (
             format!("/antigravity/https://upstream.invalid:8443{model}"),
@@ -5118,38 +5119,32 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
         assert!(!forwarded.to_lowercase().contains("authorization"));
     }
     // A named key goes to the upstream its request names, through its own
-    // route, as a Claude settings file's key goes to that file's upstream.
-    let elsewhere = send(
-        format!("/antigravity/https://other.invalid/gemini{model}"),
-        Some(named.clone()),
-    )
-    .await
-    .unwrap();
-    let _ = elsewhere.text().await;
-    let connect = fixture.requests.recv().await.unwrap();
-    assert!(
-        connect.starts_with("CONNECT other.invalid:443 "),
-        "{connect}"
-    );
-    while fixture.requests.try_recv().is_ok() {}
-    // As agy sends it: its base URL's `//` collapsed into the path.
-    let collapsed = send(
-        format!("/antigravity/https:/other.invalid/gemini{model}"),
-        Some(named.clone()),
-    )
-    .await
-    .unwrap();
-    let _ = collapsed.text().await;
-    let connect = fixture.requests.recv().await.unwrap();
-    assert!(
-        connect.starts_with("CONNECT other.invalid:443 "),
-        "{connect}"
-    );
-    while fixture.requests.try_recv().is_ok() {}
+    // route, as a Claude settings file's key goes to that file's upstream;
+    // also as agy sends it, its base URL's `//` collapsed into the path.
+    for path in [
+        format!("/antigravity/https://relay.invalid/gemini{model}"),
+        format!("/antigravity/https:/relay.invalid/gemini{model}"),
+    ] {
+        let response = send(path.clone(), Some(named.clone())).await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        response.text().await.unwrap();
+        let connect = fixture.requests.recv().await.unwrap();
+        assert!(
+            connect.starts_with("CONNECT relay.invalid:443 "),
+            "{connect}"
+        );
+        let forwarded = fixture.requests.recv().await.unwrap();
+        assert!(
+            forwarded.starts_with(&format!("POST /gemini{model} HTTP/1.1")),
+            "{forwarded}"
+        );
+        assert!(forwarded.contains("host: relay.invalid\r\n"), "{forwarded}");
+        assert!(forwarded.contains(&format!("x-goog-api-key: {named}")));
+    }
     // A key `fallback` carries reaches only the API base, and an ambiguous
     // key goes nowhere: neither sends anything.
     let fallback_elsewhere = send(
-        format!("/antigravity/https://other.invalid/gemini{model}?key={OTHER}"),
+        format!("/antigravity/https://relay.invalid/gemini{model}?key={OTHER}"),
         None,
     )
     .await
@@ -5174,7 +5169,7 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .filter(|row| row["event"] == "model_call_finished")
                 .collect();
-            if calls.len() >= 3 {
+            if calls.len() >= 5 {
                 return (raw, calls);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5182,25 +5177,41 @@ async fn antigravity_named_api_keys_route_by_value_and_others_take_fallback() {
     })
     .await
     .unwrap();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 5);
     for call in &calls {
         assert_eq!(call["service"], "antigravity");
-        assert_eq!(call["upstream_base_url"], "https://upstream.invalid/gemini");
         assert_eq!(call["input_tokens"], "12");
     }
     let named_calls: Vec<_> = calls
         .iter()
         .filter(|call| call["provider"] == "CARGO_PKG_NAME")
         .collect();
-    assert_eq!(named_calls.len(), 2);
-    for call in named_calls {
+    assert_eq!(named_calls.len(), 4);
+    for call in &named_calls {
         assert_eq!(call["proxy"], "named");
         assert_eq!(call["credential_match"], "configured");
     }
+    let bases: Vec<_> = named_calls
+        .iter()
+        .map(|call| call["upstream_base_url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bases,
+        [
+            "https://upstream.invalid/gemini",
+            "https://upstream.invalid/gemini",
+            "https://relay.invalid",
+            "https://relay.invalid",
+        ]
+    );
     let fallback = calls
         .iter()
         .find(|call| call["provider"] == crate::antigravity::API_KEY_FALLBACK)
         .unwrap();
+    assert_eq!(
+        fallback["upstream_base_url"],
+        "https://upstream.invalid/gemini"
+    );
     assert_eq!(fallback["proxy"], "spare");
     assert_eq!(fallback["credential_match"], "unmatched");
     assert!(!raw.contains(OTHER) && !raw.contains("PRIVATE PROMPT"));
