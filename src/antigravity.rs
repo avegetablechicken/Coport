@@ -162,8 +162,12 @@ pub(crate) fn parse_login(raw: &str) -> Option<Login> {
         "/token/email",
     ]
     .iter()
-    .find_map(|path| document.pointer(path).and_then(Value::as_str))
-    .and_then(AntigravityIdentity::new);
+    .find_map(|path| {
+        document
+            .pointer(path)
+            .and_then(Value::as_str)
+            .and_then(AntigravityIdentity::new)
+    });
     Some(Login {
         access_token,
         refresh_token,
@@ -212,10 +216,14 @@ fn token(document: &Value) -> Option<&serde_json::Map<String, Value>> {
 }
 fn token_field<'a>(document: &'a Value, keys: &[&str]) -> Option<&'a str> {
     let token = token(document)?;
-    keys.iter()
-        .find_map(|key| token.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|token| valid_token(token))
+    // An empty or invalid field does not hide a later key's.
+    keys.iter().find_map(|key| {
+        token
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| valid_token(token))
+    })
 }
 pub(crate) fn access_token(document: &Value) -> Option<&str> {
     token_field(document, &ACCESS_KEYS)
@@ -1404,6 +1412,19 @@ mod tests {
         apply_renewal(&mut seconds, "b", 60, None).unwrap();
         assert!((now + 60..=now + 61).contains(&seconds["expires_at"].as_i64().unwrap()));
         assert!(apply_renewal(&mut json!([]), "b", 60, None).is_err());
+    }
+
+    #[test]
+    fn an_empty_field_does_not_hide_a_later_keys() {
+        let login = parse_login(
+            &json!({"token": {"access_token": "", "accessToken": "a", "refresh_token": " ", "refreshToken": "r"},
+                "id_token_email": "", "email": "user@example.test"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(login.access_token, "a");
+        assert_eq!(login.refresh_token.as_deref(), Some("r"));
+        assert_eq!(login.identity.unwrap().email, "user@example.test");
     }
 
     #[test]
