@@ -178,7 +178,9 @@ fn read_upstream(document: &Value) -> Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(Error::config("Claude settings require ANTHROPIC_BASE_URL."))?;
-    crate::config::unwrap_upstream(upstream)
+    let upstream = crate::config::unwrap_upstream(upstream)?;
+    crate::claude_api::validate_api_upstream(&upstream)?;
+    Ok(upstream)
 }
 
 fn read(path: &Path) -> Result<Profile> {
@@ -241,6 +243,7 @@ mod tests {
             "broken",
             "{}",
             r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787","ANTHROPIC_API_KEY":"key"}}"#,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/https://platform.claude.com/v1/oauth/token","ANTHROPIC_API_KEY":"key"}}"#,
         ] {
             std::fs::write(dir.path().join("settings-api.json"), invalid).unwrap();
             assert!(load(&dirs, "api").is_err());

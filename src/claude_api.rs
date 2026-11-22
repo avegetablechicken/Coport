@@ -12,7 +12,26 @@ pub(crate) fn explicit_target(target: &str) -> Option<&str> {
     target.starts_with("/https://").then_some(target)
 }
 
-pub(crate) use crate::url_routing::validate_upstream as validate_api_upstream;
+pub(crate) fn oauth_path(url: &url::Url) -> bool {
+    let path = percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy();
+    path.ends_with("/api/oauth") || path.contains("/api/oauth/")
+}
+
+pub(crate) fn check_api_base(url: &url::Url) -> crate::Result<()> {
+    let token = url::Url::parse(crate::claude::TOKEN_REFRESH_UPSTREAM).unwrap();
+    if oauth_path(url) || crate::url_routing::overlaps(url, &token) {
+        return Err(crate::Error::config(
+            "Claude API upstream overlaps an OAuth-only endpoint.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_api_upstream(value: &str) -> crate::Result<url::Url> {
+    let url = crate::url_routing::validate_upstream(value)?;
+    check_api_base(&url)?;
+    Ok(url)
+}
 
 #[cfg(test)]
 mod tests {

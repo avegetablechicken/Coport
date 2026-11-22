@@ -176,6 +176,11 @@ impl Config {
                         // an explicit URL route: use native TLS for compatibility with
                         // certificates rustls rejects (e.g. a self-signed CA as leaf).
                         let custom_upstream = credential.upstream != self.codex.base_url.api_key;
+                        if custom_upstream {
+                            self.codex.base_url.validate_api_upstream(
+                                &crate::url_routing::validate_upstream(&credential.upstream)?,
+                            )?;
+                        }
                         matches.push(Route {
                             token: credential.token,
                             account_id: credential.account_id,

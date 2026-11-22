@@ -9,6 +9,20 @@ pub(crate) fn is_url_selector(value: &str) -> bool {
     value.contains(['.', ':', '/'])
 }
 
+/// Two HTTPS route bases overlap if either covers the other's path on the same origin.
+pub(crate) fn overlaps(a: &Url, b: &Url) -> bool {
+    fn covers(base: &str, path: &str) -> bool {
+        path.strip_prefix(base.trim_end_matches('/'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+    if a.origin() != b.origin() {
+        return false;
+    }
+    let a = percent_encoding::percent_decode_str(a.path()).decode_utf8_lossy();
+    let b = percent_encoding::percent_decode_str(b.path()).decode_utf8_lossy();
+    covers(&a, &b) || covers(&b, &a)
+}
+
 pub(crate) fn validate_routes(routes: &BTreeMap<String, Choice>) -> Result<()> {
     let mut seen = HashSet::new();
     for base in routes.keys().filter(|s| is_url_selector(s)) {

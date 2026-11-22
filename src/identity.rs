@@ -335,7 +335,11 @@ impl Provider {
             .iter()
             .map(|home| {
                 let defs = definitions(home.as_deref())?;
-                provider_upstream(self.definition(&defs)?, default)
+                let upstream = provider_upstream(self.definition(&defs)?, default)?;
+                codex
+                    .base_url
+                    .validate_api_upstream(&crate::url_routing::validate_upstream(&upstream)?)?;
+                Ok(upstream)
             })
             .collect()
     }

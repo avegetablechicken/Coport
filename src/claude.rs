@@ -297,7 +297,7 @@ impl Claude {
 
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
         crate::config::validate_directories(&self.config_dirs)?;
-        validate_upstream(&self.base_url)?;
+        crate::claude_api::check_api_base(&validate_upstream(&self.base_url)?)?;
         if self.routing.mcp_fallback.is_some() {
             return Err(Error::config(
                 "mcp_fallback is only supported under codex.routing.",
@@ -695,6 +695,14 @@ impl Claude {
         let Some((base, proxy)) = crate::url_routing::match_route(&routes, explicit)? else {
             return Ok(None);
         };
+        // A root URL selector may serve Messages on the account origin. Its
+        // OAuth endpoints still resolve by account credential.
+        if self
+            .url(explicit)
+            .is_ok_and(|url| crate::claude_api::oauth_path(&url))
+        {
+            return Ok(None);
+        }
         let auth = headers.get("authorization");
         let key = headers.get("x-api-key");
         if auth.is_some() && key.is_some() {
@@ -787,7 +795,14 @@ fn api_url(base: &str, target: &str) -> Result<Url> {
 
 impl ClaudeRoute {
     pub fn url(&self, target: &str) -> Result<Url> {
-        api_url(&self.upstream, target)
+        let url = api_url(&self.upstream, target)?;
+        if !self.oauth && crate::claude_api::oauth_path(&url) {
+            return Err(Error::new(
+                403,
+                "Claude OAuth endpoints require an account credential.",
+            ));
+        }
+        Ok(url)
     }
     pub fn headers(&self, headers: &mut HeaderMap) -> Result<()> {
         let (name, value) = if self.bearer {

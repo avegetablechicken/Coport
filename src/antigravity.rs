@@ -803,7 +803,7 @@ impl Antigravity {
     /// own hosts stay routed by login, so a URL route cannot carry a login's
     /// token past its account route.
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
-        crate::config::validate_upstream(&self.base_url.api_key)?;
+        self.api_upstream(&validate_upstream(&self.base_url.api_key)?)?;
         for (selector, choice) in &self.routing.api_key {
             if crate::url_routing::is_url_selector(selector) {
                 self.api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
@@ -1595,6 +1595,12 @@ mod tests {
             "antigravity:\n  routing:\n    api_key:\n      http://relay.example.com: us\n",
             "antigravity:\n  routing:\n    api_key:\n      relay.example.com: us\n      'https://relay.example.com/': jp\n",
             // Google's hosts stay routed by login.
+            "antigravity:\n  base_url:\n    api_key: https://daily-cloudcode-pa.googleapis.com/v1beta\n",
+            "antigravity:\n  base_url:\n    api_key: https://cloudcode-pa.googleapis.com\n",
+            "antigravity:\n  base_url:\n    api_key: https://oauth2.googleapis.com\n",
+            "antigravity:\n  base_url:\n    api_key: https://www.googleapis.com\n",
+            "antigravity:\n  base_url:\n    api_key: https://aicode.googleapis.com\n",
+            "antigravity:\n  base_url:\n    account: https://cloudcode.example:8443/account\n    api_key: https://cloudcode.example:8443/gemini\n",
             "antigravity:\n  routing:\n    api_key:\n      cloudcode-pa.googleapis.com/v1beta: us\n",
             "antigravity:\n  routing:\n    api_key:\n      'https://daily-cloudcode-pa.googleapis.com': us\n",
             "antigravity:\n  routing:\n    api_key:\n      oauth2.googleapis.com: us\n",

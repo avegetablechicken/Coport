@@ -734,6 +734,89 @@ async fn claude_third_party_explicit_url_streams_directly_without_oauth_lookup_o
 }
 
 #[tokio::test]
+async fn claude_shared_url_selector_keeps_oauth_on_the_account_route() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"test-account"}}"#,
+    )
+    .unwrap();
+    let mut account = fixture("http", "oauth_json").await;
+    let mut keys = fixture("http", "oauth_json").await;
+    let account_endpoint = format!("http://{}", account.addr);
+    let key_endpoint = format!("http://{}", keys.addr);
+    let running = running(&format!(
+        "proxies:\n  account: {account_endpoint}\n  keys: {key_endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account: {{default: account}}\n    fallback: keys\n    api_key: {{upstream.invalid: keys}}",
+        serde_json::to_string(home.path()).unwrap()
+    )).await;
+    trust(&running, &account, &account_endpoint);
+    trust(&running, &keys, &key_endpoint);
+    let client = http();
+    let profile = format!(
+        "{}/anthropic/https://upstream.invalid/api/oauth/profile",
+        running.url
+    );
+    let denied = client
+        .get(&profile)
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert!(keys.requests.try_recv().is_err() && account.requests.try_recv().is_err());
+    let allowed = client
+        .get(profile)
+        .bearer_auth("test-account")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+    assert!(
+        account
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        account
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    assert!(keys.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn codex_provider_edits_cannot_send_keys_to_account_paths_or_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let write_provider = |base: &str| {
+        std::fs::write(&path, format!("cli_auth_credentials_store = 'file'\n[model_providers.relay]\nbase_url = '{base}'\nexperimental_bearer_token = 'test-provider-key'\n")).unwrap();
+    };
+    write_provider("https://upstream.invalid/v1");
+    let config = Config::parse(&format!(
+        "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    api_key: {{relay: none}}\n    fallback: none",
+        serde_json::to_string(home.path()).unwrap()
+    )).unwrap();
+    let auth = Some("Bearer test-provider-key");
+    assert_eq!(
+        config.resolve(auth, true).await.unwrap().upstream,
+        "https://upstream.invalid/v1"
+    );
+    write_provider("http://127.0.0.1:8787/https://chatgpt.com/backend-api");
+    assert!(
+        config
+            .resolve(auth, true)
+            .await
+            .is_err_and(|e| e.message.contains("overlaps"))
+    );
+}
+
+#[tokio::test]
 async fn claude_usage_requires_saved_account_and_cannot_use_openai_fallback() {
     // A readable saved login that differs from the request token, independent
     // of the machine's own ~/.claude.

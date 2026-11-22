@@ -236,6 +236,12 @@ Malformed or incomplete selected files never fall back to environment values.
 Domain/URL selectors retain their explicit-upstream routing behavior.
 
 Codex API Key URL selectors match explicit upstream requests (see [Codex API URL routes](clients.md#codex-api-url-routes)).
+The API key base and URL selectors must use paths disjoint from the configured
+account API, the official ChatGPT account API and the OpenAI token refresh
+endpoint. A gateway can serve both `/v1` and `/backend-api` on one host and
+port. A selector covering that whole gateway would also cover the account
+API and is rejected. The same check applies to a custom provider when its
+credential is selected.
 Other selectors first match Codex provider IDs; otherwise they are treated
 as environment variable names and may reverse-match a provider by `env_key`.
 Multiple reverse matches are rejected. The built-in `openai` provider and unmatched
@@ -279,6 +285,9 @@ Claude API Key selectors can be named settings files, environment variable names
 may use Bearer or `x-api-key`; they do not trigger OAuth profile lookup or receive
 injected OAuth beta flags. Requests matching multiple credentials in a
 namespace are rejected. The two services never use each other's fallbacks.
+Claude accounts and API keys can share the same Messages upstream. Requests
+under `/api/oauth/` require an account credential even when a URL selector
+covers the whole origin. The token refresh endpoint has its own route.
 
 Codex alone supports `codex.routing.mcp_fallback` for public OpenAI documentation
 MCP. Omitted/null/`none` means direct MCP access. Explicit matched routes take

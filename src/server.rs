@@ -920,7 +920,7 @@ impl Server {
         let claude_target = if claude {
             Some(
                 crate::claude::target(target)
-                    .or_else(|| explicit_api_route.as_ref().map(|_| target))
+                    .or_else(|| crate::claude_api::explicit_target(target))
                     .ok_or(Error::config("Unroutable Claude request target."))?,
             )
         } else {
@@ -1083,7 +1083,11 @@ impl Server {
                 }
                 query_url(&r.upstream, target)?
             } else {
-                upstream_url(&r.upstream, target, r.account_id.is_some())?
+                let url = upstream_url(&r.upstream, target, r.account_id.is_some())?;
+                if r.provider.is_some() {
+                    self.config.codex.base_url.validate_api_upstream(&url)?;
+                }
+                url
             }
         };
         let native_tls = claude_route.as_ref().is_some_and(|r| r.custom_upstream)

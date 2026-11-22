@@ -32,8 +32,9 @@ pub struct Bases {
     pub api_key: String,
 }
 fn account_base() -> String {
-    "https://chatgpt.com/backend-api".into()
+    CODEX_ACCOUNT_BASE.into()
 }
+const CODEX_ACCOUNT_BASE: &str = "https://chatgpt.com/backend-api";
 fn api_base() -> String {
     "https://api.openai.com/v1".into()
 }
@@ -43,6 +44,24 @@ impl Default for Bases {
             account: account_base(),
             api_key: api_base(),
         }
+    }
+}
+impl Bases {
+    pub(crate) fn validate_api_upstream(&self, url: &Url) -> Result<()> {
+        for reserved in [
+            self.account.as_str(),
+            CODEX_ACCOUNT_BASE,
+            crate::routing::TOKEN_REFRESH_UPSTREAM,
+        ] {
+            let reserved = Url::parse(reserved)
+                .map_err(|_| Error::config("Invalid Codex account upstream."))?;
+            if crate::url_routing::overlaps(url, &reserved) {
+                return Err(Error::config(
+                    "Codex API key upstream overlaps an account API or token refresh endpoint.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -337,7 +356,20 @@ impl Config {
                 "codex.base_url.account is the ChatGPT /backend-api root, without /codex.",
             ));
         }
-        validate_upstream(&self.codex.base_url.api_key)?;
+        self.codex
+            .base_url
+            .validate_api_upstream(&validate_upstream(&self.codex.base_url.api_key)?)?;
+        for selector in self
+            .codex
+            .routing
+            .api_key
+            .keys()
+            .filter(|s| crate::url_routing::is_url_selector(s))
+        {
+            self.codex
+                .base_url
+                .validate_api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
+        }
         if let Some(name) = &self.codex.auth_env {
             validate_env(name)?;
         }
@@ -724,6 +756,58 @@ mod tests {
         }
     }
     const BASE: &str = "listen_port: 8787\nrequest_timeout_seconds: 3\n";
+
+    #[test]
+    fn codex_key_bases_and_url_routes_respect_account_path_boundaries() {
+        let account = "https://gateway.invalid/account/api";
+        for (url, allowed) in [
+            ("https://gateway.invalid/account", false),
+            ("https://GATEWAY.invalid:443/account/api/", false),
+            ("https://gateway.invalid/account/%61pi/models", false),
+            ("https://chatgpt.com/backend-api/codex", false),
+            ("https://auth.openai.com/oauth", false),
+            ("https://gateway.invalid/account/api-key", true),
+            ("https://gateway.invalid:444/account/api", true),
+            ("https://gateway.invalid/v1", true),
+        ] {
+            for config in [
+                format!("codex:\n  base_url: {{account: '{account}', api_key: '{url}'}}"),
+                format!(
+                    "codex:\n  base_url: {{account: '{account}'}}\n  routing:\n    api_key: {{'{}': none}}",
+                    url.trim_start_matches("https://")
+                ),
+            ] {
+                assert_eq!(
+                    Config::parse(&format!("{BASE}{config}")).is_ok(),
+                    allowed,
+                    "{config}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_reserves_oauth_paths_and_keeps_its_shared_messages_origin() {
+        for (url, allowed) in [
+            ("https://api.anthropic.com", true),
+            ("https://api.anthropic.com/v1/messages", true),
+            ("https://api.anthropic.com/api/oauth-tools", true),
+            ("https://api.anthropic.com/api/oauth/profile", false),
+            ("https://platform.claude.com/v1/oauth", false),
+            ("https://platform.claude.com:444/v1/oauth/token", true),
+        ] {
+            for config in [
+                format!("claude:\n  base_url: '{url}'"),
+                format!("claude:\n  routing:\n    api_key: {{'{url}': none}}"),
+            ] {
+                assert_eq!(
+                    Config::parse(&format!("{BASE}{config}")).is_ok(),
+                    allowed,
+                    "{config}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn directory_lists_default_only_when_omitted_and_preserve_empty_lists() {
