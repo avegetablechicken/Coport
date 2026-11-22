@@ -34,6 +34,11 @@ const WHITE: Rgba = [1.0, 1.0, 1.0, 1.0];
 const GREEN: Rgba = [0.20, 0.78, 0.42, 1.0];
 const GREY: Rgba = [0.62, 0.64, 0.68, 1.0];
 const RED: Rgba = [0.94, 0.30, 0.30, 1.0];
+/// Antigravity's blue, the leading shade of its traffic share in the panel.
+/// Lighter shades wash out toward Codex's teal in the menu bar, so it is the
+/// same in both appearances.
+#[cfg(target_os = "macos")]
+const ANTIGRAVITY: Rgba = [0.110, 0.490, 0.945, 1.0];
 
 /// The water line: two sine periods across the bottom, thinning to its ends.
 const WAVE: Wave = Wave {
@@ -98,14 +103,14 @@ pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
         let accent = match service {
             Service::Claude => [0.929, 0.553, 0.424, 1.0],
             Service::Codex => [0.384, 0.792, 0.765, 1.0],
-            Service::Antigravity => [0.416, 0.659, 0.961, 1.0],
+            Service::Antigravity => ANTIGRAVITY,
         };
         ([1.0, 1.0, 1.0, 1.0], accent)
     } else {
         let accent = match service {
             Service::Claude => [0.851, 0.467, 0.341, 1.0],
             Service::Codex => [0.200, 0.580, 0.565, 1.0],
-            Service::Antigravity => [0.110, 0.490, 0.945, 1.0],
+            Service::Antigravity => ANTIGRAVITY,
         };
         ([0.0, 0.0, 0.0, 0.85], accent)
     };
@@ -113,8 +118,9 @@ pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
 }
 
 /// The menu bar lighthouse in `ink`, its light taking `accent` as the turn
-/// asks: the badge's clay sky for Claude, its teal sea for Codex. Its beams
-/// fade in and out with the tint, so a lighthouse without model calls has none.
+/// asks: the badge's clay sky for Claude, its teal sea for Codex, the panel's
+/// blue for Antigravity. Its beams fade in and out with the tint, so a
+/// lighthouse without model calls has none.
 #[cfg(target_os = "macos")]
 fn glyph(size: u32, status: Status, turn: Turn, ink: Rgba, accent: Rgba) -> Vec<u8> {
     const SCALE: f32 = 0.88;
@@ -717,6 +723,10 @@ mod tests {
             assert!(codex[2] > codex[0] + 40, "{codex:?}");
             // Antigravity's blue leans further from red than Codex's teal.
             assert!(antigravity[2] > antigravity[1] + 30, "{antigravity:?}");
+            // In the dark bar light shades of blue wash toward Codex's teal.
+            if dark {
+                assert!(codex[1] > antigravity[1] + 60, "{codex:?} {antigravity:?}");
+            }
         }
         assert!(alpha(&template) > alpha(&super::template(44, Status::Stopped)));
     }
@@ -740,6 +750,17 @@ mod tests {
                 assert!(beams(&beacon(44, Turn::at(0.2), service, dark)) > 0);
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_antigravity_shines_in_the_panel_blue() {
+        let css = include_str!("../ui/style.css");
+        let at = css.find("--antigravity-1: #").unwrap() + "--antigravity-1: #".len();
+        let hex = u32::from_str_radix(&css[at..at + 6], 16).unwrap();
+        let panel = [hex >> 16, (hex >> 8) & 0xff, hex & 0xff];
+        let menu_bar = super::ANTIGRAVITY.map(|c| (c * 255.0).round() as u32);
+        assert_eq!(menu_bar[..3], panel);
     }
 
     #[cfg(target_os = "macos")]
