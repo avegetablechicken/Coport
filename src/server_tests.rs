@@ -5690,6 +5690,80 @@ async fn antigravity_startup_rows(config: &str) -> Vec<(String, serde_json::Valu
         .collect()
 }
 
+// The saved login is renewed once its access token has expired, so a lookup
+// with that token is refused; refusing the refresh then left the login
+// unable to renew. It goes on unnamed, and its ID token names the account.
+#[tokio::test]
+async fn an_unnamed_saved_login_with_an_expired_token_still_renews_through_the_probe() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let client = crate::antigravity::TEST_CLIENT_ID;
+    let mut lookup = fixture("http", "status_401").await;
+    let mut token = fixture("http", "google_token").await;
+    let lookup_endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let token_endpoint = format!("http://127.0.0.1:{}", token.addr.port());
+    for default in [true, false] {
+        let state = tempfile::tempdir().unwrap();
+        let file = state.path().join(crate::refresh_routes::ANTIGRAVITY_FILE);
+        // `default` takes it as it would without a probe; else the probe.
+        let routes = if default {
+            "      default: login\n      remote@example.invalid: none\n"
+        } else {
+            "      remote@example.invalid: none\n"
+        };
+        let running = running_with_server(
+            &format!(
+                "proxies:\n  lookup: {lookup_endpoint}\n  login: {token_endpoint}\nantigravity:\n  routing:\n    account:\n{routes}    account_probe: lookup\n"
+            ),
+            |_| {},
+            |server| {
+                server.with_antigravity_refresh_routes(crate::refresh_routes::RefreshRoutes::load(
+                    file.clone(),
+                ))
+            },
+        )
+        .await;
+        trust(&running, &lookup, &lookup_endpoint);
+        trust(&running, &token, &token_endpoint);
+        crate::antigravity::set_test_login("expired-access", "saved-refresh");
+        let response = antigravity_refresh(&running, "saved-refresh", client).await;
+        let mut lookups = Vec::new();
+        while let Ok(request) = lookup.requests.try_recv() {
+            lookups.push(request);
+        }
+        assert!(
+            lookups.len() >= 2
+                && lookups[0].starts_with("CONNECT www.googleapis.com:443 ")
+                && lookups[1].starts_with("GET /oauth2/v2/userinfo "),
+            "{lookups:?}"
+        );
+        let refreshed = if default {
+            assert_eq!(response.status(), 200);
+            assert!(response.text().await.unwrap().contains("renewed-access"));
+            assert_eq!(lookups.len(), 2, "{lookups:?}");
+            vec![
+                token.requests.recv().await.unwrap(),
+                token.requests.recv().await.unwrap(),
+            ]
+        } else {
+            // The probe's relay answers every request with 401 here.
+            assert_eq!(response.status(), 401);
+            lookups[2..].to_vec()
+        };
+        assert!(
+            refreshed[0].starts_with("CONNECT oauth2.googleapis.com:443 ")
+                && refreshed[1].starts_with("POST /token HTTP/1.1")
+                && refreshed[1].ends_with("refresh_token=saved-refresh"),
+            "{refreshed:?}"
+        );
+        if default {
+            let saved = std::fs::read_to_string(&file).unwrap();
+            assert!(saved.contains("remote@example.invalid"), "{saved}");
+        }
+        assert!(token.requests.try_recv().is_err());
+    }
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
 /// As for Claude, startup reports whether Antigravity's saved login is in the
 /// OS credential store; a section without routes, or without the saved
 /// login, reads nothing.

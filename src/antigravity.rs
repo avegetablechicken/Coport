@@ -1250,6 +1250,17 @@ impl Antigravity {
         Ok(())
     }
 
+    /// Routes the saved login's refresh when its access token, which has
+    /// usually expired by then, cannot name its account: as without a probe,
+    /// `default`, then `account_fallback`/`fallback`; else the probe route
+    /// already chosen. The response's ID token then names the account.
+    pub(crate) fn apply_unnamed_refresh(&self, route: &mut RefreshRoute) {
+        if let Some(choice) = self.account_choice(None, true) {
+            route.proxy = choice.clone();
+        }
+        route.probe_token = None;
+    }
+
     /// Routes a token by the account a Google lookup named.
     pub(crate) fn apply_profile(
         &self,

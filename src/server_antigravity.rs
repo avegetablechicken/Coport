@@ -231,11 +231,16 @@ impl Server {
         let routes = &self.antigravity_refresh_routes;
         let mut route = settings.resolve_refresh(&token, routes).await?;
         if let Some(access) = route.probe_token.clone() {
-            let identity = self
-                .antigravity_identity(&access, &route.proxy, log)
-                .await?;
-            self.learn_antigravity_login(&token, &identity);
-            settings.apply_refresh_profile(&mut route, identity)?;
+            match self.antigravity_identity(&access, &route.proxy, log).await {
+                Ok(identity) => {
+                    self.learn_antigravity_login(&token, &identity);
+                    settings.apply_refresh_profile(&mut route, identity)?;
+                }
+                // An expired token names no account, and refusing its
+                // refresh would leave the login unable to renew at all.
+                Err(error) if error.status == 401 => settings.apply_unnamed_refresh(&mut route),
+                Err(error) => return Err(error),
+            }
         }
         log.field("credential_match", credential_match(route.configured));
         if let Some(identity) = &route.identity {
