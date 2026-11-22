@@ -41,8 +41,46 @@ pub(crate) async fn read(service: &str, account: &str) -> Result<Option<String>>
 /// the credential `service:account`, whose blob is not UTF-16. Reads share
 /// the gate and cooldown of [`read`].
 pub(crate) async fn read_go_keyring(service: &str, account: &str) -> Result<Option<String>> {
+    read_go_keyring_gated(service, account, None).await
+}
+
+/// [`read_go_keyring`], answered from its last successful read when that is
+/// at most `max_age` old.
+pub(crate) async fn read_go_keyring_recent(
+    service: &str,
+    account: &str,
+    max_age: Duration,
+) -> Result<Option<String>> {
+    let key = (service.to_owned(), account.to_owned());
+    match recent(&key, max_age) {
+        Some(value) => Ok(value),
+        None => read_go_keyring_gated(service, account, Some(max_age)).await,
+    }
+}
+
+/// The last successful read of `key`, if at most `max_age` old.
+fn recent(key: &Key, max_age: Duration) -> Option<Option<String>> {
+    RECENT
+        .lock()
+        .ok()
+        .and_then(|recent| recent.get(key).cloned())
+        .filter(|(at, _)| at.elapsed() <= max_age)
+        .map(|(_, value)| value)
+}
+
+/// Reads behind the gate. With `max_age`, a read that waited there takes
+/// the one made meanwhile, so requests arriving together as a recent read
+/// ages start one system read, not one each.
+async fn read_go_keyring_gated(
+    service: &str,
+    account: &str,
+    max_age: Option<Duration>,
+) -> Result<Option<String>> {
     let gate = GATE.clone().lock_owned().await;
     let key = (service.to_owned(), account.to_owned());
+    if let Some(value) = max_age.and_then(|max_age| recent(&key, max_age)) {
+        return Ok(value);
+    }
     tokio::task::spawn_blocking(move || {
         let _gate = gate;
         let value = read_blocking(key.clone(), load_go_keyring)?;
@@ -54,25 +92,6 @@ pub(crate) async fn read_go_keyring(service: &str, account: &str) -> Result<Opti
     .await
     .unwrap_or(Err(()))
     .map_err(|_| Error::config("Cannot read the OS credential store."))
-}
-
-/// [`read_go_keyring`], answered from its last successful read when that is
-/// at most `max_age` old.
-pub(crate) async fn read_go_keyring_recent(
-    service: &str,
-    account: &str,
-    max_age: Duration,
-) -> Result<Option<String>> {
-    let key = (service.to_owned(), account.to_owned());
-    let recent = RECENT
-        .lock()
-        .ok()
-        .and_then(|recent| recent.get(&key).cloned())
-        .filter(|(at, _)| at.elapsed() <= max_age);
-    match recent {
-        Some((_, value)) => Ok(value),
-        None => read_go_keyring(service, account).await,
-    }
 }
 
 /// The last successful go-keyring read of each entry, and when it was made.
@@ -502,6 +521,28 @@ mod tests {
         );
         assert_eq!(read().await.unwrap().as_deref(), Some("third"));
         assert_eq!(test_loads(service), loads + 2);
+    }
+
+    #[tokio::test]
+    async fn requests_queued_behind_a_read_as_the_recent_one_ages_reuse_it() {
+        // Each read of this entry takes 300 ms, as a slow system store.
+        let (service, account) = ("keychain-test-slow-recent", "login");
+        set_test_entry(service, account, Some("secret"));
+        // Long enough that other tests' slow reads on the shared gate do not
+        // age the read the queued ones take.
+        let max_age = Duration::from_secs(1);
+        read_go_keyring_recent(service, account, max_age)
+            .await
+            .unwrap();
+        let loads = test_loads(service);
+        tokio::time::sleep(max_age + Duration::from_millis(50)).await;
+        let reads: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(read_go_keyring_recent(service, account, max_age)))
+            .collect();
+        for read in reads {
+            assert_eq!(read.await.unwrap().unwrap().as_deref(), Some("secret"));
+        }
+        assert_eq!(test_loads(service), loads + 1);
     }
 
     #[tokio::test]
