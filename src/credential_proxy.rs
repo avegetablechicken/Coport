@@ -198,6 +198,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
             &url(crate::antigravity::TOKEN_REFRESH_UPSTREAM)?,
             "/antigravity/",
         );
+        add(&url(crate::antigravity::USERINFO_URL)?, "/antigravity/");
     }
     // Resolve configured provider definitions, not credentials or active profiles.
     // One unavailable home must not hide routes from the other configured homes.
@@ -320,13 +321,15 @@ mod tests {
             get("cloudcode.example.com", 8443),
             Some("/antigravity/https://cloudcode.example.com:8443")
         );
-        // As Codex's and Claude's, its token endpoint is decrypted too; Google's
-        // sign-in and account hosts are not.
         assert_eq!(
             get("oauth2.googleapis.com", 443),
             Some("/antigravity/https://oauth2.googleapis.com")
         );
-        assert_eq!(routes.len(), 4);
+        assert_eq!(
+            get("www.googleapis.com", 443),
+            Some("/antigravity/https://www.googleapis.com")
+        );
+        assert_eq!(routes.len(), 5);
         // A probe route alone routes nothing.
         let probe_only = config("antigravity:\n  routing:\n    account_probe: none\n");
         assert!(scopes(&probe_only).unwrap().is_empty());

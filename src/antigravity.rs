@@ -793,21 +793,21 @@ impl Antigravity {
         crate::url_routing::validate_routes(&self.routing.api_key)
     }
 
-    /// Refuses a Gemini API upstream on a Cloud Code or Google token host:
+    /// Refuses a Gemini API upstream on a Cloud Code, token or userinfo host:
     /// those stay routed by login, so a key route cannot carry a login's
     /// token past its account route.
     fn api_upstream(&self, url: &Url) -> Result<()> {
         let google = self
             .origins()
             .into_iter()
-            .chain([TOKEN_REFRESH_UPSTREAM])
+            .chain([TOKEN_REFRESH_UPSTREAM, USERINFO_URL])
             .filter_map(|origin| Url::parse(origin).ok());
         for origin in google {
             if origin.host_str() == url.host_str()
                 && origin.port_or_known_default() == url.port_or_known_default()
             {
                 return Err(Error::config(
-                    "Antigravity API key routes cannot name a Cloud Code or Google token host.",
+                    "Antigravity API key routes cannot name a Cloud Code, Google token or userinfo host.",
                 ));
             }
         }
@@ -1543,6 +1543,7 @@ mod tests {
             "antigravity:\n  routing:\n    api_key:\n      cloudcode-pa.googleapis.com/v1beta: us\n",
             "antigravity:\n  routing:\n    api_key:\n      'https://daily-cloudcode-pa.googleapis.com': us\n",
             "antigravity:\n  routing:\n    api_key:\n      oauth2.googleapis.com: us\n",
+            "antigravity:\n  routing:\n    api_key:\n      www.googleapis.com: us\n",
             "antigravity:\n  base_url:\n    account: https://cloudcode.example\n  routing:\n    api_key:\n      cloudcode.example/v1beta: us\n",
             "antigravity:\n  routing:\n    mcp_fallback: us\n",
             "antigravity:\n  routing:\n    account:\n      default: missing\n",

@@ -4785,7 +4785,7 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
     let mut fixture = fixture("http", "gemini_sse").await;
     let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
     let running = running(&format!(
-        "proxies:\n  selected: {endpoint}\nantigravity:\n  routing:\n    account:\n      default: selected\n"
+        "connect_credential_routing: true\nproxies:\n  selected: {endpoint}\nantigravity:\n  routing:\n    account:\n      default: selected\n"
     ))
     .await;
     trust(&running, &fixture, &endpoint);
@@ -4817,12 +4817,10 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
         assert!(forwarded.starts_with(line), "{forwarded}");
         assert!(forwarded.contains(&format!("authorization: Bearer {token}")));
     }
-    let userinfo = http()
-        .get(format!(
-            "{}/antigravity/{}",
-            running.url,
-            crate::antigravity::USERINFO_URL
-        ))
+    // A proxy-port client sends the public URL without USER_INFO_OVERRIDE_URL.
+    let proxy_client = proxy_port_client(&running);
+    let userinfo = proxy_client
+        .get(crate::antigravity::USERINFO_URL)
         .bearer_auth(token)
         .send()
         .await
@@ -4831,8 +4829,29 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
         .await
         .unwrap();
     assert!(userinfo.contains("remote@example.invalid"));
-    fixture.requests.recv().await.unwrap();
-    fixture.requests.recv().await.unwrap();
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT www.googleapis.com:443 ")
+    );
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /oauth2/v2/userinfo HTTP/1.1")
+    );
+    let denied = proxy_client
+        .get("https://www.googleapis.com/drive/v3/files")
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 502);
     // Other paths on their hosts, and other tokens, send nothing.
     for (path, auth, status) in [
         ("https://www.googleapis.com/drive/v3/files", token, 502),

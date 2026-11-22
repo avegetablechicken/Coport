@@ -214,7 +214,7 @@ connection. These hosts are decrypted:
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Any, for each URL route | that route's host and port, including public IPv4 addresses |
-| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com` and `oauth2.googleapis.com`, as `/antigravity/https://<host>/...` |
+| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `www.googleapis.com` (account lookup), as `/antigravity/https://<host>/...` |
 | Antigravity, with named API Key routes or `fallback` | `antigravity.base_url.api_key`, as `/antigravity/https://<host>/...` |
 
 A host routed by more than one service uses the unprefixed `/https://` form and
@@ -506,11 +506,12 @@ the explicit URL `/antigravity/https://oauth2.googleapis.com/token`:
 
 Coport never refreshes or writes the Antigravity login itself.
 
-With [proxy port credential routing](#credential-routing-on-the-proxy-port), the
-two Cloud Code hosts, `antigravity.base_url.account` and `oauth2.googleapis.com` are
-decrypted instead, for a client started with `HTTPS_PROXY` that trusts the proxy
-CA. Every other CONNECT is refused, so its other Google hosts are not reachable
-through the proxy port.
+With [proxy port credential routing](#credential-routing-on-the-proxy-port),
+a client using `HTTPS_PROXY` can also reach the account lookup at
+`www.googleapis.com/oauth2/v2/userinfo` alongside Cloud Code and token refresh.
+If the current proxy CA does not cover `www.googleapis.com`, choose **Replace &
+Trust** on the Proxy card, or use the local `USER_INFO_OVERRIDE_URL` above
+with the current CA. AI Code's flags still use `AICODE_ENDPOINT_URL`.
 
 ### Gemini API keys
 
