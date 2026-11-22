@@ -424,14 +424,38 @@ pub fn update_settings(app: AppHandle, state: State<AppState>, patch: SettingsPa
     tray::sync(&app);
 }
 
-#[tauri::command]
-pub fn set_launch_at_login(state: State<AppState>, enabled: bool) -> Result {
-    state.core.lock().unwrap().set_launch_at_login(enabled)
+/// Runs a login item call off the UI thread and outside the core lock:
+/// Windows starts `reg.exe` and macOS waits on `SMAppService`, which would
+/// stall the panel, the tray and the monitors. Calls run one at a time, and
+/// the item they leave is recorded.
+async fn login_item<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Result<(T, platform::LoginItem)> {
+    static CALLS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let (value, item) = tauri::async_runtime::spawn_blocking(move || {
+        let _one = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        let value = call();
+        (value, platform::launch_at_login())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    state.core.lock().unwrap().launch_at_login = item;
+    Ok((value, item))
 }
 
 #[tauri::command]
-pub fn refresh_launch_at_login(state: State<AppState>) -> platform::LoginItem {
-    state.core.lock().unwrap().refresh_launch_at_login()
+pub async fn set_launch_at_login(state: State<'_, AppState>, enabled: bool) -> Result {
+    login_item(&state, move || platform::set_launch_at_login(enabled))
+        .await?
+        .0
+        .map_err(|error| error.to_string())
+}
+
+/// Rereads the login item, which System Settings can switch off or allow.
+#[tauri::command]
+pub async fn refresh_launch_at_login(state: State<'_, AppState>) -> Result<platform::LoginItem> {
+    Ok(login_item(&state, || ()).await?.1)
 }
 
 /// Opens System Settings where macOS lists login items it blocks.

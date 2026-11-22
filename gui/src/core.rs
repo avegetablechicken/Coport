@@ -357,18 +357,6 @@ impl Core {
         result
     }
 
-    pub fn set_launch_at_login(&mut self, enable: bool) -> Result<(), String> {
-        let result = platform::set_launch_at_login(enable).map_err(|e| e.to_string());
-        self.launch_at_login = platform::launch_at_login();
-        result
-    }
-
-    /// Rereads the login item, which System Settings can switch off or allow.
-    pub fn refresh_launch_at_login(&mut self) -> platform::LoginItem {
-        self.launch_at_login = platform::launch_at_login();
-        self.launch_at_login
-    }
-
     /// Probes proxies whose last result is missing or older than `max_age`.
     pub fn probe_stale(&self, max_age: Duration) {
         if let Some(config) = self.loaded_config() {
