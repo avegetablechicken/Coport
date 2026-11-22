@@ -206,20 +206,26 @@ fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
     // flushing tens of MiB took seconds on a busy disk, and a helper damaged
     // by a crash is replaced by the next start. The staging directory is
     // private, so the copy is never reachable with the source's permissions.
-    let staging = tempfile::Builder::new()
-        .prefix(".summary-helper")
-        .tempdir_in(dir)?;
-    let staged = staging.path().join("helper");
-    std::fs::copy(binary, &staged)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))?;
+    let helper = dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
+    let result = (|| {
+        let staging = tempfile::Builder::new()
+            .prefix(".summary-helper")
+            .tempdir_in(dir)?;
+        let staged = staging.path().join("helper");
+        std::fs::copy(binary, &staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::rename(&staged, &helper)
+    })();
+    if result.is_err() {
+        // An older release's helper must not answer for this one once its
+        // registered path is gone.
+        let _ = std::fs::remove_file(&helper);
     }
-    std::fs::rename(
-        &staged,
-        dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX)),
-    )
+    result
 }
 
 fn ssh_command(device: &Device, command: &str) -> Result<tokio::process::Command, String> {
@@ -1059,6 +1065,20 @@ mod tests {
             .unwrap();
         assert_eq!(output.status.code(), Some(127));
         assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    /// A helper that could not be refreshed is removed rather than left to
+    /// answer for a newer release.
+    #[test]
+    fn a_failed_helper_copy_leaves_no_older_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir
+            .path()
+            .join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&helper, b"older release").unwrap();
+        let missing = dir.path().join("missing-coportd");
+        assert!(preserve_summary_executable(dir.path(), &missing).is_err());
+        assert!(!helper.exists());
     }
 
     #[cfg(unix)]
