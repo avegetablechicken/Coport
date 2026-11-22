@@ -1290,22 +1290,15 @@ impl Antigravity {
             }) {
                 return Ok(url);
             }
-            let host = Url::parse(&target[1..])
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-            let base = self
+            // Each origin is tried whole: `base_url.account` may share a
+            // Cloud Code host with another port or path.
+            return self
                 .origins()
                 .into_iter()
-                .find(|origin| {
-                    Url::parse(origin)
-                        .ok()
-                        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-                        == host
-                })
+                .find_map(|origin| crate::routing::upstream_url(origin, target, false).ok())
                 .ok_or(Error::config(
                     "Explicit Antigravity upstream must be a Cloud Code or login endpoint.",
-                ))?;
-            return crate::routing::upstream_url(base, target, false);
+                ));
         }
         if !target.starts_with('/') || target.starts_with("//") {
             return Err(Error::config("Invalid Antigravity request target."));
