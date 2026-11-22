@@ -103,11 +103,13 @@ pub fn beacon(size: u32, turn: Turn, service: Service, dark: bool) -> Vec<u8> {
     glyph(size, Status::Running, turn, ink, rgb(accent(service)))
 }
 
-/// The app's color: the leading shade of its traffic share in the panel.
+/// The app's color: the leading shade of its traffic share in the panel, but
+/// for Claude a more orange one, as the panel's reads red in a thin beam
+/// against the bar.
 #[cfg(target_os = "macos")]
 fn accent(service: Service) -> u32 {
     match service {
-        Service::Claude => 0xe8622c,
+        Service::Claude => 0xf27d32,
         Service::Codex => 0x10a37f,
         Service::Antigravity => 0x1c7df1,
     }
@@ -751,16 +753,20 @@ mod tests {
     #[test]
     fn menu_bar_light_takes_the_panel_color() {
         let css = include_str!("../ui/style.css");
-        for (service, name) in [
-            (Service::Claude, "claude"),
-            (Service::Codex, "codex"),
-            (Service::Antigravity, "antigravity"),
-        ] {
+        let panel = |name: &str| {
             let key = format!("--{name}-1: #");
             let at = css.find(&key).unwrap() + key.len();
-            let panel = u32::from_str_radix(&css[at..at + 6], 16).unwrap();
-            assert_eq!(super::accent(service), panel, "{name}");
-        }
+            u32::from_str_radix(&css[at..at + 6], 16).unwrap()
+        };
+        assert_eq!(super::accent(Service::Codex), panel("codex"));
+        assert_eq!(super::accent(Service::Antigravity), panel("antigravity"));
+        // Claude's panel color turned toward orange: as red, more green.
+        let rgb = |hex: u32| [hex >> 16, (hex >> 8) & 0xff, hex & 0xff];
+        let (bar, panel) = (rgb(super::accent(Service::Claude)), rgb(panel("claude")));
+        assert!(
+            bar[0] >= panel[0] && bar[1] >= panel[1] + 20,
+            "{bar:?} {panel:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]
