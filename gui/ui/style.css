@@ -353,6 +353,12 @@ select:focus-visible {
   padding: 2px 0;
 }
 
+/* Only Calls and Error Rate: kept together on the left. */
+.strip.compact {
+  justify-content: flex-start;
+  gap: 32px;
+}
+
 .stat {
   display: flex;
   flex-direction: column;

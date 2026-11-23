@@ -69,7 +69,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
     ui: { trafficScope: 'all', traffic: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
       credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
     openSelect: null, closeSelect() {}, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
-    trafficControls: () => '', trafficReview: () => '', accountChart: () => '', stat: () => '', fmtMs: () => '',
+    trafficControls: () => '', trafficReview: () => '', accountTraffic: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
   });
   vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
@@ -339,23 +339,28 @@ test('Models charts draw one baseline for every bucket without reported tokens',
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
 });
-test('Models draws no chart for Unidentified rows whose calls all failed', () => {
+test('Models shows only Calls and Error Rate for Unidentified rows whose calls all failed', () => {
   const context = setup('model');
+  Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
-  const failed = { credential: 'Unidentified', requests: 3, errors: 3, tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
-  assert.equal(context.accountChart(failed, 'model', failed), '');
-  // Requests still chart them, and so does a named account that only failed.
-  assert.match(context.accountChart(failed, 'all', failed), /class="chart-bar"/);
-  assert.match(context.accountChart({ ...failed, credential: 'work' }, 'model', failed), /class="chart-bar"/);
-  // One successful call keeps the chart.
-  const mixed = { ...failed, errors: 2, errorCounts: [1, 0, 1], tokenCounts: [0, 0, 40] };
-  assert.match(context.accountChart(mixed, 'model', mixed), /class="chart-bar"/);
+  const failed = { credential: 'Unidentified', requests: 16, errors: 16, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
+  assert.equal(context.accountTraffic(failed, 'model', failed), '<div class="strip compact"><Calls=16><Error Rate=100.0%:bad></div>');
+  const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && /<Received=/.test(html);
+  // Requests keep the full row, and so does a named account that only failed.
+  assert.ok(full(context.accountTraffic(failed, 'all', failed)));
+  assert.ok(full(context.accountTraffic({ ...failed, credential: 'work' }, 'model', failed)));
+  assert.match(context.accountTraffic({ ...failed, credential: 'work' }, 'model', failed), /<tokens>/);
+  // One successful call keeps the full row.
+  const mixed = { ...failed, errors: 15, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
+  assert.ok(full(context.accountTraffic(mixed, 'model', mixed)));
   // Activity and Devices account rows both go through it.
   for (const [from, to] of [['function renderActivityTraffic(', '\nconst SEARCH_MODES'], ['function deviceTrafficContent(', '\ndocument.addEventListener("toggle"']]) {
     const body = source.slice(source.indexOf(from), source.indexOf(to));
-    assert.match(body, /accountChart\(c, scope, /);
-    assert.doesNotMatch(body, /[^t]chart\(c,/);
+    assert.match(body, /accountTraffic\(c, scope, /);
+    assert.doesNotMatch(body, /chart\(c,|Avg\. Time|modelTokenStats\(c/);
   }
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  assert.match(css, /\.strip\.compact \{[^}]*justify-content: flex-start;/);
 });
 test('Models leaves out unidentified calls without tokens, All keeps them', () => {
   const { trafficShare } = setup();
@@ -509,7 +514,7 @@ test('device traffic exposes renamed local sources with assignment choices', () 
   Object.assign(context, {
     ICON: { warning: '<warning>', more: '<more>', chevron: '' },
     esc: v => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;'),
-    trafficShare: () => '', chart: () => '', accountChart: () => '', stat: () => '', fmtMs: () => '',
+    trafficShare: () => '', chart: () => '', accountTraffic: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '',
   });
   loadSharedViews(context);

@@ -634,12 +634,15 @@ function chart(stats, scope, showPeak = false, window = stats) {
   </div>`;
 }
 
-/// An account row's chart. With Models, Unidentified calls that all failed
-/// reported no tokens, so their bars would stay empty; the 100% error rate
-/// already says it. Any call that succeeded keeps the chart.
-function accountChart(c, scope, window) {
-  if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) return "";
-  return chart(c, scope, true, window);
+/// An account row's chart and statistics, as Activity and Devices show them.
+/// With Models, Unidentified calls that all failed reported nothing beyond
+/// their count, so the row keeps only Calls and Error Rate. Any call that
+/// succeeded keeps the full row.
+function accountTraffic(c, scope, window) {
+  const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
+  const calls = stat(scope === "model" ? "Calls" : "Requests", c.requests) + stat("Error Rate", rate, c.errors ? "bad" : "");
+  if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) return `<div class="strip compact">${calls}</div>`;
+  return `${chart(c, scope, true, window)}<div class="strip">${calls}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -1559,11 +1562,9 @@ function renderActivityTraffic() {
   el.setAttribute("aria-busy", String(ui.trafficLoading));
   const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const rows = traffic?.credentials.map((c) => {
-    const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets)}</div>
-      ${accountChart(c, scope, traffic)}
-      <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
+      ${accountTraffic(c, scope, traffic)}
     </div>`;
   }).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
@@ -1848,7 +1849,7 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
     <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets, scope)}</div>
-    ${accountChart(c, scope, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
+    ${accountTraffic(c, scope, window)}</div>`).join("")}</details>`;
   return body;
 }
 document.addEventListener("toggle", event => {
