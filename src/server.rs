@@ -93,6 +93,8 @@ mod credential_checks;
 mod relay;
 pub use antigravity_forward::AntigravityProfiles;
 pub use credential_checks::CredentialReport;
+#[path = "antigravity_cooldown.rs"]
+mod antigravity_cooldown;
 #[path = "server_antigravity.rs"]
 mod antigravity_forward;
 #[path = "server_transport.rs"]
@@ -118,6 +120,7 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_profiles: ClaudeProfiles,
     antigravity_profiles: AntigravityProfiles,
+    location_cooldowns: antigravity_cooldown::LocationCooldowns,
     antigravity_refresh_routes:
         Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
     antigravity_renewed: Arc<crate::antigravity::RenewedTokens>,
@@ -145,6 +148,7 @@ impl Server {
             probes: Mutex::new(HashMap::new()),
             claude_profiles: Default::default(),
             antigravity_profiles: Default::default(),
+            location_cooldowns: Default::default(),
             antigravity_refresh_routes: Default::default(),
             antigravity_renewed: Default::default(),
             refresh_routes: Default::default(),
@@ -604,7 +608,7 @@ impl Server {
         relay: tokio::sync::mpsc::UnboundedSender<Relay>,
         destination: Option<Arc<crate::credential_proxy::Destination>>,
         tunnel: Option<TunnelLog>,
-    ) -> std::result::Result<Response<Body>, Infallible> {
+    ) -> std::io::Result<Response<Body>> {
         let mut target = incoming
             .uri()
             .path_and_query()
@@ -704,7 +708,21 @@ impl Server {
             record_tunnel(tunnel, &log);
         }
         match forwarded {
-            Ok(upstream) => {
+            Ok(mut upstream) => {
+                if let Some(scope) = upstream
+                    .extensions_mut()
+                    .remove::<antigravity_cooldown::Scope>()
+                {
+                    let Some(response) = self.location_cooldowns.inspect(scope, upstream).await
+                    else {
+                        log.outcome = "request_failed";
+                        log.status = 400;
+                        log.field("reason", "antigravity_location_cooldown");
+                        // A service error closes HTTP/1 before it sends any response headers.
+                        return Err(std::io::Error::other("Antigravity location cooldown"));
+                    };
+                    upstream = response;
+                }
                 if upstream.status() == 101 {
                     let Some((upgrade, key)) = upgrade.zip(ws_key) else {
                         return Ok(reject(

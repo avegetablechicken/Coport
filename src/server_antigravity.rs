@@ -2,6 +2,7 @@
 //! forwarded unchanged otherwise; and its Gemini API key requests, routed by
 //! their key or upstream URL. Account lookups, their caches, route states and
 //! statistics labels follow Claude's.
+use super::antigravity_cooldown::Scope;
 use super::*;
 use crate::{
     antigravity::{Antigravity, AntigravityIdentity, ApiCredential, ApiRoute},
@@ -137,8 +138,22 @@ impl Server {
             log.field("account_label", label);
         }
         log.field("credential_match", credential_match(route.configured));
+        let scope = Scope::model(incoming.method(), &url, || {
+            let login = route
+                .identity
+                .as_ref()
+                .map(|id| id.email.to_ascii_lowercase());
+            let credential = login
+                .as_deref()
+                .or(route.refresh_token.as_deref())
+                .unwrap_or(&route.token);
+            Scope::new("oauth", credential)
+        });
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
+        // Drain the input before waiting so Hyper can observe a disconnected
+        // client and cancel its pending call throughout the cooldown.
+        self.location_cooldowns.wait(scope.as_ref(), log).await;
         if log.fields.contains_key("model_call_id") {
             crate::model_calls::observe_request(&bytes, log);
         }
@@ -157,8 +172,10 @@ impl Server {
         let response = self
             .send_via(&route.proxy, request, false, deadline, log)
             .await?;
-        self.retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
-            .await
+        let response = self
+            .retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
+            .await?;
+        Ok(Scope::tag_error(scope, response))
     }
 
     /// A Gemini API request, as Codex's and Claude's API key requests: no
@@ -180,8 +197,14 @@ impl Server {
             log.field("credential_ref", reference);
         }
         log.field("credential_match", credential_match(route.configured));
+        let scope = Scope::model(incoming.method(), &url, || {
+            Scope::new(&route.upstream, &route.key)
+        });
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
+        // Drain the input before waiting so Hyper can observe a disconnected
+        // client and cancel its pending call throughout the cooldown.
+        self.location_cooldowns.wait(scope.as_ref(), log).await;
         if log.fields.contains_key("model_call_id") {
             crate::model_calls::observe_request(&bytes, log);
         }
@@ -198,8 +221,10 @@ impl Server {
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
         let deadline = Deadline::new(self.config.request_timeout_seconds);
-        self.send_via(&route.proxy, request, route.custom_upstream, deadline, log)
-            .await
+        let response = self
+            .send_via(&route.proxy, request, route.custom_upstream, deadline, log)
+            .await?;
+        Ok(Scope::tag_error(scope, response))
     }
 
     /// Antigravity's token refresh, as Codex's and Claude's: routed by its

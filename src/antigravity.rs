@@ -513,7 +513,7 @@ pub(crate) async fn saved_document(
 /// Bounds how long a login Antigravity replaced may still match.
 const RECENT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn digest(token: &str) -> String {
+pub(crate) fn digest(token: &str) -> String {
     ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
         .as_ref()
         .iter()

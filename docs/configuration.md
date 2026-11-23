@@ -319,6 +319,16 @@ antigravity:
     #   "relay.example.com/antigravity": jp # A Gemini API upstream.
 ```
 
+For `:generateContent` and `:streamGenerateContent`, a Google HTTP 400 with
+`FAILED_PRECONDITION` and the message “User location is not supported for the
+API use” starts a three-minute cooldown. Coport closes the triggering request
+before sending response headers, allowing clients such as `agy` to retry. New
+model requests for that login (or that API key and upstream) wait locally for
+the remaining time. Each still-connected request then uses its original route.
+A further matching 400 starts another three minutes. A client with a shorter
+timeout or an exhausted retry budget can still end the turn. Other accounts
+and non-model calls, including token refreshes, continue normally.
+
 Antigravity and `agy` keep their login in one item of the OS credential store,
 service `gemini` and account `antigravity`, as written by go-keyring: on macOS
 the Keychain generic password (its JSON wrapped as `go-keyring-base64:`), on
@@ -559,7 +569,7 @@ access.
 - Upstream response chunks, including SSE, are forwarded as they arrive with backpressure. There is no whole-response buffering or automatic decompression. Content-Encoding is preserved when returned by an upstream.
 - Bodyless GET requests (excluding WebSocket upgrades) retry connection, timeout, or request transport failures before response headers at most twice, with 200 ms and 400 ms backoff. Attempts use the same selected proxy and share one deadline with route selection, cold probes, backoff and response streaming. Claude profile lookups use the same sender with a 10-second maximum budget. HTTP error responses, response-body failures, and other methods are not retried. Proxy selection failures are not retried. Request logs include `upstream_attempts`; final transport failures also include a sanitized `transport_error` category.
 - `request_timeout_seconds` accepts 1–3600 seconds and configures the HTTP request timeout and the idle timeout for established WebSocket/CONNECT tunnels. Tunnel activity in either direction resets the idle timer; active tunnels have no total lifetime limit. A failure after streaming starts closes the connection without inserting a JSON error into the stream.
-- Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body.
+- Local HTTP 401 means the Bearer token is missing/malformed, or no credential matches and OpenAI fallback is disabled. HTTP 409 means the account header does not match or the token matches multiple routes. HTTP 502 indicates a routing/configuration or upstream connection failure. Upstream HTTP errors retain their original status and body except for the Antigravity location cooldown described above.
 - If a mihomo listener refuses connections, confirm the effective profile contains it, its node name is valid, and the port is not occupied. If the exit changes unexpectedly, inspect the listener's node/group selection.
 - After rebuilding a running service, restart that process to use the new executable.
 
