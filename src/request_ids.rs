@@ -8,12 +8,14 @@ const SESSION_HEADERS: &[&str] = &[
     "x-session-id",
     "x-codex-session-id",
     "x-claude-code-session-id",
+    "x-grok-session-id",
 ];
 const REQUEST_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-request-id",
     "request-id",
     "request_id",
+    "x-grok-req-id",
 ];
 
 fn valid(value: &str) -> bool {

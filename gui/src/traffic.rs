@@ -1895,7 +1895,7 @@ mod tests {
                         dir.path(),
                         30,
                         TrafficScope::Model,
-                        crate::data_api::ReaderServices::parse(crate::data_api::SERVICES),
+                        crate::data_api::ReaderServices::ALL,
                         &mut frames,
                     )
                     .unwrap();
@@ -3495,6 +3495,76 @@ mod tests {
             );
             let group = &groups[&(Service::Antigravity, expected.to_owned())];
             assert!(group.source_counts.is_empty(), "{routes}");
+        }
+    }
+
+    /// Grok's login records name their account and route, as Codex's; its
+    /// API key records name their key, as Antigravity's.
+    #[tokio::test]
+    async fn grok_records_keep_their_login_route_or_api_key() {
+        const USER_ID: &str = "8f6b2c1e-3d4a-4b5c-9d6e-7f8091a2b3c4";
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            format!(r#"{{"https://auth.x.ai::client":{{"key":"t","user_id":"{USER_ID}","email":"me@example.test"}}}}"#),
+        )
+        .unwrap();
+        let config = coport::config::Config::parse(&format!(
+            "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\ngrok:\n  homes: [{:?}]\n  routing:\n    account:\n      me@example.test: none\n      default: none\n    api_key:\n      XAI_API_KEY: none\n    fallback: none\n",
+            home.path().to_string_lossy()
+        ))
+        .unwrap();
+        let labels = config.local_traffic_credential_labels().await;
+        let identities = Identities::from_config(&config, &[]);
+        let span = Span {
+            start: 0,
+            end: 1_800_000,
+            bucket_minutes: 1,
+        };
+        for (fields, expected) in [
+            // A saved login: its account names its route, not `default`.
+            (
+                serde_json::json!({"account_id": USER_ID, "account_label": "me@example.test",
+                    "upstream_base_url": "https://cli-chat-proxy.grok.com"}),
+                "me@example.test",
+            ),
+            // A saved login without an account keeps its route.
+            (
+                serde_json::json!({"account_label": "default",
+                    "upstream_base_url": "https://cli-chat-proxy.grok.com"}),
+                "default",
+            ),
+            // API keys, named or carried by `fallback`.
+            (
+                serde_json::json!({"provider": "XAI_API_KEY", "upstream_base_url": "https://api.x.ai/v1"}),
+                "XAI_API_KEY",
+            ),
+            (
+                serde_json::json!({"provider": "XAI_API_KEY", "upstream_base_url": "https://gateway.invalid"}),
+                "XAI_API_KEY",
+            ),
+            (
+                serde_json::json!({"provider": coport::grok::API_KEY_FALLBACK, "upstream_base_url": "https://api.x.ai/v1"}),
+                "fallback",
+            ),
+        ] {
+            let mut fields = fields;
+            fields["service"] = "grok".into();
+            let e = Entry {
+                seq: 0,
+                time: DateTime::from_timestamp_millis(1000).map(|t| t.with_timezone(&Local)),
+                event: "request_finished".into(),
+                fields: serde_json::from_value(fields.clone()).unwrap(),
+            };
+            assert_eq!(e.service(), Some(Service::Grok));
+            let resolved = identities.resolve(&e, "Grok", &labels);
+            let mut groups = BTreeMap::new();
+            aggregate(&mut groups, &e, Service::Grok, span, &labels, resolved);
+            assert!(
+                groups.contains_key(&(Service::Grok, expected.to_owned())),
+                "{fields}: {:?}",
+                groups.keys().collect::<Vec<_>>()
+            );
         }
     }
 

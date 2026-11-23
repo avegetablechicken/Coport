@@ -57,8 +57,8 @@ reconciliation is read-only and never rewrites retained logs.
 | `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |
 | `model_call_unknown` / `model_observation_gap` | A call outcome could not be observed reliably, or observation exceeded a bounded parser limit; never counted as a successful model response. |
 
-Every record of a proxied request carries `service`, `codex`, `claude` or
-`antigravity`: the app
+Every record of a proxied request carries `service`, `codex`, `claude`,
+`antigravity` or `grok`: the app
 the proxy routes the request to, decided from its target before the first record.
 Token refreshes belong to their app. Routed requests also carry
 `credential_match`: `configured` when the credential is one the configuration

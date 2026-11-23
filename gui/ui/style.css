@@ -26,7 +26,7 @@
   --teal: #30b0c7;
   --indigo: #5856d6;
   --brown: #a2845e;
-  /* Traffic share hues: Codex teal after OpenQuota, Claude orange, Antigravity blue; fainter shades rank lower. */
+  /* Traffic share hues: Codex teal after OpenQuota, Claude orange, Antigravity blue, Grok violet; fainter shades rank lower. */
   --codex-1: #10a37f;
   --codex-2: #74cda8;
   --codex-3: #9fdacc;
@@ -40,10 +40,11 @@
   --antigravity-2: #6aa8f5;
   --antigravity-3: #9fc6f8;
   --antigravity-4: #cfe2fb;
-  --grok-1: #737373;
-  --grok-2: #949494;
-  --grok-3: #b3b3b3;
-  --grok-4: #d3d3d3;
+  /* Grok violet: xAI's mark is monochrome, which would read as unidentified. */
+  --grok-1: #8b5cf6;
+  --grok-2: #a78bfa;
+  --grok-3: #c4b5fd;
+  --grok-4: #ddd6fe;
   /* Unidentified traffic has no hue, but must still read on the block. */
   --share-unidentified: rgba(0, 0, 0, 0.08);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
@@ -1283,6 +1284,7 @@ details.disclosure[open] summary svg {
 .claude-mark { --service-icon: url("icons/claude.svg"); }
 .codex-mark { --service-icon: url("icons/codex.svg"); }
 .antigravity-mark { --service-icon: url("icons/antigravity.svg"); }
+.grok-mark { --service-icon: url("icons/grok.svg"); }
 
 /* Routing shares available width; compact long proxy labels before identities. */
 .routing-service + .routing-service { margin-top: 8px; }

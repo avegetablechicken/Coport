@@ -241,13 +241,14 @@ scopes and boundaries. A progressive refresh does not reconnect automatically
 when peers cannot align: it keeps the boundary most devices share and reports
 the others, which the next explicit refresh retries.
 Readers name the services they parse beyond Codex and Claude: HTTP with an
-`X-Coport-Services: antigravity` header, SSH by starting the helper with
-`COPORT_SUMMARY_SERVICES=antigravity` set through the destination's `/bin/sh`,
+`X-Coport-Services: antigravity,grok` header, SSH by starting the helper with
+`COPORT_SUMMARY_SERVICES=antigravity,grok` set through the destination's `/bin/sh`,
 which explicit executable paths now need as discovery already did. Older devices
 ignore both.
-A device leaves Antigravity's groups out for a reader that does not name it, since
-readers from before Antigravity reject a whole snapshot naming an unknown service;
-such a reader therefore shows that device without its Antigravity traffic. A
+A device leaves Antigravity's and Grok's groups out for a reader that does not name
+them, since readers from before them reject a whole snapshot naming an unknown
+service; such a reader therefore shows that device without that traffic (a reader
+that names only `antigravity` shows it without Grok's). A
 forced-command SSH key runs its own command, so it also omits them unless that
 command sets the variable (see below).
 Once all twelve views are cached, range/category switches are immediate.
@@ -302,8 +303,8 @@ to the summary command, for example an `authorized_keys` entry beginning with
 `restrict,command="/absolute/path/to/coportd --summary"`. This prevents that key
 from running management commands, shells, PTYs, or port/agent/X11 forwarding.
 Such a key's command ignores the reader's service list; to include Antigravity's
-traffic, set it there: `command="COPORT_SUMMARY_SERVICES=antigravity /absolute/path/to/coportd --summary"`.
-Only a reader that parses Antigravity should use that key.
+and Grok's traffic, set it there: `command="COPORT_SUMMARY_SERVICES=antigravity,grok /absolute/path/to/coportd --summary"`.
+Only a reader that parses the services it names should use that key.
 The service creates its private identity during startup; summary requests only
 read existing identity, configuration and processed log results.
 
@@ -379,7 +380,7 @@ local routes, and the selected remote mode stays active for subsequent retries.
 selected device also restores local handling. The daemon owns forwarding, so closing
 the GUI preserves the selected mode if **Keep proxy running after quit** is enabled.
 Home's credential warnings use current diagnostic results rather than startup logs.
-The daemon checks Codex, Claude and Antigravity credentials every 60 seconds after each check,
+The daemon checks Codex, Claude, Antigravity and Grok credentials every 60 seconds after each check,
 regardless of success or failure, and continues when the GUI is closed. The GUI
 reads these results in the background and checks locally only when the daemon is
 confirmed absent; hiding the panel does not stop the GUI timer. An unavailable or

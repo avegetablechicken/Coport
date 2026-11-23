@@ -117,7 +117,7 @@ enum Response {
     Status(Box<Status>),
     Stopped,
     Probe(crate::proxy::Probe),
-    /// Codex, Claude, then Antigravity. A list, so a daemon that reports
+    /// Codex, Claude, Antigravity, then Grok. A list, so a daemon that reports
     /// fewer apps still answers; the missing ones have no states.
     AccountStates(Vec<std::collections::BTreeMap<String, String>>),
     CredentialReports(Vec<coport::server::CredentialReport>),
@@ -911,7 +911,7 @@ pub(crate) mod tests {
         let reports = client.credential_reports().await.unwrap();
         assert_eq!(
             reports.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["Codex", "Claude", "Antigravity"]
+            ["Codex", "Claude", "Antigravity", "Grok"]
         );
         assert!(reports.iter().all(|report| report.ok));
         stop.send(()).unwrap();

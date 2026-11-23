@@ -712,6 +712,24 @@ impl Config {
                 });
             }
         }
+        // Grok's named keys, as Antigravity's.
+        let grok = &self.grok;
+        for name in grok.routing.api_key.keys() {
+            let Some(upstream) = grok.api_key_upstream(name) else {
+                continue;
+            };
+            let Ok(token) = environment_key_with_shell(name, false).await else {
+                continue;
+            };
+            if let Some(reference) = shared_api_reference("Grok", upstream, &token) {
+                result.push(TrafficProviderReference {
+                    service: "Grok".into(),
+                    name: name.clone(),
+                    upstream: upstream.trim_end_matches('/').into(),
+                    reference,
+                });
+            }
+        }
         result
     }
     /// Local route activation, not upstream token validity. Archived logins are
@@ -870,9 +888,6 @@ impl Config {
                 }
             }
         }
-        for selector in self.grok.routing.account.keys() {
-            labels.insert(("Grok".into(), selector.clone()), selector.clone());
-        }
         // Antigravity's records name their route in `account_label`.
         let antigravity = &self.antigravity.routing;
         // API key routes name theirs in `provider`, as Codex's and Claude's.
@@ -896,6 +911,27 @@ impl Config {
                 "fallback".into(),
             );
         }
+        // Grok's records name their route as Antigravity's do; its saved
+        // logins also by the account `auth.json` names.
+        let grok = &self.grok.routing;
+        for name in grok.account.keys().chain(grok.api_key.keys()) {
+            labels.insert(("Grok".into(), name.clone()), name.clone());
+        }
+        for (name, choice) in [
+            ("account_fallback", &grok.account_fallback),
+            ("fallback", &grok.fallback),
+        ] {
+            if choice.is_some() {
+                labels.insert(("Grok".into(), name.into()), name.into());
+            }
+        }
+        if grok.fallback.is_some() {
+            labels.insert(
+                ("Grok".into(), crate::grok::API_KEY_FALLBACK.into()),
+                "fallback".into(),
+            );
+        }
+        self.grok.login_labels(&mut labels);
         for (service, routing) in [
             ("Codex", &self.codex.routing),
             ("Claude", &self.claude.routing),
@@ -951,6 +987,7 @@ impl Config {
     }
     pub async fn check_credentials(&self) -> Result<()> {
         self.claude.check_credentials().await?;
+        self.grok.check_credentials().await?;
         self.check_codex_credentials().await
     }
 

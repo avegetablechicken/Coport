@@ -645,7 +645,7 @@ mod login {
             .replace('"', "\\\"");
         let body = format!(
             "[Desktop Entry]\nType=Application\nName=Coport\n\
-             Comment=Loopback proxy for Codex, Claude and Antigravity\nExec=\"{exe}\" --background\n\
+             Comment=Loopback proxy for Codex, Claude, Antigravity and Grok\nExec=\"{exe}\" --background\n\
              Terminal=false\nX-GNOME-Autostart-enabled=true\n"
         );
         if let Some(parent) = path.parent() {

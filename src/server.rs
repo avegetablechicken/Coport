@@ -204,9 +204,14 @@ impl Server {
     /// warning that the local OAuth metadata did not match.
     pub async fn account_route_states(
         &self,
-    ) -> [std::collections::BTreeMap<String, &'static str>; 3] {
+    ) -> [std::collections::BTreeMap<String, &'static str>; 4] {
         let [codex, claude] = self.claude_route_states().await;
-        [codex, claude, self.antigravity_route_states().await]
+        [
+            codex,
+            claude,
+            self.antigravity_route_states().await,
+            self.config.grok.route_states(),
+        ]
     }
     async fn claude_route_states(&self) -> [std::collections::BTreeMap<String, &'static str>; 2] {
         let mut states = self.config.account_route_states().await;
@@ -605,6 +610,23 @@ impl Server {
                 fields,
             );
         }
+        // As Codex's: whether a saved login is in a configured home.
+        let grok = &self.config.grok;
+        if grok.configured() {
+            let check = grok.check_credentials().await;
+            let mut fields = json!({"service": "grok"}).as_object().unwrap().clone();
+            if let Err(error) = &check {
+                fields.insert("reason".into(), json!(error.message));
+            }
+            self.logger.write(
+                if check.is_ok() {
+                    "current_route"
+                } else {
+                    "route_unavailable"
+                },
+                fields,
+            );
+        }
     }
     async fn handle(
         self: Arc<Self>,
@@ -880,20 +902,17 @@ impl Server {
         if incoming.method() == "CONNECT" {
             return Err(Error::new(400, "Invalid CONNECT request."));
         }
-        if service == Service::Grok {
-            if websocket {
-                return Err(Error::new(
-                    400,
-                    "Grok subscription endpoints do not use WebSockets.",
-                ));
-            }
-            return self.forward_grok(incoming, target, log).await;
-        }
         if service == Service::Antigravity {
             if websocket {
                 return Err(Error::new(400, "Antigravity does not use WebSockets."));
             }
             return self.forward_antigravity(incoming, target, log).await;
+        }
+        if service == Service::Grok {
+            if websocket {
+                return Err(Error::new(400, "Grok does not use WebSockets."));
+            }
+            return self.forward_grok(incoming, target, log).await;
         }
         // `service` was decided from this target by `Config::request_service`.
         let claude = service == Service::Claude;

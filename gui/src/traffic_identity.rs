@@ -157,6 +157,13 @@ impl Identities {
                 None => result.insert("Antigravity", &format_base(name), name),
             }
         }
+        let grok = &config.grok;
+        for name in grok.routing.api_key.keys() {
+            match grok.api_key_upstream(name) {
+                Some(base) => result.insert("Grok", base, name),
+                None => result.insert("Grok", &format_base(name), name),
+            }
+        }
         if config.codex.routing.fallback.is_some() {
             result.insert("Codex", &config.codex.base_url.api_key, "fallback");
         }
@@ -165,6 +172,9 @@ impl Identities {
         }
         if antigravity.routing.fallback.is_some() {
             result.insert("Antigravity", &antigravity.base_url.api_key, "fallback");
+        }
+        if grok.routing.fallback.is_some() {
+            result.insert("Grok", &grok.base_url.api_key, "fallback");
         }
         result.assignments = assignments
             .iter()
@@ -210,13 +220,11 @@ impl Identities {
         labels: &BTreeMap<(String, String), String>,
     ) -> Option<Resolution> {
         // Account identities remain separate even when they use the same API.
-        // An Antigravity login record without an account (a saved login whose
-        // email is not known yet) still names its account route, never an
-        // API configuration; only its Gemini API key records are matched.
-        if service == coport::routing::Service::Grok.label()
-            || entry.get("account_id").is_some_and(|id| !id.is_empty())
-            || (service == coport::routing::Service::Antigravity.label()
-                && !antigravity_api_record(entry))
+        // An Antigravity or Grok login record without an account (a saved
+        // login whose account is not known) still names its account route,
+        // never an API configuration; only their API key records are matched.
+        if entry.get("account_id").is_some_and(|id| !id.is_empty())
+            || (keyed_by_route(service) && !api_key_record(entry))
         {
             return None;
         }
@@ -247,9 +255,9 @@ impl Identities {
                 let name = labels
                     .get(&(service.to_owned(), logged.to_owned()))
                     .map_or(logged, String::as_str);
-                // A named Antigravity key goes to any upstream its request
-                // names, so its current name alone identifies it.
-                if service == coport::routing::Service::Antigravity.label()
+                // A named Antigravity or Grok key goes to any upstream its
+                // request names, so its current name alone identifies it.
+                if keyed_by_route(service)
                     && let [base] = self.bases(service, name)[..]
                 {
                     return Some(Resolution {
@@ -372,10 +380,17 @@ impl Identities {
     }
 }
 
-/// Whether an Antigravity record is a Gemini API key request rather than a
-/// Google login's: login records name their account route in
-/// `account_label`, or carry one of the login route sources as `provider`.
-fn antigravity_api_record(entry: &Entry) -> bool {
+/// Whether a service's records name their route, Antigravity's and Grok's,
+/// rather than a provider and upstream alone.
+fn keyed_by_route(service: &str) -> bool {
+    service == coport::routing::Service::Antigravity.label()
+        || service == coport::routing::Service::Grok.label()
+}
+
+/// Whether an Antigravity or Grok record is an API key request rather than a
+/// login's: login records name their account route in `account_label`, or
+/// carry one of the login route sources as `provider`.
+fn api_key_record(entry: &Entry) -> bool {
     const LOGIN_SOURCES: [&str; 4] = [
         "default",
         "antigravity-account",

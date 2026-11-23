@@ -91,12 +91,32 @@ test('groups by service with one hue each and keeps unidentified last', () => {
   assert.deepEqual(groups[0].slices.map((s) => [s.name, s.value, s.color ?? null]), [['c', 20, 'var(--codex-1)'], ['a', 10, 'var(--codex-2)'], ['Unidentified', 50, null]]);
   assert.deepEqual(groups[1].slices.map((s) => s.color), ['var(--claude-1)']);
 });
-test('Antigravity and Grok accounts each form a separate group', () => {
+test('Antigravity accounts form their own group in its hue after the other apps', () => {
   const { shareGroups } = setup();
-  const groups = shareGroups([credential('x', 10, 'Grok'), credential('g@example.com', 40, 'Antigravity'), credential('b', 30, 'Claude'), credential('c', 20)], requests);
-  assert.deepEqual(plain(groups.map((g) => [g.service, g.value])), [['Codex', 20], ['Claude', 30], ['Antigravity', 40], ['Grok', 10]]);
+  const groups = shareGroups([credential('g@example.com', 40, 'Antigravity'), credential('b', 30, 'Claude'), credential('c', 20)], requests);
+  assert.deepEqual(plain(groups.map((g) => [g.service, g.value])), [['Codex', 20], ['Claude', 30], ['Antigravity', 40]]);
   assert.deepEqual(groups[2].slices.map((s) => s.color), ['var(--antigravity-1)']);
-  assert.deepEqual(groups[3].slices.map((s) => s.color), ['var(--grok-1)']);
+});
+test('Connect always offers the Grok URL and both Grok Build endpoints on the listening port', () => {
+  const context = setup();
+  const grok = 'http://127.0.0.1:19427/grok/v1';
+  context.ui.snap = { urls: { grok }, config: { details: null } };
+  Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
+  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  const html = context.connectBlock();
+  assert.ok(html.includes('[Grok]Grok'));
+  assert.ok(html.includes(`data-text="${grok}" data-tip="Copy" aria-label="Copy Grok base URL"`));
+  assert.ok(html.includes(`[endpoints]\ncli_chat_proxy_base_url = "${grok}"\nxai_api_base_url = "${grok}"`));
+});
+test('Grok accounts form their own group in its hue after Antigravity', () => {
+  const { shareGroups } = setup();
+  const groups = shareGroups([credential('x@example.com', 10, 'Grok'), credential('g@example.com', 40, 'Antigravity'), credential('c', 20)], requests);
+  assert.deepEqual(plain(groups.map((g) => [g.service, g.value])), [['Codex', 20], ['Antigravity', 40], ['Grok', 10]]);
+  assert.deepEqual(groups[2].slices.map((s) => s.color), ['var(--grok-1)']);
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  for (let shade = 1; shade <= 4; shade += 1) assert.match(css, new RegExp(`--grok-${shade}: #`));
+  assert.match(css, /\.grok-mark \{ --service-icon: url\("icons\/grok\.svg"\); \}/);
+  assert.ok(fs.existsSync(path.join(__dirname, '../ui/icons/grok.svg')));
 });
 test('keeps every sizable credential and folds only tiny ones into Others', () => {
   const { shareGroups } = setup();

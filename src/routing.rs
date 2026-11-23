@@ -56,7 +56,7 @@ impl Service {
     }
 }
 
-/// Antigravity's scope, then other scoped targets and token refreshes decide
+/// Antigravity's and Grok's scopes, then other scoped targets and token refreshes decide
 /// the app first, then URL routes, then Claude's own paths; anything else is
 /// Codex. `url_route` matches the
 /// unscoped target against configured URL routes, given whether it was
@@ -65,11 +65,11 @@ fn service_of<E>(
     target: &str,
     url_route: impl FnOnce(&str, bool) -> std::result::Result<Option<Service>, E>,
 ) -> std::result::Result<Service, E> {
-    if target.starts_with("/grok/") {
-        return Ok(Service::Grok);
-    }
     if crate::antigravity::target(target).is_some() {
         return Ok(Service::Antigravity);
+    }
+    if crate::grok::target(target).is_some() {
+        return Ok(Service::Grok);
     }
     let codex_scoped = target.starts_with("/codex/https://");
     let claude_scoped = target.starts_with("/anthropic/") || target.starts_with("/claude/");
@@ -113,14 +113,16 @@ impl Config {
             let codex = !claude_scoped
                 && crate::url_routing::match_route(&self.codex.routing.api_key, target)?.is_some();
             let antigravity = !claude_scoped && self.antigravity.url_route_matches(target)?;
-            match (claude, codex, antigravity) {
-                (true, false, false) => Ok(Some(Service::Claude)),
-                (false, true, false) => Ok(Some(Service::Codex)),
-                (false, false, true) => Ok(Some(Service::Antigravity)),
-                (false, false, false) => Ok(None),
+            let grok = !claude_scoped && self.grok.url_route_matches(target)?;
+            match (claude, codex, antigravity, grok) {
+                (true, false, false, false) => Ok(Some(Service::Claude)),
+                (false, true, false, false) => Ok(Some(Service::Codex)),
+                (false, false, true, false) => Ok(Some(Service::Antigravity)),
+                (false, false, false, true) => Ok(Some(Service::Grok)),
+                (false, false, false, false) => Ok(None),
                 _ => Err(Error::new(
                     409,
-                    "API upstream is configured for several apps; use /codex/https://, /anthropic/https:// or /antigravity/https://.",
+                    "API upstream is configured for several apps; use /codex/https://, /anthropic/https://, /antigravity/https:// or /grok/https://.",
                 )),
             }
         })
@@ -707,8 +709,14 @@ mod tests {
 
     #[test]
     fn every_request_target_belongs_to_one_app() {
-        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\n      'https://shared.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\nantigravity:\n  routing:\n    api_key:\n      relay.invalid/antigravity: none\n      gateway.invalid/v1beta: none\n      shared.invalid/v1: none\n").unwrap();
+        let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\n      'https://shared.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\nantigravity:\n  routing:\n    api_key:\n      relay.invalid/antigravity: none\n      gateway.invalid/v1beta: none\n      shared.invalid/v1: none\ngrok:\n  homes: []\n  routing:\n    api_key:\n      grok.invalid/v1: none\n      shared.invalid/v1: none\n").unwrap();
         let cases = [
+            ("/grok/v1/responses", Service::Grok),
+            (
+                "/grok/https://cli-chat-proxy.grok.com/v1/models",
+                Service::Grok,
+            ),
+            ("/https://grok.invalid/v1/chat/completions", Service::Grok),
             ("/v1/responses", Service::Codex),
             ("/backend-api/wham/usage", Service::Codex),
             ("/mcp/openaiDeveloperDocs", Service::Codex),
@@ -740,8 +748,13 @@ mod tests {
         ];
         for (target, service) in cases {
             assert_eq!(config.request_service(target).unwrap(), service, "{target}");
-            assert_eq!(logged_service(target), service, "{target}");
+            // Unscoped URL routes need the configuration.
+            if !target.starts_with("/https://grok.invalid/") {
+                assert_eq!(logged_service(target), service, "{target}");
+            }
         }
+        // A prefix that only begins with Grok's name is not its scope.
+        assert_eq!(logged_service("/grokking/v1/responses"), Service::Codex);
         // Only the configuration decides unscoped URL routes; records logged
         // without it fall back to the proxy's default for those.
         assert_eq!(
@@ -774,7 +787,7 @@ mod tests {
         }
         for target in [
             "/https://both.invalid/v1/models",
-            // Codex and Antigravity both route shared.invalid/v1.
+            // Codex, Antigravity and Grok all route shared.invalid/v1.
             "/https://shared.invalid/v1/messages",
         ] {
             assert_eq!(
@@ -791,6 +804,7 @@ mod tests {
                 "/antigravity/https://shared.invalid/v1/messages",
                 Service::Antigravity,
             ),
+            ("/grok/https://shared.invalid/v1/messages", Service::Grok),
             // Claude's scope never considers another app's URL routes.
             (
                 "/anthropic/https://relay.invalid/antigravity/v1beta/models/g:generateContent",

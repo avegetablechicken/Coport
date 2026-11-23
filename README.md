@@ -24,6 +24,7 @@ background service, and as a menu bar / tray app.
   providers, Claude settings files and explicit upstream URLs
 - Grok Build subscription token renewal, usage and plan queries from Copool, with
   account-specific exits. [Copool setup](docs/clients.md#copool-grok-subscription-usage)
+- Grok Build requests routed by xAI login or API key, read from Grok Build's `auth.json`
 - Antigravity (Google AI Pro) Cloud Code requests routed by Google login, with Gemini token
   usage in Activity
 - Logins read where the CLIs keep them (`auth.json`, `.credentials.json` or the OS credential

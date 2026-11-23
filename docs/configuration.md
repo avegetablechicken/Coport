@@ -45,14 +45,15 @@ claude:
 
 Either service section can be omitted. An optional `antigravity` section routes
 Antigravity's Google logins and Gemini API key upstreams; see
-[Antigravity](#antigravity). Within each section:
+[Antigravity](#antigravity). An optional `grok` section routes Grok Build's xAI
+logins and API keys; see [Grok](#grok). Within each section:
 
 | Field | Purpose |
 | --- | --- |
 | `base_url` | Claude: one upstream root for both OAuth and API Keys |
-| `base_url.account` | Codex: ChatGPT account upstream. Antigravity: Cloud Code upstream of its Google login; defaults to `https://daily-cloudcode-pa.googleapis.com` |
-| `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1`. Antigravity: Gemini API upstream of keys whose request names none; defaults to `https://generativelanguage.googleapis.com` |
-| `codex.homes` / `claude.config_dirs` | Lists of directories allowed for local credential discovery |
+| `base_url.account` | Codex: ChatGPT account upstream. Antigravity: Cloud Code upstream of its Google login; defaults to `https://daily-cloudcode-pa.googleapis.com`. Grok: session API of its xAI logins; defaults to `https://cli-chat-proxy.grok.com/v1` |
+| `base_url.api_key` | Codex: API Key upstream; defaults to `https://api.openai.com/v1`. Antigravity: Gemini API upstream of keys whose request names none; defaults to `https://generativelanguage.googleapis.com`. Grok: xAI API upstream of keys whose request names none; defaults to `https://api.x.ai/v1` |
+| `codex.homes` / `claude.config_dirs` / `grok.homes` | Lists of directories allowed for local credential discovery |
 | `auth_env` | Alternative: environment variable containing the account access token |
 | `routing.account.<label>` | Proxy choice for that account source |
 | `routing.api_key.<selector>` | Proxy choice for an API Key environment variable, Codex provider ID, Claude settings name, or API upstream URL (Antigravity takes variable names and URLs) |
@@ -409,6 +410,67 @@ failures are not cached and never forward the request, redirects
 are not followed, responses are limited to 64 KiB and lookups to 10 seconds.
 `saved_login: false` requires `account_auth_file_only: false`.
 
+### Grok
+
+The `grok` section routes the requests of Grok Build (`grok`; see
+[Connect Grok Build](clients.md#connect-grok-build)) by the xAI login or API key
+they carry:
+
+```yaml
+grok:
+  base_url: # As Codex's; both are the defaults.
+    account: "https://cli-chat-proxy.grok.com/v1"
+    api_key: "https://api.x.ai/v1"
+  homes: ["~/.grok"] # Default when omitted.
+  account_auth_file_only: true # Default.
+  routing:
+    account:
+      "you@example.com": us # A saved login's email or user ID.
+      # default: us # Any other saved login.
+    # account_fallback: us
+    # fallback: us
+    # api_key:
+    #   XAI_API_KEY: jp # The key this variable holds.
+    #   "gateway.example.com/v1": jp # An xAI-compatible gateway.
+```
+
+Grok Build keeps its logins in `auth.json` in its home, an object of sign-ins
+keyed by issuer and client, each holding the access token (`key`), the refresh
+token and the account's `user_id` and `email`. As Copool and OpenQuota read it,
+Coport reads the file in each listed home for each request; `homes` follows
+Codex's `homes`. When omitted, Grok Build uses `$GROK_HOME` or `~/.grok`.
+An explicit `grok.auth_file` selects one file in place of `homes`. A saved access
+token selects its login by `user_id/team_id`, user ID, case-insensitive email, then
+`default`, then `account_fallback`, then `fallback`. Grok Build renews the token
+itself and rewrites the file, so the renewed token matches on its next request.
+No account lookup is ever made: the file names the account.
+
+With `account_auth_file_only: true`, any other login token (xAI's are JWTs) is
+rejected. With `false`, its own claims (`sub` and `email`, unverified, as
+Codex's `false` mode reads ChatGPT tokens) select its route, else
+`account_fallback`, then `fallback`; `default` stays the saved logins'. Login
+requests go to `base_url.account`, Grok Build's session API, or to an xAI API
+host their request names; never elsewhere.
+
+`routing.api_key` takes, as Antigravity's, environment variable names and
+upstream URLs. A name, such as `XAI_API_KEY`, selects the key that variable
+holds, read from Coport's environment, else from your login shell; the key goes
+to `base_url.api_key`, or to the upstream its request names after `/grok/`
+(`/grok/https://gateway.example.com/v1/...`), checked as a URL route's is. Any
+other opaque key takes `fallback`, which reaches the xAI API alone, else is
+rejected with 401, and a key two names hold is refused with 409. A URL is matched
+as [Codex API URL routes](clients.md#codex-api-url-routes) are and forwards any
+key to that upstream; one naming `base_url.account`, `cli-chat-proxy.grok.com`,
+`api.x.ai` or `auth.x.ai` is rejected, so xAI's hosts stay routed by credential.
+
+Grok Build and Copool initiate token renewal themselves. With a Grok account
+route, the proxy port accepts `POST https://auth.x.ai/oauth2/token` and routes it
+by the refresh token. See [Copool subscription usage](clients.md#copool-grok-subscription-usage)
+for first use and token rotation. `auto_refresh_access_token` does not apply to Grok. `account_probe`
+and `mcp_fallback` are not supported. As for Codex with `account_auth_file_only:
+true`, the desktop app's routing page marks the saved logins' routes active and
+the others inactive; Activity names Grok traffic by the route that carried it.
+
 ## Upstreams, proxies and ordered candidates
 
 Default upstreams must be HTTPS public hostnames; explicitly declared third-party
@@ -583,7 +645,7 @@ without a saved refresh token do not trigger renewal. Errors inside an already-o
 WebSocket or SSE stream are not replayed.
 
 After an upstream HTTP 401, Coport refreshes the matched saved Codex, Claude or
-Antigravity login through that account's configured transport, saves rotated
+Antigravity login (Grok Build renews its own) through that account's configured transport, saves rotated
 credentials to the original file or OS credential store, and retries the buffered
 request once. It preserves other
 credential fields, including edits made while the refresh ran, and never overwrites a

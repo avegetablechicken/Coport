@@ -55,6 +55,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
         "www.googleapis.com".into(),
         "oauth2.googleapis.com".into(),
         "aicode.googleapis.com".into(),
+        "api.x.ai".into(),
         "localhost".into(),
     ])
     .unwrap();
@@ -289,6 +290,14 @@ async fn running_with_server(
     }
     if config.codex.homes == crate::config::default_codex_homes() {
         config.codex.homes = isolated("codex");
+    }
+    if config.grok.homes.is_none() && config.grok.auth_file.is_none() {
+        config.grok.auth_file = Some(
+            temp.path()
+                .join("grok/auth.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     let credential_proxy =
         crate::credential_proxy::CredentialProxy::prepare(&config, &temp.path().join("tls"))
@@ -6373,6 +6382,33 @@ async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_re
             assert!(request.contains("authorization: Bearer issued-access"));
             assert!(request.contains("x-grok-client-version: test"));
         }
+        // A model call with the rotated opaque access token keeps the same
+        // account exit, including a mapping by user/team.
+        let response = client
+            .post(format!("{}/v1/responses", crate::grok::API))
+            .bearer_auth("issued-access")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT cli-chat-proxy.grok.com:443 ")
+        );
+        assert!(
+            mapped
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("POST /v1/responses ")
+        );
         for (host, path) in [
             (crate::grok::ISSUER, "/v1/settings"),
             (crate::grok::API, "/oauth2/token"),
@@ -6430,4 +6466,109 @@ async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_re
             }
         }
     }
+}
+
+// Grok Build's login, read from a temporary home's auth.json, and its API
+// keys take their own routes; only the loopback fixture proxy is reached.
+#[tokio::test]
+async fn grok_saved_logins_and_api_keys_take_their_routes_and_record_usage() {
+    const TOKEN: &str = "grok-saved-access-token";
+    let named = std::env::var("CARGO_PKG_NAME").expect("cargo test sets CARGO_PKG_NAME");
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("auth.json"),
+        crate::grok::tests::auth_json(TOKEN, "grok@example.com"),
+    )
+    .unwrap();
+    let mut fixture = fixture("http", "untyped_sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());
+    let running = running(&format!(
+        "proxies:\n  login: {endpoint}\n  key: {endpoint}\ngrok:\n  homes: [{:?}]\n  routing:\n    account:\n      grok@example.com: login\n    api_key:\n      CARGO_PKG_NAME: key\n",
+        home.path().to_string_lossy()
+    ))
+    .await;
+    trust(&running, &fixture, &endpoint);
+    let send = |path: &str, token: &str| {
+        http()
+            .post(format!("{}{path}", running.url))
+            .bearer_auth(token)
+            .header("cookie", "private-cookie")
+            .header("x-grok-session-id", "grok-session")
+            .header("x-grok-req-id", "grok-request")
+            .body(r#"{"model":"grok-request","input":"PRIVATE PROMPT"}"#)
+            .send()
+    };
+    let response = send("/grok/v1/responses", TOKEN).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), MODEL_STREAM);
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(
+        connect.starts_with("CONNECT cli-chat-proxy.grok.com:443 "),
+        "{connect}"
+    );
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(
+        forwarded.starts_with("POST /v1/responses HTTP/1.1"),
+        "{forwarded}"
+    );
+    assert!(forwarded.contains(&format!("authorization: Bearer {TOKEN}")));
+    assert!(!forwarded.contains("private-cookie"));
+    let call = first_record(&running, "model_call_finished").await;
+    assert_eq!(call["service"], "grok");
+    assert!(call.get("provider").is_none());
+    assert_eq!(call["account_id"], crate::grok::tests::USER_ID);
+    assert_eq!(call["account_label"], "grok@example.com");
+    assert_eq!(call["credential_match"], "configured");
+    assert_eq!(call["proxy"], "login");
+    assert_eq!(call["upstream_base_url"], "https://cli-chat-proxy.grok.com");
+    assert_eq!(call["session_id"], "grok-session");
+    assert_eq!(call["client_request_id"], "grok-request");
+    assert_eq!(call["model"], "gpt-test");
+    assert_eq!(call["input_tokens"], "12");
+    assert_eq!(call["output_tokens"], "3");
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    assert!(!raw.contains(TOKEN) && !raw.contains("PRIVATE PROMPT"));
+
+    // The named key goes to the xAI API through its own route.
+    let response = send("/grok/v1/chat/completions", &named).await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+    let connect = fixture.requests.recv().await.unwrap();
+    assert!(connect.starts_with("CONNECT api.x.ai:443 "), "{connect}");
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(
+        forwarded.starts_with("POST /v1/chat/completions HTTP/1.1"),
+        "{forwarded}"
+    );
+    assert!(forwarded.contains(&format!("authorization: Bearer {named}")));
+
+    // Another login, an unknown key and a login sent elsewhere reach nothing.
+    let other = crate::grok::tests::jwt("other-user", "other@example.com");
+    for (path, token, status) in [
+        ("/grok/v1/responses", other.as_str(), 401),
+        ("/grok/v1/responses", "xai-unknown-key", 401),
+        ("/grok/https://relay.invalid/v1/responses", TOKEN, 502),
+        ("/grok/v1/responses", "", 401),
+    ] {
+        let response = send(path, token).await.unwrap();
+        assert_eq!(response.status(), status, "{path} {token}");
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    let unconfigured = running_with_tls("", |_| {}).await;
+    let response = http()
+        .post(format!("{}/grok/v1/responses", unconfigured.url))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    // The routing page marks the saved login's route active.
+    let states = running.server.account_route_states().await;
+    assert_eq!(states[3]["grok@example.com"], "active");
+    let labels = running.server.cached_traffic_credential_labels().await;
+    assert_eq!(
+        labels[&("Grok".to_owned(), crate::grok::tests::USER_ID.to_owned())],
+        "grok@example.com"
+    );
 }

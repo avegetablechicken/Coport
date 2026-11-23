@@ -1,5 +1,5 @@
 //! Credential routing for proxy-port clients. A CONNECT to an API host that
-//! the codex, claude or antigravity section routes by credential is decrypted with the
+//! the codex, claude, antigravity or grok section routes by credential is decrypted with the
 //! proxy CA; each request inside then takes the explicit upstream URL form,
 //! so it is matched and forwarded exactly like a base URL request.
 use crate::{Error, Result, config::Config};
@@ -137,15 +137,6 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
             })
             .or_insert(prefix);
     };
-    if config.grok.enabled() {
-        for origin in [
-            crate::grok::ISSUER,
-            crate::grok::API,
-            &config.grok.base_url.account,
-        ] {
-            add(&crate::url_routing::validate_upstream(origin)?, "/grok/");
-        }
-    }
     let claude = &config.claude.routing;
     let codex = &config.codex.routing;
     let url = |value: &str| crate::url_routing::validate_upstream(value);
@@ -208,6 +199,25 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
             "/antigravity/",
         );
         add(&url(crate::antigravity::USERINFO_URL)?, "/antigravity/");
+    }
+    // As Antigravity's: logins reach the session API, keys the xAI API.
+    if config.grok.enabled() {
+        add(&url(crate::grok::ISSUER)?, "/grok/");
+        for origin in config.grok.origins() {
+            add(&url(origin)?, "/grok/");
+        }
+    }
+    if config.grok.serves_api_keys() {
+        add(&url(&config.grok.base_url.api_key)?, "/grok/");
+    }
+    for key in config
+        .grok
+        .routing
+        .api_key
+        .keys()
+        .filter(|k| crate::url_routing::is_url_selector(k))
+    {
+        add(&url(key)?, "/grok/");
     }
     // Resolve configured provider definitions, not credentials or active profiles.
     // One unavailable home must not hide routes from the other configured homes.
@@ -384,6 +394,45 @@ mod tests {
         assert_eq!(
             defaults.keys().collect::<Vec<_>>(),
             [&("generativelanguage.googleapis.com".to_owned(), 443)]
+        );
+    }
+
+    #[test]
+    fn grok_account_routes_cover_renewal_while_key_routes_cover_only_their_apis() {
+        let get = |routes: &BTreeMap<(String, u16), String>, host: &str| {
+            routes.get(&(host.to_owned(), 443)).cloned()
+        };
+        let logins = scopes(&config(
+            "grok:\n  homes: []\n  account_auth_file_only: false\n  routing:\n    account_fallback: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            get(&logins, "cli-chat-proxy.grok.com").as_deref(),
+            Some("/grok/https://cli-chat-proxy.grok.com")
+        );
+        assert_eq!(logins.len(), 2);
+        // `fallback` serves logins and keys alike.
+        let both = scopes(&config(
+            "grok:\n  homes: []\n  account_auth_file_only: false\n  routing:\n    fallback: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            get(&both, "api.x.ai").as_deref(),
+            Some("/grok/https://api.x.ai")
+        );
+        assert_eq!(
+            get(&both, "auth.x.ai").as_deref(),
+            Some("/grok/https://auth.x.ai")
+        );
+        let keys = scopes(&config(
+            "grok:\n  homes: []\n  routing:\n    api_key:\n      XAI_API_KEY: none\n      gateway.example.com/v1: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            keys.keys()
+                .map(|(host, _)| host.as_str())
+                .collect::<Vec<_>>(),
+            ["api.x.ai", "gateway.example.com"]
         );
     }
 

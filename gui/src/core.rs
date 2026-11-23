@@ -430,6 +430,7 @@ impl Core {
                 claude: format!("{base}/anthropic"),
                 codex: format!("{base}/v1"),
                 antigravity: format!("{base}/antigravity"),
+                grok: format!("{base}/grok/v1"),
                 chatgpt: format!("https://127.0.0.1:{port}/backend-api"),
                 ca_certificate: coport::local_tls::dir_for(&self.config_path())
                     .join(coport::local_tls::CA_FILE)
@@ -665,18 +666,6 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             |selector| describe::claude_api_key(config, selector),
             |selector| config.claude.api_key_kind(selector).unwrap_or("unknown"),
         ),
-        grok: service(
-            vec![
-                ("accountUpstream", config.grok.base_url.account.clone()),
-                ("apiKeyUpstream", config.grok.base_url.api_key.clone()),
-            ],
-            config.grok.account_auth_file_only.unwrap_or(false),
-            false,
-            &config.grok.routing,
-            false,
-            |_| None,
-            |_| "unknown",
-        ),
         // Antigravity's API keys are environment variables or upstream URLs.
         antigravity: service(
             vec![
@@ -693,6 +682,23 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             |selector| describe::antigravity_api_key(config, selector),
             |selector| config.antigravity.api_key_kind(selector),
         ),
+        // As Antigravity's; its logins name their account, so it has no probe.
+        grok: {
+            let mut grok = service(
+                vec![
+                    ("upstream", config.grok.base_url.account.clone()),
+                    ("apiKeyUpstream", config.grok.base_url.api_key.clone()),
+                ],
+                config.grok.file_only(),
+                false,
+                &config.grok.routing,
+                false,
+                |selector| describe::grok_api_key(config, selector),
+                |selector| config.grok.api_key_kind(selector),
+            );
+            grok.fallbacks.retain(|f| f.key != "accountProbe");
+            grok
+        },
     }
 }
 
@@ -803,6 +809,7 @@ impl Snapshot {
                 &mut details.codex,
                 &mut details.claude,
                 &mut details.antigravity,
+                &mut details.grok,
             ]
             .into_iter()
             .zip(states)
@@ -844,6 +851,8 @@ struct Urls {
     codex: String,
     /// Antigravity's `CLOUD_CODE_URL`.
     antigravity: String,
+    /// Grok Build's `cli_chat_proxy_base_url` and `xai_api_base_url`.
+    grok: String,
     /// Codex 0.156+ only accepts an HTTPS ChatGPT backend; the port also serves TLS.
     chatgpt: String,
     ca_certificate: String,
@@ -1243,6 +1252,7 @@ mod tests {
             claude: "claude".into(),
             codex: "codex".into(),
             antigravity: "antigravity".into(),
+            grok: "grok".into(),
             chatgpt: "chatgpt".into(),
             ca_certificate: "/tls/ca.pem".into(),
             proxy_ca_certificate: "/tls/proxy-ca.pem".into(),
@@ -1251,7 +1261,7 @@ mod tests {
         // The panel's setup snippets read `urls.caCertificate` and `urls.proxyCaCertificate`.
         assert_eq!(urls["caCertificate"], "/tls/ca.pem");
         assert_eq!(urls["proxyCaCertificate"], "/tls/proxy-ca.pem");
-        for key in ["base", "claude", "codex", "antigravity", "chatgpt"] {
+        for key in ["base", "claude", "codex", "antigravity", "grok", "chatgpt"] {
             assert!(urls[key].is_string());
         }
     }

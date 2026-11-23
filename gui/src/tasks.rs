@@ -7,8 +7,8 @@ use coport::{
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-/// Account route states of Codex, Claude and Antigravity.
-pub type AccountStates = [BTreeMap<String, String>; 3];
+/// Account route states of Codex, Claude, Antigravity and Grok.
+pub type AccountStates = [BTreeMap<String, String>; 4];
 /// States as a daemon lists them; an app it does not report has none.
 pub fn account_states(listed: Vec<BTreeMap<String, String>>) -> AccountStates {
     let mut states = AccountStates::default();
@@ -104,9 +104,11 @@ impl Tasks {
     pub async fn account_states(&self) -> Result<AccountStates, String> {
         // Only file-only mode reports activation.
         let antigravity = &self.config.antigravity;
+        let grok = &self.config.grok;
         if !self.config.codex.account_auth_file_only
             && !self.config.claude.account_auth_file_only
             && !(antigravity.account_auth_file_only && !antigravity.routing.account.is_empty())
+            && !(grok.file_only() && !grok.routing.account.is_empty())
         {
             return Ok(Default::default());
         }
@@ -192,15 +194,25 @@ mod tests {
         let codex = BTreeMap::from([("default".to_owned(), "active".to_owned())]);
         let claude = BTreeMap::from([("me".to_owned(), "inactive".to_owned())]);
         let states = account_states(vec![codex.clone(), claude.clone()]);
-        assert_eq!(states, [codex.clone(), claude.clone(), BTreeMap::new()]);
+        assert_eq!(
+            states,
+            [
+                codex.clone(),
+                claude.clone(),
+                BTreeMap::new(),
+                BTreeMap::new()
+            ]
+        );
         let antigravity = BTreeMap::from([("default".to_owned(), "active".to_owned())]);
+        let grok = BTreeMap::from([("me@example.com".to_owned(), "active".to_owned())]);
         let listed = vec![
             codex.clone(),
             claude.clone(),
             antigravity.clone(),
+            grok.clone(),
             BTreeMap::new(),
         ];
-        assert_eq!(account_states(listed), [codex, claude, antigravity]);
+        assert_eq!(account_states(listed), [codex, claude, antigravity, grok]);
     }
 
     #[tokio::test]
@@ -211,7 +223,7 @@ mod tests {
         let reports = tasks.credential_reports().await.unwrap();
         assert_eq!(
             reports.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["Codex", "Claude", "Antigravity"]
+            ["Codex", "Claude", "Antigravity", "Grok"]
         );
         assert!(reports.iter().all(|report| report.ok));
         assert!(tasks.local.lock().await.is_some());

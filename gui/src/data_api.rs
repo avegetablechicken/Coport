@@ -136,8 +136,8 @@ fn account_digest(value: &str) -> String {
         .collect()
 }
 /// Every reader parses Codex and Claude groups; one from before Antigravity
-/// rejects a whole summary naming it. Readers therefore name the further
-/// services they parse, over HTTP in this header and over SSH in this
+/// or Grok rejects a whole summary naming it. Readers therefore name the
+/// further services they parse, over HTTP in this header and over SSH in this
 /// environment variable, both ignored by older exporters. Groups of a service
 /// the reader did not name are left out.
 pub const SERVICES_HEADER: &str = "x-coport-services";
@@ -145,50 +145,69 @@ pub const SERVICES_ENV: &str = "COPORT_SUMMARY_SERVICES";
 /// The further services this version parses.
 pub const SERVICES: &str = "antigravity,grok";
 
-/// Additional service variants a reader understands.
-#[derive(Clone, Copy)]
+/// The services beyond Codex and Claude a reader parses, as it names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReaderServices {
-    antigravity: bool,
-    grok: bool,
+    pub antigravity: bool,
+    pub grok: bool,
 }
-
 impl ReaderServices {
-    pub fn parse(list: &str) -> Self {
-        let names = |wanted| {
+    /// Every service this version parses, as [`SERVICES`] names them.
+    pub const ALL: Self = Self {
+        antigravity: true,
+        grok: true,
+    };
+    /// The services a reader's comma-separated list names.
+    pub fn named(list: &str) -> Self {
+        let names = |service: &str| {
             list.split(',')
-                .any(|s| s.trim().eq_ignore_ascii_case(wanted))
+                .any(|name| name.trim().eq_ignore_ascii_case(service))
         };
         Self {
             antigravity: names("antigravity"),
             grok: names("grok"),
         }
     }
-    pub fn from_env() -> Self {
-        Self::parse(&std::env::var(SERVICES_ENV).unwrap_or_default())
+    /// The services the reader that started this helper names.
+    pub fn of_helper() -> Self {
+        std::env::var(SERVICES_ENV)
+            .map(|list| Self::named(&list))
+            .unwrap_or_default()
+    }
+    pub fn reads(self, service: Service) -> bool {
+        match service {
+            Service::Codex | Service::Claude => true,
+            Service::Antigravity => self.antigravity,
+            Service::Grok => self.grok,
+        }
     }
 }
 
+/// A published summary as a reader receives it; see [`SERVICES_HEADER`].
 fn for_reader(bytes: &[u8], services: ReaderServices) -> Result<Vec<u8>, String> {
-    let contains = |name: &[u8]| bytes.windows(name.len()).any(|part| part == name);
-    if (services.antigravity || !contains(br#""Antigravity""#))
-        && (services.grok || !contains(br#""Grok""#))
+    let named = |service: Service| {
+        let quoted = format!("\"{}\"", service.label());
+        bytes
+            .windows(quoted.len())
+            .any(|part| part == quoted.as_bytes())
+    };
+    if [Service::Antigravity, Service::Grok]
+        .into_iter()
+        .all(|service| services.reads(service) || !named(service))
     {
         return Ok(bytes.to_vec());
     }
     let mut summary: Summary =
         serde_json::from_slice(bytes).map_err(|_| "Cannot decode processed summary")?;
-    summary.for_services(services);
+    summary.only_for(services);
     summary.validate()?;
     serde_json::to_vec(&summary).map_err(|_| "Cannot encode processed summary".into())
 }
 
 impl Summary {
-    fn for_services(&mut self, services: ReaderServices) {
-        let keep = |group: &Group| match group.service {
-            Service::Grok => services.grok,
-            Service::Antigravity => services.antigravity,
-            Service::Codex | Service::Claude => true,
-        };
+    /// Leaves out the groups of services a reader cannot parse.
+    pub fn only_for(&mut self, services: ReaderServices) {
+        let keep = |group: &Group| services.reads(group.service);
         self.groups.retain(keep);
         for window in self
             .windows
@@ -419,7 +438,7 @@ fn read_node_id(dir: &Path) -> io::Result<String> {
 }
 /// Same processed DTO as HTTP. This command reads existing identity/config/log
 /// files only; it does not start/stop services or open a network listener.
-/// `services` selects the groups understood by this reader.
+/// `services`: the services whose groups the reader parses.
 pub fn read_summary(dir: &Path, services: ReaderServices) -> io::Result<Summary> {
     let (config_path, log) = crate::daemon::Client::discover(dir)
         .map(|(_, status)| (status.config_path, status.log_path))
@@ -429,7 +448,7 @@ pub fn read_summary(dir: &Path, services: ReaderServices) -> io::Result<Summary>
     let node = read_node_id(dir)?;
     let bytes = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
     let mut summary: Summary = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    summary.for_services(services);
+    summary.only_for(services);
     Ok(summary)
 }
 
@@ -757,11 +776,13 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         reply(&mut socket, 503, b"{}").await;
         return;
     }
-    let services = ReaderServices::parse(&reader_services(&head).unwrap_or_default());
+    let services = reader_services(&head)
+        .map(|list| ReaderServices::named(&list))
+        .unwrap_or_default();
     if let Ok(Some((minutes, scope))) = requested_window(&head) {
         let selected = (|| {
             let mut summary: Summary = serde_json::from_slice(&bytes).ok()?;
-            summary.for_services(services);
+            summary.only_for(services);
             summary
                 .windows
                 .retain(|w| w.minutes == minutes && w.scope == scope);
@@ -892,7 +913,7 @@ mod tests {
             1440,
             crate::traffic::TrafficScope::All,
             original_end,
-            ReaderServices::parse(SERVICES),
+            ReaderServices::ALL,
             &mut output,
         )
         .unwrap();
@@ -1008,8 +1029,8 @@ mod tests {
             );
         }
     }
-    /// A state directory whose log holds one Antigravity and one Codex model
-    /// call; returns it with its log and configuration.
+    /// A state directory whose log holds one Antigravity, one Grok and one
+    /// Codex model call; returns it with its log and configuration.
     fn antigravity_traffic() -> (tempfile::TempDir, PathBuf, &'static str) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();
@@ -1027,7 +1048,8 @@ mod tests {
             row(
                 "antigravity",
                 "/antigravity/v1internal:streamGenerateContent",
-            ) + &row("codex", "/v1/responses"),
+            ) + &row("grok", "/grok/v1/responses")
+                + &row("codex", "/v1/responses"),
         )
         .unwrap();
         let config: &str = "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n";
@@ -1052,10 +1074,10 @@ mod tests {
         all
     }
 
-    /// Readers from before Antigravity reject a summary naming it, so only an
-    /// HTTP reader that names it receives its groups.
+    /// Readers from before Antigravity or Grok reject a summary naming it, so
+    /// only an HTTP reader that names a service receives its groups.
     #[tokio::test]
-    async fn antigravity_groups_reach_only_http_readers_that_name_them() {
+    async fn antigravity_and_grok_groups_reach_only_http_readers_that_name_them() {
         let (_dir, log, config) = antigravity_traffic();
         let services = summary_services;
         let key = DataKey::new(KEY).unwrap();
@@ -1067,12 +1089,20 @@ mod tests {
         )
         .unwrap();
         let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes)))));
-        for (extra, antigravity) in [
-            ("", false),
-            ("X-Coport-Window: 30:model\r\n", false),
-            ("X-Coport-Services: codex, antigravity\r\n", true),
+        for (extra, antigravity, grok) in [
+            ("", false, false),
+            ("X-Coport-Window: 30:model\r\n", false, false),
+            // A reader from before Grok.
+            ("X-Coport-Services: codex, antigravity\r\n", true, false),
             (
                 "X-Coport-Services: antigravity\r\nX-Coport-Window: 30:model\r\n",
+                true,
+                false,
+            ),
+            ("X-Coport-Services: Grok\r\n", false, true),
+            (
+                "X-Coport-Services: antigravity,grok\r\nX-Coport-Window: 30:model\r\n",
+                true,
                 true,
             ),
         ] {
@@ -1093,70 +1123,40 @@ mod tests {
             let body = &response[split..];
             let summary: Summary = serde_json::from_slice(body).unwrap();
             summary.validate().unwrap();
-            assert_eq!(
-                services(&summary),
-                if antigravity {
-                    vec![Service::Codex, Service::Antigravity]
-                } else {
-                    vec![Service::Codex]
-                },
-                "{extra:?}"
-            );
-            assert_eq!(
-                body.windows(b"Antigravity".len())
-                    .any(|w| w == b"Antigravity"),
-                antigravity
-            );
-        }
-
-        // A reader from the Antigravity-only release can parse every frame
-        // after Grok groups have been filtered out, including alignment windows.
-        let (_, complete) = shared.read().await.clone().unwrap();
-        let mut summary: Summary = serde_json::from_slice(&complete).unwrap();
-        for group in summary.groups.iter_mut().chain(
-            summary
-                .windows
-                .iter_mut()
-                .chain(&mut summary.previous_windows)
-                .flat_map(|w| &mut w.groups),
-        ) {
-            if group.service == Service::Antigravity {
-                group.service = Service::Grok;
+            let mut expected = vec![Service::Codex];
+            if antigravity {
+                expected.push(Service::Antigravity);
             }
-        }
-        let bytes = serde_json::to_vec(&summary).unwrap();
-        for (advertised, expects_grok) in [
-            ("", false),
-            ("antigravity", false),
-            ("grok", true),
-            (SERVICES, true),
-        ] {
-            let body = for_reader(&bytes, ReaderServices::parse(advertised)).unwrap();
-            let summary: Summary = serde_json::from_slice(&body).unwrap();
-            summary.validate().unwrap();
-            assert_eq!(
-                summary_services(&summary).contains(&Service::Grok),
-                expects_grok
-            );
+            if grok {
+                expected.push(Service::Grok);
+            }
+            assert_eq!(services(&summary), expected, "{extra:?}");
+            let names = |name: &[u8]| body.windows(name.len()).any(|w| w == name);
+            assert_eq!(names(b"Antigravity"), antigravity, "{extra:?}");
+            assert_eq!(names(b"\"Grok\""), grok, "{extra:?}");
         }
 
-        assert!(ReaderServices::parse(" Antigravity ").antigravity);
-        assert!(!ReaderServices::parse("antigravity-next,codex").antigravity);
+        assert_eq!(
+            ReaderServices::named(" Antigravity , GROK"),
+            ReaderServices::ALL
+        );
+        assert_eq!(
+            ReaderServices::named("antigravity-next,grok-x,codex"),
+            ReaderServices::default()
+        );
+        assert_eq!(ReaderServices::named(SERVICES), ReaderServices::ALL);
     }
 
     /// As over HTTP, for the SSH helper's stream and single summary.
     #[cfg(unix)]
     #[test]
-    fn antigravity_groups_reach_only_ssh_readers_that_name_them() {
+    fn antigravity_and_grok_groups_reach_only_ssh_readers_that_name_them() {
         let (dir, _log, config) = antigravity_traffic();
         std::fs::write(dir.path().join("config.yaml"), config).unwrap();
         prepare_identity(dir.path()).unwrap();
         let services = summary_services;
-        for antigravity in [false, true] {
-            let reader = ReaderServices {
-                antigravity,
-                grok: false,
-            };
+        for reader in ["", "antigravity", "grok", SERVICES] {
+            let reader = ReaderServices::named(reader);
             let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
             let mut output = Vec::new();
             stream_summary_at(
@@ -1171,17 +1171,23 @@ mod tests {
             for line in output.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 let frame: Summary = serde_json::from_slice(line).unwrap();
                 frame.validate().unwrap();
-                assert_eq!(
-                    services(&frame).contains(&Service::Antigravity),
-                    antigravity
-                );
+                for service in [Service::Antigravity, Service::Grok] {
+                    assert_eq!(
+                        services(&frame).contains(&service),
+                        reader.reads(service),
+                        "{reader:?}"
+                    );
+                }
                 assert!(services(&frame).contains(&Service::Codex));
             }
             let summary = read_summary(dir.path(), reader).unwrap();
-            assert_eq!(
-                services(&summary).contains(&Service::Antigravity),
-                antigravity
-            );
+            for service in [Service::Antigravity, Service::Grok] {
+                assert_eq!(
+                    services(&summary).contains(&service),
+                    reader.reads(service),
+                    "{reader:?}"
+                );
+            }
         }
     }
     #[tokio::test]
@@ -1636,13 +1642,13 @@ mod ssh_summary_tests {
             }
         });
         let (client, status) = crate::daemon::tests::wait_for_daemon(&state);
-        let missing_default = read_summary(&state, ReaderServices::parse(SERVICES));
+        let missing_default = read_summary(&state, ReaderServices::ALL);
         // A valid but different default configuration must not override the
         // live daemon's account mapping, nor its separate log path.
         std::fs::write(state.join("config.yaml"), "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        let wrong_default = read_summary(&state, ReaderServices::parse(SERVICES));
+        let wrong_default = read_summary(&state, ReaderServices::ALL);
         std::fs::write(state.join("config.yaml"), "invalid: [").unwrap();
-        let invalid_default = read_summary(&state, ReaderServices::parse(SERVICES));
+        let invalid_default = read_summary(&state, ReaderServices::ALL);
         client.stop().unwrap();
         daemon.join().unwrap().unwrap();
         assert_eq!(status.config_path, config_path);
@@ -1667,7 +1673,7 @@ mod ssh_summary_tests {
         crate::settings::create_private(&dir.path().join("config.yaml"),b"listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let node = prepare_identity(dir.path()).unwrap();
         let before = std::fs::read(dir.path().join("data-identity.key")).unwrap();
-        let summary = read_summary(dir.path(), ReaderServices::parse(SERVICES)).unwrap();
+        let summary = read_summary(dir.path(), ReaderServices::ALL).unwrap();
         summary.validate().unwrap();
         assert_eq!(summary.node_id, node);
         assert!(summary.groups.is_empty());

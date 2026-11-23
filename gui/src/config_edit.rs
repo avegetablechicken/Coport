@@ -15,7 +15,7 @@ enum Kind {
 type Getter = fn(&Config) -> Value;
 
 /// Configuration values the Settings page may change, as dotted YAML keys.
-const EDITABLE: [(&str, Kind, Getter); 13] = [
+const EDITABLE: [(&str, Kind, Getter); 14] = [
     ("auto_refresh_access_token", Kind::Flag, |c| {
         json!(c.auto_refresh_access_token)
     }),
@@ -49,6 +49,9 @@ const EDITABLE: [(&str, Kind, Getter); 13] = [
     }),
     ("antigravity.account_auth_file_only", Kind::Flag, |c| {
         json!(c.antigravity.account_auth_file_only)
+    }),
+    ("grok.account_auth_file_only", Kind::Flag, |c| {
+        json!(c.grok.file_only())
     }),
     ("claude.account_auth_file_only", Kind::Flag, |c| {
         json!(c.claude.account_auth_file_only)

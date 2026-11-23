@@ -16,6 +16,7 @@ pub fn is_model_endpoint(method: &str, raw: &str) -> bool {
         .or_else(|| raw.strip_prefix("/anthropic/"))
         .or_else(|| raw.strip_prefix("/claude/"))
         .or_else(|| raw.strip_prefix("/antigravity/"))
+        .or_else(|| raw.strip_prefix("/grok/"))
         .unwrap_or(raw)
         .trim_start_matches('/');
     // Only explicit upstream targets are URLs; `v1internal:x` would parse as one.
@@ -1580,6 +1581,26 @@ mod tests {
             &mut log,
         );
         assert_eq!(log.fields["model_outcome"], "failed");
+    }
+    #[test]
+    fn grok_builds_responses_and_chat_completions_are_model_calls() {
+        for target in [
+            "/grok/v1/responses",
+            "/grok/v1/chat/completions",
+            "/grok/chat/completions",
+            "/grok/https://cli-chat-proxy.grok.com/v1/responses",
+            "/grok/https://gateway.example.com/v1/responses",
+        ] {
+            assert!(is_model_endpoint("POST", target), "{target}");
+        }
+        for target in [
+            "/grok/v1/models",
+            "/grok/v1/settings",
+            "/grok/v1/billing?format=credits",
+        ] {
+            assert!(!is_model_endpoint("GET", target), "{target}");
+            assert!(!is_model_endpoint("POST", target), "{target}");
+        }
     }
     #[test]
     fn gemini_methods_and_responses_are_model_calls() {

@@ -199,7 +199,7 @@ To route proxy-port clients by credential, as for base URL clients, enable
 connect_credential_routing: true # Default false; restart to apply.
 ```
 
-CONNECT requests to the API hosts that the `codex`, `claude` and `antigravity`
+CONNECT requests to the API hosts that the `codex`, `claude`, `antigravity` and `grok`
 sections route by credential are then answered locally instead of tunnelled: the
 client's TLS is terminated with a certificate from a second private CA,
 `tls/proxy-ca.pem` (with an owner-only `tls/proxy-ca-key.pem`), and each request
@@ -218,8 +218,9 @@ connection. These hosts are decrypted:
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Any, for each URL route | that route's host and port, including public IPv4 addresses |
 | Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `www.googleapis.com` (account lookup), as `/antigravity/https://<host>/...` |
-| Grok, with subscription account routes or a fallback | `auth.x.ai` and `cli-chat-proxy.grok.com` |
 | Antigravity, with named API Key routes or `fallback` | `antigravity.base_url.api_key`, as `/antigravity/https://<host>/...` |
+| Grok, with account routes, `account_fallback` or `fallback` | `grok.base_url.account`, `cli-chat-proxy.grok.com` and `auth.x.ai`, as `/grok/https://<host>/...` |
+| Grok, with named API Key routes or `fallback` | `grok.base_url.api_key`, as `/grok/https://<host>/...` |
 
 A host routed by more than one service uses the unprefixed `/https://` form and
 its usual conflict rules. Destination discovery reads local provider/settings definitions
@@ -593,6 +594,48 @@ not logged), and model calls record Gemini usage as above. Neither form needs
 `base_url.api_key` (with a name or `fallback`) and each URL route's host are
 decrypted too, as `/antigravity/https://<host>/...`.
 
+## Connect Grok Build
+
+Grok Build (`grok`) sends a login's requests to its session API,
+`cli-chat-proxy.grok.com`, and an API key's (`XAI_API_KEY`) to the xAI API. Add a
+`grok` section as shown in [Configuration](configuration.md#grok), then point both
+endpoints of `~/.grok/config.toml` (`$GROK_HOME/config.toml`) at the local
+listener:
+
+```toml
+[endpoints]
+cli_chat_proxy_base_url = "http://127.0.0.1:8787/grok/v1"
+xai_api_base_url = "http://127.0.0.1:8787/grok/v1"
+```
+
+`GROK_CLI_CHAT_PROXY_BASE_URL` and `GROK_XAI_API_BASE_URL` set the same for one
+session. Use your configured `listen_port`. The `/grok` prefix is removed and the
+credential decides the upstream: a saved login's requests go to
+`grok.base_url.account` (`/grok/v1/responses` reaches
+`https://cli-chat-proxy.grok.com/v1/responses`), a named or `fallback` key's to
+`grok.base_url.api_key`. Model, settings, billing and telemetry requests take the
+same route; Responses and Chat Completions calls record their model and usage. An
+explicit `/grok/https://<host>/...` target names the upstream: an xAI API host for
+a login, also a named key's gateway, or a URL route's. Grok Build's WebSocket
+connections, if any, are refused with 400.
+
+A custom model in Grok Build's configuration may name a gateway through Coport in
+the same way, with its own key:
+
+```toml
+[model."gateway-model"]
+model = "grok-4.7"
+base_url = "http://127.0.0.1:8787/grok/https://gateway.example.com/v1"
+env_key = "GATEWAY_KEY"
+```
+
+with `GATEWAY_KEY: jp` (a named key) or `gateway.example.com/v1: jp` (a URL route)
+under `grok.routing.api_key`. Records name the route by its variable or URL
+(`fallback` as `grok-api-key-fallback`), and a login's by its account and route.
+With [proxy port credential routing](#credential-routing-on-the-proxy-port), the
+session API, `base_url.api_key` (with a name or `fallback`) and each URL route's
+host are decrypted as `/grok/https://<host>/...`. Account routes also cover
+`auth.x.ai` for client-initiated token renewal. The client saves the renewed login.
 
 ## Copool Grok subscription usage
 
@@ -638,8 +681,8 @@ and configured fallbacks can also route requests. Existing configurations
 without either file setting continue to use learned identities and fallbacks.
 
 `base_url.account` selects the upstream for billing and settings. Renewals
-always go to `auth.x.ai/oauth2/token`. The `api_key` URL is validated
-separately. Setting it alone enables no API Key routes.
+always go to `auth.x.ai/oauth2/token`. Named keys under `routing.api_key` use
+`base_url.api_key` by default.
 
 To select different exits per login, add `grok.routing.account` entries.
 Selectors match the exact `user_id/team_id`, then `user_id`, then email.
@@ -649,5 +692,4 @@ For other Copool logins the first request uses `account_fallback` or
 `fallback`. With neither configured, Coport rejects unknown accounts locally.
 A successful renewal associates the returned token digests with the account
 identified by xAI or by the matched login. Coport keeps these mappings in
-`grok-token-routes.json` across restarts. A JWT supplied by a client cannot
-declare its own route.
+`grok-token-routes.json` across restarts. For these subscription endpoints, identity comes from a saved login or a successful renewal.

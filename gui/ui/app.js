@@ -138,7 +138,7 @@ function toast(text) {
 
 // Original provider SVGs copied from OpenQuota; CSS masks apply the GUI theme color.
 function serviceMark(service) {
-  const name = { Claude: "claude", Codex: "codex", Antigravity: "antigravity" }[service];
+  const name = { Claude: "claude", Codex: "codex", Antigravity: "antigravity", Grok: "grok" }[service];
   return name ? `<span class="service-mark ${name}-mark" aria-hidden="true"></span>` : "";
 }
 
@@ -838,14 +838,15 @@ function connectBlock() {
   return block(
     "Connect",
     "",
-    `${row("Codex", "Codex", s.urls.codex)}${row("Claude", "Claude", s.urls.claude)}${row("Antigravity", "Antigravity", s.urls.antigravity)}
+    `${row("Codex", "Codex", s.urls.codex)}${row("Claude", "Claude", s.urls.claude)}${row("Antigravity", "Antigravity", s.urls.antigravity)}${row("Grok", "Grok", s.urls.grok)}
      <details class="disclosure" id="setup-snippets" ${ui.snippetsOpen ? "open" : ""}><summary>${ICON.chevron}Setup snippets</summary>
        ${snippet("Top of ~/.codex/config.toml, then restart Codex. Codex 0.156+ requires an HTTPS chatgpt_base_url", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Antigravity CLI (agy): environment, so its Cloud Code requests come here", `CLOUD_CODE_URL=${s.urls.antigravity}`)}
+       ${snippet("~/.grok/config.toml, so Grok Build's login and API key requests come here", `[endpoints]\ncli_chat_proxy_base_url = "${s.urls.grok}"\nxai_api_base_url = "${s.urls.grok}"`)}
        ${ui.snap.config.details?.editable?.connect_credential_routing ? `
-       ${snippet("Proxy port instead of base URLs: environment for Codex and Claude, which keep their original API URLs", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
+       ${snippet("Proxy port for clients using their original API URLs; set HTTPS_PROXY to the listener", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
      </details>`
   );
 }
@@ -1067,7 +1068,7 @@ function routingBlock() {
   };
   const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
   const credentialError = s.credentialError ? `<div class="placeholder">Credential checks unavailable: ${esc(s.credentialError)}</div>` : "";
-  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude) + section("Antigravity", d.antigravity) + (d.grok?.configured ? section("Grok", d.grok) : ""));
+  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude) + section("Antigravity", d.antigravity) + section("Grok", d.grok));
 }
 
 // ---------------------------------------------------------------- activity
@@ -1356,7 +1357,8 @@ function maskAccountName(name) {
   return name;
 }
 
-/// Credentials grouped by app, each group in its hue. `measure` gives a credential's amount, or null when it
+/// Credentials grouped by app, Codex, Claude, Antigravity, then Grok, each group in its hue; traffic
+/// has no other service. `measure` gives a credential's amount, or null when it
 /// is unknown. The two largest of a service always keep their slice; past them
 /// a credential under SHARE_MIN of the whole ring folds into "Others", when at
 /// least two do. Unknown amounts keep their row. Others takes the next shade after
@@ -2272,7 +2274,8 @@ function configSettings() {
     `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a Codex, Claude or Antigravity login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
      ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
      ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}
-     ${flag("antigravity.account_auth_file_only", "Antigravity: saved login only", "When off, accepts other Google logins and looks up their email.")}`
+     ${flag("antigravity.account_auth_file_only", "Antigravity: saved login only", "When off, accepts other Google logins and looks up their email.")}
+     ${flag("grok.account_auth_file_only", "Grok: saved logins only", "When off, accepts other xAI logins by the account their token names.")}`
   )}`;
 }
 

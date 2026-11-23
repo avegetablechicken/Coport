@@ -46,6 +46,11 @@ pub fn antigravity_api_key(config: &Config, selector: &str) -> Option<String> {
     config.antigravity.api_key_upstream(selector).map(display)
 }
 
+/// A named key's xAI API base; URL routes name their own.
+pub fn grok_api_key(config: &Config, selector: &str) -> Option<String> {
+    config.grok.api_key_upstream(selector).map(display)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

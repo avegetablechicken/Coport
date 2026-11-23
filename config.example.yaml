@@ -90,18 +90,24 @@ claude:
 #     #   "relay.example.com/antigravity": us # .../antigravity/https://relay.example.com/antigravity
 #     # account_probe: us # Google account lookup before the route is known.
 
-# Grok Build subscription refreshes from Copool. Enable connect_credential_routing
-# above for proxy-port clients. Use an existing proxy name or none for direct.
+# Grok Build (~/.grok/config.toml: [endpoints] cli_chat_proxy_base_url and
+# xai_api_base_url = "http://127.0.0.1:8787/grok/v1") routes its logins by the
+# account auth.json names, and its API keys by key or upstream URL; see
+# docs/configuration.md#grok.
 # grok:
-#   base_url:
-#     account: "https://cli-chat-proxy.grok.com/v1"
-#     api_key: "https://api.x.ai/v1" # Separate from subscription requests.
-#   account_auth_file_only: false # Also accepts learned identities or an explicit fallback.
-#   # auth_file: "~/.grok/auth.json" # Override Grok Build's standard login location.
+#   base_url: # As Codex's.
+#     account: "https://cli-chat-proxy.grok.com/v1" # xAI login.
+#     api_key: "https://api.x.ai/v1" # Keys naming no upstream.
+#   # auth_file: "~/.grok/auth.json" # One login file in place of homes.
+#   homes: ["~/.grok"]
+#   account_auth_file_only: true # false: route other logins by their token's claims.
 #   routing:
-#     account_fallback: us # Used before Copool's account can be identified.
 #     account:
-#       "you@example.com": jp
+#       "you@example.com": us # A saved login's email or user ID; default: any other.
+#     # account_fallback: us # First renewal for a Copool login unknown to Coport.
+#     # api_key:
+#     #   MY_SUB2API_GROK_API_KEY: none # This environment variable holds the direct-route key.
+#     #   "gateway.example.com/v1": us # .../grok/https://gateway.example.com/v1
 
 # Omit API Key entries unless configured. To enable them, add under routing:
 # codex.routing.api_key.OPENAI_API_KEY: us

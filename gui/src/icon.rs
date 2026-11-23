@@ -111,8 +111,8 @@ fn accent(service: Service) -> u32 {
     match service {
         Service::Claude => 0xf27d32,
         Service::Codex => 0x10a37f,
-        Service::Grok => 0x737373,
         Service::Antigravity => 0x1c7df1,
+        Service::Grok => 0x8b5cf6,
     }
 }
 
@@ -695,7 +695,12 @@ mod tests {
         // At rest a colored frame matches the template drawn in the light bar's
         // ink, so swapping between them does not jump.
         let template = template(44, Status::Running);
-        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+        for service in [
+            Service::Claude,
+            Service::Codex,
+            Service::Antigravity,
+            Service::Grok,
+        ] {
             let rest = beacon(44, Turn::REST, service, false);
             for (t, c) in template.chunks(4).zip(rest.chunks(4)) {
                 assert!((t[3] as f32 * 0.85 - c[3] as f32).abs() <= 1.0);
@@ -720,7 +725,12 @@ mod tests {
             assert!(antigravity[2] > antigravity[1] + 30, "{antigravity:?}");
         }
         // The light keeps its color whatever the bar's appearance.
-        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+        for service in [
+            Service::Claude,
+            Service::Codex,
+            Service::Antigravity,
+            Service::Grok,
+        ] {
             let (light, dark) = (lantern(service, false), lantern(service, true));
             for (l, d) in light.into_iter().zip(dark) {
                 assert!(l.abs_diff(d) <= 12, "{service:?}: {light:?} {dark:?}");
@@ -741,7 +751,12 @@ mod tests {
                 .sum()
         };
         assert_eq!(beams(&template(44, Status::Running)), 0);
-        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+        for service in [
+            Service::Claude,
+            Service::Codex,
+            Service::Antigravity,
+            Service::Grok,
+        ] {
             for dark in [false, true] {
                 assert_eq!(beams(&beacon(44, Turn::REST, service, dark)), 0);
                 assert_eq!(beams(&beacon(44, Turn::at(1.0), service, dark)), 0);
@@ -761,6 +776,7 @@ mod tests {
         };
         assert_eq!(super::accent(Service::Codex), panel("codex"));
         assert_eq!(super::accent(Service::Antigravity), panel("antigravity"));
+        assert_eq!(super::accent(Service::Grok), panel("grok"));
         // Claude's panel color turned toward orange: as red, more green.
         let rgb = |hex: u32| [hex >> 16, (hex >> 8) & 0xff, hex & 0xff];
         let (bar, panel) = (rgb(super::accent(Service::Claude)), rgb(panel("claude")));
@@ -773,7 +789,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn menu_bar_beams_shine_in_the_app_color() {
-        for service in [Service::Claude, Service::Codex, Service::Antigravity] {
+        for service in [
+            Service::Claude,
+            Service::Codex,
+            Service::Antigravity,
+            Service::Grok,
+        ] {
             let accent = super::accent(service);
             let accent = [accent >> 16, (accent >> 8) & 0xff, accent & 0xff].map(|c| c as u8);
             for dark in [false, true] {
