@@ -225,7 +225,9 @@ impl Server {
             )
             .await?;
         Ok(
-            if refresh && !settings.subscription_file_only() && response.status().is_success() {
+            // Learned whatever the policy, which only decides whether learned
+            // tokens are used, so turning it off later finds these renewals.
+            if refresh && response.status().is_success() {
                 self.learn_refresh_route(
                     response,
                     self.grok_routes.clone(),

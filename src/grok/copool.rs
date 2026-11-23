@@ -153,7 +153,7 @@ impl Grok {
         refresh: bool,
         learned: &RefreshRoutes<GrokAccount>,
     ) -> Result<(&'a Choice, Option<GrokAccount>, Option<&'a str>)> {
-        let known = if self.subscription_file_only() {
+        let known = if self.file_only() {
             None
         } else if refresh {
             learned.identity(token)
@@ -166,7 +166,7 @@ impl Grok {
             None => Self::saved(files, token, refresh).await,
         };
         let unavailable = || Error::config("Cannot read Grok auth_file.");
-        if identity.is_none() && self.subscription_file_only() {
+        if identity.is_none() && self.file_only() {
             return Err(if unreadable {
                 unavailable()
             } else {
@@ -302,6 +302,14 @@ mod tests {
             config.grok.route("unknown", false, &routes).await,
             Err(Error { status: 403, .. })
         ));
+        // Settings shows the default as on, and every endpoint keeps it.
+        config.grok.account_auth_file_only = None;
+        for (token, refresh) in [("known", true), ("unknown", false)] {
+            assert!(matches!(
+                config.grok.route(token, refresh, &routes).await,
+                Err(Error { status: 403, .. })
+            ));
+        }
         config.grok.account_auth_file_only = Some(false);
         assert!(
             config
@@ -363,7 +371,8 @@ mod tests {
                 Err(Error { status: s, .. }) if s == status
             ));
         }
-        let fallback = parse("  routing:\n    account_fallback: none\n");
+        let fallback =
+            parse("  account_auth_file_only: false\n  routing:\n    account_fallback: none\n");
         let (_, identity, label) = fallback
             .route_in(vec![broken.clone()], "unknown", false, &routes)
             .await

@@ -6299,6 +6299,93 @@ async fn antigravity_location_cooldown_disconnects_before_headers_and_only_delay
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
 
+/// Renewals are learned whatever the saved-login policy, which only decides
+/// whether learned tokens are used: a policy turned off later finds the
+/// accounts renewed while it was on.
+#[tokio::test]
+async fn grok_renewals_are_learned_while_the_saved_login_policy_is_on() {
+    let mut mapped = fixture("http", "grok").await;
+    let mapped_url = format!("http://{}", mapped.addr);
+    let state = tempfile::tempdir().unwrap();
+    let routes = state.path().join(crate::refresh_routes::GROK_FILE);
+    let auth = state.path().join("auth.json");
+    let login = json!({"user_id":"alice","team_id":"team","key":"saved-access","refresh_token":"saved-refresh"});
+    std::fs::write(
+        &auth,
+        json!({format!("{}::{}", crate::grok::ISSUER, crate::grok::CLIENT_ID): login}).to_string(),
+    )
+    .unwrap();
+    let config = |policy: &str| {
+        format!(
+            "connect_credential_routing: true\nproxies:\n  mapped: {mapped_url}\ngrok:\n  auth_file: {}\n{policy}  routing:\n    account: {{alice/team: mapped}}\n",
+            serde_json::to_string(&auth).unwrap()
+        )
+    };
+    let start = |policy: &'static str| {
+        let config = config(policy);
+        let routes = routes.clone();
+        async move {
+            running_with_server(
+                &config,
+                |_| {},
+                |server| {
+                    server.with_grok_routes(crate::refresh_routes::RefreshRoutes::load(routes))
+                },
+            )
+            .await
+        }
+    };
+    let billing = |client: &reqwest::Client| {
+        client
+            .get(format!("{}/v1/billing?format=credits", crate::grok::API))
+            .bearer_auth("issued-access")
+            .send()
+    };
+    // The default policy: the saved login renews and is learned.
+    let strict = start("").await;
+    trust(&strict, &mapped, &mapped_url);
+    let client = proxy_port_client(&strict);
+    let reply = client
+        .post("https://auth.x.ai/oauth2/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", crate::grok::CLIENT_ID),
+            ("refresh_token", "saved-refresh"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    reply.bytes().await.unwrap();
+    for _ in 0..2 {
+        mapped.requests.recv().await.unwrap();
+    }
+    let learned =
+        crate::refresh_routes::RefreshRoutes::<crate::grok::GrokAccount>::load(routes.clone());
+    assert_eq!(
+        learned.identity("issued-refresh").unwrap().user_id(),
+        "alice"
+    );
+    assert!(learned.access_identity("issued-access").is_some());
+    // Until auth.json holds it, the policy refuses the renewed token.
+    assert_eq!(billing(&client).await.unwrap().status(), 403);
+    assert!(mapped.requests.try_recv().is_err());
+    drop(strict);
+    // Turned off, the renewal's account route takes it at once.
+    let open = start("  account_auth_file_only: false\n").await;
+    trust(&open, &mapped, &mapped_url);
+    let reply = billing(&proxy_port_client(&open)).await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(
+        mapped
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT cli-chat-proxy.grok.com:443 ")
+    );
+}
+
 #[tokio::test]
 async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_restart() {
     let mut bootstrap = fixture("http", "grok").await;
@@ -6308,7 +6395,7 @@ async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_re
     let state = tempfile::tempdir().unwrap();
     let file = state.path().join(crate::refresh_routes::GROK_FILE);
     let config = format!(
-        "connect_credential_routing: true\nproxies:\n  first: {bootstrap_url}\n  mapped: {mapped_url}\ngrok:\n  routing:\n    account_fallback: first\n    account: {{alice/team: mapped}}\n"
+        "connect_credential_routing: true\nproxies:\n  first: {bootstrap_url}\n  mapped: {mapped_url}\ngrok:\n  account_auth_file_only: false\n  routing:\n    account_fallback: first\n    account: {{alice/team: mapped}}\n"
     );
     for restart in [false, true] {
         let running = running_with_server(

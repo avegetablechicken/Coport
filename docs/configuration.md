@@ -445,8 +445,10 @@ token selects its login by `user_id/team_id`, user ID, case-insensitive email, t
 itself and rewrites the file, so the renewed token matches on its next request.
 No account lookup is ever made: the file names the account.
 
-With `account_auth_file_only: true`, any other login token (xAI's are JWTs) is
-rejected. With `false`, its own claims (`sub` and `email`, unverified, as
+With `account_auth_file_only: true`, the default, any other login token (xAI's
+are JWTs) is rejected on every Grok endpoint, billing, settings and renewal
+included; renewals relayed through Coport are still learned, for when the
+policy is turned off. With `false`, its own claims (`sub` and `email`, unverified, as
 Codex's `false` mode reads ChatGPT tokens) select its route, else
 `account_fallback`, then `fallback`; `default` stays the saved logins'. Login
 requests go to `base_url.account`, Grok Build's session API, or to an xAI API

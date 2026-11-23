@@ -207,14 +207,10 @@ fn same_origin(a: &Url, b: &Url) -> bool {
 }
 
 impl Grok {
+    /// The one file policy of every Grok endpoint, as Settings shows it:
+    /// only saved logins unless `account_auth_file_only: false`.
     pub fn file_only(&self) -> bool {
         self.account_auth_file_only.unwrap_or(true)
-    }
-
-    /// Existing Copool configurations without homes or a file policy may
-    /// bootstrap an unidentified refresh through their configured fallback.
-    pub(crate) fn subscription_file_only(&self) -> bool {
-        self.account_auth_file_only.unwrap_or(self.homes.is_some())
     }
 
     fn login_files(&self) -> Vec<PathBuf> {
@@ -484,7 +480,7 @@ impl Grok {
         // A rotated opaque access token is still an account credential.
         // Resolve it before a gateway or key fallback can claim it.
         if let Some(identity) = learned.and_then(|routes| routes.access_identity(token)) {
-            if !self.enabled() || self.subscription_file_only() {
+            if !self.enabled() || self.file_only() {
                 return Err(Error::new(401, "Grok token does not match a saved login."));
             }
             let identity = identity.model_identity();
@@ -708,7 +704,7 @@ impl Grok {
     /// be read, for credential checks.
     pub async fn check_credentials(&self) -> Result<()> {
         self.check_api_keys().await?;
-        if !self.enabled() || !self.subscription_file_only() {
+        if !self.enabled() || !self.file_only() {
             return Ok(());
         }
         match self.logins() {

@@ -642,9 +642,12 @@ host are decrypted as `/grok/https://<host>/...`. Account routes also cover
 Set `connect_credential_routing: true` in Coport and add a Grok route to the
 same YAML file. This example sends subscription requests through an existing
 outbound proxy named `us`. Use `none` for a direct outbound connection.
+Copool's logins are not in Grok Build's `auth.json`, so turn off the saved-login
+policy, which is on by default for every Grok endpoint:
 
 ```yaml
 grok:
+  account_auth_file_only: false
   routing:
     account_fallback: us
 ```
@@ -677,10 +680,10 @@ Coport looks for Grok Build's login in `grok.homes`, else at
 `$GROK_HOME/auth.json`, or `~/.grok/auth.json` when `GROK_HOME` is unset, as
 for its model requests. Set `auth_file` to override that path. A file that
 cannot be read does not hide another's login, but a token no route can take is
-then refused with 502. With `true`, every token must match the current saved
-login even when a fallback exists. With `false`, learned accounts and
-configured fallbacks can also route requests. Existing configurations without
-either file setting also use learned identities and fallbacks.
+then refused with 502. With `true`, the default, every token must match the
+current saved login even when a fallback exists. With `false`, learned accounts
+and configured fallbacks can also route requests. Renewals are learned either
+way, so turning the policy off later finds the accounts renewed meanwhile.
 
 `base_url.account` selects the upstream for billing and settings. Renewals
 always go to `auth.x.ai/oauth2/token`. Named keys under `routing.api_key` use
@@ -690,8 +693,9 @@ To select different exits per login, add `grok.routing.account` entries.
 Selectors match the exact `user_id/team_id`, then `user_id`, then email.
 Optionally set `grok.auth_file` to the Grok Build login file (usually
 `~/.grok/auth.json`) to identify its access or refresh token on first use.
-For other Copool logins the first request uses `account_fallback` or
-`fallback`. With neither configured, Coport rejects unknown accounts locally.
+With `account_auth_file_only: false`, the first request of another Copool
+login uses `account_fallback` or `fallback`. With neither configured, or with
+the policy on, Coport rejects unknown accounts locally.
 A successful renewal associates the returned token digests with the account
 identified by xAI or by the matched login. Coport keeps these mappings in
 `grok-token-routes.json` across restarts. For these subscription endpoints, identity comes from a saved login or a successful renewal.
