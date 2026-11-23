@@ -87,7 +87,8 @@ impl Account for AntigravityIdentity {
     }
 }
 /// A login rotates its refresh token on every renewal; a client may still
-/// retry a recent generation.
+/// retry a recent generation. A generation is one renewal: its refresh
+/// token and, for Grok, its access token, learned together.
 const PER_ACCOUNT: usize = 4;
 const LIMIT: usize = 256;
 
@@ -193,24 +194,25 @@ impl<A: Account> RefreshRoutes<A> {
             routes.insert(digest(&format!("access\0{access}")), learned.clone());
         }
         routes.insert(digest(refresh_token), learned);
-        let mut generations: Vec<(u64, String)> = routes
-            .iter()
-            .filter(|(_, learned)| learned.account_id == identity.account_id())
-            .map(|(key, learned)| (learned.learned_at, key.clone()))
+        // Whole generations go, so a renewal's access token never outlives
+        // or crowds out its refresh token.
+        let mut generations: Vec<u64> = routes
+            .values()
+            .filter(|learned| learned.account_id == identity.account_id())
+            .map(|learned| learned.learned_at)
             .collect();
         generations.sort_unstable();
-        for (_, key) in generations.iter().rev().skip(PER_ACCOUNT) {
-            routes.remove(key);
+        generations.dedup();
+        if let Some(&kept) = generations.iter().rev().nth(PER_ACCOUNT - 1) {
+            routes.retain(|_, learned| {
+                learned.account_id != identity.account_id() || learned.learned_at >= kept
+            });
         }
         while routes.len() > LIMIT {
-            let Some(oldest) = routes
-                .iter()
-                .min_by_key(|(_, learned)| learned.learned_at)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some(oldest) = routes.values().map(|learned| learned.learned_at).min() else {
                 break;
             };
-            routes.remove(&oldest);
+            routes.retain(|_, learned| learned.learned_at != oldest);
         }
         let Some(path) = &self.path else {
             return Ok(());
@@ -389,5 +391,55 @@ mod tests {
         assert_eq!(routes.routes.lock().unwrap().len(), LIMIT);
         assert!(routes.identity("many-0").is_none());
         assert!(routes.identity(&format!("many-{LIMIT}")).is_some());
+    }
+
+    /// Grok keeps a renewal's access token beside its refresh token: they
+    /// share a generation, and go together.
+    #[test]
+    fn grok_access_tokens_take_no_generation_of_their_own() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let access = |account: &str, n: usize| {
+            let claims = serde_json::json!({"sub": account, "n": n}).to_string();
+            format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims))
+        };
+        let renew = |routes: &RefreshRoutes<crate::grok::GrokAccount>, account: &str, n: usize| {
+            let body = serde_json::json!({"access_token": access(account, n), "refresh_token": format!("{account}-{n}")});
+            assert!(
+                routes
+                    .learn_response(body.to_string().as_bytes(), None)
+                    .unwrap()
+            );
+        };
+        let routes = RefreshRoutes::<crate::grok::GrokAccount>::default();
+        for n in 0..6 {
+            renew(&routes, "alice", n);
+        }
+        for n in 0..6 {
+            let kept = n >= 6 - PER_ACCOUNT;
+            assert_eq!(
+                routes.identity(&format!("alice-{n}")).is_some(),
+                kept,
+                "{n}"
+            );
+            assert_eq!(
+                routes.access_identity(&access("alice", n)).is_some(),
+                kept,
+                "{n}"
+            );
+        }
+        // Past the limit, the oldest renewals go whole.
+        for n in 0..LIMIT {
+            renew(&routes, &format!("user{n}"), 0);
+        }
+        assert!(routes.routes.lock().unwrap().len() <= LIMIT);
+        for n in 0..LIMIT {
+            let account = format!("user{n}");
+            assert_eq!(
+                routes.identity(&format!("{account}-0")).is_some(),
+                routes.access_identity(&access(&account, 0)).is_some(),
+                "{account}"
+            );
+        }
+        assert!(routes.identity(&format!("user{}-0", LIMIT - 1)).is_some());
     }
 }
