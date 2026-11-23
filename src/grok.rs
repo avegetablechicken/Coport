@@ -574,7 +574,7 @@ impl Grok {
         }))
     }
 
-    /// An API key's route: `base_url.api_key` for a path or an xAI host
+    /// An API key's route: `base_url.api_key` for a path or the xAI API host
     /// the request names; a named key may go to another upstream its
     /// request names, as a Claude settings file's key goes to that file's
     /// upstream. A key `fallback` carries, which any client may send,
@@ -604,9 +604,10 @@ impl Grok {
         }
         let named =
             Url::parse(&rest[1..]).map_err(|_| Error::config("Invalid explicit upstream."))?;
+        // The logins' session API is not a key's: a named key there is
+        // refused below, as a URL route naming it is.
         let xai = [base, DEFAULT_API_BASE]
             .into_iter()
-            .chain(self.origins())
             .filter_map(|origin| Url::parse(origin).ok())
             .find(|origin| same_origin(origin, &named));
         if let Some(origin) = xai {
@@ -1025,6 +1026,25 @@ pub(crate) mod tests {
         // Fallback keys may still reach xAI's API by URL.
         let explicit = api(resolve(&fallback, "xai-unknown", "/https://api.x.ai/v1/models").await);
         assert_eq!(explicit.url.as_str(), "https://api.x.ai/v1/models");
+        // No key, named or not, reaches the logins' session API, so an
+        // unknown login token cannot take a key route there either.
+        let named = config(
+            home.path(),
+            "  routing:\n    api_key:\n      XAI_API_KEY: none\n    fallback: none\n",
+        )
+        .grok;
+        for token in ["xai-named-key", "xai-unknown"] {
+            for target in [
+                "/https://cli-chat-proxy.grok.com/v1/responses",
+                "/https://cli-chat-proxy.grok.com/v1/settings",
+            ] {
+                assert_eq!(
+                    status(resolve(&named, token, target).await),
+                    502,
+                    "{token} {target}"
+                );
+            }
+        }
         // A key two names hold is refused.
         let two = config(
             home.path(),
