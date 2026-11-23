@@ -1026,6 +1026,12 @@ details.disclosure[open] summary svg {
   transform: rotate(90deg);
 }
 
+/* A disclosure's summary of its rows, right-aligned like a row's value. */
+details.disclosure summary .disclosure-value {
+  margin-left: auto;
+  color: var(--secondary);
+}
+
 .snippet {
   margin-top: 6px;
 }

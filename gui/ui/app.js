@@ -198,6 +198,7 @@ const ui = {
   expanded: new Set(),
   builtPage: null,
   websocketOpen: false,
+  savedLoginsOpen: false,
   snippetsOpen: false,
   rendering: false,
   proxies: {},
@@ -2272,11 +2273,29 @@ function configSettings() {
     "Subscription Logins",
     "",
     `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a Codex, Claude or Antigravity login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
-     ${flag("codex.account_auth_file_only", "Codex: saved logins only", "When off, accepts other ChatGPT logins.")}
-     ${flag("claude.account_auth_file_only", "Claude: saved logins only", "When off, accepts other Claude logins and looks up their account details.")}
-     ${flag("antigravity.account_auth_file_only", "Antigravity: saved login only", "When off, accepts other Google logins and looks up their email.")}
-     ${flag("grok.account_auth_file_only", "Grok: saved logins only", "When off, accepts other xAI logins by the account their token names.")}`
+     ${savedLoginsOnly(v, flag)}`
   )}`;
+}
+
+/// Providers whose "saved logins only" switch shares one disclosure.
+const SAVED_LOGIN_PROVIDERS = [
+  ["codex", "Codex", "When off, accepts other ChatGPT logins."],
+  ["claude", "Claude", "When off, accepts other Claude logins and looks up their account details."],
+  ["antigravity", "Antigravity", "When off, accepts other Google logins and looks up their email."],
+  ["grok", "Grok", "When off, accepts other xAI logins by the account their token names."],
+];
+
+/// One "Saved logins only" disclosure: its summary names the providers that
+/// accept saved logins only, its rows hold a switch per provider.
+function savedLoginsOnly(v, flag) {
+  const on = SAVED_LOGIN_PROVIDERS.filter(([id]) => v[`${id}.account_auth_file_only`]);
+  const status = on.length === 0 ? "Off"
+    : on.length === SAVED_LOGIN_PROVIDERS.length ? "All"
+    : on.map(([, name]) => name).join(", ");
+  return `<details class="disclosure" id="saved-logins-only" ${ui.savedLoginsOpen ? "open" : ""}>
+    <summary data-tip="Accept only logins saved in Coport.">${ICON.chevron}Saved logins only<span class="disclosure-value">${status}</span></summary>
+    ${SAVED_LOGIN_PROVIDERS.map(([id, name, tip]) => flag(`${id}.account_auth_file_only`, name, tip)).join("")}
+  </details>`;
 }
 
 /// Saves a number field when it differs from the configuration. Called on
@@ -3028,6 +3047,7 @@ document.addEventListener("focusout", (event) => {
 document.addEventListener("toggle", (event) => {
   const { id, open } = event.target;
   if (id === "websocket-timeouts") ui.websocketOpen = open;
+  else if (id === "saved-logins-only") ui.savedLoginsOpen = open;
   else if (id === "setup-snippets") ui.snippetsOpen = open;
 }, true);
 
