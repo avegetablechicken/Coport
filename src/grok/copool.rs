@@ -46,6 +46,14 @@ impl GrokAccount {
     }
 }
 
+impl GrokAccount {
+    /// The account records name, as for a saved login's requests: the user
+    /// ID, without the team a route may also name.
+    pub fn user_id(&self) -> &str {
+        self.id.split('/').next().unwrap_or(&self.id)
+    }
+}
+
 impl Account for GrokAccount {
     const TRACK_ACCESS_TOKEN: bool = true;
 

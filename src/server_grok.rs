@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     grok::{ApiRoute, GrokAccount, GrokRoute, GrokTarget},
-    refresh_routes::{Account, RefreshRoutes},
+    refresh_routes::RefreshRoutes,
 };
 
 impl Server {
@@ -206,7 +206,7 @@ impl Server {
             settings.route(&token, refresh, &self.grok_routes).await?;
         log.field("credential_match", credential_match(selector.is_some()));
         if let Some(account) = &identity {
-            log.field("account_id", account.account_id());
+            log.field("account_id", account.user_id());
         }
         if let Some(selector) = selector {
             log.field("account_label", selector);

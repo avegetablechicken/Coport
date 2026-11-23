@@ -6474,6 +6474,37 @@ async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_re
         assert!(mapped.requests.try_recv().is_err());
         assert!(bootstrap.requests.try_recv().is_err());
         running.server.logger.flush().unwrap();
+        // Renewal, billing, settings and model calls of one login record one
+        // account, as Grok Build's saved logins name it: its user ID.
+        let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        let accounts: std::collections::BTreeSet<_> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|row| {
+                row["event"] == "request_finished"
+                    && row["status"] == "200"
+                    && row["path"]
+                        .as_str()
+                        .is_some_and(|p| p.starts_with("/grok/"))
+                    && row["account_id"].is_string()
+            })
+            .map(|row| {
+                (
+                    row["path"].as_str().unwrap_or("").to_owned(),
+                    row["account_id"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        for path in ["/v1/billing", "/v1/settings", "/v1/responses"] {
+            assert!(
+                accounts.iter().any(|(p, _)| p.ends_with(path)),
+                "{path}: {accounts:?}"
+            );
+        }
+        assert!(
+            accounts.iter().all(|(_, id)| *id == "alice"),
+            "{accounts:?}"
+        );
         for content in [
             std::fs::read_to_string(&file).unwrap(),
             std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap(),
