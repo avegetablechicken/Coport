@@ -713,11 +713,14 @@ impl Server {
         }
         match forwarded {
             Ok(mut upstream) => {
-                if let Some(scope) = upstream
+                if let Some(inspect) = upstream
                     .extensions_mut()
-                    .remove::<antigravity_cooldown::Scope>()
+                    .remove::<antigravity_cooldown::Inspect>()
                 {
-                    let Some(response) = self.location_cooldowns.inspect(scope, upstream).await
+                    let Some(response) = self
+                        .location_cooldowns
+                        .inspect(inspect, upstream, &mut log)
+                        .await
                     else {
                         log.outcome = "request_failed";
                         log.status = 400;

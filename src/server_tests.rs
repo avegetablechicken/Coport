@@ -176,6 +176,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     };
                     io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
+                else if response_mode == "permission_denied" {
+                    let body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"The caller does not have permission","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"IAM_PERMISSION_DENIED","metadata":{"consumer":"projects/secret-project"}}]}}"#;
+                    io.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
                 else if response_mode == "location_once" && attempt == 0 {
                     let body = r#"{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
                     io.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
@@ -6143,6 +6147,73 @@ async fn auto_refresh_of_antigravity_is_opt_in_for_model_calls_and_stops_once_re
         .count();
     assert_eq!(refreshes, 1, "{requests:?}");
     assert_eq!(antigravity_saved_item().await, antigravity_wrapped_login());
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+#[tokio::test]
+async fn antigravity_upstream_errors_log_their_reason_and_reach_the_client_intact() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let (running, mut fixture) = antigravity_auto_setup(false, "permission_denied").await;
+    // As agy's periodic config fetch: a GET that is not a model call.
+    let reply = http()
+        .get(format!(
+            "{}/antigravity/https://aicode.googleapis.com/v1alpha:fetchConfig",
+            running.url
+        ))
+        .bearer_auth("access-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 403);
+    assert!(
+        reply
+            .text()
+            .await
+            .unwrap()
+            .contains("IAM_PERMISSION_DENIED")
+    );
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT ")
+    );
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /v1alpha:fetchConfig ")
+    );
+    // A 403 never starts a location cooldown.
+    assert_eq!(
+        antigravity_call(&running, "streamGenerateContent")
+            .await
+            .status(),
+        403
+    );
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let finished = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["event"] == "request_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 2, "{raw}");
+    for line in &finished {
+        assert_eq!(line["status"], "403");
+        assert_eq!(line["upstream_error_status"], "PERMISSION_DENIED");
+        assert_eq!(line["upstream_error_reason"], "IAM_PERMISSION_DENIED");
+        assert_eq!(
+            line["upstream_error_message"],
+            "The caller does not have permission"
+        );
+    }
+    assert!(!raw.contains("secret-project"));
+    assert!(!raw.contains("access-secret"));
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
 

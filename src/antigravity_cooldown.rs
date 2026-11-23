@@ -1,11 +1,13 @@
 //! A location rejection is terminal for agy. Close that request before headers
-//! and let its next model call wait locally for this login's cooldown.
+//! and let its next model call wait locally for this login's cooldown. Other
+//! upstream errors pass through unchanged, with Google's error envelope logged.
 use super::*;
 use std::io::Read;
 use tokio::time::{Instant as Tick, sleep_until};
 
 const COOLDOWN: Duration = Duration::from_secs(180);
 const ERROR_LIMIT: usize = 16 * 1024;
+const MESSAGE_LIMIT: usize = 300;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(super) struct Scope(String, String);
@@ -26,18 +28,24 @@ impl Scope {
         .then(scope)
     }
 
+    /// Mark an upstream error for inspection; only a 400 model call can
+    /// start a location cooldown.
     pub(super) fn tag_error(
         scope: Option<Self>,
         mut response: reqwest::Response,
     ) -> reqwest::Response {
-        if response.status() == 400 {
-            if let Some(scope) = scope {
-                response.extensions_mut().insert(scope);
-            }
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            let cooldown = scope.filter(|_| status == 400);
+            response.extensions_mut().insert(Inspect(cooldown));
         }
         response
     }
 }
+
+/// An upstream error to inspect, with the login it may cool down.
+#[derive(Clone)]
+pub(super) struct Inspect(Option<Scope>);
 
 #[derive(Default)]
 pub(super) struct LocationCooldowns(Mutex<HashMap<Scope, Tick>>);
@@ -59,11 +67,12 @@ impl LocationCooldowns {
     }
 
     /// Inspect only a small error envelope. Replay every original byte (and
-    /// any body error) for ordinary, oversized or unrecognized 400s.
+    /// any body error) for ordinary, oversized or unrecognized errors.
     pub(super) async fn inspect(
         &self,
-        scope: Scope,
+        Inspect(scope): Inspect,
         response: reqwest::Response,
+        log: &mut RequestLog,
     ) -> Option<reqwest::Response> {
         if response
             .content_length()
@@ -82,12 +91,21 @@ impl LocationCooldowns {
                 other => break other,
             }
         };
-        if overflow.is_none() && location_error(&parts.headers, &prefix) {
-            let now = Tick::now();
-            let mut entries = self.0.lock().unwrap();
-            entries.retain(|_, until| *until > now);
-            entries.insert(scope, now + COOLDOWN);
-            return None;
+        let error = overflow
+            .is_none()
+            .then(|| error_envelope(&parts.headers, &prefix))
+            .flatten();
+        if let Some(error) = &error {
+            log_error(error, log);
+        }
+        if let (Some(scope), Some(error)) = (scope, &error) {
+            if location_error(error) {
+                let now = Tick::now();
+                let mut entries = self.0.lock().unwrap();
+                entries.retain(|_, until| *until > now);
+                entries.insert(scope, now + COOLDOWN);
+                return None;
+            }
         }
         let prefix = futures_util::stream::iter([Ok(Bytes::from(prefix))]);
         let stream = prefix
@@ -97,7 +115,8 @@ impl LocationCooldowns {
     }
 }
 
-fn location_error(headers: &HeaderMap, body: &[u8]) -> bool {
+/// The `error` object of a complete, small JSON error body.
+fn error_envelope(headers: &HeaderMap, body: &[u8]) -> Option<serde_json::Value> {
     // agy's Go transport can request gzip even for JSON errors. Inspect a
     // bounded decoded copy; the original encoding is preserved on pass-through.
     let mut decoded = Vec::new();
@@ -112,16 +131,46 @@ fn location_error(headers: &HeaderMap, body: &[u8]) -> bool {
                 .is_err()
                 || decoded.len() > ERROR_LIMIT
             {
-                return false;
+                return None;
             }
             &decoded
         }
-        _ => return false,
+        _ => return None,
     };
-    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    let error = &envelope["error"];
+    let mut envelope = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let error = envelope.get_mut("error")?.take();
+    error.is_object().then_some(error)
+}
+
+/// Record why the upstream refused: its status, `ErrorInfo` reason and a
+/// single-line, bounded message. Other details are not logged.
+fn log_error(error: &serde_json::Value, log: &mut RequestLog) {
+    if let Some(status) = error["status"].as_str() {
+        log.field("upstream_error_status", status);
+    }
+    let reason = error["details"].as_array().and_then(|details| {
+        details.iter().find_map(|detail| {
+            detail["@type"]
+                .as_str()
+                .is_some_and(|t| t.ends_with("google.rpc.ErrorInfo"))
+                .then(|| detail["reason"].as_str())
+                .flatten()
+        })
+    });
+    if let Some(reason) = reason {
+        log.field("upstream_error_reason", reason);
+    }
+    if let Some(message) = error["message"].as_str() {
+        let mut message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some((cut, _)) = message.char_indices().nth(MESSAGE_LIMIT) {
+            message.truncate(cut);
+            message.push('…');
+        }
+        log.field("upstream_error_message", message);
+    }
+}
+
+fn location_error(error: &serde_json::Value) -> bool {
     error["status"] == "FAILED_PRECONDITION"
         && error["message"].as_str().is_some_and(|msg| {
             msg.trim()
@@ -137,21 +186,21 @@ mod tests {
     const LOCATION: &[u8] = br#"{"error":{"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
 
     fn bad(body: Vec<u8>) -> reqwest::Response {
+        failed(400, body)
+    }
+
+    fn failed(status: u16, body: Vec<u8>) -> reqwest::Response {
         Response::builder()
-            .status(400)
+            .status(status)
             .header("x-test", "retained")
             .body(body)
             .unwrap()
             .into()
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn cooldown_lasts_three_minutes_and_restarts_only_on_a_fresh_rejection() {
-        let cooldowns = LocationCooldowns::default();
-        let key = Scope::new("upstream", "first");
-        let other = Scope::new("upstream", "second");
+    fn log() -> (tempfile::TempDir, RequestLog) {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RequestLog {
+        let log = RequestLog {
             logger: Arc::new(Logger::new(dir.path().join("log"))),
             fields: Default::default(),
             started: Instant::now(),
@@ -159,10 +208,23 @@ mod tests {
             bytes: 0,
             outcome: "request_finished",
         };
+        (dir, log)
+    }
+
+    fn cooling(scope: Scope) -> Inspect {
+        Inspect(Some(scope))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooldown_lasts_three_minutes_and_restarts_only_on_a_fresh_rejection() {
+        let cooldowns = LocationCooldowns::default();
+        let key = Scope::new("upstream", "first");
+        let other = Scope::new("upstream", "second");
+        let (_dir, mut log) = log();
         for _ in 0..2 {
             assert!(
                 cooldowns
-                    .inspect(key.clone(), bad(LOCATION.to_vec()))
+                    .inspect(cooling(key.clone()), bad(LOCATION.to_vec()), &mut log)
                     .await
                     .is_none()
             );
@@ -189,9 +251,10 @@ mod tests {
     #[tokio::test]
     async fn unrelated_and_oversized_error_bodies_are_forwarded_intact() {
         let cooldowns = LocationCooldowns::default();
+        let (_dir, mut log) = log();
         for bytes in [br#"{"error":{"status":"INVALID_ARGUMENT","message":"User location is not supported for the API use."}}"#.to_vec(),
             br#"{"error":{"status":"FAILED_PRECONDITION","message":"Invalid project resource name"}}"#.to_vec(), vec![1; ERROR_LIMIT+1]] {
-            let response = cooldowns.inspect(Scope::new("oauth", "test"), bad(bytes.clone())).await.unwrap();
+            let response = cooldowns.inspect(cooling(Scope::new("oauth", "test")), bad(bytes.clone()), &mut log).await.unwrap();
             assert_eq!(response.status(), 400);
             assert_eq!(response.headers()["x-test"], "retained");
             assert_eq!(response.bytes().await.unwrap(), bytes);
@@ -204,9 +267,74 @@ mod tests {
             .insert("content-encoding", "gzip".parse().unwrap());
         assert!(
             cooldowns
-                .inspect(Scope::new("oauth", "test"), response)
+                .inspect(cooling(Scope::new("oauth", "test")), response, &mut log)
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn error_reasons_are_logged_and_bodies_forwarded_intact() {
+        let cooldowns = LocationCooldowns::default();
+        let long = "x ".repeat(400);
+        let body = format!(
+            r#"{{"error":{{"code":403,"status":"PERMISSION_DENIED","message":"Denied.\n{long}","details":[{{"@type":"type.googleapis.com/google.rpc.Help"}},{{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED","metadata":{{"consumer":"projects/1"}}}}]}}}}"#
+        );
+        let (_dir, mut log) = log();
+        // A 403 cannot cool a login down even when it names the location.
+        for (status, bytes) in [(403, body.clone().into_bytes()), (403, LOCATION.to_vec())] {
+            let response = cooldowns
+                .inspect(Inspect(None), failed(status, bytes.clone()), &mut log)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["x-test"], "retained");
+            assert_eq!(response.bytes().await.unwrap(), bytes);
+            if bytes != LOCATION {
+                assert_eq!(log.fields["upstream_error_status"], "PERMISSION_DENIED");
+                assert_eq!(log.fields["upstream_error_reason"], "SERVICE_DISABLED");
+                let message = log.fields["upstream_error_message"].as_str().unwrap();
+                assert!(message.starts_with("Denied. x x"));
+                assert!(!message.contains('\n'));
+                assert_eq!(message.chars().count(), MESSAGE_LIMIT + 1);
+                assert!(!log.fields.contains_key("consumer"));
+            }
+        }
+        assert_eq!(
+            log.fields["upstream_error_status"], "FAILED_PRECONDITION",
+            "a later error replaces the earlier status"
+        );
+        assert!(cooldowns.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_upstream_errors_are_tagged_and_only_400s_cool_down() {
+        let scope = || Some(Scope::new("oauth", "test"));
+        let ok = Scope::tag_error(scope(), failed(200, vec![]));
+        assert!(ok.extensions().get::<Inspect>().is_none());
+        for (status, cools) in [(400, true), (403, false), (500, false)] {
+            let tagged = Scope::tag_error(scope(), failed(status, vec![]));
+            let Inspect(cooldown) = tagged.extensions().get::<Inspect>().unwrap();
+            assert_eq!(cooldown.is_some(), cools, "{status}");
+        }
+        let untagged = Scope::tag_error(None, failed(403, vec![]));
+        assert!(untagged.extensions().get::<Inspect>().unwrap().0.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_json_errors_log_nothing() {
+        let cooldowns = LocationCooldowns::default();
+        let (_dir, mut log) = log();
+        for bytes in [
+            b"<html>403</html>".to_vec(),
+            br#"{"error":"denied"}"#.to_vec(),
+        ] {
+            let response = cooldowns
+                .inspect(Inspect(None), failed(403, bytes.clone()), &mut log)
+                .await
+                .unwrap();
+            assert_eq!(response.bytes().await.unwrap(), bytes);
+        }
+        assert!(log.fields.is_empty());
     }
 }
