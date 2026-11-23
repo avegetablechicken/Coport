@@ -175,7 +175,7 @@ impl Server {
         let response = self
             .retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
             .await?;
-        Ok(Scope::tag_error(scope, response))
+        Ok(self.location_cooldowns.observe(scope, response))
     }
 
     /// A Gemini API request, as Codex's and Claude's API key requests: no
@@ -224,7 +224,7 @@ impl Server {
         let response = self
             .send_via(&route.proxy, request, route.custom_upstream, deadline, log)
             .await?;
-        Ok(Scope::tag_error(scope, response))
+        Ok(self.location_cooldowns.observe(scope, response))
     }
 
     /// Antigravity's token refresh, as Codex's and Claude's: routed by its

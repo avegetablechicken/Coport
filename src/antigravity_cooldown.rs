@@ -1,11 +1,21 @@
 //! A location rejection is terminal for agy. Close that request before headers
 //! and let its next model call wait locally for this login's cooldown. Other
 //! upstream errors pass through unchanged, with Google's error envelope logged.
+//!
+//! A rejection soon after a cooldown ends doubles the next one, up to the last
+//! step; a model call the upstream accepts starts the login over.
 use super::*;
 use std::io::Read;
 use tokio::time::{Instant as Tick, sleep_until};
 
-const COOLDOWN: Duration = Duration::from_secs(180);
+const STEPS: [Duration; 3] = [
+    Duration::from_secs(3 * 60),
+    Duration::from_secs(6 * 60),
+    Duration::from_secs(12 * 60),
+];
+/// How long after a cooldown ends a fresh rejection still counts as the same
+/// episode and moves to the next step.
+const EPISODE: Duration = STEPS[STEPS.len() - 1];
 const ERROR_LIMIT: usize = 16 * 1024;
 const MESSAGE_LIMIT: usize = 300;
 
@@ -27,34 +37,27 @@ impl Scope {
             && matches!(action, "generateContent" | "streamGenerateContent"))
         .then(scope)
     }
-
-    /// Mark an upstream error for inspection; only a 400 model call can
-    /// start a location cooldown.
-    pub(super) fn tag_error(
-        scope: Option<Self>,
-        mut response: reqwest::Response,
-    ) -> reqwest::Response {
-        let status = response.status();
-        if status.is_client_error() || status.is_server_error() {
-            let cooldown = scope.filter(|_| status == 400);
-            response.extensions_mut().insert(Inspect(cooldown));
-        }
-        response
-    }
 }
 
 /// An upstream error to inspect, with the login it may cool down.
 #[derive(Clone)]
 pub(super) struct Inspect(Option<Scope>);
 
+/// A login's current or most recent cooldown and its step in `STEPS`.
+#[derive(Clone, Copy)]
+struct Cooldown {
+    until: Tick,
+    step: usize,
+}
+
 #[derive(Default)]
-pub(super) struct LocationCooldowns(Mutex<HashMap<Scope, Tick>>);
+pub(super) struct LocationCooldowns(Mutex<HashMap<Scope, Cooldown>>);
 
 impl LocationCooldowns {
     pub(super) async fn wait(&self, scope: Option<&Scope>, log: &mut RequestLog) {
         let Some(scope) = scope else { return };
         loop {
-            let until = self.0.lock().unwrap().get(scope).copied();
+            let until = self.0.lock().unwrap().get(scope).map(|c| c.until);
             let Some(until) = until.filter(|until| *until > Tick::now()) else {
                 return;
             };
@@ -64,6 +67,51 @@ impl LocationCooldowns {
             );
             sleep_until(until).await;
         }
+    }
+
+    /// Mark an upstream error for inspection; only a 400 model call can
+    /// start a location cooldown. An accepted model call ends its login's
+    /// episode, unless it was sent before a cooldown that is still running.
+    pub(super) fn observe(
+        &self,
+        scope: Option<Scope>,
+        mut response: reqwest::Response,
+    ) -> reqwest::Response {
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            let cooldown = scope.filter(|_| status == 400);
+            response.extensions_mut().insert(Inspect(cooldown));
+        } else if let Some(scope) = scope.filter(|_| status.is_success()) {
+            let mut entries = self.0.lock().unwrap();
+            if entries.get(&scope).is_some_and(|c| c.until <= Tick::now()) {
+                entries.remove(&scope);
+            }
+        }
+        response
+    }
+
+    /// Start the login's next cooldown. A call sent before the running
+    /// cooldown began is the same rejection and changes nothing.
+    fn reject(&self, scope: Scope, log: &mut RequestLog) {
+        let now = Tick::now();
+        let mut entries = self.0.lock().unwrap();
+        entries.retain(|_, c| now.saturating_duration_since(c.until) <= EPISODE);
+        let cooldown = match entries.get(&scope).copied() {
+            Some(running) if running.until > now => running,
+            previous => {
+                let step = previous.map_or(0, |c| (c.step + 1).min(STEPS.len() - 1));
+                let next = Cooldown {
+                    until: now + STEPS[step],
+                    step,
+                };
+                entries.insert(scope, next);
+                next
+            }
+        };
+        log.field(
+            "location_cooldown_ms",
+            cooldown.until.saturating_duration_since(now).as_millis(),
+        );
     }
 
     /// Inspect only a small error envelope. Replay every original byte (and
@@ -100,10 +148,7 @@ impl LocationCooldowns {
         }
         if let (Some(scope), Some(error)) = (scope, &error) {
             if location_error(error) {
-                let now = Tick::now();
-                let mut entries = self.0.lock().unwrap();
-                entries.retain(|_, until| *until > now);
-                entries.insert(scope, now + COOLDOWN);
+                self.reject(scope, log);
                 return None;
             }
         }
@@ -215,18 +260,40 @@ mod tests {
         Inspect(Some(scope))
     }
 
+    async fn reject(cooldowns: &LocationCooldowns, scope: &Scope, log: &mut RequestLog) {
+        let response = cooldowns
+            .inspect(cooling(scope.clone()), bad(LOCATION.to_vec()), log)
+            .await;
+        assert!(response.is_none());
+    }
+
+    /// `scope` stays cooling for exactly `minutes` from now.
+    async fn cools_for(cooldowns: &LocationCooldowns, scope: &Scope, minutes: u64) {
+        let (_dir, mut log) = log();
+        let mut retry = Box::pin(cooldowns.wait(Some(scope), &mut log));
+        assert!(retry.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(minutes * 60 - 1)).await;
+        assert!(retry.as_mut().now_or_never().is_none(), "{minutes} min");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(retry.now_or_never().is_some(), "{minutes} min");
+    }
+
+    fn accepted(cooldowns: &LocationCooldowns, scope: &Scope) {
+        let response = cooldowns.observe(Some(scope.clone()), failed(200, vec![]));
+        assert!(response.extensions().get::<Inspect>().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn cooldown_lasts_three_minutes_and_restarts_only_on_a_fresh_rejection() {
+    async fn repeated_rejections_back_off_to_twelve_minutes_for_that_login_only() {
         let cooldowns = LocationCooldowns::default();
         let key = Scope::new("upstream", "first");
         let other = Scope::new("upstream", "second");
         let (_dir, mut log) = log();
-        for _ in 0..2 {
-            assert!(
-                cooldowns
-                    .inspect(cooling(key.clone()), bad(LOCATION.to_vec()), &mut log)
-                    .await
-                    .is_none()
+        for minutes in [3, 6, 12, 12] {
+            reject(&cooldowns, &key, &mut log).await;
+            assert_eq!(
+                log.fields["location_cooldown_ms"],
+                (minutes * 60_000).to_string()
             );
             assert!(
                 cooldowns
@@ -234,18 +301,53 @@ mod tests {
                     .now_or_never()
                     .is_some()
             );
-            assert!(
-                cooldowns
-                    .wait(Some(&key), &mut log)
-                    .now_or_never()
-                    .is_none()
-            );
-            tokio::time::advance(Duration::from_secs(179)).await;
-            let mut retry = Box::pin(cooldowns.wait(Some(&key), &mut log));
-            assert!(retry.as_mut().now_or_never().is_none());
-            tokio::time::advance(Duration::from_secs(1)).await;
-            assert!(retry.now_or_never().is_some());
+            cools_for(&cooldowns, &key, minutes).await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_sent_before_a_cooldown_neither_extend_nor_end_it() {
+        let cooldowns = LocationCooldowns::default();
+        let key = Scope::new("upstream", "first");
+        let (_dir, mut log) = log();
+        reject(&cooldowns, &key, &mut log).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        // Concurrent calls in flight when the first was rejected.
+        reject(&cooldowns, &key, &mut log).await;
+        assert_eq!(log.fields["location_cooldown_ms"], "120000");
+        accepted(&cooldowns, &key);
+        cools_for(&cooldowns, &key, 2).await;
+        // The episode continued: the next rejection takes the next step.
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 6).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_call_or_a_quiet_episode_starts_over() {
+        let cooldowns = LocationCooldowns::default();
+        let key = Scope::new("upstream", "first");
+        let (_dir, mut log) = log();
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 3).await;
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 6).await;
+        // Errors other than a location rejection keep the episode going.
+        let response = cooldowns.observe(Some(key.clone()), failed(503, vec![]));
+        assert!(response.extensions().get::<Inspect>().is_some());
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 12).await;
+        accepted(&cooldowns, &key);
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 3).await;
+
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 6).await;
+        tokio::time::advance(EPISODE).await;
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 12).await;
+        tokio::time::advance(EPISODE + Duration::from_secs(1)).await;
+        reject(&cooldowns, &key, &mut log).await;
+        cools_for(&cooldowns, &key, 3).await;
     }
 
     #[tokio::test]
@@ -310,14 +412,15 @@ mod tests {
     #[tokio::test]
     async fn only_upstream_errors_are_tagged_and_only_400s_cool_down() {
         let scope = || Some(Scope::new("oauth", "test"));
-        let ok = Scope::tag_error(scope(), failed(200, vec![]));
+        let cooldowns = LocationCooldowns::default();
+        let ok = cooldowns.observe(scope(), failed(200, vec![]));
         assert!(ok.extensions().get::<Inspect>().is_none());
         for (status, cools) in [(400, true), (403, false), (500, false)] {
-            let tagged = Scope::tag_error(scope(), failed(status, vec![]));
+            let tagged = cooldowns.observe(scope(), failed(status, vec![]));
             let Inspect(cooldown) = tagged.extensions().get::<Inspect>().unwrap();
             assert_eq!(cooldown.is_some(), cools, "{status}");
         }
-        let untagged = Scope::tag_error(None, failed(403, vec![]));
+        let untagged = cooldowns.observe(None, failed(403, vec![]));
         assert!(untagged.extensions().get::<Inspect>().unwrap().0.is_none());
     }
 
