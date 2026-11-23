@@ -198,7 +198,7 @@ const ui = {
   expanded: new Set(),
   builtPage: null,
   websocketOpen: false,
-  savedLoginsOpen: false,
+  otherLoginsOpen: false,
   snippetsOpen: false,
   rendering: false,
   proxies: {},
@@ -2248,10 +2248,12 @@ function configSettings() {
       <span class="number-field"><input class="field" id="${id}" data-config="${key}" inputmode="decimal" spellcheck="false"
         value="${esc(String(v[key]))}" aria-label="${label}"${tip} /><span class="unit">${unit}</span></span></div>`;
   };
-  const flag = (key, label, description) => {
+  // An inverted switch is on while its configuration value is false.
+  const flag = (key, label, description, inverted = false) => {
     const tip = ` data-tip="${esc(description)}"`;
+    const invert = inverted ? ' data-inverted="true"' : "";
     return `<div class="row"><span class="row-label"${tip}>${label}</span>
-      <button class="switch" role="switch" aria-checked="${v[key]}" data-action="config-flag" data-key="${key}" aria-label="${label}"${tip}></button></div>`;
+      <button class="switch" role="switch" aria-checked="${v[key] !== inverted}" data-action="config-flag" data-key="${key}"${invert} aria-label="${label}"${tip}></button></div>`;
   };
   return `${block(
     "Network",
@@ -2273,28 +2275,28 @@ function configSettings() {
     "Subscription Logins",
     "",
     `${flag("auto_refresh_access_token", "Auto-refresh logins", "If a Codex, Claude or Antigravity login expires, retries the request once and saves the updated login. Restart the proxy to apply.")}
-     ${savedLoginsOnly(v, flag)}`
+     ${otherLogins(v, flag)}`
   )}`;
 }
 
-/// Providers whose "saved logins only" switch shares one disclosure.
-const SAVED_LOGIN_PROVIDERS = [
-  ["codex", "Codex", "When off, accepts other ChatGPT logins."],
-  ["claude", "Claude", "When off, accepts other Claude logins and looks up their account details."],
-  ["antigravity", "Antigravity", "When off, accepts other Google logins and looks up their email."],
-  ["grok", "Grok", "When off, accepts other xAI logins by the account their token names."],
+/// Providers that can accept logins other than the ones saved in Coport.
+const OTHER_LOGIN_PROVIDERS = [
+  ["codex", "Codex", "Accepts any ChatGPT login and routes it by the account its token names."],
+  ["claude", "Claude", "Accepts any Claude login and looks up its account to route it."],
+  ["antigravity", "Antigravity", "Accepts any Google login and looks up its email to route it."],
+  ["grok", "Grok", "Accepts any xAI login and routes it by the account its token names."],
 ];
 
-/// One "Saved logins only" disclosure: its summary names the providers that
-/// accept saved logins only, its rows hold a switch per provider.
-function savedLoginsOnly(v, flag) {
-  const on = SAVED_LOGIN_PROVIDERS.filter(([id]) => v[`${id}.account_auth_file_only`]);
-  const status = on.length === 0 ? "Off"
-    : on.length === SAVED_LOGIN_PROVIDERS.length ? "All"
+/// One "Accept other logins" disclosure: its summary names the providers that
+/// accept them, its rows switch `account_auth_file_only` off per provider.
+function otherLogins(v, flag) {
+  const on = OTHER_LOGIN_PROVIDERS.filter(([id]) => !v[`${id}.account_auth_file_only`]);
+  const status = on.length === 0 ? "None"
+    : on.length === OTHER_LOGIN_PROVIDERS.length ? "All"
     : on.map(([, name]) => name).join(", ");
-  return `<details class="disclosure" id="saved-logins-only" ${ui.savedLoginsOpen ? "open" : ""}>
-    <summary data-tip="Accept only logins saved in Coport.">${ICON.chevron}Saved logins only<span class="disclosure-value">${status}</span></summary>
-    ${SAVED_LOGIN_PROVIDERS.map(([id, name, tip]) => flag(`${id}.account_auth_file_only`, name, tip)).join("")}
+  return `<details class="disclosure" id="other-logins" ${ui.otherLoginsOpen ? "open" : ""}>
+    <summary data-tip="By default, Coport only accepts the logins saved in it and rejects others, such as a login from another device or account.">${ICON.chevron}Accept other logins<span class="disclosure-value">${status}</span></summary>
+    ${OTHER_LOGIN_PROVIDERS.map(([id, name, tip]) => flag(`${id}.account_auth_file_only`, name, tip, true)).join("")}
   </details>`;
 }
 
@@ -2856,7 +2858,8 @@ async function act(action, el) {
       await refresh();
       break;
     case "config-flag":
-      await setConfigValue(el.dataset.key, el.getAttribute("aria-checked") !== "true");
+      // The new configuration value: the switch's new state, unless inverted.
+      await setConfigValue(el.dataset.key, (el.getAttribute("aria-checked") !== "true") !== (el.dataset.inverted === "true"));
       break;
     case "create-config":
       try {
@@ -3047,7 +3050,7 @@ document.addEventListener("focusout", (event) => {
 document.addEventListener("toggle", (event) => {
   const { id, open } = event.target;
   if (id === "websocket-timeouts") ui.websocketOpen = open;
-  else if (id === "saved-logins-only") ui.savedLoginsOpen = open;
+  else if (id === "other-logins") ui.otherLoginsOpen = open;
   else if (id === "setup-snippets") ui.snippetsOpen = open;
 }, true);
 
