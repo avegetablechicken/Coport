@@ -634,15 +634,19 @@ function chart(stats, scope, showPeak = false, window = stats) {
   </div>`;
 }
 
-/// An account row's chart and statistics, as Activity and Devices show them.
-/// With Models, Unidentified calls that all failed reported nothing beyond
-/// their count, so the row keeps only Calls and Error Rate. Any call that
-/// succeeded keeps the full row.
-function accountTraffic(c, scope, window) {
+/// One account's row, as Activity and Devices show it. With Models,
+/// Unidentified calls that all failed reported nothing beyond their count, so
+/// the row is one line: the account, its calls and its error rate. Any call
+/// that succeeded keeps the full row.
+function accountRow(c, scope, window, review = "") {
   const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
-  const calls = stat(scope === "model" ? "Calls" : "Requests", c.requests) + stat("Error Rate", rate, c.errors ? "bad" : "");
-  if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) return `<div class="strip compact">${calls}</div>`;
-  return `${chart(c, scope, true, window)}<div class="strip">${calls}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}`;
+  const identity = `<span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>`;
+  if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) {
+    const calls = `${c.requests.toLocaleString("en-US")} ${c.requests === 1 ? "call" : "calls"}`;
+    return `<div class="credential-traffic"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
+  }
+  return `<div class="credential-traffic"><div class="traffic-identity">${identity}${review}</div>
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -1561,12 +1565,7 @@ function renderActivityTraffic() {
   const scope = traffic?.scope ?? ui.trafficScope;
   el.setAttribute("aria-busy", String(ui.trafficLoading));
   const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-  const rows = traffic?.credentials.map((c) => {
-    return `<div class="credential-traffic">
-      <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets)}</div>
-      ${accountTraffic(c, scope, traffic)}
-    </div>`;
-  }).join("");
+  const rows = traffic?.credentials.map((c) => accountRow(c, scope, traffic, trafficReview(c, traffic.targets))).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; past each service's two largest, credentials under 2.5% of the ring are grouped as Others when there are at least two.",
@@ -1847,9 +1846,7 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
   let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window, detailsKey)}</div>`;
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
-  if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
-    <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets, scope)}</div>
-    ${accountTraffic(c, scope, window)}</div>`).join("")}</details>`;
+  if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => accountRow(c, scope, window, trafficReview(c, traffic.targets, scope))).join("")}</details>`;
   return body;
 }
 document.addEventListener("toggle", event => {

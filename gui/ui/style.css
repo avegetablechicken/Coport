@@ -353,12 +353,6 @@ select:focus-visible {
   padding: 2px 0;
 }
 
-/* Only Calls and Error Rate: kept together on the left. */
-.strip.compact {
-  justify-content: flex-start;
-  gap: 32px;
-}
-
 .stat {
   display: flex;
   flex-direction: column;
@@ -1234,6 +1228,9 @@ details.disclosure summary .disclosure-value {
   font-size: 11px;
   line-height: 18px;
 }
+/* A row with only calls and errors is a single line. */
+.traffic-identity.brief { margin-bottom: 0; }
+.traffic-brief { display: flex; align-items: start; gap: 8px; color: var(--secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .traffic-identity strong {
   min-width: 0;
   overflow-wrap: anywhere;

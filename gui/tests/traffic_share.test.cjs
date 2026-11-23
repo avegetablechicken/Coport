@@ -69,9 +69,10 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
     ui: { trafficScope: 'all', traffic: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
       credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
     openSelect: null, closeSelect() {}, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
-    trafficControls: () => '', trafficReview: () => '', accountTraffic: () => '', stat: () => '', fmtMs: () => '',
+    trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
   });
+  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), context);
   vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
   context.renderActivityTraffic();
   assert.match(el.innerHTML, /<strong>su\*\*\*3@gmail\.com<\/strong>/);
@@ -339,28 +340,32 @@ test('Models charts draw one baseline for every bucket without reported tokens',
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
 });
-test('Models shows only Calls and Error Rate for Unidentified rows whose calls all failed', () => {
+test('Models shows Unidentified rows whose calls all failed as one line of calls and errors', () => {
   const context = setup('model');
   Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
-  const failed = { credential: 'Unidentified', requests: 16, errors: 16, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
-  assert.equal(context.accountTraffic(failed, 'model', failed), '<div class="strip compact"><Calls=16><Error Rate=100.0%:bad></div>');
-  const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && /<Received=/.test(html);
+  const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
+  const brief = context.accountRow(failed, 'model', failed, '<review>');
+  assert.equal(brief, '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
+    + '<span class="traffic-brief"><span>16 calls · <span class="bad">100.0% errors</span></span><review></span></div></div>');
+  assert.match(context.accountRow({ ...failed, requests: 1, errors: 1 }, 'model', failed), />1 call · </);
+  const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && /<Received=/.test(html) && !/brief/.test(html);
   // Requests keep the full row, and so does a named account that only failed.
-  assert.ok(full(context.accountTraffic(failed, 'all', failed)));
-  assert.ok(full(context.accountTraffic({ ...failed, credential: 'work' }, 'model', failed)));
-  assert.match(context.accountTraffic({ ...failed, credential: 'work' }, 'model', failed), /<tokens>/);
+  assert.ok(full(context.accountRow(failed, 'all', failed)));
+  assert.ok(full(context.accountRow({ ...failed, credential: 'work' }, 'model', failed)));
+  assert.match(context.accountRow({ ...failed, credential: 'work' }, 'model', failed), /<tokens>/);
   // One successful call keeps the full row.
   const mixed = { ...failed, errors: 15, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
-  assert.ok(full(context.accountTraffic(mixed, 'model', mixed)));
+  assert.ok(full(context.accountRow(mixed, 'model', mixed)));
   // Activity and Devices account rows both go through it.
   for (const [from, to] of [['function renderActivityTraffic(', '\nconst SEARCH_MODES'], ['function deviceTrafficContent(', '\ndocument.addEventListener("toggle"']]) {
     const body = source.slice(source.indexOf(from), source.indexOf(to));
-    assert.match(body, /accountTraffic\(c, scope, /);
-    assert.doesNotMatch(body, /chart\(c,|Avg\. Time|modelTokenStats\(c/);
+    assert.match(body, /accountRow\(c, scope, /);
+    assert.doesNotMatch(body, /chart\(c,|Avg\. Time|traffic-identity/);
   }
+  // The single line drops the gap that a chart would follow.
   const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
-  assert.match(css, /\.strip\.compact \{[^}]*justify-content: flex-start;/);
+  assert.match(css, /\.traffic-identity\.brief \{ margin-bottom: 0; \}/);
 });
 test('Models leaves out unidentified calls without tokens, All keeps them', () => {
   const { trafficShare } = setup();
@@ -514,9 +519,10 @@ test('device traffic exposes renamed local sources with assignment choices', () 
   Object.assign(context, {
     ICON: { warning: '<warning>', more: '<more>', chevron: '' },
     esc: v => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;'),
-    trafficShare: () => '', chart: () => '', accountTraffic: () => '', stat: () => '', fmtMs: () => '',
+    trafficShare: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '',
   });
+  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), context);
   loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function deviceTrafficContent('), source.indexOf('document.addEventListener("toggle"')), context);
   const traffic = { requests: 2, errors: 0, credentials: [{ service: 'Claude', credential: 'myServer', requests: 2,

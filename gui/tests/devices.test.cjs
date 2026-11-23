@@ -185,7 +185,8 @@ test('automatic alignment retains previous traffic while refreshing without an e
 test('upstream account disclosures retain per-device expansion and place rings before charts', () => {
   const h = harness(async () => []);
   const events = {};
-  Object.assign(h, { trafficReview: () => '', chart: () => '<chart>', accountTraffic: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
+  Object.assign(h, { trafficReview: () => '', chart: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
+  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), h);
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
   const traffic = { requests: 2, errors: 0, credentials: [

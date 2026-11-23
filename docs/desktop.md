@@ -259,8 +259,8 @@ action retrieves remote statistics for the current selection. Local
 traffic assignments re-merge cached snapshots without reconnecting to devices.
 Expanded upstream accounts use the same order as Activity
 Traffic: known accounts by received bytes descending, unidentified accounts last.
-With **Models**, an unidentified account whose calls all failed shows only its
-service, Calls and Error Rate: those calls reported nothing else to show.
+With **Models**, an unidentified account whose calls all failed is one line:
+its service, calls and error rate, since those calls reported nothing else.
 
 Each device selects one read-only transport: **HTTP/HTTPS** or **SSH**.
 HTTP/HTTPS requests the authenticated service described above. SSH invokes
