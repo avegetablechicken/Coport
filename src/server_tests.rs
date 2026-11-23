@@ -6454,6 +6454,23 @@ async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_re
             .await
             .unwrap();
         assert_eq!(reply.status(), 403);
+        // Base URL clients reach the same endpoints with or without `/v1`,
+        // and with the same limits.
+        for (method, path, status) in [
+            ("POST", "/grok/billing", 405),
+            ("DELETE", "/grok/settings", 405),
+            ("POST", "/grok/v1/settings", 405),
+            ("GET", "/grok/billing?other=1", 404),
+            ("GET", "/grok/v1/billing?other=1", 404),
+        ] {
+            let reply = http()
+                .request(method.parse().unwrap(), format!("{}{path}", running.url))
+                .bearer_auth("issued-access")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), status, "{method} {path}");
+        }
         assert!(mapped.requests.try_recv().is_err());
         assert!(bootstrap.requests.try_recv().is_err());
         running.server.logger.flush().unwrap();

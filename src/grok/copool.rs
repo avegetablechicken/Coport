@@ -204,11 +204,19 @@ impl Grok {
         }
         let url = Url::parse(&self.base_url.account).ok()?;
         let base = url.as_str().trim_end_matches('/');
+        // A scoped base URL may omit `/v1`, as model requests may: those
+        // reach the same endpoints and keep their limits.
         let suffix = [Some(base), Some(DEFAULT_BASE), scoped.map(|_| "v1")]
             .into_iter()
             .flatten()
-            .filter_map(|prefix| rest.strip_prefix(prefix))
-            .find(|path| matches!(*path, "/billing" | "/billing?format=credits" | "/settings"))?;
+            .filter_map(|prefix| rest.strip_prefix(prefix).map(str::to_owned))
+            .chain(scoped.map(|path| format!("/{path}")))
+            .find(|path| {
+                matches!(
+                    path.as_str(),
+                    "/billing" | "/billing?format=credits" | "/settings"
+                )
+            })?;
         Some((Url::parse(&format!("{base}{suffix}")).ok()?, false))
     }
 }
@@ -241,6 +249,7 @@ mod tests {
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 3\ngrok:\n  base_url: {account: 'https://gateway.example.com:8443/custom/'}\n  routing: {account_fallback: none}").unwrap();
         for target in [
             "/grok/v1/billing?format=credits",
+            "/grok/billing?format=credits",
             "/grok/https://cli-chat-proxy.grok.com/v1/billing?format=credits",
             "/https://gateway.example.com:8443/custom/billing?format=credits",
         ] {
@@ -261,9 +270,12 @@ mod tests {
             "/grok/https://api.x.ai/v1/settings",
             "/grok/https://gateway.example.com:8443/custom/oauth2/token",
             "/grok/https://gateway.example.com:8443/customized/settings",
+            "/grok/billing?format=other",
+            "/grok/v1/settings/other",
         ] {
-            assert!(config.grok.endpoint(target).is_none());
+            assert!(config.grok.endpoint(target).is_none(), "{target}");
         }
+        assert!(config.grok.endpoint("/grok/settings").is_some());
     }
 
     #[tokio::test]
