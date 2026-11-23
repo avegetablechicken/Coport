@@ -634,6 +634,14 @@ function chart(stats, scope, showPeak = false, window = stats) {
   </div>`;
 }
 
+/// An account row's chart. With Models, Unidentified calls that all failed
+/// reported no tokens, so their bars would stay empty; the 100% error rate
+/// already says it. Any call that succeeded keeps the chart.
+function accountChart(c, scope, window) {
+  if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) return "";
+  return chart(c, scope, true, window);
+}
+
 /// The share ring, chart and totals of one traffic view, as Home, each device
 /// card and Merged Traffic show it. An unchanged view reuses its markup.
 /// `source` names whose traffic it is ("local", "merged" or "device/<id>"), so
@@ -1554,7 +1562,7 @@ function renderActivityTraffic() {
     const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
     return `<div class="credential-traffic">
       <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets)}</div>
-      ${chart(c, scope, true, traffic)}
+      ${accountChart(c, scope, traffic)}
       <div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}
     </div>`;
   }).join("");
@@ -1840,7 +1848,7 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => `<div class="credential-traffic">
     <div class="traffic-identity"><span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>${trafficReview(c, traffic.targets, scope)}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
+    ${accountChart(c, scope, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`).join("")}</details>`;
   return body;
 }
 document.addEventListener("toggle", event => {
