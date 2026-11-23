@@ -96,6 +96,7 @@ pub(crate) fn access(value: &Value, service: Service) -> Option<&str> {
     match service {
         Service::Codex => value["tokens"]["access_token"].as_str(),
         Service::Claude => value["claudeAiOauth"]["accessToken"].as_str(),
+        Service::Grok => None,
         Service::Antigravity => crate::antigravity::access_token(value),
     }
     .filter(|s| crate::identity::valid_token(s))
@@ -104,6 +105,7 @@ pub(crate) fn refresh(value: &Value, service: Service) -> Option<&str> {
     match service {
         Service::Codex => value["tokens"]["refresh_token"].as_str(),
         Service::Claude => value["claudeAiOauth"]["refreshToken"].as_str(),
+        Service::Grok => None,
         Service::Antigravity => crate::antigravity::refresh_token(value),
     }
     .filter(|s| crate::identity::valid_token(s))

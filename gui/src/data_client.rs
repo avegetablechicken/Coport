@@ -1365,7 +1365,7 @@ mod tests {
                     let mut header = Vec::new();
                     while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.unwrap()); }
                     let header = String::from_utf8(header).unwrap().to_lowercase();
-                    assert!(header.contains("x-coport-services: antigravity"));
+                    assert!(header.contains("x-coport-services: antigravity,grok"));
                     let body = if phase == 0 {
                         assert!(header.contains("x-coport-window: 1440:all"));
                         if peer == 1 { slow.notified().await; }

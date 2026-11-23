@@ -218,6 +218,7 @@ connection. These hosts are decrypted:
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Any, for each URL route | that route's host and port, including public IPv4 addresses |
 | Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `www.googleapis.com` (account lookup), as `/antigravity/https://<host>/...` |
+| Grok, with subscription account routes or a fallback | `auth.x.ai` and `cli-chat-proxy.grok.com` |
 | Antigravity, with named API Key routes or `fallback` | `antigravity.base_url.api_key`, as `/antigravity/https://<host>/...` |
 
 A host routed by more than one service uses the unprefixed `/https://` form and
@@ -591,3 +592,62 @@ not logged), and model calls record Gemini usage as above. Neither form needs
 [proxy port credential routing](#credential-routing-on-the-proxy-port),
 `base_url.api_key` (with a name or `fallback`) and each URL route's host are
 decrypted too, as `/antigravity/https://<host>/...`.
+
+
+## Copool Grok subscription usage
+
+Set `connect_credential_routing: true` in Coport and add a Grok route to the
+same YAML file. This example sends subscription requests through an existing
+outbound proxy named `us`. Use `none` for a direct outbound connection.
+
+```yaml
+grok:
+  routing:
+    account_fallback: us
+```
+
+Apply the configuration and check the Proxy card. If the stored proxy CA
+does not cover `auth.x.ai` and `cli-chat-proxy.grok.com`, use **Replace &
+Trust**, then reopen Copool so it loads the updated trust. Set Copool's
+account proxy to Coport's HTTP listening address (e.g. `http://127.0.0.1:8787`).
+
+Copool sends Grok Build's form-encoded refresh grant to `POST /oauth2/token`
+on `auth.x.ai`. It reads `GET /v1/billing?format=credits` and
+`GET /v1/settings` on `cli-chat-proxy.grok.com`. Base URL clients may also
+reach these paths under `/grok`. Copool owns token renewal and saves the response.
+
+A Grok Build login can take its own exit from the first request. For example,
+with `ny2` declared under `proxies`:
+
+```yaml
+grok:
+  base_url:
+    account: "https://cli-chat-proxy.grok.com/v1"
+    api_key: "https://api.x.ai/v1"
+  account_auth_file_only: false
+  routing:
+    account:
+      "subscriber@example.com": ny2
+```
+
+With the file policy explicitly set, Coport looks for Grok Build's login at
+`$GROK_HOME/auth.json`, or `~/.grok/auth.json` when `GROK_HOME` is unset.
+Set `auth_file` to override that path. With `true`, every token must match the
+current saved login even when a fallback exists. With `false`, learned accounts
+and configured fallbacks can also route requests. Existing configurations
+without either file setting continue to use learned identities and fallbacks.
+
+`base_url.account` selects the upstream for billing and settings. Renewals
+always go to `auth.x.ai/oauth2/token`. The `api_key` URL is validated
+separately. Setting it alone enables no API Key routes.
+
+To select different exits per login, add `grok.routing.account` entries.
+Selectors match the exact `user_id/team_id`, then `user_id`, then email.
+Optionally set `grok.auth_file` to the Grok Build login file (usually
+`~/.grok/auth.json`) to identify its access or refresh token on first use.
+For other Copool logins the first request uses `account_fallback` or
+`fallback`. With neither configured, Coport rejects unknown accounts locally.
+A successful renewal associates the returned token digests with the account
+identified by xAI or by the matched login. Coport keeps these mappings in
+`grok-token-routes.json` across restarts. A JWT supplied by a client cannot
+declare its own route.

@@ -46,6 +46,8 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
         "182.92.106.196".into(),
         "developers.openai.com".into(),
         "auth.openai.com".into(),
+        "auth.x.ai".into(),
+        "cli-chat-proxy.grok.com".into(),
         "platform.claude.com".into(),
         "api.anthropic.com".into(),
         "daily-cloudcode-pa.googleapis.com".into(),
@@ -162,6 +164,17 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                         io.write_all(b"\x81\x02ok\x88\x00").await.unwrap();
                         io.shutdown().await.unwrap();
                     }
+                }
+                else if response_mode=="grok" {
+                    // The ID token names the user and team. The access token is opaque.
+                    let body = if request.starts_with("POST /oauth2/token ") {
+                        r#"{"id_token":"h.eyJzdWIiOiJhbGljZSIsInRlYW1faWQiOiJ0ZWFtIn0.s","access_token":"issued-access","refresh_token":"issued-refresh"}"#
+                    } else if request.starts_with("GET /v1/billing?format=credits ") {
+                        r#"{"creditUsagePercent":42}"#
+                    } else {
+                        r#"{"subscription_tier_display":"SuperGrok"}"#
+                    };
+                    io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
                 else if response_mode == "location_once" && attempt == 0 {
                     let body = r#"{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
@@ -6204,4 +6217,146 @@ async fn antigravity_location_cooldown_disconnects_before_headers_and_only_delay
     );
     assert!(fixture.requests.try_recv().is_err());
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+#[tokio::test]
+async fn copool_grok_refresh_and_usage_follow_the_account_across_rotation_and_restart() {
+    let mut bootstrap = fixture("http", "grok").await;
+    let mut mapped = fixture("http", "grok").await;
+    let bootstrap_url = format!("http://{}", bootstrap.addr);
+    let mapped_url = format!("http://{}", mapped.addr);
+    let state = tempfile::tempdir().unwrap();
+    let file = state.path().join(crate::refresh_routes::GROK_FILE);
+    let config = format!(
+        "connect_credential_routing: true\nproxies:\n  first: {bootstrap_url}\n  mapped: {mapped_url}\ngrok:\n  routing:\n    account_fallback: first\n    account: {{alice/team: mapped}}\n"
+    );
+    for restart in [false, true] {
+        let running = running_with_server(
+            &config,
+            |_| {},
+            |server| {
+                server.with_grok_routes(crate::refresh_routes::RefreshRoutes::load(file.clone()))
+            },
+        )
+        .await;
+        trust(&running, &bootstrap, &bootstrap_url);
+        trust(&running, &mapped, &mapped_url);
+        let client = proxy_port_client(&running);
+        let refresh = if restart {
+            "issued-refresh"
+        } else {
+            "initial+refresh"
+        };
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("client_id", crate::grok::CLIENT_ID),
+            ("refresh_token", refresh),
+        ];
+        let reply = client
+            .post("https://auth.x.ai/oauth2/token")
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 200);
+        assert!(reply.text().await.unwrap().contains("issued-access"));
+        let selected = if restart { &mut mapped } else { &mut bootstrap };
+        assert!(
+            selected
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("CONNECT auth.x.ai:443 ")
+        );
+        let request = selected.requests.recv().await.unwrap();
+        assert!(request.starts_with("POST /oauth2/token "));
+        assert!(request.ends_with(if restart {
+            "refresh_token=issued-refresh"
+        } else {
+            "refresh_token=initial%2Brefresh"
+        }));
+        for (path, expected) in [
+            ("/v1/billing?format=credits", "creditUsagePercent"),
+            ("/v1/settings", "SuperGrok"),
+        ] {
+            let reply = client
+                .get(format!("{}{path}", crate::grok::API))
+                .bearer_auth("issued-access")
+                .header("x-grok-client-version", "test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+            assert!(reply.text().await.unwrap().contains(expected));
+            assert!(
+                mapped
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .starts_with("CONNECT cli-chat-proxy.grok.com:443 ")
+            );
+            let request = mapped.requests.recv().await.unwrap();
+            assert!(request.starts_with(&format!("GET {path} ")));
+            assert!(request.contains("authorization: Bearer issued-access"));
+            assert!(request.contains("x-grok-client-version: test"));
+        }
+        for (host, path) in [
+            (crate::grok::ISSUER, "/v1/settings"),
+            (crate::grok::API, "/oauth2/token"),
+            (crate::grok::API, "/v1/chat/completions"),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{host}{path}"))
+                    .bearer_auth("issued-access")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                404
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{}/v1/settings", crate::grok::API))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .post(format!("{}/v1/settings", crate::grok::API))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            405
+        );
+        let reply = client
+            .post("https://auth.x.ai/oauth2/token")
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", "another-client"),
+                ("refresh_token", "secret"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 403);
+        assert!(mapped.requests.try_recv().is_err());
+        assert!(bootstrap.requests.try_recv().is_err());
+        running.server.logger.flush().unwrap();
+        for content in [
+            std::fs::read_to_string(&file).unwrap(),
+            std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap(),
+        ] {
+            for token in ["initial+refresh", "issued-access", "issued-refresh"] {
+                assert!(!content.contains(token));
+            }
+        }
+    }
 }

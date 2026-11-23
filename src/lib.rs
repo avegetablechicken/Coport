@@ -7,6 +7,7 @@ mod codex_env;
 pub mod config;
 pub mod credential_proxy;
 pub mod external_access;
+pub mod grok;
 pub mod identity;
 mod keychain;
 pub mod local_tls;

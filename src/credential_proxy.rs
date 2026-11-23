@@ -113,7 +113,7 @@ fn hosts(scopes: &BTreeMap<(String, u16), String>) -> Result<BTreeSet<String>> {
     let hosts: BTreeSet<String> = scopes.keys().map(|(host, _)| host.clone()).collect();
     if hosts.is_empty() {
         return Err(Error::config(
-            "connect_credential_routing requires codex, claude or antigravity routes.",
+            "connect_credential_routing requires codex, claude, antigravity or grok routes.",
         ));
     }
     Ok(hosts)
@@ -137,6 +137,15 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
             })
             .or_insert(prefix);
     };
+    if config.grok.enabled() {
+        for origin in [
+            crate::grok::ISSUER,
+            crate::grok::API,
+            &config.grok.base_url.account,
+        ] {
+            add(&crate::url_routing::validate_upstream(origin)?, "/grok/");
+        }
+    }
     let claude = &config.claude.routing;
     let codex = &config.codex.routing;
     let url = |value: &str| crate::url_routing::validate_upstream(value);

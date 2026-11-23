@@ -778,6 +778,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml_ng",
  "tempfile",
  "time",

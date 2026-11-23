@@ -530,3 +530,78 @@ fn provider_auth_precedence_dotenv_and_live_rotation() {
     fs::remove_file(app.path("codex/auth.json")).unwrap();
     refused(&app, &a, &b, Some("rotated-provider-key"), 502);
 }
+
+#[tokio::test]
+async fn grok_email_route_loads_and_matches_grok_builds_standard_login_on_first_request() {
+    let ny2 = Probe::new();
+    let mut app = App::new();
+    app.env.insert(
+        "GROK_HOME".into(),
+        app.path("grok").to_string_lossy().into_owned(),
+    );
+    let client_id = "b1a00492-073a-47ea-816f-4c329264a828";
+    app.write(
+        "grok/auth.json",
+        json!({ format!("https://auth.x.ai::{client_id}"): {
+            "user_id": "test-user", "email": "subscriber@example.invalid",
+            "key": "saved-access", "refresh_token": "saved-refresh"
+        }})
+        .to_string(),
+    );
+    app.config(&format!(
+        r#"
+connect_credential_routing: true
+proxies:
+  ny2: http://127.0.0.1:{}
+codex: {{homes: []}}
+claude: {{config_dirs: []}}
+grok:
+  base_url:
+    account: "https://cli-chat-proxy.grok.com/v1"
+    api_key: "https://api.x.ai/v1"
+  account_auth_file_only: false
+  routing:
+    account:
+      subscriber@example.invalid: ny2
+"#,
+        ny2.port
+    ));
+    app.restart();
+    let ca =
+        reqwest::Certificate::from_pem(&fs::read(app.path("tls/proxy-ca.pem")).unwrap()).unwrap();
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}", app.port)).unwrap())
+        .use_rustls_tls()
+        .add_root_certificate(ca)
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+    let renew = |token| {
+        client.post("https://auth.x.ai/oauth2/token").form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", token),
+        ])
+    };
+    assert_eq!(renew("other-refresh").send().await.unwrap().status(), 403);
+    assert_eq!(ny2.count(), 0);
+    // The local outbound proxy intentionally returns 502 after recording the
+    // CONNECT. Reaching it proves route selection without contacting xAI.
+    for (request, host) in [
+        (renew("saved-refresh"), "auth.x.ai"),
+        (
+            client
+                .get("https://cli-chat-proxy.grok.com/v1/billing?format=credits")
+                .bearer_auth("saved-access"),
+            "cli-chat-proxy.grok.com",
+        ),
+    ] {
+        let before = ny2.count();
+        assert_eq!(request.send().await.unwrap().status(), 502);
+        assert!(ny2.count() > before);
+        assert!(
+            ny2.last()
+                .starts_with(format!("CONNECT {host}:443 ").as_bytes())
+        );
+    }
+}

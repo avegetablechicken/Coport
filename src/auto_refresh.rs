@@ -116,6 +116,7 @@ impl Server {
     }
     pub(super) async fn refresh_snapshot(&self, service: Service, token: &str) -> Option<Snapshot> {
         let sources = match service {
+            Service::Grok => return None,
             Service::Codex => self.config.codex.account_sources(),
             Service::Claude => self.config.claude.account_sources(),
             Service::Antigravity => {
@@ -371,16 +372,8 @@ fn refresh_request(
 ) -> Result<reqwest::Request> {
     let refresh =
         credentials::refresh(value, service).ok_or(Error::config("Login has no refresh token."))?;
-    let mut request = reqwest::Request::new(
-        hyper::Method::POST,
-        Url::parse(match service {
-            Service::Codex => TOKEN_REFRESH_UPSTREAM,
-            Service::Claude => crate::claude::TOKEN_REFRESH_UPSTREAM,
-            Service::Antigravity => crate::antigravity::TOKEN_REFRESH_UPSTREAM,
-        })
-        .unwrap(),
-    );
-    let (content_type, body) = match service {
+    let (url, content_type, body) = match service {
+        Service::Grok => return Err(Error::config("Grok renewal is managed by the client.")),
         Service::Codex => {
             let claims =
                 crate::identity::claims(value["tokens"]["id_token"].as_str().unwrap_or(""));
@@ -400,9 +393,14 @@ fn refresh_request(
                 .append_pair("refresh_token", refresh)
                 .append_pair("client_id", client)
                 .finish();
-            ("application/x-www-form-urlencoded", body)
+            (
+                TOKEN_REFRESH_UPSTREAM,
+                "application/x-www-form-urlencoded",
+                body,
+            )
         }
         Service::Antigravity => (
+            crate::antigravity::TOKEN_REFRESH_UPSTREAM,
             "application/x-www-form-urlencoded",
             crate::antigravity::refresh_form(
                 refresh,
@@ -422,9 +420,10 @@ fn refresh_request(
             } else {
                 scopes.join(" ")
             };
-            ("application/json", json!({"grant_type":"refresh_token", "refresh_token":refresh, "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e", "scope":scope}).to_string())
+            (crate::claude::TOKEN_REFRESH_UPSTREAM, "application/json", json!({"grant_type":"refresh_token", "refresh_token":refresh, "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e", "scope":scope}).to_string())
         }
     };
+    let mut request = reqwest::Request::new(hyper::Method::POST, Url::parse(url).unwrap());
     request
         .headers_mut()
         .insert("content-type", content_type.parse().unwrap());
@@ -449,6 +448,7 @@ fn merge_tokens(service: Service, original: &Value, payload: &Value) -> Result<V
     }
     let mut updated = original.clone();
     match service {
+        Service::Grok => return Err(Error::config("Grok renewal is managed by the client.")),
         Service::Antigravity => {
             let lifetime = payload["expires_in"].as_u64().unwrap_or(3600);
             crate::antigravity::apply_renewal(

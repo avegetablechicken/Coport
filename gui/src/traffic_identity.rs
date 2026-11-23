@@ -213,7 +213,8 @@ impl Identities {
         // An Antigravity login record without an account (a saved login whose
         // email is not known yet) still names its account route, never an
         // API configuration; only its Gemini API key records are matched.
-        if entry.get("account_id").is_some_and(|id| !id.is_empty())
+        if service == coport::routing::Service::Grok.label()
+            || entry.get("account_id").is_some_and(|id| !id.is_empty())
             || (service == coport::routing::Service::Antigravity.label()
                 && !antigravity_api_record(entry))
         {

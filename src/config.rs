@@ -151,6 +151,8 @@ struct Raw {
     claude: crate::claude::Claude,
     #[serde(default)]
     antigravity: crate::antigravity::Antigravity,
+    #[serde(default)]
+    grok: crate::grok::Grok,
     listen_port: u16,
     #[serde(default)]
     allow_external_access: bool,
@@ -228,6 +230,7 @@ pub struct Config {
     pub codex: Codex,
     pub claude: crate::claude::Claude,
     pub antigravity: crate::antigravity::Antigravity,
+    pub grok: crate::grok::Grok,
     pub listen_port: u16,
     pub allow_external_access: bool,
     /// Refresh saved OAuth logins after a model request returns HTTP 401.
@@ -289,6 +292,7 @@ impl Config {
             .collect();
         let c = Self {
             codex,
+            grok: raw.grok,
             claude: raw.claude,
             antigravity: raw.antigravity,
             listen_port: raw.listen_port,
@@ -334,6 +338,7 @@ impl Config {
             ));
         }
 
+        self.grok.validate(self)?;
         self.claude.validate(self)?;
         self.antigravity.validate(self)?;
         validate_directories(&self.codex.homes)?;

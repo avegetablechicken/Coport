@@ -111,6 +111,7 @@ fn accent(service: Service) -> u32 {
     match service {
         Service::Claude => 0xf27d32,
         Service::Codex => 0x10a37f,
+        Service::Grok => 0x737373,
         Service::Antigravity => 0x1c7df1,
     }
 }

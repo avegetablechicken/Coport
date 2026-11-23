@@ -33,6 +33,7 @@ pub enum Service {
     Codex,
     Claude,
     Antigravity,
+    Grok,
 }
 impl Service {
     /// The logged `service` value.
@@ -41,6 +42,7 @@ impl Service {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Antigravity => "antigravity",
+            Self::Grok => "grok",
         }
     }
     /// The name statistics show.
@@ -49,6 +51,7 @@ impl Service {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::Antigravity => "Antigravity",
+            Self::Grok => "Grok",
         }
     }
 }
@@ -62,6 +65,9 @@ fn service_of<E>(
     target: &str,
     url_route: impl FnOnce(&str, bool) -> std::result::Result<Option<Service>, E>,
 ) -> std::result::Result<Service, E> {
+    if target.starts_with("/grok/") {
+        return Ok(Service::Grok);
+    }
     if crate::antigravity::target(target).is_some() {
         return Ok(Service::Antigravity);
     }
@@ -96,6 +102,12 @@ pub fn logged_service(path: &str) -> Service {
 impl Config {
     /// The app of a request target; see [`Service`].
     pub fn request_service(&self, target: &str) -> Result<Service> {
+        if self.grok.enabled()
+            && target.starts_with("/https://")
+            && self.grok.endpoint(target).is_some()
+        {
+            return Ok(Service::Grok);
+        }
         service_of(target, |target, claude_scoped| {
             let claude = self.claude.url_route_matches(target)?;
             let codex = !claude_scoped

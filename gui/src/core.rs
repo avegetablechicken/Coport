@@ -665,6 +665,18 @@ fn details(config: &Config, probes: &BTreeMap<String, (Probe, SystemTime)>) -> C
             |selector| describe::claude_api_key(config, selector),
             |selector| config.claude.api_key_kind(selector).unwrap_or("unknown"),
         ),
+        grok: service(
+            vec![
+                ("accountUpstream", config.grok.base_url.account.clone()),
+                ("apiKeyUpstream", config.grok.base_url.api_key.clone()),
+            ],
+            config.grok.account_auth_file_only.unwrap_or(false),
+            false,
+            &config.grok.routing,
+            false,
+            |_| None,
+            |_| "unknown",
+        ),
         // Antigravity's API keys are environment variables or upstream URLs.
         antigravity: service(
             vec![
@@ -859,6 +871,7 @@ struct ConfigDetails {
     codex: ServiceDto,
     claude: ServiceDto,
     antigravity: ServiceDto,
+    grok: ServiceDto,
 }
 
 #[derive(Serialize)]

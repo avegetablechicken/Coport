@@ -51,7 +51,7 @@ fn main() {
                 &helper_directory(&args, 4)?,
                 minutes,
                 scope,
-                coport_gui::data_api::reader_names_antigravity(),
+                coport_gui::data_api::ReaderServices::from_env(),
                 std::io::stdout().lock(),
             )
         })();
@@ -65,7 +65,7 @@ fn main() {
         let result = helper_directory(&args, 1).and_then(|dir| {
             coport_gui::data_api::read_summary(
                 &dir,
-                coport_gui::data_api::reader_names_antigravity(),
+                coport_gui::data_api::ReaderServices::from_env(),
             )
         });
         match result {

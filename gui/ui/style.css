@@ -40,6 +40,10 @@
   --antigravity-2: #6aa8f5;
   --antigravity-3: #9fc6f8;
   --antigravity-4: #cfe2fb;
+  --grok-1: #737373;
+  --grok-2: #949494;
+  --grok-3: #b3b3b3;
+  --grok-4: #d3d3d3;
   /* Unidentified traffic has no hue, but must still read on the block. */
   --share-unidentified: rgba(0, 0, 0, 0.08);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;

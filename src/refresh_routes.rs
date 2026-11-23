@@ -18,19 +18,23 @@ use std::{
 
 /// The files, beside the configuration, that keep learned routes across restarts.
 pub const FILE: &str = "claude-refresh-routes.json";
+pub const GROK_FILE: &str = "grok-token-routes.json";
 pub const CODEX_FILE: &str = "codex-refresh-routes.json";
 pub const ANTIGRAVITY_FILE: &str = "antigravity-refresh-routes.json";
 
 /// The account a learned refresh token routes as.
 pub trait Account: Clone + Send + 'static {
-    /// The account a successful token response names.
-    fn named_by(response: &serde_json::Value) -> Option<Self>;
+    /// Grok clients can keep rotated opaque access tokens outside the saved login.
+    const TRACK_ACCESS_TOKEN: bool = false;
+    /// The account a successful token response names, filling in optional
+    /// claims from the previous login when the subject matches.
+    fn named_by(response: &serde_json::Value, previous: Option<&Self>) -> Option<Self>;
     fn learned(account_id: String, usernames: Vec<String>) -> Self;
     fn account_id(&self) -> &str;
     fn usernames(&self) -> &[String];
 }
 impl Account for ClaudeIdentity {
-    fn named_by(response: &serde_json::Value) -> Option<Self> {
+    fn named_by(response: &serde_json::Value, _: Option<&Self>) -> Option<Self> {
         Self::token_response(response)
     }
     fn learned(account_id: String, usernames: Vec<String>) -> Self {
@@ -48,7 +52,7 @@ impl Account for ClaudeIdentity {
 }
 /// A learned Codex account carries no token of its own.
 impl Account for Identity {
-    fn named_by(response: &serde_json::Value) -> Option<Self> {
+    fn named_by(response: &serde_json::Value, _: Option<&Self>) -> Option<Self> {
         Self::token_response(response)
     }
     fn learned(account_id: String, usernames: Vec<String>) -> Self {
@@ -69,7 +73,7 @@ impl Account for Identity {
 /// An Antigravity account, keyed by email, is learned from Google's token
 /// responses, whose ID token names it, or from a lookup.
 impl Account for AntigravityIdentity {
-    fn named_by(response: &serde_json::Value) -> Option<Self> {
+    fn named_by(response: &serde_json::Value, _: Option<&Self>) -> Option<Self> {
         Self::token_response(response)
     }
     fn learned(account_id: String, _: Vec<String>) -> Self {
@@ -152,9 +156,22 @@ impl<A: Account> RefreshRoutes<A> {
             .map(|learned| A::learned(learned.account_id.clone(), learned.usernames.clone()))
     }
 
+    pub(crate) fn access_identity(&self, access: &str) -> Option<A> {
+        self.identity(&format!("access\0{access}"))
+    }
+
     /// Records the account of a refresh token, keeping the newest few of
     /// each account, and saves the routes when they have a file.
     pub fn learn(&self, refresh_token: &str, identity: &A) -> std::io::Result<()> {
+        self.learn_tokens(refresh_token, None, identity)
+    }
+
+    fn learn_tokens(
+        &self,
+        refresh_token: &str,
+        access: Option<&str>,
+        identity: &A,
+    ) -> std::io::Result<()> {
         let mut routes = self
             .routes
             .lock()
@@ -167,14 +184,15 @@ impl<A: Account> RefreshRoutes<A> {
             .map(|learned| learned.learned_at + 1)
             .max()
             .map_or(now, |next| next.max(now));
-        routes.insert(
-            digest(refresh_token),
-            Learned {
-                account_id: identity.account_id().into(),
-                usernames: identity.usernames().to_vec(),
-                learned_at,
-            },
-        );
+        let learned = Learned {
+            account_id: identity.account_id().into(),
+            usernames: identity.usernames().to_vec(),
+            learned_at,
+        };
+        if let Some(access) = access {
+            routes.insert(digest(&format!("access\0{access}")), learned.clone());
+        }
+        routes.insert(digest(refresh_token), learned);
         let mut generations: Vec<(u64, String)> = routes
             .iter()
             .filter(|(_, learned)| learned.account_id == identity.account_id())
@@ -231,10 +249,13 @@ impl<A: Account> RefreshRoutes<A> {
         else {
             return Ok(false);
         };
-        let Some(identity) = A::named_by(&value).or(previous.cloned()) else {
+        let Some(identity) = A::named_by(&value, previous).or_else(|| previous.cloned()) else {
             return Ok(false);
         };
-        self.learn(refresh_token, &identity)?;
+        let access = value["access_token"]
+            .as_str()
+            .filter(|s| A::TRACK_ACCESS_TOKEN && crate::identity::valid_token(s));
+        self.learn_tokens(refresh_token, access, &identity)?;
         Ok(true)
     }
 }

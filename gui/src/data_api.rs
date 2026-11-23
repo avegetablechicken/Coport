@@ -143,38 +143,52 @@ fn account_digest(value: &str) -> String {
 pub const SERVICES_HEADER: &str = "x-coport-services";
 pub const SERVICES_ENV: &str = "COPORT_SUMMARY_SERVICES";
 /// The further services this version parses.
-pub const SERVICES: &str = "antigravity";
+pub const SERVICES: &str = "antigravity,grok";
 
-/// Whether a reader's comma-separated service list names Antigravity.
-pub fn names_antigravity(list: &str) -> bool {
-    list.split(',')
-        .any(|name| name.trim().eq_ignore_ascii_case("antigravity"))
+/// Additional service variants a reader understands.
+#[derive(Clone, Copy)]
+pub struct ReaderServices {
+    antigravity: bool,
+    grok: bool,
 }
 
-/// Whether the reader that started this helper names Antigravity.
-pub fn reader_names_antigravity() -> bool {
-    std::env::var(SERVICES_ENV).is_ok_and(|list| names_antigravity(&list))
+impl ReaderServices {
+    pub fn parse(list: &str) -> Self {
+        let names = |wanted| {
+            list.split(',')
+                .any(|s| s.trim().eq_ignore_ascii_case(wanted))
+        };
+        Self {
+            antigravity: names("antigravity"),
+            grok: names("grok"),
+        }
+    }
+    pub fn from_env() -> Self {
+        Self::parse(&std::env::var(SERVICES_ENV).unwrap_or_default())
+    }
 }
 
-/// A published summary as a reader receives it; see [`SERVICES_HEADER`].
-fn for_reader(bytes: &[u8], antigravity: bool) -> Result<Vec<u8>, String> {
-    let named = bytes
-        .windows(b"\"Antigravity\"".len())
-        .any(|part| part == b"\"Antigravity\"");
-    if antigravity || !named {
+fn for_reader(bytes: &[u8], services: ReaderServices) -> Result<Vec<u8>, String> {
+    let contains = |name: &[u8]| bytes.windows(name.len()).any(|part| part == name);
+    if (services.antigravity || !contains(br#""Antigravity""#))
+        && (services.grok || !contains(br#""Grok""#))
+    {
         return Ok(bytes.to_vec());
     }
     let mut summary: Summary =
         serde_json::from_slice(bytes).map_err(|_| "Cannot decode processed summary")?;
-    summary.without_antigravity();
+    summary.for_services(services);
     summary.validate()?;
     serde_json::to_vec(&summary).map_err(|_| "Cannot encode processed summary".into())
 }
 
 impl Summary {
-    /// Leaves out Antigravity's groups for a reader that cannot parse them.
-    pub fn without_antigravity(&mut self) {
-        let keep = |group: &Group| group.service != Service::Antigravity;
+    fn for_services(&mut self, services: ReaderServices) {
+        let keep = |group: &Group| match group.service {
+            Service::Grok => services.grok,
+            Service::Antigravity => services.antigravity,
+            Service::Codex | Service::Claude => true,
+        };
         self.groups.retain(keep);
         for window in self
             .windows
@@ -194,7 +208,7 @@ impl Summary {
             || self.window_start.checked_add(30 * 60_000) != Some(self.window_end)
             || self.window_end > now + 60_000
             || self.window_end < now - 150_000
-            || self.groups.len() > 259
+            || self.groups.len() > 260
         {
             return Err("Invalid or stale processed summary.".into());
         }
@@ -284,7 +298,7 @@ impl Summary {
     }
 }
 fn validate_groups(groups: &[Group], buckets: usize) -> Result<(), String> {
-    if groups.len() > 259 {
+    if groups.len() > 260 {
         return Err("Too many traffic groups.".into());
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -405,8 +419,8 @@ fn read_node_id(dir: &Path) -> io::Result<String> {
 }
 /// Same processed DTO as HTTP. This command reads existing identity/config/log
 /// files only; it does not start/stop services or open a network listener.
-/// `antigravity`: whether the reader parses Antigravity's groups.
-pub fn read_summary(dir: &Path, antigravity: bool) -> io::Result<Summary> {
+/// `services` selects the groups understood by this reader.
+pub fn read_summary(dir: &Path, services: ReaderServices) -> io::Result<Summary> {
     let (config_path, log) = crate::daemon::Client::discover(dir)
         .map(|(_, status)| (status.config_path, status.log_path))
         .unwrap_or_else(|| (dir.join("config.yaml"), dir.join("logs/proxy.log")));
@@ -415,9 +429,7 @@ pub fn read_summary(dir: &Path, antigravity: bool) -> io::Result<Summary> {
     let node = read_node_id(dir)?;
     let bytes = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
     let mut summary: Summary = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if !antigravity {
-        summary.without_antigravity();
-    }
+    summary.for_services(services);
     Ok(summary)
 }
 
@@ -426,18 +438,18 @@ pub fn stream_summary(
     dir: &Path,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
-    antigravity: bool,
+    services: ReaderServices,
     output: impl io::Write,
 ) -> io::Result<()> {
     let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-    stream_summary_at(dir, minutes, scope, end, antigravity, output)
+    stream_summary_at(dir, minutes, scope, end, services, output)
 }
 fn stream_summary_at(
     dir: &Path,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
     end: i64,
-    antigravity: bool,
+    services: ReaderServices,
     mut output: impl io::Write,
 ) -> io::Result<()> {
     bucket_minutes(minutes).ok_or_else(|| io::Error::other("Unsupported traffic range"))?;
@@ -448,13 +460,13 @@ fn stream_summary_at(
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
     let first = publish_selected(&config, &log, &key, &node, minutes, scope, end)
-        .and_then(|bytes| for_reader(&bytes, antigravity))
+        .and_then(|bytes| for_reader(&bytes, services))
         .map_err(io::Error::other)?;
     output.write_all(&first)?;
     output.write_all(b"\n")?;
     output.flush()?;
     let rest = publish_at(&config, &log, &key, &node, end)
-        .and_then(|bytes| for_reader(&bytes, antigravity))
+        .and_then(|bytes| for_reader(&bytes, services))
         .map_err(io::Error::other)?;
     output.write_all(&rest)?;
     output.write_all(b"\n")?;
@@ -745,13 +757,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         reply(&mut socket, 503, b"{}").await;
         return;
     }
-    let antigravity = reader_services(&head).is_some_and(|list| names_antigravity(&list));
+    let services = ReaderServices::parse(&reader_services(&head).unwrap_or_default());
     if let Ok(Some((minutes, scope))) = requested_window(&head) {
         let selected = (|| {
             let mut summary: Summary = serde_json::from_slice(&bytes).ok()?;
-            if !antigravity {
-                summary.without_antigravity();
-            }
+            summary.for_services(services);
             summary
                 .windows
                 .retain(|w| w.minutes == minutes && w.scope == scope);
@@ -770,7 +780,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             None => reply(&mut socket, 503, b"{}").await,
         }
     } else {
-        match for_reader(&bytes, antigravity) {
+        match for_reader(&bytes, services) {
             Ok(bytes) => reply(&mut socket, 200, &bytes).await,
             Err(_) => reply(&mut socket, 503, b"{}").await,
         }
@@ -882,7 +892,7 @@ mod tests {
             1440,
             crate::traffic::TrafficScope::All,
             original_end,
-            true,
+            ReaderServices::parse(SERVICES),
             &mut output,
         )
         .unwrap();
@@ -1099,8 +1109,39 @@ mod tests {
             );
         }
 
-        assert!(names_antigravity(" Antigravity "));
-        assert!(!names_antigravity("antigravity-next,codex"));
+        // A reader from the Antigravity-only release can parse every frame
+        // after Grok groups have been filtered out, including alignment windows.
+        let (_, complete) = shared.read().await.clone().unwrap();
+        let mut summary: Summary = serde_json::from_slice(&complete).unwrap();
+        for group in summary.groups.iter_mut().chain(
+            summary
+                .windows
+                .iter_mut()
+                .chain(&mut summary.previous_windows)
+                .flat_map(|w| &mut w.groups),
+        ) {
+            if group.service == Service::Antigravity {
+                group.service = Service::Grok;
+            }
+        }
+        let bytes = serde_json::to_vec(&summary).unwrap();
+        for (advertised, expects_grok) in [
+            ("", false),
+            ("antigravity", false),
+            ("grok", true),
+            (SERVICES, true),
+        ] {
+            let body = for_reader(&bytes, ReaderServices::parse(advertised)).unwrap();
+            let summary: Summary = serde_json::from_slice(&body).unwrap();
+            summary.validate().unwrap();
+            assert_eq!(
+                summary_services(&summary).contains(&Service::Grok),
+                expects_grok
+            );
+        }
+
+        assert!(ReaderServices::parse(" Antigravity ").antigravity);
+        assert!(!ReaderServices::parse("antigravity-next,codex").antigravity);
     }
 
     /// As over HTTP, for the SSH helper's stream and single summary.
@@ -1112,6 +1153,10 @@ mod tests {
         prepare_identity(dir.path()).unwrap();
         let services = summary_services;
         for antigravity in [false, true] {
+            let reader = ReaderServices {
+                antigravity,
+                grok: false,
+            };
             let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
             let mut output = Vec::new();
             stream_summary_at(
@@ -1119,7 +1164,7 @@ mod tests {
                 30,
                 crate::traffic::TrafficScope::Model,
                 end,
-                antigravity,
+                reader,
                 &mut output,
             )
             .unwrap();
@@ -1132,7 +1177,7 @@ mod tests {
                 );
                 assert!(services(&frame).contains(&Service::Codex));
             }
-            let summary = read_summary(dir.path(), antigravity).unwrap();
+            let summary = read_summary(dir.path(), reader).unwrap();
             assert_eq!(
                 services(&summary).contains(&Service::Antigravity),
                 antigravity
@@ -1591,13 +1636,13 @@ mod ssh_summary_tests {
             }
         });
         let (client, status) = crate::daemon::tests::wait_for_daemon(&state);
-        let missing_default = read_summary(&state, true);
+        let missing_default = read_summary(&state, ReaderServices::parse(SERVICES));
         // A valid but different default configuration must not override the
         // live daemon's account mapping, nor its separate log path.
         std::fs::write(state.join("config.yaml"), "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        let wrong_default = read_summary(&state, true);
+        let wrong_default = read_summary(&state, ReaderServices::parse(SERVICES));
         std::fs::write(state.join("config.yaml"), "invalid: [").unwrap();
-        let invalid_default = read_summary(&state, true);
+        let invalid_default = read_summary(&state, ReaderServices::parse(SERVICES));
         client.stop().unwrap();
         daemon.join().unwrap().unwrap();
         assert_eq!(status.config_path, config_path);
@@ -1622,7 +1667,7 @@ mod ssh_summary_tests {
         crate::settings::create_private(&dir.path().join("config.yaml"),b"listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let node = prepare_identity(dir.path()).unwrap();
         let before = std::fs::read(dir.path().join("data-identity.key")).unwrap();
-        let summary = read_summary(dir.path(), true).unwrap();
+        let summary = read_summary(dir.path(), ReaderServices::parse(SERVICES)).unwrap();
         summary.validate().unwrap();
         assert_eq!(summary.node_id, node);
         assert!(summary.groups.is_empty());

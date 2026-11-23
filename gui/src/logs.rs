@@ -110,6 +110,7 @@ impl Entry {
     pub fn service(&self) -> Option<Service> {
         match self.get("service") {
             // Token refreshes were once logged as `*_auth`.
+            Some("grok") => Some(Service::Grok),
             Some("codex" | "codex_auth") => Some(Service::Codex),
             Some("claude" | "claude_auth") => Some(Service::Claude),
             Some("antigravity") => Some(Service::Antigravity),

@@ -717,6 +717,9 @@ async fn serve_until(
         .with_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
             dir.join(coport::refresh_routes::FILE),
         ))
+        .with_grok_routes(coport::refresh_routes::RefreshRoutes::load(
+            dir.join(coport::refresh_routes::GROK_FILE),
+        ))
         .with_codex_refresh_routes(coport::refresh_routes::RefreshRoutes::load(
             dir.join(coport::refresh_routes::CODEX_FILE),
         ))

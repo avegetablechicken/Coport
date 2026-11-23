@@ -870,6 +870,9 @@ impl Config {
                 }
             }
         }
+        for selector in self.grok.routing.account.keys() {
+            labels.insert(("Grok".into(), selector.clone()), selector.clone());
+        }
         // Antigravity's records name their route in `account_label`.
         let antigravity = &self.antigravity.routing;
         // API key routes name theirs in `provider`, as Codex's and Claude's.

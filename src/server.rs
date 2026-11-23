@@ -97,6 +97,8 @@ pub use credential_checks::CredentialReport;
 mod antigravity_cooldown;
 #[path = "server_antigravity.rs"]
 mod antigravity_forward;
+#[path = "server_grok.rs"]
+mod grok_forward;
 #[path = "server_transport.rs"]
 mod transport;
 #[path = "websocket_relay.rs"]
@@ -125,6 +127,7 @@ pub struct Server {
         Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
     antigravity_renewed: Arc<crate::antigravity::RenewedTokens>,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
+    grok_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::grok::GrokAccount>>,
     codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
     // When background discovery last failed for a token, until a success. Only
@@ -151,6 +154,7 @@ impl Server {
             location_cooldowns: Default::default(),
             antigravity_refresh_routes: Default::default(),
             antigravity_renewed: Default::default(),
+            grok_routes: Default::default(),
             refresh_routes: Default::default(),
             codex_refresh_routes: Default::default(),
             auto_refresh: Default::default(),
@@ -872,6 +876,15 @@ impl Server {
         }
         if incoming.method() == "CONNECT" {
             return Err(Error::new(400, "Invalid CONNECT request."));
+        }
+        if service == Service::Grok {
+            if websocket {
+                return Err(Error::new(
+                    400,
+                    "Grok subscription endpoints do not use WebSockets.",
+                ));
+            }
+            return self.forward_grok(incoming, target, log).await;
         }
         if service == Service::Antigravity {
             if websocket {

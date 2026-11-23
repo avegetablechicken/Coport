@@ -1895,7 +1895,7 @@ mod tests {
                         dir.path(),
                         30,
                         TrafficScope::Model,
-                        true,
+                        crate::data_api::ReaderServices::parse(crate::data_api::SERVICES),
                         &mut frames,
                     )
                     .unwrap();

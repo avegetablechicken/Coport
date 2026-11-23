@@ -1067,7 +1067,7 @@ function routingBlock() {
   };
   const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
   const credentialError = s.credentialError ? `<div class="placeholder">Credential checks unavailable: ${esc(s.credentialError)}</div>` : "";
-  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude) + section("Antigravity", d.antigravity));
+  return block("Routing", "", credentialError + accountError + section("Codex", d.codex) + section("Claude", d.claude) + section("Antigravity", d.antigravity) + (d.grok?.configured ? section("Grok", d.grok) : ""));
 }
 
 // ---------------------------------------------------------------- activity
@@ -1327,7 +1327,7 @@ function modelTokenStats(stats, scope) {
   return `<div class="strip">${stat(input, tokens(stats.inputTokens))}${stat("Output Tokens", tokens(stats.outputTokens))}${stat("Cached Input", tokens(stats.cachedInputTokens))}${stat("Hit Rate", stats.cacheHitRate == null ? "—" : (100 * stats.cacheHitRate).toFixed(1) + "%")}</div>`;
 }
 
-const SHARE_SERVICES = ["Codex", "Claude", "Antigravity"];
+const SHARE_SERVICES = ["Codex", "Claude", "Antigravity", "Grok"];
 const SHARE_SHADES = 4;
 /// The smallest part of the ring a sector is drawn at, so it stays hoverable;
 /// credentials below it fold into Others.
@@ -1356,8 +1356,7 @@ function maskAccountName(name) {
   return name;
 }
 
-/// Credentials grouped by app, Codex, Claude, then Antigravity, each group in its hue; traffic
-/// has no other service. `measure` gives a credential's amount, or null when it
+/// Credentials grouped by app, each group in its hue. `measure` gives a credential's amount, or null when it
 /// is unknown. The two largest of a service always keep their slice; past them
 /// a credential under SHARE_MIN of the whole ring folds into "Others", when at
 /// least two do. Unknown amounts keep their row. Others takes the next shade after
