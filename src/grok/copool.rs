@@ -7,6 +7,7 @@ use crate::{
     refresh_routes::{Account, RefreshRoutes},
 };
 use serde_json::Value;
+use std::path::PathBuf;
 use url::Url;
 #[derive(Clone)]
 pub struct GrokAccount {
@@ -112,22 +113,34 @@ impl Grok {
         ))
     }
 
-    async fn saved(&self, token: &str, refresh: bool) -> Result<Option<GrokAccount>> {
-        // Preserve the learned/fallback-only behavior of legacy Copool configurations.
-        if self.auth_file.is_none() && self.homes.is_none() && self.account_auth_file_only.is_none()
-        {
-            return Ok(None);
-        }
-        for file in self.login_files() {
-            if let Some(identity) = Self::saved_in_file(&file, token, refresh).await? {
-                return Ok(Some(identity));
+    /// The saved login holding `token`, as model requests find it, in every
+    /// file: one that cannot be read does not hide a later file's login. The
+    /// flag tells whether a file could not be read.
+    async fn saved(files: Vec<PathBuf>, token: &str, refresh: bool) -> (Option<GrokAccount>, bool) {
+        let mut unreadable = false;
+        for file in files {
+            match Self::saved_in_file(&file, token, refresh).await {
+                Ok(Some(identity)) => return (Some(identity), false),
+                Ok(None) => {}
+                Err(_) => unreadable = true,
             }
         }
-        Ok(None)
+        (None, unreadable)
     }
 
     pub(crate) async fn route<'a>(
         &'a self,
+        token: &str,
+        refresh: bool,
+        learned: &RefreshRoutes<GrokAccount>,
+    ) -> Result<(&'a Choice, Option<GrokAccount>, Option<&'a str>)> {
+        self.route_in(self.login_files(), token, refresh, learned)
+            .await
+    }
+
+    async fn route_in<'a>(
+        &'a self,
+        files: Vec<PathBuf>,
         token: &str,
         refresh: bool,
         learned: &RefreshRoutes<GrokAccount>,
@@ -140,15 +153,20 @@ impl Grok {
             learned.access_identity(token)
         };
         let saved = known.is_none();
-        let identity = match known {
-            Some(account) => Some(account),
-            None => self.saved(token, refresh).await?,
+        let (identity, unreadable) = match known {
+            Some(account) => (Some(account), false),
+            None => Self::saved(files, token, refresh).await,
         };
+        let unavailable = || Error::config("Cannot read Grok auth_file.");
         if identity.is_none() && self.subscription_file_only() {
-            return Err(Error::new(
-                403,
-                "Grok requires the current saved login when account_auth_file_only is true.",
-            ));
+            return Err(if unreadable {
+                unavailable()
+            } else {
+                Error::new(
+                    403,
+                    "Grok requires the current saved login when account_auth_file_only is true.",
+                )
+            });
         }
         let mapped = identity.as_ref().and_then(|account| {
             std::iter::once(&account.id)
@@ -164,10 +182,13 @@ impl Grok {
         if let Some((key, choice)) = mapped {
             return Ok((choice, identity, Some(key)));
         }
-        let choice = self
-            .routing
-            .account_default()
-            .ok_or(Error::new(403, "No matching Grok account route."))?;
+        let choice = self.routing.account_default().ok_or_else(|| {
+            if unreadable {
+                unavailable()
+            } else {
+                Error::new(403, "No matching Grok account route.")
+            }
+        })?;
         Ok((choice, identity, None))
     }
 
@@ -280,6 +301,62 @@ mod tests {
                 .1
                 .is_none()
         );
+    }
+
+    /// Without homes, auth_file or a file policy, Grok Build's own login in
+    /// its default home still names its route for billing, settings and
+    /// renewal, as for its model requests; an unreadable home does not hide
+    /// a later one's login, and only stops a request no route can take.
+    #[tokio::test]
+    async fn subscription_requests_find_the_saved_login_in_every_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (broken, saved) = (dir.path().join("broken.json"), dir.path().join("auth.json"));
+        std::fs::write(&broken, "{").unwrap();
+        let login = json!({"user_id":"user","email":"user@example.test","key":"access","refresh_token":"refresh"});
+        std::fs::write(
+            &saved,
+            json!({format!("{ISSUER}::{CLIENT_ID}"): login}).to_string(),
+        )
+        .unwrap();
+        let parse = |grok: &str| {
+            Config::parse(&format!(
+                "listen_port: 8787\nrequest_timeout_seconds: 3\ngrok:\n{grok}"
+            ))
+            .unwrap()
+            .grok
+        };
+        let routes = RefreshRoutes::default();
+        let defaults = parse("  routing:\n    account: {'user@example.test': none}\n");
+        for (token, refresh) in [("access", false), ("refresh", true)] {
+            let (_, identity, label) = defaults
+                .route_in(vec![broken.clone(), saved.clone()], token, refresh, &routes)
+                .await
+                .unwrap();
+            assert_eq!(label, Some("user@example.test"));
+            assert_eq!(identity.unwrap().account_id(), "user");
+        }
+        // An unknown token: no route is 403, an unreadable home 502, and a
+        // fallback still carries it.
+        for (files, status) in [(vec![saved.clone()], 403), (vec![broken.clone()], 502)] {
+            assert!(matches!(
+                defaults.route_in(files, "unknown", false, &routes).await,
+                Err(Error { status: s, .. }) if s == status
+            ));
+        }
+        let fallback = parse("  routing:\n    account_fallback: none\n");
+        let (_, identity, label) = fallback
+            .route_in(vec![broken.clone()], "unknown", false, &routes)
+            .await
+            .unwrap();
+        assert!(identity.is_none() && label.is_none());
+        let strict =
+            parse("  account_auth_file_only: true\n  routing:\n    account_fallback: none\n");
+        assert!(matches!(
+            strict
+                .route_in(vec![broken], "unknown", false, &routes)
+                .await,
+            Err(Error { status: 502, .. })
+        ));
     }
 
     #[tokio::test]

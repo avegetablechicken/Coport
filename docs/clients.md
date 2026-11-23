@@ -673,12 +673,14 @@ grok:
       "subscriber@example.com": ny2
 ```
 
-With the file policy explicitly set, Coport looks for Grok Build's login at
-`$GROK_HOME/auth.json`, or `~/.grok/auth.json` when `GROK_HOME` is unset.
-Set `auth_file` to override that path. With `true`, every token must match the
-current saved login even when a fallback exists. With `false`, learned accounts
-and configured fallbacks can also route requests. Existing configurations
-without either file setting continue to use learned identities and fallbacks.
+Coport looks for Grok Build's login in `grok.homes`, else at
+`$GROK_HOME/auth.json`, or `~/.grok/auth.json` when `GROK_HOME` is unset, as
+for its model requests. Set `auth_file` to override that path. A file that
+cannot be read does not hide another's login, but a token no route can take is
+then refused with 502. With `true`, every token must match the current saved
+login even when a fallback exists. With `false`, learned accounts and
+configured fallbacks can also route requests. Existing configurations without
+either file setting also use learned identities and fallbacks.
 
 `base_url.account` selects the upstream for billing and settings. Renewals
 always go to `auth.x.ai/oauth2/token`. Named keys under `routing.api_key` use
