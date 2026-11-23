@@ -73,6 +73,10 @@ impl Account for Identity {
 /// An Antigravity account, keyed by email, is learned from Google's token
 /// responses, whose ID token names it, or from a lookup.
 impl Account for AntigravityIdentity {
+    // Apps that renew a login themselves keep its new access token; learned
+    // with its refresh token, it still names the account after a restart.
+    const TRACK_ACCESS_TOKEN: bool = true;
+
     fn named_by(response: &serde_json::Value, _: Option<&Self>) -> Option<Self> {
         Self::token_response(response)
     }

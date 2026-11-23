@@ -1170,8 +1170,12 @@ impl Antigravity {
                 "Antigravity token does not match the saved login.",
             ));
         }
-        // Issued by a relayed refresh of another account's learned login.
-        if let Some(identity) = renewed.and_then(|r| r.identity) {
+        // Issued by a relayed refresh of another account's learned login:
+        // recently, else as the saved routes recorded it before a restart.
+        if let Some(identity) = renewed
+            .and_then(|r| r.identity)
+            .or_else(|| learned.access_identity(token))
+        {
             let proxy = self
                 .account_choice(Some(&identity), false)
                 .ok_or(Error::config("Antigravity account has no proxy route."))?;

@@ -5840,6 +5840,13 @@ async fn antigravity_token_refresh_routes_like_codex_and_learns_its_id_token_acc
     let open = start(false).await;
     trust(&open, &token, &token_endpoint);
     trust(&open, &payload, &payload_endpoint);
+    // So does the access token its refresh issued, which the client kept
+    // across the restart, with no account lookup.
+    antigravity_request(&open, "renewed-access").await;
+    expect_payload(&mut payload, "renewed-access").await;
+    assert!(token.requests.try_recv().is_err());
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(!saved.contains("renewed-access"));
     let response = antigravity_refresh(&open, "saved-refresh", client).await;
     assert_eq!(response.status(), 200);
     assert!(

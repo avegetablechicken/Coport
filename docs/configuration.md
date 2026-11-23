@@ -398,7 +398,8 @@ route that carried it.
 
 With `account_auth_file_only: true`, any other token is rejected. With `false`,
 an access token a relayed refresh issued for a learned refresh token takes its
-account's route; any
+account's route, also after a restart: its digest is kept with that refresh
+token's in `antigravity-refresh-routes.json`; any
 other token is named by `GET https://www.googleapis.com/oauth2/v2/userinfo`
 through `account_probe` (omitted: `account_fallback`, then `fallback`); only the
 Bearer token is sent, never the request or its headers. The returned email then
