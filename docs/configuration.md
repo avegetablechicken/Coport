@@ -10,8 +10,9 @@ cp config.example.yaml config.yaml
 On Windows PowerShell, use `Copy-Item` and `coport.exe`.
 The executable, service manager, tests, and packaging tools do not require Python.
 
-The top level contains shared server settings and named proxies. **Codex and
-Claude each have their own credential directories, `base_url`, and `routing` settings**:
+The top level contains shared server settings and named proxies. **Codex, Claude,
+Antigravity and Grok each have their own credential sources, `base_url`, and
+`routing` settings**:
 
 ```yaml
 listen_port: 8787
@@ -43,9 +44,9 @@ claude:
     #   ANTHROPIC_API_KEY: claude_official
 ```
 
-Either service section can be omitted. An optional `antigravity` section routes
+Every service section can be omitted. The `antigravity` section routes
 Antigravity's Google logins and Gemini API key upstreams; see
-[Antigravity](#antigravity). An optional `grok` section routes Grok Build's xAI
+[Antigravity](#antigravity). The `grok` section routes Grok Build's xAI
 logins and API keys; see [Grok](#grok). Within each section:
 
 | Field | Purpose |
@@ -139,7 +140,8 @@ A supplied `ChatGPT-Account-Id` must match the token's actual account ID.
 Access-token profile metadata takes precedence over top-level claims and ID-token
 metadata. These are routing hints; upstream authentication still validates tokens.
 
-Both services support `account_auth_file_only`, defaulting to `true`:
+Every service supports `account_auth_file_only`, defaulting to `true`. For Codex
+and Claude (Antigravity and Grok are described in their own sections):
 
 | Mode | Codex | Claude |
 | --- | --- | --- |

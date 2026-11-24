@@ -37,7 +37,7 @@ const STILL = args.includes("--still");
 
 const WIDTH = 360; // The panel's window width (gui/tauri.conf.json).
 // From the header through Outbound Proxies.
-const HEIGHT = Number(option("--height", 898));
+const HEIGHT = Number(option("--height", 1040));
 const SCALE = 2;
 const FPS = SCENES[SCENE].fps;
 const SECONDS = SCENES[SCENE].seconds;
@@ -178,7 +178,8 @@ try {
     await Promise.race([exited, new Promise((ok) => setTimeout(ok, 5000))]);
   }
   server.close();
-  rmSync(work, { recursive: true, force: true });
+  // Chrome's helpers may still be writing to the profile for a moment.
+  rmSync(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 // A closing WebSocket can keep the event loop alive after Chrome is gone.
 process.exit();

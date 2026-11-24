@@ -5,28 +5,30 @@
 <h1 align="center">Coport</h1>
 
 <p align="center">
-  Route Codex and Claude Code through the right outbound proxy for each account.
+  Route Codex, Claude Code, Antigravity and Grok Build through the right outbound proxy for each
+  account.
 </p>
 
-Coport is a cross-platform (macOS, Linux, Windows) loopback reverse proxy for Codex, Claude Code,
-ChatGPT account APIs and the OpenAI documentation MCP. It matches each request's account or API Key
-credential and picks the outbound proxy configured for it. HTTP/SSE and WebSocket traffic pass
-through unchanged: no model mapping or protocol conversion. It ships as a CLI with a built-in
-background service, and as a menu bar / tray app.
+Coport is a cross-platform (macOS, Linux, Windows) loopback reverse proxy for coding agents: Codex
+(with ChatGPT account APIs and the OpenAI documentation MCP), Claude Code, Antigravity (Google AI
+Pro) and Grok Build. It matches each request's account or API Key credential and picks the outbound
+proxy configured for it. HTTP/SSE and WebSocket traffic pass through unchanged: no model mapping or
+protocol conversion. It ships as a CLI with a built-in background service, and as a menu bar / tray
+app.
 
 <p align="center">
-  <img src="assets/coport-demo.gif" alt="Coport panel in light and dark themes: proxy status, per-account model traffic, recent requests and outbound proxy tests" width="720">
+  <img src="assets/coport-demo.gif" alt="Coport panel in light and dark themes: proxy status, connection URLs for Codex, Claude, Antigravity and Grok, per-account model traffic, recent requests and outbound proxy tests" width="720">
 </p>
 
 ## Features
 
 - Per-credential routing for Codex and Claude Code: ChatGPT/Claude logins, API Keys, Codex
   providers, Claude settings files and explicit upstream URLs
+- Antigravity (Google AI Pro) Cloud Code requests routed by Google login, and Gemini API key
+  requests by key or upstream URL, with Gemini token usage in Activity
+- Grok Build requests routed by xAI login or API key, read from Grok Build's `auth.json`
 - Grok Build subscription token renewal, usage and plan queries from Copool, with
   account-specific exits. [Copool setup](docs/clients.md#copool-grok-subscription-usage)
-- Grok Build requests routed by xAI login or API key, read from Grok Build's `auth.json`
-- Antigravity (Google AI Pro) Cloud Code requests routed by Google login, with Gemini token
-  usage in Activity
 - Logins read where the CLIs keep them (`auth.json`, `.credentials.json` or the OS credential
   store), refreshed per request
 - HTTP, HTTPS and SOCKS5 outbound proxies with authentication and ordered, health-checked
@@ -57,6 +59,7 @@ A minimal configuration:
 
 ```yaml
 listen_port: 8787
+request_timeout_seconds: 300
 proxies:
   us: "http://127.0.0.1:7891"
 codex:
@@ -67,22 +70,54 @@ claude:
   routing:
     account:
       "you@example.com": us
+antigravity:
+  routing:
+    account:
+      default: us
+grok:
+  routing:
+    account:
+      default: us
 ```
 
-Point the clients at the local listener (Codex: top level of `~/.codex/config.toml`; Claude Code:
-`~/.claude/settings.json`):
+Each service section is optional; keep only the clients you use. Then point each client at the
+local listener.
+
+Codex, at the top level of `~/.codex/config.toml`:
 
 ```toml
 openai_base_url = "http://127.0.0.1:8787/v1"
 chatgpt_base_url = "https://127.0.0.1:8787/backend-api"
 ```
 
+Codex requires HTTPS for `chatgpt_base_url`; trust the CA that Coport creates in `tls/ca.pem` next
+to its configuration, as described in [Connecting clients](docs/clients.md#connect-codex).
+
+Claude Code, in `~/.claude/settings.json`:
+
 ```json
 { "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic" } }
 ```
 
-Codex requires HTTPS for `chatgpt_base_url`; trust the CA that Coport creates in `tls/ca.pem` next
-to its configuration, as described in [Connecting clients](docs/clients.md#connect-codex).
+Antigravity CLI (`agy`), from its environment:
+
+```sh
+CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity \
+USER_INFO_OVERRIDE_URL=http://127.0.0.1:8787/antigravity/https://www.googleapis.com/oauth2/v2/userinfo \
+AICODE_ENDPOINT_URL=http://127.0.0.1:8787/antigravity/https://aicode.googleapis.com \
+agy
+```
+
+Grok Build, in `~/.grok/config.toml`:
+
+```toml
+[endpoints]
+cli_chat_proxy_base_url = "http://127.0.0.1:8787/grok/v1"
+xai_api_base_url = "http://127.0.0.1:8787/grok/v1"
+```
+
+[Connecting clients](docs/clients.md) covers each client's details, API keys and the proxy-port
+mode.
 
 ## Desktop app
 
@@ -132,7 +167,7 @@ target/release/coport service status
 | Topic | Contents |
 | --- | --- |
 | [Configuration](docs/configuration.md) | Credential sources, routing, proxies, overrides, limits |
-| [Connecting clients](docs/clients.md) | Codex, Claude Code, MCP, TLS trust, proxy-port mode, third-party APIs |
+| [Connecting clients](docs/clients.md) | Codex, Claude Code, Antigravity, Grok Build, MCP, TLS trust, proxy-port mode, third-party APIs |
 | [Desktop app](docs/desktop.md) | Panel, data locations, device statistics, remote forwarding |
 | [Background service](docs/service.md) | Install, update and runtime directories |
 | [Logs](docs/logs.md) | Log files, events, model-call accounting, WebSocket timeouts |

@@ -33,11 +33,15 @@
 
   const CODEX = { service: "Codex", path: "/backend-api/codex/responses" };
   const CLAUDE = { service: "Claude", path: "/v1/messages" };
+  const ANTIGRAVITY = { service: "Antigravity", path: "/antigravity/v1internal:streamGenerateContent" };
+  const GROK = { service: "Grok", path: "/grok/v1/responses" };
   const ACCOUNTS = [
-    { ...CODEX, credential: "work@example.com", proxy: "us", weight: 0.42 },
-    { ...CODEX, credential: "personal@example.com", proxy: "jp", weight: 0.18 },
-    { ...CLAUDE, credential: "you@example.com", proxy: "claude_official", weight: 0.3 },
-    { ...CLAUDE, credential: "api", proxy: "none", weight: 0.1 },
+    { ...CODEX, credential: "work@example.com", proxy: "us", weight: 0.3 },
+    { ...CLAUDE, credential: "you@example.com", proxy: "claude_official", weight: 0.24 },
+    { ...ANTIGRAVITY, credential: "pro@example.com", proxy: "us", weight: 0.18 },
+    { ...GROK, credential: "builder@example.com", proxy: "jp", weight: 0.14 },
+    { ...CODEX, credential: "personal@example.com", proxy: "jp", weight: 0.1 },
+    { ...CLAUDE, credential: "api", proxy: "none", weight: 0.04 },
   ];
 
   // Calls a device logged: the history before the recording plus live arrivals.
@@ -52,11 +56,11 @@
       }
       return accounts[0];
     };
-    const call = (time, live = false) => {
+    const call = (time, live = false, account = pick()) => {
       const error = !live && random() < 0.03;
       const input = Math.round(18_000 + random() * 90_000);
       calls.push({
-        seq: seq++, time, account: pick(), error,
+        seq: seq++, time, account, error,
         status: error ? 529 : 200,
         ms: Math.round(2_400 + random() * 14_000),
         bytes: Math.round(8_000 + random() * 60_000),
@@ -75,11 +79,11 @@
   const DEVICES = [
     {
       id: "6f1c2a90-0d1e-4c55-9a43-3d2b7f0e8a11", name: "mbp16", host: "mbp16",
-      traffic: device(11, [ACCOUNTS[0], ACCOUNTS[2]], 0.8),
+      traffic: device(11, [ACCOUNTS[0], ACCOUNTS[1], ACCOUNTS[3]], 0.8),
     },
     {
       id: "b3e8d4c7-52a9-4f0b-8e61-7c4d9a2f5b38", name: "studio", host: "studio",
-      traffic: device(23, [ACCOUNTS[1], { ...CODEX, credential: "Unidentified", proxy: "none", weight: 0.3 }], 0.5),
+      traffic: device(23, [ACCOUNTS[2], ACCOUNTS[4], { ...CODEX, credential: "Unidentified", proxy: "none", weight: 0.3 }], 0.5),
     },
   ];
 
@@ -196,6 +200,8 @@
         base: "http://127.0.0.1:8787",
         claude: "http://127.0.0.1:8787/anthropic",
         codex: "http://127.0.0.1:8787/v1",
+        antigravity: "http://127.0.0.1:8787/antigravity",
+        grok: "http://127.0.0.1:8787/grok/v1",
         chatgpt: "https://127.0.0.1:8787/backend-api",
         caCertificate: "~/Library/Application Support/io.github.coport.gui/tls/ca.pem",
         proxyCaCertificate: "~/Library/Application Support/io.github.coport.gui/tls/proxy-ca.pem",
@@ -224,11 +230,23 @@
             apiKeyRoutes: [route("api", "profile", ["none"])],
             fallbacks: [fallback("accountFallback"), fallback("fallback"), fallback("accountProbe", ["claude_official"])],
           },
+          antigravity: {
+            configured: true, upstreams: [], fileOnly: true,
+            accountRoutes: [route("pro@example.com", "account", ["us"])],
+            apiKeyRoutes: [],
+            fallbacks: [fallback("accountFallback"), fallback("fallback"), fallback("accountProbe")],
+          },
+          grok: {
+            configured: true, upstreams: [], fileOnly: true,
+            accountRoutes: [route("builder@example.com", "account", ["jp", "us"])],
+            apiKeyRoutes: [],
+            fallbacks: [fallback("accountFallback"), fallback("fallback")],
+          },
         },
       },
       settings: {
         deviceCount: DEVICES.length, appearance: "System", startProxyOnLaunch: true, keepProxyRunningOnQuit: true,
-        launchAtLogin: true, logBytes: 3_481_202, trafficCompatibility: { exists: false, choices: 0, error: null },
+        maskAccountNames: false, launchAtLogin: true, logBytes: 3_481_202, trafficCompatibility: { exists: false, choices: 0, error: null },
       },
       proxyCa: null,
     };
@@ -270,6 +288,16 @@
   const clicked = new Set();
   // When the last page change began; its motion follows the recording's clock.
   let changedAt = null;
+  // A page change animates copies with Element.animate. A copy can leave the
+  // document mid-change, where getAnimations() no longer finds it, and the
+  // change ends only once all of them have finished.
+  const motions = new Set();
+  const animate = Element.prototype.animate;
+  Element.prototype.animate = function (...args) {
+    const animation = animate.apply(this, args);
+    motions.add(animation);
+    return animation;
+  };
 
   // Clicks happen in order, even when a preview jumps past some of them.
   async function tour(elapsed) {
@@ -291,7 +319,8 @@
       ARRIVALS.forEach((at, i) => {
         if (elapsed >= at && !arrived.has(i)) {
           arrived.add(i);
-          local.call(START + at, true);
+          // Live calls take turns among the four services.
+          local.call(START + at, true, ACCOUNTS[i % 4]);
         }
       });
       if (SCENE === "tour") await tour(elapsed);
@@ -302,20 +331,28 @@
         content.scrollTop = elapsed >= LOG_AT ? content.scrollTop + (logOffset() ?? 0) : 0;
       } else if (ui.page === "devices") {
         await refresh();
-        await loadDeviceCards();
+        // Peers' statistics come from the last refresh's cache, as on a revisit.
+        await Promise.all([loadMergedData(true), loadDeviceCards()]);
       } else {
         await refresh();
         await loadHomeTraffic(true);
       }
       // A page change in motion shows where it is at this time, or ends.
-      for (const animation of document.getAnimations()) {
-        if (changedAt == null || !animation.effect?.target?.closest?.(".page-motion")) continue;
+      for (const animation of changedAt == null ? [] : motions) {
         const { delay, duration } = animation.effect.getTiming();
-        if (elapsed - changedAt >= delay + duration) animation.finish();
-        else {
+        if (elapsed - changedAt >= delay + duration) {
+          animation.finish();
+          motions.delete(animation);
+        } else {
           animation.pause();
           animation.currentTime = elapsed - changedAt;
         }
+      }
+      // Looping indicators copied into the change hold their frame for this time.
+      for (const animation of document.getAnimations()) {
+        if (changedAt == null || motions.has(animation) || !animation.effect?.target?.closest?.(".page-motion")) continue;
+        animation.pause();
+        animation.currentTime = elapsed - changedAt;
       }
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     },
