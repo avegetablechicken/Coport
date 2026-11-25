@@ -7,7 +7,7 @@ const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 function setup(scope = 'model') {
   const context = { ui: { trafficScope: scope }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function outputTpsStat('), source.indexOf('function trafficSummary(')), context);
+  vm.runInContext(source.slice(source.indexOf('function tooltipScopeKey('), source.indexOf('function trafficSummary(')), context);
   vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
   return context;
 }
@@ -422,7 +422,7 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
   const brief = context.accountRow(failed, 'model', failed, '<review>');
-  assert.equal(brief, '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
+  assert.equal(brief.replace(/ data-tip-scope="[^"]*"/, ''), '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
     + '<span class="traffic-brief"><span>16 calls · <span class="bad">100.0% errors</span></span><review></span></div></div>');
   assert.match(context.accountRow({ ...failed, requests: 1, errors: 1 }, 'model', failed), />1 call · </);
   const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && !/Received|brief/.test(html);
@@ -540,13 +540,18 @@ test('bar tooltips use their own time bucket and only the plotted metric', () =>
     assert.match(groups[0], /<rect class=""/);
     for (const i of [1, 2]) assert.match(groups[i], /<rect class="idle"[^>]* y="31.00"[^>]* height="1.00"/);
   }
+  const old = context.chart(stats, 'model', false, { start, end, bucketMinutes: 1 });
+  const refreshed = context.chart(stats, 'model', false, { start: start + 15_000, end: end + 15_000, bucketMinutes: 1 });
+  const slots = html => [...html.matchAll(/data-tip-slot="([^"]*)"/g)].map(m => m[1]);
+  assert.deepEqual(slots(old), slots(refreshed), 'live-window movement retains the hovered column');
+  assert.notDeepEqual(tips(old), tips(refreshed), 'its displayed time range still updates');
 });
 
 test('hovering across bars updates the tooltip and leaving hides it', () => {
   const events = {};
   const timers = new Map();
   let timerId = 0;
-  const tip = { hidden: true, style: {}, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
+  const tip = { hidden: true, style: {}, contains: () => false, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
   const context = {
     $: () => tip,
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
@@ -565,7 +570,7 @@ test('hovering across bars updates the tooltip and leaving hides it', () => {
       setAttribute(name, value) { this[name] = value; },
       removeAttribute(name) { delete this[name]; },
     };
-    const target = { owner, closest: selector => selector.includes('.chart-bar') ? owner : null };
+    const target = { owner, parentElement: owner, closest: selector => selector.includes('.chart-bar') ? owner : null };
     return { owner, target };
   };
   const flush = () => { for (const [id, fn] of timers) { timers.delete(id); fn(); } };
@@ -796,7 +801,7 @@ test('Output TPS warning tooltip adds the total-duration rate without changing t
   context.stat = (label, value) => `${label}<value>${value}</value>`;
   const stats = { outputTokens: 1000, latencyTotalMs: 20000, outputTps: 66.6 };
   const html = context.outputTpsStat(stats, 'model');
-  assert.match(html, /^Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="output-tps-\d+" data-tip="From request start instead of the first token: 50\.0 tok\/s\."/);
+  assert.match(html, /^Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="tooltip-\d+" data-tip="From request start instead of the first token: 50\.0 tok\/s\."/);
   assert.match(html, /aria-label="From request start instead of the first token: 50\.0 tok\/s\."/);
   assert.match(html, />!<\/span><value>66\.6 tok\/s<\/value>$/);
   for (const fields of [

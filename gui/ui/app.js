@@ -613,7 +613,9 @@ function chart(stats, scope, showPeak = false, window = stats) {
     const from = start + i * bucketMs;
     const to = Math.min(from + bucketMs, end);
     const range = Number.isFinite(from) && Number.isFinite(to) ? `${date(from)} – ${date(to)}\n` : "";
-    bars += `<g class="chart-bar" data-tip="${esc(range + title)}" aria-label="${esc(range + title)}">`;
+    // Live windows advance on refresh; keep the hovered column and update
+    // its timestamp/value, while a different category or bucket width differs.
+    bars += `<g class="chart-bar" data-tip-slot="${scope}:${i}:${bucketMs}" data-tip="${esc(range + title)}" aria-label="${esc(range + title)}">`;
     bars += `<rect class="${v ? "" : "idle"}" x="${x}" y="${(h - bh).toFixed(2)}" width="${bar.toFixed(2)}" height="${bh.toFixed(2)}" rx="1"></rect>`;
     if (v && errors[i]) {
       const eh = (bh * errors[i]) / calls[i];
@@ -641,14 +643,15 @@ function chart(stats, scope, showPeak = false, window = stats) {
 /// the row is one line: the account, its calls and its error rate. Any call
 /// that succeeded keeps the full row.
 function accountRow(c, scope, window, review = "", source = "local") {
+  const identityKey = JSON.stringify(["account", source, c.service, c.credential]);
   const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
   const identity = `<span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>`;
   if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) {
     const calls = `${c.requests.toLocaleString("en-US")} ${c.requests === 1 ? "call" : "calls"}`;
-    return `<div class="credential-traffic"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
+    return `<div class="credential-traffic" data-tip-scope="${tooltipScopeKey(identityKey)}"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
   }
-  return `<div class="credential-traffic"><div class="traffic-identity">${identity}${review}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${outputTpsStat(c, scope, JSON.stringify(["account", source, c.service, c.credential]))}</div>${modelTokenStats(c, scope)}</div>`;
+  return `<div class="credential-traffic" data-tip-scope="${tooltipScopeKey(identityKey)}"><div class="traffic-identity">${identity}${review}</div>
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${outputTpsStat(c, scope, identityKey)}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -656,18 +659,20 @@ function accountRow(c, scope, window, review = "", source = "local") {
 /// `source` names whose traffic it is ("local", "merged" or "device/<id>"), so
 /// a page change carries it over to the same traffic on the next page.
 const trafficMarkup = new WeakMap();
+// Keep private identities in memory; DOM scopes expose only session-local IDs.
+function tooltipScopeKey(key) {
+  const keys = tooltipScopeKey.keys ||= new Map();
+  if (!keys.has(key)) keys.set(key, `tooltip-${keys.size}`);
+  return keys.get(key);
+}
 function outputTpsStat(stats, scope, key = "output-tps") {
   if (scope !== "model") return "";
-  // Stable across fresh snapshots without putting unmasked account names
-  // into DOM attributes. The registry lives only for this panel session.
-  const keys = outputTpsStat.keys ||= new Map();
-  if (!keys.has(key)) keys.set(key, `output-tps-${keys.size}`);
   const average = Number.isFinite(stats.outputTokens) && stats.outputTokens > 0
     && Number.isFinite(stats.latencyTotalMs) && stats.latencyTotalMs > 0
     ? stats.outputTokens * 1000 / stats.latencyTotalMs : null;
   const averageText = average == null || !Number.isFinite(average) ? "—" : average.toFixed(1) + " tok/s";
   const tip = `From request start instead of the first token: ${averageText}.`;
-  const label = `Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="${keys.get(key)}" data-tip="${esc(tip)}" aria-label="${esc(tip)}">${ICON.warning}</span>`;
+  const label = `Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="${tooltipScopeKey(key)}" data-tip="${esc(tip)}" aria-label="${esc(tip)}">${ICON.warning}</span>`;
   const value = stats.outputTps == null || !Number.isFinite(stats.outputTps) ? "—" : stats.outputTps.toFixed(1) + " tok/s";
   return stat(label, value);
 }
@@ -961,7 +966,7 @@ function proxiesBlock() {
             p.local && probe?.exitIp
               ? ` → ${mark ? `<span class="flag" data-tip="${esc(probe.country)}">${mark}</span> ` : ""}${esc(probe.exitIp)}`
               : "";
-          return `<div class="row proxy">
+          return `<div class="row proxy" data-tip-scope="proxy:${esc(p.name)}">
             <span class="dot ${dot}" ${probe?.error ? `data-tip="${esc(probe.error)}"` : ""}></span>
             <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
             <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
@@ -1016,7 +1021,7 @@ function routingChain(names) {
   return `<span class="chain">${names.map((name) => `<span class="route-proxy${name.length > 14 ? " route-proxy-long" : ""}" title="${esc(name === "none" ? "direct" : name)}">${tag(name)}</span>`).join('<span class="arrow">→</span>')}</span>`;
 }
 
-function routingRow(route, account, fileOnly = false) {
+function routingRow(route, account, fileOnly = false, service = "") {
   const identity = routeIdentity(route.selector, route.kind || (account ? "account" : "unknown"));
   const warning = {
     remote: "No match in the local OAuth account cache. The account probe confirmed this account is available.",
@@ -1029,14 +1034,14 @@ function routingRow(route, account, fileOnly = false) {
       + (route.activation === "probe_failed" ? '<span class="route-activation bad">Probe failed</span>' : "")
       + (needsWarning ? `<span class="route-activation route-warning tip-wide" tabindex="0" role="img" aria-label="${esc(warning)}" data-tip="${esc(warning)}">${ICON.warning}</span>` : "");
   if (account || route.kind === "api_key") {
-    return `<div class="route-summary route-static">
+    return `<div class="route-summary route-static" data-tip-scope="${tooltipScopeKey(JSON.stringify(["route", service, account, route.kind, route.selector]))}">
       <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name" data-full-name="${esc(identity.name)}">${esc(identity.name)}</span>${activation}</span>
       <span class="route-destination">${routingChain(route.proxies)}</span>
     </div>`;
   }
   const extra = route.detail && route.detail !== route.selector ? route.detail : "";
   const title = `${identity.type}: ${route.selector}${extra ? `\n${extra}` : ""}`;
-  return `<div class="route-summary" title="${esc(title)}">
+  return `<div class="route-summary" data-tip-scope="${tooltipScopeKey(JSON.stringify(["route", service, account, route.kind, route.selector]))}" title="${esc(title)}">
     <span class="route-identity"><span class="route-icon" aria-hidden="true">${ROUTE_ICON[identity.kind]}</span><span class="route-name">${esc(identity.name)}</span></span>
     <span class="route-destination">${routingChain(route.proxies)}</span>
   </div>`;
@@ -1052,19 +1057,87 @@ document.addEventListener("pointerover", (event) => {
   }
 });
 
-// Render every `data-tip` (controls, notes, account warnings and bar details)
-// outside the scrolling panel, keeping tooltips inside the viewport. Keyboard
-// focus shows one as well; a click does not.
+// One renderer for data-tip, HTML titles and SVG titles on every platform.
+// Native titles are held while open to prevent a second desktop tooltip.
+// Keyboard focus shows one as well; a click does not.
 let routeTooltipTimer;
 let routeTooltipOwner;
 let routeTooltipMode;
 let routeTooltipPointer;
+let routeTooltipIdentity;
+let routeTooltipAnchor;
+const heldTooltipTitles = new Map();
+
+function tooltipText(owner) {
+  return owner.dataset?.tip ?? owner.getAttribute?.("title") ?? heldTooltipTitles.get(owner)?.text
+    ?? owner.querySelector?.(":scope > title")?.textContent;
+}
+
+function tooltipOwner(node) {
+  if (node?.nodeType === 3) node = node.parentElement;
+  for (; node; node = node.parentElement) {
+    if (tooltipText(node) != null) return tooltipText(node) ? node : null;
+  }
+  return null;
+}
+
+// Use stable controls/scopes where present, then a structural path within
+// that scope. Tooltip text and status classes may change on every refresh.
+function tooltipIdentity(owner) {
+  if (owner.dataset.tipKey) return JSON.stringify(["key", owner.dataset.tipKey]);
+  const parts = [];
+  for (let node = owner; node; node = node.parentElement) {
+    const anchor = node.id ? ["id", node.id]
+      : node.dataset.tipScope ? ["scope", node.dataset.tipScope]
+      : node.dataset.morph ? ["morph", node.dataset.morph] : null;
+    if (anchor) { parts.push(anchor); break; }
+    if (node.dataset.tipSlot || node.dataset.slice) {
+      parts.push([node.tagName, node.dataset.tipSlot ?? node.dataset.slice]);
+    } else if (node.dataset.action) {
+      parts.push([node.tagName, ...["action", "name", "target", "id", "key", "service"].map(key => node.dataset[key] ?? "")]);
+    } else if (node.matches?.(".stat")) {
+      parts.push(["stat", node.querySelector(".stat-label")?.textContent]);
+    } else {
+      parts.push([node.tagName, node.parentElement ? [...node.parentElement.children].indexOf(node) : 0]);
+    }
+  }
+  return JSON.stringify(parts);
+}
+
+function holdTooltipTitles(owner) {
+  for (let node = owner; node; node = node.parentElement) {
+    const title = node.getAttribute?.("title");
+    if (title != null) {
+      heldTooltipTitles.set(node, { ...heldTooltipTitles.get(node), text: title, title });
+      node.removeAttribute("title");
+    }
+    const shape = node.querySelector?.(":scope > title");
+    if (shape) {
+      const held = heldTooltipTitles.get(node);
+      heldTooltipTitles.set(node, { ...held, text: held?.title ?? shape.textContent, shape });
+      shape.remove();
+    }
+  }
+}
+
+function releaseTooltipTitles() {
+  for (const [node, { title, shape }] of heldTooltipTitles) {
+    if (shape) {
+      if (!node.querySelector(":scope > title")) node.prepend(shape);
+    }
+    if (title != null && !node.hasAttribute("title")) node.setAttribute("title", title);
+  }
+  heldTooltipTitles.clear();
+}
 
 function hideRouteTooltip() {
   clearTimeout(routeTooltipTimer);
   routeTooltipOwner?.removeAttribute("aria-describedby");
   routeTooltipOwner = null;
   $("route-tooltip").hidden = true;
+  routeTooltipIdentity = null;
+  routeTooltipAnchor = null;
+  releaseTooltipTitles();
 }
 
 function routeTooltipPosition(anchor, size, width, height) {
@@ -1078,11 +1151,20 @@ function routeTooltipPosition(anchor, size, width, height) {
 function paintRouteTooltip() {
   const owner = routeTooltipOwner;
   if (!owner?.isConnected) return hideRouteTooltip();
+  holdTooltipTitles(owner);
   const tip = $("route-tooltip");
-  tip.textContent = owner.dataset.tip;
+  const text = tooltipText(owner);
+  if (!text) return hideRouteTooltip();
+  if (tip.textContent !== text) tip.textContent = text;
   tip.hidden = false;
   tip.style.visibility = "hidden";
-  const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
+  const anchor = owner.getBoundingClientRect();
+  routeTooltipAnchor = anchor;
+  const height = document.documentElement.clientHeight;
+  // Long notes scroll on the roomier side instead of covering their trigger
+  // and causing a pointerout/show loop.
+  tip.style.maxHeight = `${Math.max(0, anchor.top - 18, height - anchor.bottom - 18)}px`;
+  const { left, top } = routeTooltipPosition(anchor, tip.getBoundingClientRect(), document.documentElement.clientWidth, height);
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
   tip.style.visibility = "visible";
@@ -1091,20 +1173,43 @@ function paintRouteTooltip() {
 
 function transferRouteTooltip(owner) {
   routeTooltipOwner?.removeAttribute("aria-describedby");
+  releaseTooltipTitles();
   routeTooltipOwner = owner;
+  holdTooltipTitles(owner);
   if (!$("route-tooltip").hidden) paintRouteTooltip();
 }
 
-// A refresh rebuilds Traffic's nodes. Keep the tooltip (and its pending
-// delay) only for the same metric under the pointer or keyboard focus.
+// Let the pointer cross the six-pixel gap to read or scroll a long note.
+function tooltipBridge(point) {
+  const tip = $("route-tooltip");
+  if (!routeTooltipOwner || tip.hidden || !point) return false;
+  const anchor = routeTooltipOwner.isConnected ? routeTooltipOwner.getBoundingClientRect() : routeTooltipAnchor;
+  if (!anchor) return false;
+  const box = tip.getBoundingClientRect();
+  return point.x >= Math.min(anchor.left, box.left) && point.x <= Math.max(anchor.right, box.right)
+    && ((box.bottom <= anchor.top && point.y >= box.bottom && point.y <= anchor.top)
+      || (box.top >= anchor.bottom && point.y >= anchor.bottom && point.y <= box.top));
+}
+
+// Keep both visible and pending tooltips across replacement of any panel
+// region, including the top bar, native titles and SVG chart titles.
 function refreshRouteTooltip() {
   const owner = routeTooltipOwner;
-  if (!owner || owner.isConnected) return;
-  const key = owner.dataset.tipKey;
-  const next = routeTooltipMode === "focus"
-    ? [...$("content").querySelectorAll("[data-tip-key]")].find(el => el.dataset.tipKey === key)
-    : routeTooltipPointer && document.elementFromPoint(routeTooltipPointer.x, routeTooltipPointer.y)?.closest("[data-tip]");
-  if (!key || next?.dataset.tipKey !== key) return hideRouteTooltip();
+  if (!owner) return;
+  if (owner.isConnected) {
+    holdTooltipTitles(owner);
+    if (!$("route-tooltip").hidden) paintRouteTooltip();
+    return;
+  }
+  const hit = routeTooltipPointer && document.elementFromPoint(routeTooltipPointer.x, routeTooltipPointer.y);
+  const overTip = (hit && $("route-tooltip").contains(hit)) || tooltipBridge(routeTooltipPointer);
+  const next = routeTooltipMode === "focus" || overTip
+    ? [$("top"), $("content")].filter(Boolean).flatMap(root => [...root.querySelectorAll("[data-tip], [title], svg title")])
+        .map(el => el.tagName.toLowerCase() === "title" ? el.parentElement : el)
+        .find(el => tooltipIdentity(el) === routeTooltipIdentity)
+    : tooltipOwner(hit);
+  if (!next || tooltipIdentity(next) !== routeTooltipIdentity
+      || next.getBoundingClientRect().width === 0) return hideRouteTooltip();
   transferRouteTooltip(next);
   if (routeTooltipMode === "focus") next.focus({ preventScroll: true });
 }
@@ -1113,27 +1218,30 @@ function showRouteTooltip(owner, mode = "pointer") {
   routeTooltipMode = mode;
   if (routeTooltipOwner === owner) return;
   if (routeTooltipOwner && !routeTooltipOwner.isConnected
-      && owner.dataset.tipKey && owner.dataset.tipKey === routeTooltipOwner.dataset.tipKey) {
+      && tooltipIdentity(owner) === routeTooltipIdentity) {
     transferRouteTooltip(owner);
     return;
   }
   hideRouteTooltip();
   routeTooltipOwner = owner;
-  routeTooltipTimer = setTimeout(paintRouteTooltip, owner.matches(".chart-bar") ? 100 : 500);
+  routeTooltipIdentity = tooltipIdentity(owner);
+  holdTooltipTitles(owner);
+  routeTooltipTimer = setTimeout(paintRouteTooltip, owner.matches(".chart-bar, [data-slice]") ? 100 : 500);
 }
 
 document.addEventListener("pointermove", (event) => {
   routeTooltipPointer = { x: event.clientX, y: event.clientY };
   // WebKit may not send pointerout for a newly replaced hovered node.
   if (routeTooltipOwner?.isConnected && routeTooltipMode === "pointer"
-      && !routeTooltipOwner.contains(event.target)) {
+      && !routeTooltipOwner.contains(event.target) && !$("route-tooltip").contains(event.target)
+      && !tooltipBridge(routeTooltipPointer)) {
     if (routeTooltipOwner.matches(":focus-visible")) routeTooltipMode = "focus";
     else hideRouteTooltip();
   }
 });
 for (const type of ["pointerover", "focusin"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".chart-bar, [data-tip]");
+    const owner = tooltipOwner(event.target);
     if (type === "focusin" && !owner?.matches(":focus-visible")) return;
     if (type === "pointerover") routeTooltipPointer = { x: event.clientX, y: event.clientY };
     if (owner) showRouteTooltip(owner, type === "focusin" ? "focus" : "pointer");
@@ -1141,12 +1249,18 @@ for (const type of ["pointerover", "focusin"]) {
 }
 for (const type of ["pointerout", "focusout"]) {
   document.addEventListener(type, (event) => {
-    const owner = event.target.closest?.(".chart-bar, [data-tip]");
+    if ($("route-tooltip").contains(event.target)) {
+      if (!$("route-tooltip").contains(event.relatedTarget) && !routeTooltipOwner?.contains(event.relatedTarget)) hideRouteTooltip();
+      return;
+    }
+    const owner = tooltipOwner(event.target);
     if (!owner || owner !== routeTooltipOwner || owner.contains(event.relatedTarget)) return;
-    if (!owner.isConnected && owner.dataset.tipKey) return;
+    if (!owner.isConnected) return;
+    if (type === "pointerout" && $("route-tooltip").contains(event.relatedTarget)) return;
+    if (type === "pointerout" && tooltipBridge({ x: event.clientX, y: event.clientY })) return;
     // Some engines dispatch focusout just before innerHTML detaches the
     // focused node. Let that replacement finish before deciding to close.
-    if (type === "focusout" && owner.dataset.tipKey) {
+    if (type === "focusout") {
       queueMicrotask(() => {
         if (owner !== routeTooltipOwner) return;
         if (!owner.isConnected) return refreshRouteTooltip();
@@ -1164,7 +1278,13 @@ document.addEventListener("scroll", (event) => {
   if (event.target !== $("route-tooltip")) hideRouteTooltip();
 }, true);
 window.addEventListener("resize", hideRouteTooltip);
-window.addEventListener("pointerdown", hideRouteTooltip, true);
+window.addEventListener("pointerdown", event => {
+  if (!$("route-tooltip").contains(event.target)) hideRouteTooltip();
+}, true);
+window.addEventListener("blur", hideRouteTooltip);
+window.addEventListener("keydown", event => {
+  if (event.key === "Escape") hideRouteTooltip();
+});
 
 function routingBlock() {
   const s = ui.snap;
@@ -1180,12 +1300,12 @@ function routingBlock() {
     if (!configured) {
       return `<div class="subhead"><span>${name}</span><span class="faint">Not configured</span></div>`;
     }
-    const rows = svc.accountRoutes.map((route) => routingRow(route, true, svc.fileOnly)).join("")
-      + svc.apiKeyRoutes.map((route) => routingRow(route, false)).join("");
+    const rows = svc.accountRoutes.map((route) => routingRow(route, true, svc.fileOnly, name)).join("")
+      + svc.apiKeyRoutes.map((route) => routingRow(route, false, false, name)).join("");
     const fallbacks = svc.fallbacks.filter((f) => f.proxies)
       .sort((a, b) => MINOR_FALLBACKS.has(a.key) - MINOR_FALLBACKS.has(b.key))
-      .map((f) => `<div class="route-default"><span class="route-default-name">${FALLBACK_LABEL[f.key]}</span><span class="route-destination">${routingChain(f.proxies)}</span></div>`).join("");
-    return `<div class="routing-service"><div class="subhead"><span>${name}</span>${badge}</div>${rows}
+      .map((f) => `<div class="route-default" data-tip-slot="${f.key}"><span class="route-default-name">${FALLBACK_LABEL[f.key]}</span><span class="route-destination">${routingChain(f.proxies)}</span></div>`).join("");
+    return `<div class="routing-service" data-tip-scope="routing:${name}"><div class="subhead"><span>${name}</span>${badge}</div>${rows}
       ${fallbacks ? `<div class="route-defaults"><div class="route-defaults-title">Defaults &amp; helpers</div>${fallbacks}</div>` : ""}</div>`;
   };
   const accountError = s.accountStatesError ? `<div class="placeholder">Account status unavailable: ${esc(s.accountStatesError)}</div>` : "";
@@ -1314,88 +1434,6 @@ document.addEventListener("scroll", (event) => {
   if (openSelect && !openSelect.menu.contains(event.target)) closeSelect();
 }, true);
 window.addEventListener("resize", () => closeSelect());
-
-// WebKitGTK and WebView2 draw a `title` as the desktop's own tooltip, in its
-// theme rather than the panel's: an in-panel one in the menus' look replaces
-// it there. While the pointer is on an element, its title and every
-// ancestor's move to `data-tooltip`, and an SVG shape's <title> is detached,
-// so that no native one shows, not even an ancestor's in their place; they
-// come back as it leaves. A `data-tip` shows the route tooltip instead.
-if (!document.documentElement.classList.contains("macos")) {
-  const tip = document.createElement("div");
-  tip.className = "tooltip";
-  tip.setAttribute("aria-hidden", "true");
-  document.body.append(tip);
-  let owner = null;
-  let shape = null;
-  let held = [];
-  let timer;
-  const shapeTitle = (node) => node instanceof SVGElement && node.querySelector(":scope > title");
-  const routed = (node) => node.matches(".chart-bar, [data-tip]");
-  const titled = (node) => {
-    for (; node instanceof Element; node = node.parentElement)
-      if (routed(node) || node.hasAttribute("title") || node.dataset.tooltip !== undefined || shapeTitle(node)) return node;
-    return null;
-  };
-  const hold = (node) => {
-    for (; node instanceof Element; node = node.parentElement) {
-      const text = node.getAttribute("title");
-      if (text === null) continue;
-      node.dataset.tooltip = text;
-      node.removeAttribute("title");
-      if (!held.includes(node)) held.push(node);
-    }
-  };
-  // A title set while the pointer is on its owner, as a route name's is.
-  new MutationObserver(() => {
-    if (owner) hold(owner);
-  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["title"] });
-  const hide = () => {
-    clearTimeout(timer);
-    tip.classList.remove("shown");
-    if (shape) {
-      owner.prepend(shape);
-      delete owner.dataset.tooltip;
-    }
-    for (const node of held) {
-      if (!node.hasAttribute("title")) node.setAttribute("title", node.dataset.tooltip);
-      delete node.dataset.tooltip;
-    }
-    owner = shape = null;
-    held = [];
-  };
-  // Placed as the route tooltip is, which shows every `data-tip`.
-  const show = () => {
-    if (!owner?.isConnected || !owner.dataset.tooltip) return hide();
-    tip.textContent = owner.dataset.tooltip;
-    tip.classList.add("shown");
-    const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
-    tip.style.left = `${left}px`;
-    tip.style.top = `${top}px`;
-  };
-  document.addEventListener("pointerover", (event) => {
-    const node = titled(event.target);
-    if (node === owner) return;
-    hide();
-    if (!node) return;
-    owner = node;
-    if (!routed(node) && !node.hasAttribute("title")) {
-      shape = shapeTitle(node) || null;
-      if (shape) {
-        node.dataset.tooltip = shape.textContent;
-        shape.remove();
-      }
-    }
-    hold(node);
-    if (routed(node) || !node.dataset.tooltip) return;
-    // A ring's slices answer as quickly as a chart's bars.
-    timer = setTimeout(show, shape ? 100 : 500);
-  });
-  document.addEventListener("pointerout", (event) => {
-    if (!event.relatedTarget) hide();
-  });
-  for (const type of ["pointerdown", "keydown", "wheel", "blur"]) window.addEventListener(type, hide, true);
-}
 
 function trafficRangeSelect(id, selected, label) {
   return panelSelect(id, TRAFFIC_RANGES.map(([minutes, text]) => [minutes, `Last ${text}`]), selected, label, "traffic-range");
@@ -1669,11 +1707,11 @@ function trafficShare(credentials, scope, source = "") {
     // Its key and width let a redrawn ring move each slice from where it was (showRing).
     return `<path style="--slice:${color(s)}" data-slice="${esc(`${s.service}|${s.members ? "Others" : s.name}`)}" data-width="${widths[i] / turn}" d="${ringSector(from, cursor, size / 2, (size / 2) * SHARE_RING_INNER)}"><title>${esc(label(s))}</title></path>`;
   }).join("");
-  const legend = groups.map((g) => `<div class="share-group">
+  const legend = groups.map((g) => `<div class="share-group" data-tip-slot="${g.service}">
     <div class="share-service" title="${esc(label({ service: g.service, name: "Total", value: g.value }))}">${serviceMark(g.service)}<span>${esc(g.service)}</span><span>${value(g.value)}</span></div>
-    ${g.slices.map((s) => `<div class="share-item${s.muted ? " muted" : ""}" title="${esc(label({ ...s, service: g.service }))}">
+    ${g.slices.map((s) => `<div class="share-item${s.muted ? " muted" : ""}" title="${esc(label({ ...s, service: g.service }))}" data-tip-slot="${tooltipScopeKey(JSON.stringify([g.service, s.members ? "Others" : s.name]))}">
       <i style="--slice:${color(s)}"></i><span>${esc(s.name)}</span><span>${value(s.value)}</span></div>`).join("")}</div>`).join("");
-  return `<div class="traffic-share">
+  return `<div class="traffic-share" data-tip-scope="${tooltipScopeKey(JSON.stringify(["share", source, scope]))}">
     <div class="share-ring"${source ? ` data-morph="ring:${esc(source)}" data-ring="${esc(source)}"` : ""} title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
       <div class="share-total"><strong>${format(total)}</strong><span>${unit}</span></div></div>
     <div class="share-legend">${legend}</div></div>`;
@@ -1957,7 +1995,7 @@ function detail(e) {
     })
     .join("");
   const json = JSON.stringify({ event: e.event, timestamp: e.time ? new Date(e.time).toISOString() : undefined, ...e.fields }, null, 2);
-  return `<div class="detail">
+  return `<div class="detail" data-tip-scope="detail:${esc(e.time)}:${esc(e.seq)}">
     <dl class="kv"><dt>event</dt><dd>${esc(e.event)}</dd>${e.time ? `<dt>time</dt><dd>${esc(new Date(e.time).toLocaleString("en-GB"))}</dd>` : ""}${rows}</dl>
     <button class="icon-btn" data-action="copy" data-text="${esc(json)}" data-tip="Copy as JSON" aria-label="Copy as JSON">${ICON.copy}</button>
   </div>`;
@@ -2333,7 +2371,7 @@ function deviceSettings() {
     const forwarding = deviceForwardingSettings(device);
     const capabilities = deviceCapabilities(device);
     const tip = capabilities ? ` data-tip="${esc(capabilities)}" tabindex="0"` : "";
-    return `<div class="device-settings-item"><div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>${forwarding}</div>`;
+    return `<div class="device-settings-item" data-tip-scope="device-settings:${esc(device.id)}"><div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>${forwarding}</div>`;
   }).join("");
   const form = ui.deviceFormOpen ? `<div class="device-form">
     <label>Connection${panelSelect("device-transport", [["ssh", "SSH"], ["http", "HTTP / HTTPS"]], d.transport, "Connection", "field")}</label>
@@ -2442,7 +2480,7 @@ function configSettings() {
   const field = (key, label, unit = "", description = "") => {
     const id = `config-${key.replaceAll(".", "-")}`;
     const tip = description ? ` data-tip="${esc(description)}"` : "";
-    return `<div class="row"><span class="row-label"${tip}>${label}</span>
+    return `<div class="row" data-tip-scope="config:${key}"><span class="row-label"${tip}>${label}</span>
       <span class="number-field"><input class="field" id="${id}" data-config="${key}" inputmode="decimal" spellcheck="false"
         value="${esc(String(v[key]))}" aria-label="${label}"${tip} /><span class="unit">${unit}</span></span></div>`;
   };
@@ -2450,7 +2488,7 @@ function configSettings() {
   const flag = (key, label, description, inverted = false) => {
     const tip = ` data-tip="${esc(description)}"`;
     const invert = inverted ? ' data-inverted="true"' : "";
-    return `<div class="row"><span class="row-label"${tip}>${label}</span>
+    return `<div class="row" data-tip-scope="config:${key}"><span class="row-label"${tip}>${label}</span>
       <button class="switch" role="switch" aria-checked="${v[key] !== inverted}" data-action="config-flag" data-key="${key}"${invert} aria-label="${label}"${tip}></button></div>`;
   };
   return `${block(
@@ -2564,7 +2602,10 @@ new MutationObserver(() => {
   if (observedPage) fitObserver.unobserve(observedPage);
   if (page) fitObserver.observe(page);
   observedPage = page;
-}).observe($("content"), { childList: true, subtree: true });
+}).observe($("content"), { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["title", "data-tip"] });
+new MutationObserver(refreshRouteTooltip).observe($("top"), {
+  childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["title", "data-tip"],
+});
 
 // ---------------------------------------------------------------- share rings
 
@@ -3490,6 +3531,7 @@ listen("panel-shown", async ({ payload } = {}) => {
 });
 listen("panel-hidden", () => {
   ui.menuBarNavigation = false;
+  hideRouteTooltip();
   // Repeated native hide events must not extend the previous page's lifetime.
   panelHiddenAt ??= Date.now();
   closeSelect();

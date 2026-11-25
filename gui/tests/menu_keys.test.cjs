@@ -42,6 +42,7 @@ function panel({ navigating = true } = {}) {
     IS_MAC: true,
     ui: { page: "main", menuBarNavigation: navigating },
     closeSelect() {},
+    hideRouteTooltip() {},
     showSelect: (trigger, last) => opened.push([trigger.name, last]),
     PANEL_PAGE_TIMEOUT_MS: 60 * 1000,
     openSelect: null,

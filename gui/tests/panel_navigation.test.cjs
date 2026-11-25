@@ -23,6 +23,7 @@ function panel(page = "settings") {
     listen: (name, handler) => { events[name] = handler; },
     scheduleRefresh() {},
     closeSelect() {},
+    hideRouteTooltip() {},
     render: () => rendered.push(ui.page),
     $: () => content,
     refresh: async () => {},

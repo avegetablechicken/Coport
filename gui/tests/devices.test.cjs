@@ -520,7 +520,7 @@ test('forwarding appears below its available SSH device only in Settings', () =>
   assert.match(html, /^Devices/);
   assert.doesNotMatch(html, /Request forwarding|Start forwarding|Stop forwarding|Updating…/);
   assert.match(html, /class="switch" role="switch" aria-checked="false"[^>]*data-action="device-forward" data-id="ssh"[^>]*><\/button>/);
-  const groups = html.split('<div class="device-settings-item">').slice(1);
+  const groups = html.split(/<div class="device-settings-item"[^>]*>/).slice(1);
   assert.match(groups[0], /Remote[\s\S]*SSH forwarding/);
   assert.doesNotMatch(groups[1], /SSH forwarding|data-action="device-forward"/);
   assert.doesNotMatch(html, /data-action="forwarding-restore"/);
@@ -1203,7 +1203,7 @@ test('startup restore follows only the active device when forwarding switches ta
     const html = h.deviceSettings();
     assert.equal((html.match(/data-action="device-forward"/g) || []).length, 2);
     assert.equal((html.match(/data-action="forwarding-restore"/g) || []).length, 1);
-    const groups = html.split('<div class="device-settings-item">').slice(1);
+    const groups = html.split(/<div class="device-settings-item"[^>]*>/).slice(1);
     for (let i = 0; i < 2; i++) {
       if (h.ui.devices[i].id === selected) {
         assert.match(groups[i], /SSH forwarding[\s\S]*aria-checked="true"[^>]*data-action="device-forward"[\s\S]*Restore on startup[\s\S]*aria-checked="true"[^>]*data-action="forwarding-restore"/);

@@ -14,26 +14,40 @@ function panel(page = 'main') {
   let timerId = 0, observer, owners = [], hit = 0;
   let rows = [{ key: 'account-a', tip: '50.0 tok/s' }];
   const body = { matches: () => false };
-  const tip = { hidden: true, style: {}, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
+  const tip = { hidden: true, style: {}, contains: node => node === tip, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
   const doc = {
     activeElement: body,
     documentElement: { clientWidth: 480, clientHeight: 640 },
     addEventListener(type, fn) { events[type] = fn; },
-    elementFromPoint: () => owners[hit] ?? null,
+    elementFromPoint: () => hit === -2 ? tip : owners[hit] ?? null,
   };
-  const owner = row => ({
-    dataset: { tipKey: row.key, tip: row.tip }, isConnected: true, keyboard: false,
-    matches(selector) { return selector === ':focus-visible' ? this.keyboard : selector === ':hover' && owners[hit] === this; },
+  const owner = row => {
+    const attrs = row.kind === 'title' || row.title ? { title: row.title ?? row.tip } : {};
+    const el = {
+    tagName: row.kind === 'svg' || row.kind === 'bar' ? 'g' : 'SPAN',
+    dataset: { ...(row.kind !== 'title' && row.kind !== 'svg' ? { tip: row.tip } : {}),
+      ...(row.generic ? {} : { tipKey: row.key }), ...(row.slot ? { tipSlot: row.slot } : {}) },
+    isConnected: true, keyboard: false, children: [],
+    matches(selector) { return selector === ':focus-visible' ? this.keyboard : selector === ':hover' ? owners[hit] === this : selector.includes('.chart-bar') && row.kind === 'bar'; },
     contains(target) { return target === this; },
     closest() { return this; },
-    getBoundingClientRect: () => ({ left: 100, top: 120, bottom: 132 }),
-    setAttribute(name, value) { this[name] = value; },
-    removeAttribute(name) { delete this[name]; },
+    getBoundingClientRect: () => ({ left: 100, top: 120, bottom: 132, width: 12, height: 12 }),
+    getAttribute: name => attrs[name] ?? null,
+    hasAttribute: name => name in attrs,
+    setAttribute(name, value) { attrs[name] = value; this[name] = value; },
+    removeAttribute(name) { delete attrs[name]; delete this[name]; },
+    querySelector(selector) { return selector === ':scope > title' ? this.children.find(c => c.tagName === 'title') ?? null : null; },
+    prepend(child) { this.children.unshift(child); child.parentElement = this; },
     focus() { this.keyboard = true; doc.activeElement = this; events.focusin({ target: this }); },
-  });
+    };
+    if (row.generic) el.parentElement = { tagName: 'DIV', dataset: { tipScope: row.key }, children: [el] };
+    if (row.kind === 'svg') el.prepend({ tagName: 'title', textContent: row.tip,
+      remove() { this.parentElement.children.splice(this.parentElement.children.indexOf(this), 1); this.parentElement = null; } });
+    return el;
+  };
   const content = {
     firstElementChild: {},
-    querySelectorAll: selector => selector === '[data-tip-key]' ? owners : [],
+    querySelectorAll: selector => selector.includes('[data-tip]') ? owners : [],
     contains: node => owners.includes(node),
     set innerHTML(_) {
       for (const old of owners) {
@@ -130,7 +144,7 @@ test('a different account under the pointer, a removed metric, and page changes 
 });
 
 test('click, scroll and resize still dismiss the tooltip after a refresh', () => {
-  for (const close of [p => p.windowEvents.pointerdown(), p => p.windowEvents.resize(), p => p.events.scroll({ target: p.content })]) {
+  for (const close of [p => p.windowEvents.pointerdown({ target: p.content }), p => p.windowEvents.resize(), p => p.events.scroll({ target: p.content })]) {
     const p = panel(); p.hover(); p.flush(); p.redraw();
     close(p);
     assert.equal(p.tip.hidden, true);
@@ -151,4 +165,94 @@ test('a real keyboard focus departure still closes the tooltip', () => {
   p.events.focusout({ target: owner, relatedTarget: p.content });
   p.flushMicrotasks();
   assert.equal(p.tip.hidden, true);
+});
+
+for (const kind of ['data', 'title', 'svg', 'bar']) {
+  test(`${kind}: unkeyed tooltips retain their pending delay and update over repeated refreshes`, () => {
+    const p = panel();
+    p.rows([{ key: 'account-a', generic: true, kind, tip: 'old value', slot: kind === 'bar' ? 'minute-10' : undefined }]);
+    p.redraw(); p.hover();
+    const timer = [...p.timers.keys()][0];
+    p.redraw();
+    assert.deepEqual([...p.timers.keys()], [timer]);
+    p.flush();
+    for (let i = 0; i < 4; i++) {
+      p.rows([{ key: 'account-a', generic: true, kind, tip: `new value ${i}`, slot: kind === 'bar' ? 'minute-10' : undefined }]);
+      p.redraw();
+      assert.equal(p.tip.hidden, false);
+      assert.equal(p.tip.textContent, `new value ${i}`);
+      assert.equal(p.owner().getAttribute('title'), null, 'native HTML tooltip is suppressed');
+      assert.equal(p.owner().querySelector(':scope > title'), null, 'native SVG tooltip is suppressed');
+    }
+    p.events.pointerout({ target: p.owner(), relatedTarget: null });
+    assert.equal(p.tip.hidden, true);
+    if (kind === 'title') assert.equal(p.owner().getAttribute('title'), 'new value 3');
+    if (kind === 'svg') assert.equal(p.owner().querySelector(':scope > title').textContent, 'new value 3');
+  });
+
+  test(`${kind}: keyboard focus retains an unkeyed tooltip through row reordering`, () => {
+    const p = panel();
+    const row = { key: 'account-a', generic: true, kind, tip: 'wanted account' };
+    p.rows([row]); p.redraw(); p.owner().focus(); p.flush();
+    p.rows([{ ...row, key: 'account-b', tip: 'different account' }, row]);
+    p.redraw();
+    assert.equal(p.tip.hidden, false);
+    assert.equal(p.tip.textContent, row.tip);
+    assert.equal(p.doc.activeElement.parentElement.dataset.tipScope, 'account-a');
+  });
+}
+
+test('a chart category or bucket-width change does not retain the previous tooltip', () => {
+  const p = panel();
+  const row = { key: 'chart-a', generic: true, kind: 'bar', slot: 'model:0:60000', tip: '10:00' };
+  p.rows([row]); p.redraw(); p.hover(); p.flush();
+  p.rows([{ ...row, slot: 'all:0:900000', tip: '10:00 – 10:15' }]); p.redraw();
+  assert.equal(p.tip.hidden, true);
+});
+
+test('tooltip text updates without replacing its node and restores the latest native title', () => {
+  const p = panel();
+  p.rows([{ key: 'status', generic: true, kind: 'title', tip: 'available' }]);
+  p.redraw(); p.hover(); p.flush();
+  p.owner().setAttribute('title', 'offline'); p.observe();
+  assert.equal(p.tip.textContent, 'offline');
+  assert.equal(p.owner().getAttribute('title'), null);
+  p.events.pointerout({ target: p.owner(), relatedTarget: null });
+  assert.equal(p.owner().getAttribute('title'), 'offline');
+});
+
+test('suppressing a native title preserves both an attribute and an SVG title on the same node', () => {
+  const p = panel();
+  p.rows([{ key: 'slice', generic: true, kind: 'svg', title: 'attribute text', tip: 'SVG text' }]);
+  p.redraw(); p.hover(); p.flush();
+  assert.equal(p.tip.textContent, 'attribute text');
+  assert.equal(p.owner().getAttribute('title'), null);
+  assert.equal(p.owner().querySelector(':scope > title'), null);
+  p.events.pointerout({ target: p.owner(), relatedTarget: null });
+  assert.equal(p.owner().getAttribute('title'), 'attribute text');
+  assert.equal(p.owner().querySelector(':scope > title').textContent, 'SVG text');
+});
+
+test('long tooltips remain usable while the pointer scrolls their text across refreshes', () => {
+  const p = panel(); p.hover(); p.flush();
+  p.events.pointerout({ target: p.owner(), relatedTarget: p.tip });
+  p.hit(-2);
+  p.events.pointermove({ target: p.tip, clientX: 106, clientY: 90 });
+  p.events.scroll({ target: p.tip });
+  p.windowEvents.pointerdown({ target: p.tip });
+  p.redraw();
+  assert.equal(p.tip.hidden, false);
+  p.events.pointerout({ target: p.tip, relatedTarget: p.content });
+  assert.equal(p.tip.hidden, true);
+});
+
+test('Escape and window blur dismiss every tooltip source', () => {
+  for (const kind of ['data', 'title', 'svg']) {
+    for (const close of [p => p.windowEvents.keydown({ key: 'Escape' }), p => p.windowEvents.blur()]) {
+      const p = panel();
+      p.rows([{ key: 'test', generic: true, kind, tip: 'shown' }]); p.redraw(); p.hover(); p.flush();
+      close(p);
+      assert.equal(p.tip.hidden, true);
+    }
+  }
 });

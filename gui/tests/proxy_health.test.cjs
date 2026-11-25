@@ -158,7 +158,8 @@ test('traffic IPC reads cached identities without starting account probes', () =
 
 test('account routes explain each activation state', () => {
   const block = source.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
-  const row = (activation) => vm.runInNewContext(`${block}\nroutingRow(route, true, true)`, {
+  const scope = source.match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];
+  const row = (activation) => vm.runInNewContext(`${scope}\n${block}\nroutingRow(route, true, true)`, {
     route: { selector: 'you@example.com', proxies: [], activation },
     routeIdentity: (name) => ({ kind: 'account', name }), routingChain: () => '',
     ROUTE_ICON: { account: '' }, ICON: { warning: '' }, esc: (value) => value,
