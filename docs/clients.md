@@ -217,7 +217,7 @@ connection. These hosts are decrypted:
 | Codex, for each named provider or its `env_key` selector | provider upstream hosts and ports from the configured Codex homes |
 | Claude, for each named settings selector | the selected settings file's upstream host and port |
 | Any, for each URL route | that route's host and port, including public IPv4 addresses |
-| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `www.googleapis.com` (account lookup), as `/antigravity/https://<host>/...` |
+| Antigravity, with account routes, `account_fallback` or `fallback` | `antigravity.base_url.account`, `daily-cloudcode-pa.googleapis.com`, `cloudcode-pa.googleapis.com`, `aicode.googleapis.com`, `oauth2.googleapis.com` and `www.googleapis.com` (account lookup and scope check), as `/antigravity/https://<host>/...` |
 | Antigravity, with named API Key routes or `fallback` | `antigravity.base_url.api_key`, as `/antigravity/https://<host>/...` |
 | Grok, with account routes, `account_fallback` or `fallback` | `grok.base_url.account`, `cli-chat-proxy.grok.com` and `auth.x.ai`, as `/grok/https://<host>/...` |
 | Grok, with named API Key routes or `fallback` | `grok.base_url.api_key`, as `/grok/https://<host>/...` |
@@ -450,9 +450,9 @@ forwarding to `antigravity.base_url.account`, so `/antigravity/v1internal:loadCo
 reaches `https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` by
 default. Explicit targets such as
 `/antigravity/https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`
-may name only `base_url`, one of the two Cloud Code hosts or one of the two
-login endpoints below; any other target is rejected before any outbound
-connection. Requests are plain HTTP/1.1 JSON and
+may name only `base_url`, one of the two Cloud Code hosts, AI Code
+(`aicode.googleapis.com`) or one of the two account endpoints below; any other
+target is rejected before any outbound connection. Requests are plain HTTP/1.1 JSON and
 server-sent events, forwarded unchanged except for hop-by-hop headers and
 cookies. `agy` ignores `CLOUD_CODE_URL` while an enterprise gateway is
 configured.
@@ -473,19 +473,36 @@ the account lookup of its eligibility check
 `AICODE_ENDPOINT_URL`). Where Google is unreachable directly, each stalls
 until its connection times out, about 30 seconds, and a refused lookup ends
 the session, so name both through Coport as above: they take the login's route
-as its Cloud Code requests do. Only those two paths are served on their hosts;
-any other is rejected before any outbound connection.
+as its Cloud Code requests do. `AICODE_ENDPOINT_URL` also carries AI Code's
+license and quota checks and its fallback model route, all served on that
+host. On `www.googleapis.com` only the account lookup and `agy`'s scope check
+(`/oauth2/v3/tokeninfo`, whose token is the `access_token` query parameter
+rather than a header; a Bearer header naming another token is refused with
+400) are served; any other path is rejected before any outbound connection.
+The query is never logged.
 
-`agy` has no setting for its token endpoint, and reaches it and other Google
-services, such as its telemetry, directly. Where Google is reachable only
-through an outbound proxy and those requests must succeed too, start
-Antigravity with that proxy as well; `NO_PROXY` keeps the local listener
-direct:
+`agy` has no setting for its token endpoint, which it must reach before any
+request once its access token expires, even one to Coport. Its Cloud Code
+client, which also renews the login, takes its proxy from `agy`'s own
+`AGY_LLM_GATEWAY_PROXY_URL` (used without an enterprise gateway too) before
+`HTTPS_PROXY`, and trusts the extra CA in `AGY_CA_CERT` (or
+`AGY_LLM_GATEWAY_CA_CERT`). With [proxy port credential
+routing](#credential-routing-on-the-proxy-port), point both at Coport so the
+refresh takes the login's route, without `HTTPS_PROXY` reaching the commands
+`agy` runs:
 
 ```sh
-HTTPS_PROXY=http://127.0.0.1:<proxy-port> NO_PROXY=127.0.0.1,localhost \
-CLOUD_CODE_URL=http://127.0.0.1:8787/antigravity agy
+export AGY_LLM_GATEWAY_PROXY_URL=http://127.0.0.1:8787
+export AGY_CA_CERT="<config dir>/tls/proxy-ca.pem"
 ```
+
+The GUI's setup snippets show the exact path. Loopback URLs such as
+`CLOUD_CODE_URL` stay direct. Neither variable is documented by Google, and
+the names come from `agy` 1.5's enterprise gateway; check a token refresh in
+Activity after upgrading `agy`. What stays direct cannot be routed by Coport:
+`agy`'s telemetry (`play.googleapis.com`) trusts only Google's own roots and
+takes only `HTTPS_PROXY`, voice transcription dials `aicode.googleapis.com`
+over gRPC, and the profile picture and plugin marketplace carry no login.
 
 As for Codex and Claude, Antigravity's token refresh is routed by Coport when
 it arrives through [the proxy port](#credential-routing-on-the-proxy-port) or at
@@ -512,11 +529,11 @@ the explicit URL `/antigravity/https://oauth2.googleapis.com/token`:
 Coport never refreshes or writes the Antigravity login itself.
 
 With [proxy port credential routing](#credential-routing-on-the-proxy-port),
-a client using `HTTPS_PROXY` can also reach the account lookup at
-`www.googleapis.com/oauth2/v2/userinfo` alongside Cloud Code and token refresh.
-If the current proxy CA does not cover `www.googleapis.com`, choose **Replace &
-Trust** on the Proxy card, or use the local `USER_INFO_OVERRIDE_URL` above
-with the current CA. AI Code's flags still use `AICODE_ENDPOINT_URL`.
+a client using the proxy port can also reach the account lookup and scope
+check on `www.googleapis.com` and AI Code alongside Cloud Code and token
+refresh. If the current proxy CA does not cover `www.googleapis.com` or
+`aicode.googleapis.com`, choose **Replace & Trust** on the Proxy card, or keep
+`USER_INFO_OVERRIDE_URL` and `AICODE_ENDPOINT_URL` above with the current CA.
 
 ### Gemini API keys
 

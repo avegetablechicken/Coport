@@ -348,7 +348,11 @@ mod tests {
             get("www.googleapis.com", 443),
             Some("/antigravity/https://www.googleapis.com")
         );
-        assert_eq!(routes.len(), 5);
+        assert_eq!(
+            get("aicode.googleapis.com", 443),
+            Some("/antigravity/https://aicode.googleapis.com")
+        );
+        assert_eq!(routes.len(), 6);
         // A probe route alone routes nothing.
         let probe_only = config("antigravity:\n  routing:\n    account_probe: none\n");
         assert!(scopes(&probe_only).unwrap().is_empty());

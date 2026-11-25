@@ -26,14 +26,20 @@ pub const CLOUD_CODE_ORIGINS: [&str; 2] = [
 ];
 /// Names the Google account of an access token.
 pub const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+/// Lists an access token's scopes. agy's scope check sends the token as the
+/// `access_token` query parameter, not as a header.
+pub const TOKENINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/tokeninfo";
+/// AI Code, which agy calls with its login for its flags, licenses and quota
+/// and as a fallback route for model calls; `AICODE_ENDPOINT_URL` names it.
+pub const AICODE_ORIGIN: &str = "https://aicode.googleapis.com";
 /// AI Code's feature flags, which agy fetches with its login as it starts.
 pub const AICODE_FETCH_CONFIG: &str = "https://aicode.googleapis.com/v1alpha:fetchConfig";
-/// The Google endpoints besides Cloud Code that agy calls with its login and
-/// waits on as it starts: the account lookup of its eligibility check and AI
-/// Code's flags. Its `USER_INFO_OVERRIDE_URL` and `AICODE_ENDPOINT_URL` may
-/// name them in the `/antigravity` scope, where they take the login's route
-/// as its Cloud Code requests do; other paths on their hosts are refused.
-pub const LOGIN_ENDPOINTS: [&str; 2] = [USERINFO_URL, AICODE_FETCH_CONFIG];
+/// The account endpoints on `www.googleapis.com` that agy calls with its
+/// login: the account lookup of its eligibility check (named by its
+/// `USER_INFO_OVERRIDE_URL`) and its scope check. In the `/antigravity` scope
+/// they take the login's route as its Cloud Code requests do; other paths on
+/// that host are refused.
+pub const LOGIN_ENDPOINTS: [&str; 2] = [USERINFO_URL, TOKENINFO_URL];
 /// Where Antigravity renews its login, as Codex's and Claude's token endpoints.
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://oauth2.googleapis.com/token";
 /// SHA-256 of Antigravity's OAuth client ID; the token endpoint serves every
@@ -729,6 +735,29 @@ pub fn token_host(target: &str) -> bool {
 pub fn token_refresh(target: &str) -> bool {
     target.strip_prefix('/') == Some(TOKEN_REFRESH_UPSTREAM)
 }
+
+/// The access token of a tokeninfo target in the `/antigravity` scope, which
+/// agy sends as the `access_token` query parameter instead of a Bearer
+/// header. None for other targets or without one; a repeated parameter is
+/// refused, as the query is forwarded as sent.
+pub fn query_token(target: &str) -> Result<Option<String>> {
+    let tokeninfo = Url::parse(TOKENINFO_URL).unwrap();
+    let Some(url) = crate::routing::upstream_url(TOKENINFO_URL, target, false)
+        .ok()
+        .filter(|url| url.path() == tokeninfo.path())
+    else {
+        return Ok(None);
+    };
+    let mut tokens = url
+        .query_pairs()
+        .filter(|(name, _)| name == "access_token")
+        .map(|(_, value)| value.into_owned());
+    let token = tokens.next();
+    if tokens.next().is_some() {
+        return Err(Error::new(400, "Supply the access token once."));
+    }
+    Ok(token)
+}
 /// A token request's field `name`, from a form or JSON body; none when a
 /// form repeats it, as the body is forwarded as sent.
 pub(crate) fn form_field(body: &[u8], name: &str) -> Option<String> {
@@ -1001,10 +1030,12 @@ impl Antigravity {
         Ok(())
     }
 
-    /// Origins proxy-port clients send Antigravity's requests to.
+    /// Origins Antigravity sends its login's requests to, whole: Cloud Code
+    /// and AI Code. Proxy-port clients reach them decrypted.
     pub(crate) fn origins(&self) -> Vec<&str> {
         let mut origins = vec![self.base_url.account.as_str()];
         origins.extend(CLOUD_CODE_ORIGINS);
+        origins.push(AICODE_ORIGIN);
         origins
     }
 
@@ -1311,8 +1342,8 @@ impl Antigravity {
     }
 
     /// The upstream URL of a target inside the `/antigravity` scope: a path
-    /// under `base_url.account`, an explicit Cloud Code URL, or exactly one of
-    /// `LOGIN_ENDPOINTS`.
+    /// under `base_url.account`, an explicit Cloud Code or AI Code URL, or
+    /// exactly one of `LOGIN_ENDPOINTS`.
     pub fn url(&self, target: &str) -> Result<Url> {
         if target.starts_with("/https://") || target.starts_with("/http://") {
             if let Some(url) = LOGIN_ENDPOINTS.into_iter().find_map(|endpoint| {
@@ -1329,7 +1360,7 @@ impl Antigravity {
                 .into_iter()
                 .find_map(|origin| crate::routing::upstream_url(origin, target, false).ok())
                 .ok_or(Error::config(
-                    "Explicit Antigravity upstream must be a Cloud Code or login endpoint.",
+                    "Explicit Antigravity upstream must be a Cloud Code, AI Code or login endpoint.",
                 ));
         }
         if !target.starts_with('/') || target.starts_with("//") {
@@ -1959,7 +1990,7 @@ mod tests {
                 .as_str(),
             "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
         );
-        // agy's `USER_INFO_OVERRIDE_URL` and `AICODE_ENDPOINT_URL`, exactly.
+        // agy's `USER_INFO_OVERRIDE_URL` and scope check, exactly.
         for endpoint in LOGIN_ENDPOINTS {
             assert_eq!(ag.url(&format!("/{endpoint}")).unwrap().as_str(), endpoint);
         }
@@ -1969,16 +2000,29 @@ mod tests {
                 .as_str(),
             "https://www.googleapis.com/oauth2/v2/userinfo?alt=json"
         );
+        // `AICODE_ENDPOINT_URL` names the whole AI Code host.
+        for path in ["v1alpha:fetchConfig", "v1alpha:fetchLicenses?alt=json"] {
+            assert_eq!(
+                ag.url(&format!("/{AICODE_ORIGIN}/{path}"))
+                    .unwrap()
+                    .as_str(),
+                format!("{AICODE_ORIGIN}/{path}")
+            );
+        }
         for invalid in [
             "/https://www.googleapis.com/oauth2/v2/userinfo/x",
             "/https://www.googleapis.com/oauth2/v2/userinfox",
             "/https://www.googleapis.com/oauth2/v2/",
+            "/https://www.googleapis.com/oauth2/v3/tokeninfox",
+            "/https://www.googleapis.com/oauth2/v3/",
             "/https://www.googleapis.com/drive/v3/files",
             "/https://www.googleapis.com/oauth2/v2/userinfo/../../drive/v3/files",
             "/http://www.googleapis.com/oauth2/v2/userinfo",
             "/https://user@www.googleapis.com/oauth2/v2/userinfo",
             "/https://www.googleapis.com:8443/oauth2/v2/userinfo",
-            "/https://aicode.googleapis.com/v1alpha:other",
+            "/http://aicode.googleapis.com/v1alpha:fetchConfig",
+            "/https://aicode.googleapis.com:8443/v1alpha:fetchConfig",
+            "/https://user@aicode.googleapis.com/v1alpha:fetchConfig",
             "/https://aicode.googleapis.com/v1alpha:fetchConfig#x",
             "/https://example.com/v1internal:loadCodeAssist",
             "/http://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
@@ -1987,6 +2031,39 @@ mod tests {
             "/a/../../x",
         ] {
             assert!(ag.url(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn tokeninfo_names_its_token_in_the_query() {
+        let tokeninfo = format!("/{TOKENINFO_URL}");
+        assert_eq!(
+            query_token(&format!("{tokeninfo}?access_token=ya29.a-b")).unwrap(),
+            Some("ya29.a-b".into())
+        );
+        assert_eq!(
+            query_token(&format!("{tokeninfo}?alt=json&access_token=ya29%2Ex")).unwrap(),
+            Some("ya29.x".into())
+        );
+        assert_eq!(query_token(&tokeninfo).unwrap(), None);
+        assert_eq!(
+            query_token(&format!("{tokeninfo}?id_token=x")).unwrap(),
+            None
+        );
+        assert_eq!(
+            query_token(&format!("{tokeninfo}?access_token=a&access_token=b"))
+                .unwrap_err()
+                .status,
+            400
+        );
+        // Only tokeninfo: the token of another endpoint is never read.
+        for other in [
+            format!("/{USERINFO_URL}?access_token=x"),
+            "/https://www.googleapis.com/oauth2/v3/tokeninfox?access_token=x".into(),
+            "/https://example.com/oauth2/v3/tokeninfo?access_token=x".into(),
+            "/v1internal:loadCodeAssist?access_token=x".into(),
+        ] {
+            assert_eq!(query_token(&other).unwrap(), None, "{other}");
         }
     }
 

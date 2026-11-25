@@ -109,6 +109,24 @@ test('Connect always offers the Grok URL and both Grok Build endpoints on the li
   assert.ok(html.includes(`data-text="${grok}" data-tip="Copy" aria-label="Copy Grok base URL"`));
   assert.ok(html.includes(`[endpoints]\ncli_chat_proxy_base_url = "${grok}"\nxai_api_base_url = "${grok}"`));
 });
+test('Connect gives agy its endpoint variables, and its own proxy and CA with the proxy port', () => {
+  const context = setup();
+  const base = 'http://127.0.0.1:19427';
+  const ag = `${base}/antigravity`;
+  const ca = '/Users/u/Library/Application Support/io.github.coport.gui/tls/proxy-ca.pem';
+  Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
+  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  const endpoints = `CLOUD_CODE_URL=${ag}\nUSER_INFO_OVERRIDE_URL=${ag}/https://www.googleapis.com/oauth2/v2/userinfo\nAICODE_ENDPOINT_URL=${ag}/https://aicode.googleapis.com`;
+  const snap = (routing) => ({ urls: { base, antigravity: ag, proxyCaCertificate: ca }, config: { details: { editable: { connect_credential_routing: routing } } } });
+  assert.equal(context.agyEnvironment(snap(false)), endpoints);
+  // The path keeps its spaces in one shell word; HTTPS_PROXY is not agy's.
+  const routed = context.agyEnvironment(snap(true));
+  assert.equal(routed, `${endpoints}\nAGY_LLM_GATEWAY_PROXY_URL=${base}\nAGY_CA_CERT="${ca}"`);
+  assert.ok(!routed.includes('HTTPS_PROXY'));
+  context.ui.snap = snap(true);
+  const html = context.connectBlock();
+  assert.ok(html.includes('AGY_LLM_GATEWAY_PROXY_URL=') && html.includes('AGY_CA_CERT='));
+});
 test('Grok accounts form their own group in its hue after Antigravity', () => {
   const { shareGroups } = setup();
   const groups = shareGroups([credential('x@example.com', 10, 'Grok'), credential('g@example.com', 40, 'Antigravity'), credential('c', 20)], requests);

@@ -75,6 +75,29 @@ impl Server {
             }
             return self.forward_antigravity_refresh(incoming, log).await;
         }
+        // agy's scope check names its token in the query: route by it as by
+        // a Bearer header, which must name the same token if both are sent.
+        if let Some(token) = crate::antigravity::query_token(rest)? {
+            let bearer = incoming
+                .headers()
+                .get("authorization")
+                .map(|v| v.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")));
+            match bearer {
+                None => {
+                    let value = format!("Bearer {token}")
+                        .parse()
+                        .map_err(|_| Error::new(401, "Invalid credential."))?;
+                    incoming.headers_mut().insert("authorization", value);
+                }
+                Some(Some(bearer)) if bearer == token => {}
+                Some(_) => {
+                    return Err(Error::new(
+                        400,
+                        "Supply one access token: the Bearer header and access_token differ.",
+                    ));
+                }
+            }
+        }
         // As for Codex and Claude: only the saved login's model calls renew it.
         let auto_refresh = self.config.auto_refresh_access_token
             && settings.saved_login

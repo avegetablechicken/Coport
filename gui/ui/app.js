@@ -859,7 +859,7 @@ function connectBlock() {
        ${snippet("Top of ~/.codex/config.toml, then restart Codex. Codex 0.156+ requires an HTTPS chatgpt_base_url", `openai_base_url = "${s.urls.base}/v1"\nchatgpt_base_url = "${s.urls.chatgpt}"`)}
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
-       ${snippet("Antigravity CLI (agy): environment, so its Cloud Code requests come here", `CLOUD_CODE_URL=${s.urls.antigravity}`)}
+       ${snippet("Antigravity CLI (agy): environment, so its Google login requests come here", agyEnvironment(s))}
        ${snippet("~/.grok/config.toml, so Grok Build's login and API key requests come here", `[endpoints]\ncli_chat_proxy_base_url = "${s.urls.grok}"\nxai_api_base_url = "${s.urls.grok}"`)}
        ${ui.snap.config.details?.editable?.connect_credential_routing ? `
        ${snippet("Proxy port for clients using their original API URLs; set HTTPS_PROXY to the listener", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
@@ -870,6 +870,21 @@ function connectBlock() {
 function snippet(label, code) {
   return `<div class="snippet"><div class="snippet-label">${label}</div><div class="snippet-code"><pre>${esc(code)}</pre>
     <button class="icon-btn" data-action="copy" data-text="${esc(code)}" aria-label="Copy snippet">${ICON.copy}</button></div></div>`;
+}
+
+// agy reads these only from its environment. Its token refresh has no URL
+// setting: with the proxy port, agy's own proxy and CA variables send it here
+// without HTTPS_PROXY reaching the commands it runs.
+function agyEnvironment(s) {
+  const lines = [
+    `CLOUD_CODE_URL=${s.urls.antigravity}`,
+    `USER_INFO_OVERRIDE_URL=${s.urls.antigravity}/https://www.googleapis.com/oauth2/v2/userinfo`,
+    `AICODE_ENDPOINT_URL=${s.urls.antigravity}/https://aicode.googleapis.com`,
+  ];
+  if (s.config.details?.editable?.connect_credential_routing) {
+    lines.push(`AGY_LLM_GATEWAY_PROXY_URL=${s.urls.base}`, `AGY_CA_CERT="${s.urls.proxyCaCertificate}"`);
+  }
+  return lines.join("\n");
 }
 
 function recentBlock() {

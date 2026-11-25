@@ -4954,6 +4954,11 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
             "aicode.googleapis.com",
             "GET /v1alpha:fetchConfig HTTP/1.1",
         ),
+        (
+            "https://aicode.googleapis.com/v1alpha:fetchLicenses",
+            "aicode.googleapis.com",
+            "GET /v1alpha:fetchLicenses HTTP/1.1",
+        ),
     ] {
         let response = http()
             .get(format!("{}/antigravity/{url}", running.url))
@@ -4971,6 +4976,30 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
         assert!(forwarded.starts_with(line), "{forwarded}");
         assert!(forwarded.contains(&format!("authorization: Bearer {token}")));
     }
+    // agy's scope check names its token only in the query.
+    let tokeninfo = format!("{}?access_token={token}", crate::antigravity::TOKENINFO_URL);
+    let response = http()
+        .get(format!("{}/antigravity/{tokeninfo}", running.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        fixture
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT www.googleapis.com:443 ")
+    );
+    let forwarded = fixture.requests.recv().await.unwrap();
+    assert!(
+        forwarded.starts_with(&format!(
+            "GET /oauth2/v3/tokeninfo?access_token={token} HTTP/1.1"
+        )),
+        "{forwarded}"
+    );
+    assert!(forwarded.contains(&format!("authorization: Bearer {token}")));
     // A proxy-port client sends the public URL without USER_INFO_OVERRIDE_URL.
     let proxy_client = proxy_port_client(&running);
     let userinfo = proxy_client
@@ -4999,6 +5028,35 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
             .unwrap()
             .starts_with("GET /oauth2/v2/userinfo HTTP/1.1")
     );
+    // Without `AICODE_ENDPOINT_URL` or a Bearer header for the scope check.
+    for (url, host, line) in [
+        (
+            "https://aicode.googleapis.com/v1alpha:fetchQuotaStatus".to_owned(),
+            "aicode.googleapis.com",
+            "GET /v1alpha:fetchQuotaStatus HTTP/1.1".to_owned(),
+        ),
+        (
+            tokeninfo.clone(),
+            "www.googleapis.com",
+            format!("GET /oauth2/v3/tokeninfo?access_token={token} HTTP/1.1"),
+        ),
+    ] {
+        let mut request = proxy_client.get(&url);
+        if host == "aicode.googleapis.com" {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(request.send().await.unwrap().status(), 200, "{url}");
+        assert!(
+            fixture
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .starts_with(&format!("CONNECT {host}:443 "))
+        );
+        let forwarded = fixture.requests.recv().await.unwrap();
+        assert!(forwarded.starts_with(&line), "{forwarded}");
+    }
     let denied = proxy_client
         .get("https://www.googleapis.com/drive/v3/files")
         .bearer_auth(token)
@@ -5009,7 +5067,6 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
     // Other paths on their hosts, and other tokens, send nothing.
     for (path, auth, status) in [
         ("https://www.googleapis.com/drive/v3/files", token, 502),
-        ("https://aicode.googleapis.com/v1alpha:other", token, 502),
         (crate::antigravity::USERINFO_URL, "other-token", 401),
     ] {
         let response = http()
@@ -5020,11 +5077,38 @@ async fn antigravity_login_endpoints_take_the_saved_logins_route() {
             .unwrap();
         assert_eq!(response.status(), status, "{path}");
     }
+    // Nor does a scope check with another, a repeated, a mismatched or no token.
+    let base = format!(
+        "{}/antigravity/{}",
+        running.url,
+        crate::antigravity::TOKENINFO_URL
+    );
+    for (url, bearer, status) in [
+        (format!("{base}?access_token=other-token"), None, 401),
+        (
+            format!("{base}?access_token={token}&access_token={token}"),
+            None,
+            400,
+        ),
+        (
+            format!("{base}?access_token={token}"),
+            Some("other-token"),
+            400,
+        ),
+        (base.clone(), None, 401),
+    ] {
+        let mut request = http().get(&url);
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        assert_eq!(request.send().await.unwrap().status(), status, "{url}");
+    }
     assert!(fixture.requests.try_recv().is_err());
     // They are not model calls, and the log keeps no token.
     running.server.logger.flush().unwrap();
     let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(!raw.contains("model_call_finished") && !raw.contains(token));
+    assert!(!raw.contains("access_token=") && !raw.contains("other-token"));
 }
 
 // agy's Gemini API key requests (`modelProvider: "gemini"`) reach a relay
