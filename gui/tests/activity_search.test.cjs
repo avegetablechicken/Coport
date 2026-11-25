@@ -10,6 +10,7 @@ function setup() {
   const context = { ui, invoke: (_, query) => new Promise(resolve => pending.push({ query, resolve })), renderActivityList() {}, $: () => null };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('async function loadActivity('), source.indexOf('\nfunction uptime()')), context);
+  vm.runInContext(source.slice(source.indexOf('function activityFilter('), source.indexOf('\nfunction renderActivitySide(')), context);
   return { ui, pending, load: context.loadActivity };
 }
 test('newer search result survives an older response', async () => {
@@ -39,7 +40,7 @@ test('more appends the next page after the cursor', async () => {
   assert.equal(JSON.stringify(ui.rows), '["a","b"]');
   assert.equal(ui.activityNext, null);
 });
-for (const [key, value] of [['search', 'new'], ['searchMode', 'proxy'], ['filter', 'errors'], ['activityFrom', 60000], ['activityTo', 7200000]]) {
+for (const [key, value] of [['search', 'new'], ['searchMode', 'proxy'], ['filter', 'errors'], ['upstream', true], ['activityFrom', 60000], ['activityTo', 7200000]]) {
   test(`ignores a response after ${key} changes before the next query`, async () => {
     const { ui, pending, load } = setup();
     const request = load();
@@ -154,4 +155,16 @@ test('a live burst larger than a page resets pagination instead of skipping a ga
   pending[1].resolve({ rows: rows(2500, 500), next: { time: 2001, seq: 2001 } });
   await more;
   assert.deepEqual(seqs(ui.rows), seqs(rows(3000, 1000)));
+});
+test('the side switch asks for upstream responses, except under All Events', () => {
+  const { ui, pending, load } = setup();
+  const filters = [];
+  for (const filter of ['requests', 'models', 'errors', 'all']) {
+    for (const upstream of [false, true]) {
+      Object.assign(ui, { filter, upstream });
+      load();
+      filters.push(pending.at(-1).query.filter);
+    }
+  }
+  assert.deepEqual(filters, ['requests', 'upstream_requests', 'models', 'upstream_models', 'errors', 'upstream_errors', 'all', 'all']);
 });

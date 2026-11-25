@@ -1021,7 +1021,7 @@ impl From<Entry> for EntryDto {
                 .and(e.service())
                 .map(coport::routing::Service::label),
             proxy: e.get("proxy").map(str::to_owned),
-            duration_ms: e.duration_ms(),
+            duration_ms: e.listed_duration_ms(),
             bytes: (e.is_request_end() || e.is_model_call_end()).then(|| e.bytes()),
             error: e.is_error(),
             reason: e.get("reason").map(str::to_owned),

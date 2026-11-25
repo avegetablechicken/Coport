@@ -704,6 +704,8 @@ input.field::placeholder {
 
 /* Activity log range: a preset menu in the Log header; Custom Range… opens
    this editor below it. */
+/* The Log's response and range selects sit as close as Traffic's. */
+.log-block .block-aside { gap: 4px; }
 .range-select {
   max-width: 220px;
   overflow: hidden;

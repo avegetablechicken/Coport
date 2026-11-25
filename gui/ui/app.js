@@ -167,6 +167,8 @@ const ui = {
   /// Opened from View All: keep the Log at the top until the user scrolls.
   pinLog: false,
   filter: "requests",
+  /// The Log lists what upstreams returned instead of what clients received.
+  upstream: false,
   search: "",
   searchMode: "keyword",
   activityRequest: 0,
@@ -243,7 +245,7 @@ function scheduleRefresh() {
 async function loadActivity(mode) {
   if (ui.activityTo == null) resolveActivityRange();
   const query = {
-    filter: ui.filter, search: ui.search, searchMode: ui.searchMode,
+    filter: activityFilter(), search: ui.search, searchMode: ui.searchMode,
     range: { from: ui.activityFrom, to: ui.activityTo + 60 * 1000 },
     after: mode === "more" ? ui.activityNext : null,
     fresh: mode === "live",
@@ -254,7 +256,7 @@ async function loadActivity(mode) {
   const request = ++ui.activityRequest;
   ui.activityLoadingKey = key;
   ui.activityLoadingRequest = request;
-  const current = () => request === ui.activityRequest && query.filter === ui.filter && query.search === ui.search
+  const current = () => request === ui.activityRequest && query.filter === activityFilter() && query.search === ui.search
     && query.searchMode === ui.searchMode && query.range.from === ui.activityFrom && query.range.to === ui.activityTo + 60 * 1000;
   if (mode === "more") ui.activityLoadingMore = true;
   let activity;
@@ -1711,7 +1713,8 @@ function activityShell() {
     <section class="block" id="activity-forwarding" hidden></section>
     <section class="block" id="activity-traffic" data-morph="traffic"></section>
     <section class="block log-block" data-morph="log">
-      <div class="block-head"><span class="block-title">Log</span><span class="block-aside" id="activity-range"></span></div>
+      <div class="block-head"><span class="block-title">Log</span><span class="block-aside">
+        ${panelSelect("activity-side", ACTIVITY_SIDES, ui.upstream ? "upstream" : "client", "Responses listed", "", `title="${esc(ACTIVITY_SIDE_TIP)}"`)}<span id="activity-range"></span></span></div>
       <div class="range-editor" id="range-editor" role="dialog" aria-label="Custom log range" hidden>
         <label class="range-row"><span class="range-label">From</span>
           <input class="field" id="activity-from" type="datetime-local" aria-label="Start of the log range" /></label>
@@ -1735,10 +1738,26 @@ function activityShell() {
   </div>`;
 }
 
+/// The backend filter for the Log. All Events lists both sides already.
+function activityFilter() {
+  return ui.upstream && ui.filter !== "all" ? `upstream_${ui.filter}` : ui.filter;
+}
+
+const ACTIVITY_SIDES = [["client", "Client"], ["upstream", "Upstream"]];
+const ACTIVITY_SIDE_TIP = "Client: responses the proxy sent to clients. Upstream: responses upstreams sent to the proxy.";
+
+function renderActivitySide() {
+  const el = $("activity-side");
+  if (!el) return;
+  // All Events lists both sides, so there is nothing to switch.
+  el.hidden = ui.filter === "all";
+}
+
 function renderActivityList() {
   const filters = $("filters");
   if (!filters) return;
   renderActivityRange();
+  renderActivitySide();
   filters.innerHTML = [
     ["requests", "Requests"],
     ["models", "Models"],
@@ -2931,6 +2950,11 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "activity-side") {
+    ui.upstream = event.target.value === "upstream";
+    await loadActivity();
+    return;
+  }
   if (event.target.id === "search-mode") {
     ui.searchMode = event.target.value;
     clearTimeout(searchTimer);

@@ -77,14 +77,32 @@ impl Entry {
             .and_then(|b| b.parse().ok())
             .unwrap_or(0)
     }
-    /// Whether the entry belongs to an Activity list filter.
+    /// Whether the entry belongs to an Activity list filter. The plain
+    /// filters list what the proxy returned to its clients; their `upstream_`
+    /// forms list what upstreams returned to the proxy instead.
     pub fn matches_filter(&self, filter: &str) -> bool {
         match filter {
             "errors" => self.is_error(),
             "models" => self.is_model_call_end(),
             "all" => true,
+            "upstream_requests" => self.is_upstream_response(),
+            "upstream_models" => self.is_upstream_response() && self.get("model_call_id").is_some(),
+            "upstream_errors" => self.is_upstream_response() && self.is_error(),
             _ => self.is_request_end(),
         }
+    }
+    /// The status and headers an upstream answered a request with, before the
+    /// proxy relayed them.
+    pub fn is_upstream_response(&self) -> bool {
+        self.event == "upstream_response"
+    }
+    /// For a request end, how long the request took; for an upstream
+    /// response, how long the upstream took to send its headers.
+    pub fn listed_duration_ms(&self) -> Option<u64> {
+        if self.is_upstream_response() {
+            return self.get("headers_ms")?.parse().ok();
+        }
+        self.duration_ms()
     }
     pub fn is_error(&self) -> bool {
         if self.event.starts_with("model_call_") {
@@ -422,6 +440,63 @@ mod tests {
         assert_eq!(unknown.path(), Some("/"));
         let root = entry(serde_json::json!({"method":"GET","path":"/","destination":"x:1"}));
         assert_eq!(root.path(), Some("/"));
+    }
+
+    #[test]
+    fn upstream_filters_list_what_upstreams_returned() {
+        let entry = |event: &str, fields: serde_json::Value| Entry {
+            seq: 0,
+            time: None,
+            event: event.into(),
+            fields: fields.as_object().unwrap().clone(),
+        };
+        let upstream_ok = entry(
+            "upstream_response",
+            serde_json::json!({"status":"200","headers_ms":"120","model_call_id":"m"}),
+        );
+        let upstream_limited = entry(
+            "upstream_response",
+            serde_json::json!({"status":"429","headers_ms":"30"}),
+        );
+        // Refused by the proxy itself: the client got a status no upstream sent.
+        let rejected = entry(
+            "request_rejected",
+            serde_json::json!({"status":"403","duration_ms":"5"}),
+        );
+        let finished = entry(
+            "request_finished",
+            serde_json::json!({"status":"200","duration_ms":"900","model_call_id":"m"}),
+        );
+        let model_end = entry("model_call_finished", serde_json::json!({"status":"200"}));
+        let listed = |filter: &str| {
+            [
+                &upstream_ok,
+                &upstream_limited,
+                &rejected,
+                &finished,
+                &model_end,
+            ]
+            .map(|e| e.matches_filter(filter))
+        };
+        assert_eq!(listed("requests"), [false, false, true, true, false]);
+        assert_eq!(listed("errors"), [false, true, true, false, false]);
+        assert_eq!(listed("models"), [false, false, false, false, true]);
+        assert_eq!(
+            listed("upstream_requests"),
+            [true, true, false, false, false]
+        );
+        assert_eq!(
+            listed("upstream_errors"),
+            [false, true, false, false, false]
+        );
+        assert_eq!(
+            listed("upstream_models"),
+            [true, false, false, false, false]
+        );
+        assert_eq!(listed("all"), [true; 5]);
+        // Upstream rows show how long the headers took; request ends their whole duration.
+        assert_eq!(upstream_ok.listed_duration_ms(), Some(120));
+        assert_eq!(finished.listed_duration_ms(), Some(900));
     }
 
     #[test]
