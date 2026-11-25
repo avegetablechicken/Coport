@@ -2551,10 +2551,42 @@ function ringAt(shown, now) {
   });
 }
 
+/// Where each source's ring sits below the top of its row, and its move there:
+/// a longer or shorter legend recenters the ring, which then slides from where
+/// it was drawn rather than jumping.
+const ringPlace = new Map();
+const RING_EASING = "cubic-bezier(0.32, 0.72, 0, 1)";
+
+/// How far below its row's top a ring of `place` is drawn at `now`.
+function ringOffset(place, now) {
+  const progress = Math.min(1, Math.max(0, (now - place.start) / MORPH_MS));
+  return place.top + (place.from - place.top) * (1 - ringEase(progress));
+}
+
+function placeRing(ring, source, now, still) {
+  const row = ring.closest(".traffic-share");
+  const box = ring.getBoundingClientRect();
+  if (!row || !box.height) return;
+  const top = box.top - row.getBoundingClientRect().top;
+  const place = ringPlace.get(source);
+  const at = place ? ringOffset(place, now) : top;
+  // A ring redrawn mid-move heading the same place carries on with it.
+  const going = !still && place && place.from !== place.top && Math.abs(place.top - top) < 0.5 && now - place.start < MORPH_MS;
+  if (!going && (still || Math.abs(at - top) < 0.5)) {
+    ringPlace.set(source, { top, from: top, start: now });
+    return;
+  }
+  const next = going ? place : { top, from: at, start: now };
+  ringPlace.set(source, next);
+  ring.animate([{ transform: `translateY(${next.from - top}px)` }, { transform: "none" }],
+    { duration: MORPH_MS, delay: next.start - now, easing: RING_EASING });
+}
+
 function showRing(ring, now) {
   const source = ring.dataset.ring;
   if (ringFinal.has(ring)) return;
   ringFinal.set(ring, true);
+  placeRing(ring, source, now, pageMotion || REDUCED_MOTION.matches || document.hidden);
   const layout = ringLayout(ring);
   for (const path of ring.querySelectorAll("path[data-slice]")) ringFinal.set(path, path.getAttribute("d"));
   const shown = ringShown.get(source);

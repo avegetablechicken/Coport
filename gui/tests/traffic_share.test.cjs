@@ -922,3 +922,40 @@ test('Slices that change places are matched by rank, so the ring does not jump',
   const first = plain(blendRing(start, end, 0));
   assert.deepEqual(first.map((s) => [s.slice, +(s.to - s.from).toFixed(6)]), [['Codex|b', 0.5], ['Codex|a', 0.3], ['Codex|new', 0], ['Codex|Unidentified', 0.2]]);
 });
+test('a recentered ring slides from where it was drawn to its new place', () => {
+  const context = { MORPH_MS: 400 };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('const ringShown = new Map();'), source.indexOf('\nfunction showRing(')), context);
+  const moves = [];
+  const ring = (top) => ({
+    closest: () => ({ getBoundingClientRect: () => ({ top: 100 }) }),
+    getBoundingClientRect: () => ({ top: 100 + top, height: 84 }),
+    animate: (frames, options) => moves.push({ from: plain(frames)[0].transform, delay: options.delay, duration: options.duration }),
+  });
+  const offset = (s) => Number(/translateY\((-?[\d.]+)px\)/.exec(s)[1]);
+  context.placeRing(ring(10), 'home', 0, false);
+  assert.equal(moves.length, 0, 'a first ring shows where it is');
+  context.placeRing(ring(10), 'home', 100, false);
+  assert.equal(moves.length, 0, 'a ring that stays put does not move');
+  // A longer legend moves the ring down 10px: it starts where it was.
+  context.placeRing(ring(20), 'home', 1000, false);
+  assert.deepEqual(moves.pop(), { from: 'translateY(-10px)', delay: 0, duration: 400 });
+  // Redrawn halfway, it carries on with the same move.
+  context.placeRing(ring(20), 'home', 1200, false);
+  assert.deepEqual(moves.pop(), { from: 'translateY(-10px)', delay: -200, duration: 400 });
+  // Sent elsewhere halfway, it leaves from where it is drawn then.
+  const drawn = vm.runInContext("ringOffset(ringPlace.get('home'), 1200)", context);
+  assert.ok(drawn > 10 && drawn < 20, `mid-move offset ${drawn}`);
+  context.placeRing(ring(4), 'home', 1200, false);
+  const turn = moves.pop();
+  assert.equal(turn.delay, 0);
+  assert.ok(Math.abs(offset(turn.from) - (drawn - 4)) < 1e-9, turn.from);
+  // A page change or reduced motion puts it in place at once, and later moves start there.
+  context.placeRing(ring(30), 'home', 1300, true);
+  assert.equal(moves.length, 0);
+  context.placeRing(ring(36), 'home', 5000, false);
+  assert.equal(moves.pop().from, 'translateY(-6px)');
+  // Each source keeps its own place.
+  context.placeRing(ring(50), 'device', 5000, false);
+  assert.equal(moves.length, 0);
+});
