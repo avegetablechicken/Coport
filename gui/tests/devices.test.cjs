@@ -130,7 +130,7 @@ test('each device renders full Traffic metrics and an offline peer leaves other 
   Object.assign(h, { chart: () => '<svg class="chart"></svg>', stat: (name, value) => `${name}:${value};`, fmtMs: v => `${v} ms`, fmtBytes: v => `${v} B`, modelTokenStats: t => `Input Tokens:${t.inputTokens};Hit Rate:${t.cacheHitRate};`, trafficShare: () => '<div class="traffic-share">Account usage</div>', serviceMark: () => '', message: (kind, value) => value, ICON: { chevron: '' } });
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
-  const traffic = { requests: 5, errors: 1, avgMs: 200, bytes: 1234, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
+  const traffic = { requests: 5, errors: 1, avgMs: 200, bytes: 1234, outputTps: 50, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
   h.ui.devices = [{ id: 'online', name: 'Online', ssh: { host: 'online' }, data: { transport: 'ssh' } }, { id: 'offline', name: 'Offline', ssh: { host: 'offline' }, data: { transport: 'ssh' } }];
   h.ui.localTrafficViews = { '30:model': { ...traffic, start: 0, end: 1800000, bucketMinutes: 1 } };
   h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 1800000, bucketMinutes: 1, sources: [{ name: 'Online', traffic }, { name: 'Offline', error: 'Unavailable' }] };
@@ -138,7 +138,8 @@ test('each device renders full Traffic metrics and an offline peer leaves other 
   assert.equal((html.match(/Calls:5/g) || []).length, 2);
   // A peer's card says how recent its data is; this device's is live.
   assert.equal((html.match(/Data through/g) || []).length, 1);
-  for (const metric of ['Error Rate:20%', 'Avg. Time:200 ms', 'Received:1234 B', 'Input Tokens:100', 'Hit Rate:0.3', 'traffic-share', 'class="chart"']) assert.ok(html.includes(metric), metric);
+  for (const metric of ['Error Rate:20%', 'Avg. Time:200 ms', 'Output TPS<span', '</span>:50.0 tok/s', 'Input Tokens:100', 'Hit Rate:0.3', 'traffic-share', 'class="chart"']) assert.ok(html.includes(metric), metric);
+  assert.doesNotMatch(html, /Received/);
   assert.match(html, /Offline/); assert.match(html, /Traffic unavailable/);
 });
 

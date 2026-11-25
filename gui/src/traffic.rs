@@ -667,6 +667,9 @@ pub struct CredentialTraffic {
     /// Average time to a model call's first streamed output, over the calls
     /// that streamed any.
     first_token_ms: Option<u64>,
+    output_tps: Option<f64>,
+    output_tps_tokens: u64,
+    output_tps_duration_ms: u64,
     counts: Vec<u64>,
     error_counts: Vec<u64>,
     /// Reported input plus output tokens per bucket; calls without usage add nothing.
@@ -760,6 +763,12 @@ fn read_at(
         summary.latency_count += group.latency_count;
         summary.first_token_total += group.first_token_total;
         summary.first_token_count += group.first_token_count;
+        summary.output_tps_tokens = summary
+            .output_tps_tokens
+            .saturating_add(group.output_tps_tokens);
+        summary.output_tps_duration_ms = summary
+            .output_tps_duration_ms
+            .saturating_add(group.output_tps_duration_ms);
         summary.cache_read += group.cache_read;
         summary.cache_prompt += group.cache_prompt;
         for i in 0..bucket_count {
@@ -773,6 +782,10 @@ fn read_at(
     summary.first_token_ms = (summary.first_token_count > 0)
         .then(|| summary.first_token_total / summary.first_token_count);
     summary.cache_hit_rate = summary.hit_rate();
+    summary.output_tps = crate::data_api::output_tps(
+        Some(summary.output_tps_tokens),
+        Some(summary.output_tps_duration_ms),
+    );
     let mut credentials: Vec<_> = groups.into_values().collect();
     for group in &mut credentials {
         group.cache_hit_rate = group.hit_rate();
@@ -947,6 +960,27 @@ fn aggregate(
         group.first_token_total = group.first_token_total.saturating_add(ms);
         group.first_token_count += 1;
         group.first_token_ms = Some(group.first_token_total / group.first_token_count);
+    }
+    // Use paired measurements, never divide all usage by timings from only
+    // some calls. Active, failed and non-streaming calls have no output rate.
+    if (e.event == "model_call_finished"
+        || (e.event == "request_finished" && is_historical_http_call(e)))
+        && !e.is_error()
+        && let (Some(output), Some(first), Some(duration)) = (
+            output.filter(|n| *n > 1),
+            token("first_token_ms"),
+            e.duration_ms(),
+        )
+        && let Some(duration) = duration.checked_sub(first).filter(|ms| *ms > 0)
+    {
+        // The first token precedes the measured interval. Request completion
+        // approximates the last token, so this includes any stream tail delay.
+        group.output_tps_tokens = group.output_tps_tokens.saturating_add(output - 1);
+        group.output_tps_duration_ms = group.output_tps_duration_ms.saturating_add(duration);
+        group.output_tps = crate::data_api::output_tps(
+            Some(group.output_tps_tokens),
+            Some(group.output_tps_duration_ms),
+        );
     }
 }
 
@@ -1353,6 +1387,10 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
                         .then_some(g.first_token_total),
                     first_token_samples: (scope == TrafficScope::Model)
                         .then_some(g.first_token_count),
+                    output_tps_tokens: (scope == TrafficScope::Model)
+                        .then_some(g.output_tps_tokens),
+                    output_tps_duration_ms: (scope == TrafficScope::Model)
+                        .then_some(g.output_tps_duration_ms),
                     counts: g.counts,
                     error_counts: g.error_counts,
                     token_counts: g.token_counts,
@@ -1596,6 +1634,10 @@ mod tests {
                             .then_some(g.first_token_total),
                         first_token_samples: (scope == TrafficScope::Model)
                             .then_some(g.first_token_count),
+                        output_tps_tokens: (scope == TrafficScope::Model)
+                            .then_some(g.output_tps_tokens),
+                        output_tps_duration_ms: (scope == TrafficScope::Model)
+                            .then_some(g.output_tps_duration_ms),
                         counts: g.counts,
                         error_counts: g.error_counts,
                         token_counts: g.token_counts,
@@ -2823,6 +2865,185 @@ mod tests {
         assert_eq!(model.summary.cached_input_tokens, Some(6));
         assert_eq!(model.summary.cache_hit_rate, Some(0.2));
         assert_eq!(model.credentials.len(), 1);
+    }
+
+    #[test]
+    fn output_tps_uses_paired_completed_streams_and_excludes_first_tokens() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("proxy.log");
+            let at = (Local::now() - chrono::Duration::minutes(2)).to_rfc3339();
+            let call = |id: &str,
+                        event: &str,
+                        output: Option<&str>,
+                        first: Option<&str>,
+                        duration: Option<&str>| {
+                let mut row = serde_json::json!({"timestamp":at,"event":event,"service":"codex",
+                    "model_call_id":id,"provider":id,"method":"POST","path":"/v1/responses","status":"200"});
+                for (key, value) in [
+                    ("output_tokens", output),
+                    ("first_token_ms", first),
+                    ("duration_ms", duration),
+                ] {
+                    if let Some(value) = value {
+                        row[key] = value.into();
+                    }
+                }
+                row.to_string()
+            };
+            let mut rows = vec![
+                call(
+                    "a",
+                    "model_call_finished",
+                    Some("101"),
+                    Some("1000"),
+                    Some("3000"),
+                ),
+                call(
+                    "b",
+                    "model_call_finished",
+                    Some("301"),
+                    Some("2000"),
+                    Some("10000"),
+                ),
+                call(
+                    "no-first",
+                    "model_call_finished",
+                    Some("999"),
+                    None,
+                    Some("5000"),
+                ),
+                call(
+                    "no-output",
+                    "model_call_finished",
+                    None,
+                    Some("1000"),
+                    Some("5000"),
+                ),
+                call(
+                    "no-duration",
+                    "model_call_finished",
+                    Some("999"),
+                    Some("1000"),
+                    None,
+                ),
+                call(
+                    "zero-time",
+                    "model_call_finished",
+                    Some("999"),
+                    Some("5000"),
+                    Some("5000"),
+                ),
+                call(
+                    "negative-time",
+                    "model_call_finished",
+                    Some("999"),
+                    Some("5001"),
+                    Some("5000"),
+                ),
+                call(
+                    "zero-output",
+                    "model_call_finished",
+                    Some("0"),
+                    Some("1000"),
+                    Some("5000"),
+                ),
+                call(
+                    "one-output",
+                    "model_call_finished",
+                    Some("1"),
+                    Some("1000"),
+                    Some("5000"),
+                ),
+                call(
+                    "failed",
+                    "model_call_failed",
+                    Some("999"),
+                    Some("1000"),
+                    Some("5000"),
+                ),
+                call(
+                    "active",
+                    "model_call_updated",
+                    Some("999"),
+                    Some("1000"),
+                    Some("5000"),
+                ),
+            ];
+            // A duplicated terminal event and an earlier lifecycle stage must
+            // not add another sample when the retained files are scanned again.
+            rows.push(rows[0].clone());
+            rows.push(call("a", "model_call_started", None, None, None));
+            std::fs::write(&path, rows.join(newline) + newline).unwrap();
+            for _ in 0..2 {
+                let traffic =
+                    read(&path, 30, &configured(&["a", "b"]), TrafficScope::Model).unwrap();
+                assert_eq!(traffic.summary.output_tps_tokens, 400);
+                assert_eq!(traffic.summary.output_tps_duration_ms, 10_000);
+                assert_eq!(traffic.summary.output_tps, Some(40.0));
+                assert_eq!(
+                    traffic
+                        .credentials
+                        .iter()
+                        .find(|c| c.credential == "a")
+                        .unwrap()
+                        .output_tps,
+                    Some(50.0)
+                );
+                let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+                let key = coport::external_access::DataKey::new(&"e".repeat(64)).unwrap();
+                let context = ExportIdentities {
+                    labels: configured(&["a", "b"]),
+                    identities: Default::default(),
+                    references: Vec::new(),
+                };
+                let exported = export_window_limit(
+                    ReadSource::Path(&path),
+                    &config,
+                    &key,
+                    ExportOptions {
+                        end: traffic.end,
+                        minutes: 30,
+                        scope: TrafficScope::Model,
+                        limit: 24,
+                    },
+                    &context,
+                )
+                .unwrap();
+                assert_eq!(
+                    exported
+                        .iter()
+                        .filter_map(|g| g.stats.output_tps_tokens)
+                        .sum::<u64>(),
+                    400
+                );
+                assert_eq!(
+                    exported
+                        .iter()
+                        .filter_map(|g| g.stats.output_tps_duration_ms)
+                        .sum::<u64>(),
+                    10_000
+                );
+            }
+            std::fs::write(
+                &path,
+                call(
+                    "old",
+                    "model_call_finished",
+                    Some("100"),
+                    None,
+                    Some("5000"),
+                ) + newline,
+            )
+            .unwrap();
+            assert_eq!(
+                read(&path, 30, &BTreeMap::new(), TrafficScope::Model)
+                    .unwrap()
+                    .summary
+                    .output_tps,
+                None
+            );
+        }
     }
 
     #[test]

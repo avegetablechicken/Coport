@@ -5,8 +5,9 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 function setup(scope = 'model') {
-  const context = { ui: { trafficScope: scope }, esc: (v) => String(v), serviceMark: (s) => `[${s}]` };
+  const context = { ui: { trafficScope: scope }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function outputTpsStat('), source.indexOf('function trafficSummary(')), context);
   vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
   return context;
 }
@@ -402,7 +403,8 @@ test('Models shows the average first token time before Avg. Time where this devi
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 650, firstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
   for (const html of [context.accountRow(local, 'model', local), context.trafficSummary(local, 'model')]) {
-    assert.match(html, /<Error Rate=[^>]*>\s*<First Token=650 ms>\s*<Avg\. Time=4000 ms>\s*<Received=9 B>/);
+    assert.match(html, /<Error Rate=[^>]*>\s*<First Token=650 ms>\s*<Avg\. Time=4000 ms>\s*<Output TPS<span[^>]*>!<\/span>=—>/);
+    assert.doesNotMatch(html, /Received/);
   }
   // No streamed output is unknown, not zero.
   const none = { ...local, firstTokenMs: null, firstTokenSamples: 0 };
@@ -423,7 +425,7 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   assert.equal(brief, '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
     + '<span class="traffic-brief"><span>16 calls · <span class="bad">100.0% errors</span></span><review></span></div></div>');
   assert.match(context.accountRow({ ...failed, requests: 1, errors: 1 }, 'model', failed), />1 call · </);
-  const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && /<Received=/.test(html) && !/brief/.test(html);
+  const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && !/Received|brief/.test(html);
   // Requests keep the full row, and so does a named account that only failed.
   assert.ok(full(context.accountRow(failed, 'all', failed)));
   assert.ok(full(context.accountRow({ ...failed, credential: 'work' }, 'model', failed)));
@@ -744,6 +746,80 @@ test('Merged First Token averages the devices that report it; older devices add 
   assert.match(context.trafficSummary(total, 'model'), /<First Token>/);
   // Reported without streamed output: shown as unknown.
   assert.equal(context.sumTrafficViews([quiet]).firstTokenMs, null);
+});
+test('Output TPS merges paired generation totals and renders unknown measurements', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  Object.assign(context, { ICON: { warning: '!' }, stat: (label, value) => `<stat>${label}=${value}</stat>` });
+  vm.runInContext(source.slice(source.indexOf('function modelTokenStats('), source.indexOf('const SHARE_SERVICES')), context);
+  const view = (tokens, ms) => ({ outputTokens: 9999, latencyTotalMs: 99999,
+    outputTpsTokens: tokens, outputTpsDurationMs: ms,
+    credentials: [{ service: 'Codex', credential: 'work', outputTpsTokens: tokens, outputTpsDurationMs: ms }] });
+  const total = context.sumTrafficViews([view(100, 2000), view(300, 8000), view(undefined, undefined), view(0, 0)]);
+  assert.equal(total.outputTps, 40);
+  assert.equal(total.credentials[0].outputTps, 40);
+  assert.match(context.outputTpsStat(total, 'model'), /Output TPS[^]*=40\.0 tok\/s/);
+  assert.match(context.outputTpsStat(total.credentials[0], 'model'), /Output TPS[^]*=40\.0 tok\/s/);
+  assert.doesNotMatch(context.modelTokenStats(total, 'model'), /Output TPS/);
+  for (const unknown of [view(undefined, undefined), view(0, 0)]) {
+    const merged = context.sumTrafficViews([unknown]);
+    assert.equal(merged.outputTps, null);
+    assert.match(context.outputTpsStat(merged, 'model'), /Output TPS[^]*=—/);
+  }
+  assert.equal(context.modelTokenStats(total, 'all'), '');
+  assert.equal(context.outputTpsStat(total, 'all'), '');
+});
+test('Output TPS replaces Received in the summary and account row, leaving four token stats', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  Object.assign(context, { ICON: { warning: '!' }, chart: () => '', fmtMs: String, fmtBytes: String });
+  for (const [start, end] of [
+    ['function stat(', '// ---------------------------------------------------------------- main'],
+    ["/// One account's row", '/// The share ring, chart and totals'],
+    ['function modelTokenStats(', 'const SHARE_SERVICES'],
+  ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
+  const view = { service: 'Codex', credential: 'work', requests: 1, errors: 0,
+    firstTokenSamples: 1, firstTokenMs: 500, avgMs: 2500, outputTps: 50,
+    inputTokens: 10, outputTokens: 101, cachedInputTokens: 0, cacheHitRate: 0, credentials: [] };
+  for (const html of [context.trafficSummary(view, 'model'), context.accountRow(view, 'model', view)]) {
+    const strips = html.split('<div class="strip">').slice(1);
+    assert.equal(strips.length, 2);
+    assert.equal((strips[0].match(/class="stat"/g) || []).length, 5);
+    assert.match(strips[0], /Avg\. Time[^]*Output TPS[^]*50\.0 tok\/s/);
+    assert.equal((strips[1].match(/class="stat"/g) || []).length, 4);
+    assert.doesNotMatch(strips[1], /Output TPS/);
+    assert.doesNotMatch(html, /Received/);
+  }
+});
+test('Output TPS warning tooltip adds the total-duration rate without changing the main value', () => {
+  const context = setup('model');
+  context.stat = (label, value) => `${label}<value>${value}</value>`;
+  const stats = { outputTokens: 1000, latencyTotalMs: 20000, outputTps: 66.6 };
+  const html = context.outputTpsStat(stats, 'model');
+  assert.match(html, /^Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="output-tps-\d+" data-tip="From request start instead of the first token: 50\.0 tok\/s\."/);
+  assert.match(html, /aria-label="From request start instead of the first token: 50\.0 tok\/s\."/);
+  assert.match(html, />!<\/span><value>66\.6 tok\/s<\/value>$/);
+  for (const fields of [
+    { outputTokens: null }, { outputTokens: 0 }, { outputTokens: NaN }, { outputTokens: Infinity },
+    { latencyTotalMs: undefined }, { latencyTotalMs: 0 }, { latencyTotalMs: -1 }, { latencyTotalMs: Infinity },
+  ]) {
+    const unknown = context.outputTpsStat({ ...stats, ...fields }, 'model');
+    assert.match(unknown, /data-tip="From request start instead of the first token: —\."/);
+    assert.match(unknown, /<value>66\.6 tok\/s<\/value>$/);
+  }
+  loadSharedViews(context);
+  const merged = context.sumTrafficViews([
+    { outputTokens: 100, latencyTotalMs: 1000, outputTpsTokens: 99, outputTpsDurationMs: 500 },
+    { outputTokens: 300, latencyTotalMs: 9000, outputTpsTokens: 299, outputTpsDurationMs: 7500 },
+  ]);
+  assert.match(context.outputTpsStat(merged, 'model'), /data-tip="From request start instead of the first token: 40\.0 tok\/s\."/);
+  assert.equal(merged.outputTps, 49.75);
+  const keyOf = html => html.match(/data-tip-key="([^"]+)"/)[1];
+  const identity = JSON.stringify(['account', 'local', 'Codex', 'private@example.test']);
+  const first = context.outputTpsStat(stats, 'model', identity);
+  assert.doesNotMatch(first, /private@example/);
+  assert.equal(keyOf(first), keyOf(context.outputTpsStat(merged, 'model', identity)));
+  assert.notEqual(keyOf(first), keyOf(context.outputTpsStat(stats, 'model', JSON.stringify(['account', 'remote', 'Codex', 'private@example.test']))));
 });
 test('Merged Traffic is exactly the sum of the device views', () => {
   const context = setup('model');

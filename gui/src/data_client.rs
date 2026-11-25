@@ -236,6 +236,7 @@ pub struct TrafficView {
     stats: Stats,
     avg_ms: Option<u64>,
     first_token_ms: Option<u64>,
+    output_tps: Option<f64>,
     cache_hit_rate: Option<f64>,
     credentials: Vec<CredentialView>,
     targets: Vec<crate::traffic_identity::Target>,
@@ -252,6 +253,7 @@ struct CredentialView {
     stats: Stats,
     avg_ms: Option<u64>,
     first_token_ms: Option<u64>,
+    output_tps: Option<f64>,
     cache_hit_rate: Option<f64>,
 }
 /// Over the calls that streamed output, where any source reported them.
@@ -301,6 +303,10 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
                 avg_ms: (stats.latency_samples > 0)
                     .then(|| stats.latency_total_ms / stats.latency_samples),
                 first_token_ms: first_token_ms(&stats),
+                output_tps: crate::data_api::output_tps(
+                    stats.output_tps_tokens,
+                    stats.output_tps_duration_ms,
+                ),
                 cache_hit_rate: (stats.cache_prompt > 0)
                     .then(|| stats.cache_read as f64 / stats.cache_prompt as f64),
                 stats,
@@ -313,6 +319,10 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
     TrafficView {
         avg_ms: (total.latency_samples > 0).then(|| total.latency_total_ms / total.latency_samples),
         first_token_ms: first_token_ms(&total),
+        output_tps: crate::data_api::output_tps(
+            total.output_tps_tokens,
+            total.output_tps_duration_ms,
+        ),
         cache_hit_rate: (total.cache_prompt > 0)
             .then(|| total.cache_read as f64 / total.cache_prompt as f64),
         stats: total,
@@ -445,6 +455,8 @@ fn add_stats(to: &mut Stats, from: &Stats) {
         // Sources that did not report it, as older ones, add nothing.
         (&mut to.first_token_total_ms, from.first_token_total_ms),
         (&mut to.first_token_samples, from.first_token_samples),
+        (&mut to.output_tps_tokens, from.output_tps_tokens),
+        (&mut to.output_tps_duration_ms, from.output_tps_duration_ms),
     ] {
         if let Some(value) = from {
             *to = Some(to.unwrap_or(0).saturating_add(value));
@@ -2422,6 +2434,32 @@ mod tests {
         );
         assert!(unknown.values().all(|g| g.anonymous_upstream));
     }
+    #[test]
+    fn output_tps_merges_paired_totals_without_older_devices_diluting_them() {
+        let mut total = empty_stats(30);
+        for (tokens, duration) in [
+            (Some(100), Some(2000)),
+            (Some(300), Some(8000)),
+            (None, None),
+            (Some(0), Some(0)),
+        ] {
+            let mut stats = empty_stats(30);
+            stats.output_tps_tokens = tokens;
+            stats.output_tps_duration_ms = duration;
+            stats.output_tokens = Some(9999);
+            stats.latency_total_ms = 99999;
+            add_stats(&mut total, &stats);
+        }
+        assert_eq!(total.output_tps_tokens, Some(400));
+        assert_eq!(total.output_tps_duration_ms, Some(10000));
+        assert_eq!(
+            crate::data_api::output_tps(total.output_tps_tokens, total.output_tps_duration_ms),
+            Some(40.0)
+        );
+        assert_eq!(crate::data_api::output_tps(None, None), None);
+        assert_eq!(crate::data_api::output_tps(Some(0), Some(0)), None);
+    }
+
     #[test]
     fn first_token_averages_the_devices_that_report_it() {
         let id = uuid::Uuid::new_v4().to_string();

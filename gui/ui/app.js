@@ -461,7 +461,7 @@ function renderTop() {
 }
 
 function renderPage() {
-  hideRouteTooltip();
+  if (ui.builtPage !== ui.page) hideRouteTooltip();
   const content = $("content");
   for (const details of content.querySelectorAll("details[data-device-traffic]")) (ui.deviceTrafficOpen ||= Object.create(null))[details.dataset.deviceTraffic] = details.open;
   if (ui.page === "activity") {
@@ -640,7 +640,7 @@ function chart(stats, scope, showPeak = false, window = stats) {
 /// Unidentified calls that all failed reported nothing beyond their count, so
 /// the row is one line: the account, its calls and its error rate. Any call
 /// that succeeded keeps the full row.
-function accountRow(c, scope, window, review = "") {
+function accountRow(c, scope, window, review = "", source = "local") {
   const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
   const identity = `<span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>`;
   if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) {
@@ -648,7 +648,7 @@ function accountRow(c, scope, window, review = "") {
     return `<div class="credential-traffic"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
   }
   return `<div class="credential-traffic"><div class="traffic-identity">${identity}${review}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${outputTpsStat(c, scope, JSON.stringify(["account", source, c.service, c.credential]))}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -656,6 +656,21 @@ function accountRow(c, scope, window, review = "") {
 /// `source` names whose traffic it is ("local", "merged" or "device/<id>"), so
 /// a page change carries it over to the same traffic on the next page.
 const trafficMarkup = new WeakMap();
+function outputTpsStat(stats, scope, key = "output-tps") {
+  if (scope !== "model") return "";
+  // Stable across fresh snapshots without putting unmasked account names
+  // into DOM attributes. The registry lives only for this panel session.
+  const keys = outputTpsStat.keys ||= new Map();
+  if (!keys.has(key)) keys.set(key, `output-tps-${keys.size}`);
+  const average = Number.isFinite(stats.outputTokens) && stats.outputTokens > 0
+    && Number.isFinite(stats.latencyTotalMs) && stats.latencyTotalMs > 0
+    ? stats.outputTokens * 1000 / stats.latencyTotalMs : null;
+  const averageText = average == null || !Number.isFinite(average) ? "—" : average.toFixed(1) + " tok/s";
+  const tip = `From request start instead of the first token: ${averageText}.`;
+  const label = `Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="${keys.get(key)}" data-tip="${esc(tip)}" aria-label="${esc(tip)}">${ICON.warning}</span>`;
+  const value = stats.outputTps == null || !Number.isFinite(stats.outputTps) ? "—" : stats.outputTps.toFixed(1) + " tok/s";
+  return stat(label, value);
+}
 function trafficSummary(view, scope, window = view, source = "") {
   const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}|${source}|${accountNamesMasked()}`;
   const cached = trafficMarkup.get(view);
@@ -674,7 +689,7 @@ function trafficSummary(view, scope, window = view, source = "") {
        ${stat("Error Rate", rate, rateClass)}
        ${scope === "model" && view.firstTokenSamples != null ? stat("First Token", fmtMs(view.firstTokenMs ?? null)) : ""}
        ${stat("Avg. Time", fmtMs(view.avgMs))}
-       ${stat("Received", fmtBytes(view.bytes))}
+       ${outputTpsStat(view, scope, JSON.stringify(["summary", source]))}
      </div>${modelTokenStats(view, scope)}</div>`;
   trafficMarkup.set(view, { key, html });
   return html;
@@ -684,10 +699,11 @@ const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "
 const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
 /// Reported only by this version's logs and devices; older devices add nothing.
 const REPORTED_FIRST_TOKEN = ["firstTokenTotalMs", "firstTokenSamples"];
+const REPORTED_OUTPUT_TPS = ["outputTpsTokens", "outputTpsDurationMs"];
 function addTraffic(to, from, offset = 0, length = Infinity) {
   for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
   // Unreported usage stays unknown unless some part reported it.
-  for (const key of [...REPORTED_TOKENS, ...REPORTED_FIRST_TOKEN]) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
+  for (const key of [...REPORTED_TOKENS, ...REPORTED_FIRST_TOKEN, ...REPORTED_OUTPUT_TPS]) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
   for (const key of ["counts", "errorCounts", "tokenCounts"]) {
     const values = from[key] ?? [];
     to[key] ||= Array(values.length).fill(0);
@@ -709,6 +725,7 @@ function finishTraffic(traffic) {
   for (const key of REPORTED_TOKENS) traffic[key] ??= null;
   traffic.avgMs = traffic.latencySamples ? Math.floor(traffic.latencyTotalMs / traffic.latencySamples) : null;
   traffic.firstTokenMs = traffic.firstTokenSamples ? Math.floor(traffic.firstTokenTotalMs / traffic.firstTokenSamples) : null;
+  traffic.outputTps = traffic.outputTpsDurationMs > 0 && traffic.outputTpsTokens != null ? traffic.outputTpsTokens * 1000 / traffic.outputTpsDurationMs : null;
   traffic.cacheHitRate = traffic.cachePrompt ? traffic.cacheRead / traffic.cachePrompt : null;
   return traffic;
 }
@@ -1040,6 +1057,8 @@ document.addEventListener("pointerover", (event) => {
 // focus shows one as well; a click does not.
 let routeTooltipTimer;
 let routeTooltipOwner;
+let routeTooltipMode;
+let routeTooltipPointer;
 
 function hideRouteTooltip() {
   clearTimeout(routeTooltipTimer);
@@ -1056,37 +1075,88 @@ function routeTooltipPosition(anchor, size, width, height) {
   return { left, top };
 }
 
-function showRouteTooltip(owner) {
-  if (routeTooltipOwner === owner) return;
-  hideRouteTooltip();
-  routeTooltipOwner = owner;
-  routeTooltipTimer = setTimeout(() => {
-    if (!owner.isConnected) return hideRouteTooltip();
-    const tip = $("route-tooltip");
-    tip.textContent = owner.dataset.tip;
-    tip.hidden = false;
-    tip.style.visibility = "hidden";
-    const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
-    tip.style.left = `${left}px`;
-    tip.style.top = `${top}px`;
-    tip.style.visibility = "visible";
-    owner.setAttribute("aria-describedby", "route-tooltip");
-  }, owner.matches(".chart-bar") ? 100 : 500);
+function paintRouteTooltip() {
+  const owner = routeTooltipOwner;
+  if (!owner?.isConnected) return hideRouteTooltip();
+  const tip = $("route-tooltip");
+  tip.textContent = owner.dataset.tip;
+  tip.hidden = false;
+  tip.style.visibility = "hidden";
+  const { left, top } = routeTooltipPosition(owner.getBoundingClientRect(), tip.getBoundingClientRect(), document.documentElement.clientWidth, document.documentElement.clientHeight);
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+  tip.style.visibility = "visible";
+  owner.setAttribute("aria-describedby", "route-tooltip");
 }
 
+function transferRouteTooltip(owner) {
+  routeTooltipOwner?.removeAttribute("aria-describedby");
+  routeTooltipOwner = owner;
+  if (!$("route-tooltip").hidden) paintRouteTooltip();
+}
+
+// A refresh rebuilds Traffic's nodes. Keep the tooltip (and its pending
+// delay) only for the same metric under the pointer or keyboard focus.
+function refreshRouteTooltip() {
+  const owner = routeTooltipOwner;
+  if (!owner || owner.isConnected) return;
+  const key = owner.dataset.tipKey;
+  const next = routeTooltipMode === "focus"
+    ? [...$("content").querySelectorAll("[data-tip-key]")].find(el => el.dataset.tipKey === key)
+    : routeTooltipPointer && document.elementFromPoint(routeTooltipPointer.x, routeTooltipPointer.y)?.closest("[data-tip]");
+  if (!key || next?.dataset.tipKey !== key) return hideRouteTooltip();
+  transferRouteTooltip(next);
+  if (routeTooltipMode === "focus") next.focus({ preventScroll: true });
+}
+
+function showRouteTooltip(owner, mode = "pointer") {
+  routeTooltipMode = mode;
+  if (routeTooltipOwner === owner) return;
+  if (routeTooltipOwner && !routeTooltipOwner.isConnected
+      && owner.dataset.tipKey && owner.dataset.tipKey === routeTooltipOwner.dataset.tipKey) {
+    transferRouteTooltip(owner);
+    return;
+  }
+  hideRouteTooltip();
+  routeTooltipOwner = owner;
+  routeTooltipTimer = setTimeout(paintRouteTooltip, owner.matches(".chart-bar") ? 100 : 500);
+}
+
+document.addEventListener("pointermove", (event) => {
+  routeTooltipPointer = { x: event.clientX, y: event.clientY };
+  // WebKit may not send pointerout for a newly replaced hovered node.
+  if (routeTooltipOwner?.isConnected && routeTooltipMode === "pointer"
+      && !routeTooltipOwner.contains(event.target)) {
+    if (routeTooltipOwner.matches(":focus-visible")) routeTooltipMode = "focus";
+    else hideRouteTooltip();
+  }
+});
 for (const type of ["pointerover", "focusin"]) {
   document.addEventListener(type, (event) => {
     const owner = event.target.closest?.(".chart-bar, [data-tip]");
     if (type === "focusin" && !owner?.matches(":focus-visible")) return;
-    if (owner) showRouteTooltip(owner);
+    if (type === "pointerover") routeTooltipPointer = { x: event.clientX, y: event.clientY };
+    if (owner) showRouteTooltip(owner, type === "focusin" ? "focus" : "pointer");
   });
 }
 for (const type of ["pointerout", "focusout"]) {
   document.addEventListener(type, (event) => {
     const owner = event.target.closest?.(".chart-bar, [data-tip]");
-    if (!owner || owner.contains(event.relatedTarget)) return;
-    if (type === "pointerout" && owner.matches(":focus-visible")) return;
-    if (type === "focusout" && owner.matches(":hover")) return;
+    if (!owner || owner !== routeTooltipOwner || owner.contains(event.relatedTarget)) return;
+    if (!owner.isConnected && owner.dataset.tipKey) return;
+    // Some engines dispatch focusout just before innerHTML detaches the
+    // focused node. Let that replacement finish before deciding to close.
+    if (type === "focusout" && owner.dataset.tipKey) {
+      queueMicrotask(() => {
+        if (owner !== routeTooltipOwner) return;
+        if (!owner.isConnected) return refreshRouteTooltip();
+        if (owner.matches(":hover")) routeTooltipMode = "pointer";
+        else hideRouteTooltip();
+      });
+      return;
+    }
+    if (type === "pointerout" && owner.matches(":focus-visible")) { routeTooltipMode = "focus"; return; }
+    if (type === "focusout" && owner.matches(":hover")) { routeTooltipMode = "pointer"; return; }
     hideRouteTooltip();
   });
 }
@@ -1968,7 +2038,7 @@ function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = tr
   let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window, detailsKey)}</div>`;
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
-  if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => accountRow(c, scope, window, trafficReview(c, traffic.targets, scope))).join("")}</details>`;
+  if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => accountRow(c, scope, window, trafficReview(c, traffic.targets, scope), detailsKey)).join("")}</details>`;
   return body;
 }
 document.addEventListener("toggle", event => {
@@ -2488,7 +2558,7 @@ const fitObserver = new ResizeObserver(queueFit);
 fitObserver.observe($("content"));
 let observedPage = null;
 new MutationObserver(() => {
-  if (routeTooltipOwner && !routeTooltipOwner.isConnected) hideRouteTooltip();
+  refreshRouteTooltip();
   const page = $("content").firstElementChild;
   if (page === observedPage) return;
   if (observedPage) fitObserver.unobserve(observedPage);

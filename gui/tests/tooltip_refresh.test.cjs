@@ -1,0 +1,154 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { test } = require('node:test');
+
+const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+const between = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+
+// Run the real renderPage and content observer: refreshing replaces the
+// hovered/focused node, as innerHTML does in the panel's WebView.
+function panel(page = 'main') {
+  const events = {}, windowEvents = {}, timers = new Map(), microtasks = [];
+  let timerId = 0, observer, owners = [], hit = 0;
+  let rows = [{ key: 'account-a', tip: '50.0 tok/s' }];
+  const body = { matches: () => false };
+  const tip = { hidden: true, style: {}, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
+  const doc = {
+    activeElement: body,
+    documentElement: { clientWidth: 480, clientHeight: 640 },
+    addEventListener(type, fn) { events[type] = fn; },
+    elementFromPoint: () => owners[hit] ?? null,
+  };
+  const owner = row => ({
+    dataset: { tipKey: row.key, tip: row.tip }, isConnected: true, keyboard: false,
+    matches(selector) { return selector === ':focus-visible' ? this.keyboard : selector === ':hover' && owners[hit] === this; },
+    contains(target) { return target === this; },
+    closest() { return this; },
+    getBoundingClientRect: () => ({ left: 100, top: 120, bottom: 132 }),
+    setAttribute(name, value) { this[name] = value; },
+    removeAttribute(name) { delete this[name]; },
+    focus() { this.keyboard = true; doc.activeElement = this; events.focusin({ target: this }); },
+  });
+  const content = {
+    firstElementChild: {},
+    querySelectorAll: selector => selector === '[data-tip-key]' ? owners : [],
+    contains: node => owners.includes(node),
+    set innerHTML(_) {
+      for (const old of owners) {
+        if (doc.activeElement === old) {
+          doc.activeElement = body;
+          events.focusout({ target: old, relatedTarget: body });
+        }
+        old.isConnected = false;
+      }
+      owners = rows.map(owner);
+      this.firstElementChild = {};
+    },
+  };
+  const context = {
+    ui: { page, builtPage: page }, document: doc,
+    $: id => id === 'route-tooltip' ? tip : content,
+    window: { addEventListener(type, fn) { windowEvents[type] = fn; } },
+    setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
+    clearTimeout(id) { timers.delete(id); },
+    queueMicrotask(fn) { microtasks.push(fn); },
+    closeSelect() {}, main: () => '', devicesPage: () => '', settings: () => '',
+    renderActivityForwarding() {}, renderActivityList() {},
+    fitObserver: { observe() {}, unobserve() {} }, observedPage: null,
+    MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },
+  };
+  vm.createContext(context);
+  vm.runInContext(between('let routeTooltipTimer;', '\nfunction routingBlock('), context);
+  vm.runInContext(between('function renderPage() {', '/// A block:'), context);
+  vm.runInContext(between('new MutationObserver(() => {\n  refreshRouteTooltip()', '// ---------------------------------------------------------------- share rings'), context);
+  content.innerHTML = '';
+  const redraw = () => { context.renderPage(); while (microtasks.length) microtasks.shift()(); observer(); };
+  const hover = () => events.pointerover({ target: owners[hit], clientX: 106, clientY: 126 });
+  const flush = () => { for (const [id, fn] of timers) { timers.delete(id); fn(); } };
+  return { context, doc, tip, timers, events, windowEvents, content, redraw, hover, flush,
+    owner: () => owners[hit], rows: value => { rows = value; }, hit: value => { hit = value; }, observe: () => observer(),
+    flushMicrotasks: () => { while (microtasks.length) microtasks.shift()(); } };
+}
+
+for (const page of ['main', 'devices', 'activity']) {
+  test(`${page}: repeated refreshes keep the hovered TPS tooltip visible and current`, () => {
+    const p = panel(page);
+    p.hover(); p.flush();
+    assert.equal(p.tip.hidden, false);
+    assert.equal(p.doc.activeElement.matches(':focus-visible'), false);
+    for (let i = 0; i < 5; i++) {
+      const previous = p.owner();
+      p.rows([{ key: 'account-a', tip: `${50 + i}.0 tok/s` }]);
+      p.redraw();
+      if (page === 'activity') { p.content.innerHTML = ''; p.observe(); }
+      assert.equal(p.tip.hidden, false);
+      assert.equal(p.tip.textContent, `${50 + i}.0 tok/s`);
+      assert.equal(p.owner()['aria-describedby'], 'route-tooltip');
+      // A delayed leave from the detached SVG must not close its replacement.
+      p.events.pointerout({ target: previous, relatedTarget: null });
+      assert.equal(p.tip.hidden, false);
+    }
+    p.events.pointerout({ target: p.owner(), relatedTarget: null });
+    assert.equal(p.tip.hidden, true);
+  });
+}
+
+test('refresh while waiting keeps the original hover delay, then shows the latest text', () => {
+  const p = panel();
+  p.hover();
+  const timer = [...p.timers.keys()][0];
+  for (let i = 0; i < 3; i++) p.redraw();
+  assert.deepEqual([...p.timers.keys()], [timer]);
+  assert.equal(p.tip.hidden, true);
+  p.rows([{ key: 'account-a', tip: '75.0 tok/s' }]); p.redraw(); p.flush();
+  assert.equal(p.tip.textContent, '75.0 tok/s');
+  assert.equal(p.tip.hidden, false);
+});
+
+test('keyboard tooltip follows the same account when refreshed rows change order', () => {
+  const p = panel();
+  p.owner().focus(); p.flush();
+  p.rows([{ key: 'account-b', tip: 'other account' }, { key: 'account-a', tip: '75.0 tok/s' }]);
+  p.redraw();
+  assert.equal(p.tip.hidden, false);
+  assert.equal(p.tip.textContent, '75.0 tok/s');
+  assert.equal(p.doc.activeElement.dataset.tipKey, 'account-a');
+  assert.equal(p.doc.activeElement.isConnected, true);
+});
+
+test('a different account under the pointer, a removed metric, and page changes close the tooltip', () => {
+  for (const next of ['different', 'missing', 'page']) {
+    const p = panel(); p.hover(); p.flush();
+    if (next === 'different') p.rows([{ key: 'account-b', tip: 'other account' }]);
+    if (next === 'missing') p.rows([]);
+    if (next === 'page') p.context.ui.page = 'settings';
+    p.redraw(); p.flush();
+    assert.equal(p.tip.hidden, true, next);
+  }
+});
+
+test('click, scroll and resize still dismiss the tooltip after a refresh', () => {
+  for (const close of [p => p.windowEvents.pointerdown(), p => p.windowEvents.resize(), p => p.events.scroll({ target: p.content })]) {
+    const p = panel(); p.hover(); p.flush(); p.redraw();
+    close(p);
+    assert.equal(p.tip.hidden, true);
+  }
+});
+
+test('moving off a replaced hovered node closes the tooltip even without pointerout', () => {
+  const p = panel(); p.hover(); p.flush(); p.redraw();
+  p.events.pointermove({ target: p.content, clientX: 400, clientY: 400 });
+  assert.equal(p.tip.hidden, true);
+});
+
+test('a real keyboard focus departure still closes the tooltip', () => {
+  const p = panel();
+  const owner = p.owner();
+  owner.focus(); p.flush(); p.hit(-1);
+  owner.keyboard = false;
+  p.events.focusout({ target: owner, relatedTarget: p.content });
+  p.flushMicrotasks();
+  assert.equal(p.tip.hidden, true);
+});
