@@ -1539,13 +1539,17 @@ function ringSector(from, to, outer, inner, gap = 1.6, radius = 3) {
   }
   const outerBeta = Math.asin(Math.min(1, corner / (outer - corner)));
   const innerBeta = Math.asin(Math.min(1, corner / (inner + corner)));
+  // The corners shorten each arc, so a slice just over half a turn can have
+  // arcs under half; flagging those large would draw them the other way round.
+  const outerLarge = width - 2 * outerBeta > Math.PI ? 1 : 0;
+  const innerLarge = width - 2 * innerBeta > Math.PI ? 1 : 0;
   return [
     `M ${at(outer, start + outerBeta)}`,
-    `A ${outer} ${outer} 0 ${large} 1 ${at(outer, end - outerBeta)}`,
+    `A ${outer} ${outer} 0 ${outerLarge} 1 ${at(outer, end - outerBeta)}`,
     `Q ${at(outer, end)} ${at(outer - corner, end)}`,
     `L ${at(inner + corner, end)}`,
     `Q ${at(inner, end)} ${at(inner, end - innerBeta)}`,
-    `A ${inner} ${inner} 0 ${large} 0 ${at(inner, start + innerBeta)}`,
+    `A ${inner} ${inner} 0 ${innerLarge} 0 ${at(inner, start + innerBeta)}`,
     `Q ${at(inner, start)} ${at(inner + corner, start)}`,
     `L ${at(outer - corner, start)}`,
     `Q ${at(outer, start)} ${at(outer, start + outerBeta)}`,

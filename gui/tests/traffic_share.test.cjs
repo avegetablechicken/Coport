@@ -256,6 +256,25 @@ test('sectors are closed paths and vanish when too narrow', () => {
   assert.match(ringSector(0, 0.75, 42, 26), / A 42 42 0 1 1 /);
   assert.equal(ringSector(0, 0.0001, 42, 26), '');
 });
+test('every sector arc bends the short or long way its ends call for', () => {
+  // A growing or shrinking slice passes every width, including those just
+  // over half a turn whose rounded corners leave arcs under half.
+  const { ringSector } = setup();
+  const arc = /(-?[\d.]+) (-?[\d.]+) A ([\d.]+) [\d.]+ 0 ([01]) ([01]) (-?[\d.]+) (-?[\d.]+)/g;
+  for (const inner of [42 * 0.618, 30]) {
+    for (let i = 1; i <= 2000; i++) {
+      const from = 0.13;
+      const d = ringSector(from, from + i / 2000, 42, inner);
+      for (const m of d.matchAll(arc)) {
+        const [x1, y1, , large, sweep, x2, y2] = m.slice(1).map(Number);
+        const turn = sweep ? Math.atan2(y2 - 42, x2 - 42) - Math.atan2(y1 - 42, x1 - 42) : Math.atan2(y1 - 42, x1 - 42) - Math.atan2(y2 - 42, x2 - 42);
+        const span = ((turn % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+        if (Math.abs(span - Math.PI) < 1e-3) continue;
+        assert.equal(large, span > Math.PI ? 1 : 0, `width ${i / 2000}, inner ${inner}: ${m[0]}`);
+      }
+    }
+  }
+});
 test('traffic data keeps the category it was read for', async () => {
   const pending = [];
   const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, page: 'main' };
