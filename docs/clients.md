@@ -373,12 +373,32 @@ profile API before routing.
 
 The unprefixed `/v1/oauth/token` and explicit
 `/https://platform.claude.com/v1/oauth/token` paths are also supported, including
-`/anthropic` and `/claude` prefixes. Use the local URL as an OAuth base URL,
-or enable proxy port credential routing before using the listener as an HTTP
-proxy.
+`/anthropic` and `/claude` prefixes. Give the local URL to clients whose token
+URL can be set, such as account managers, or enable proxy port credential
+routing before using the listener as an HTTP proxy.
 
 Implementation references: Sub2api's [Anthropic forwarding](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/service/gateway_anthropic_passthrough.go)
 and [Claude header definitions](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/pkg/claude/constants.go).
+
+### Claude Code sign-in and renewal
+
+Claude Code (checked with 2.1.326) has no setting for its token or profile URL,
+and `ANTHROPIC_BASE_URL` does not cover them. It renews an expired login at
+`https://platform.claude.com/v1/oauth/token` and reads the account from
+`https://api.anthropic.com/api/oauth/profile` at start and after each renewal,
+directly or through `HTTPS_PROXY`. Proxy variables set in `settings.json` also
+reach the commands Claude Code runs, and the proxy port refuses hosts other than
+routed APIs, so `git`, package managers and other network commands would fail.
+Official plugin marketplace updates (`downloads.claude.ai`, then `github.com`)
+carry no login and stay direct.
+
+`CLAUDE_CODE_CUSTOM_OAUTH_URL` cannot point at Coport, because Claude Code
+accepts only Anthropic's own endpoints there. With any other value in the
+environment, Claude Code stops at start with `CLAUDE_CODE_CUSTOM_OAUTH_URL is
+not an approved endpoint.`. With it in `settings.json`, sign-in, renewal and the
+profile lookup fail without a connection. An expired login is then refused with
+401 ("Please run /login") until another program renews the saved login; the
+next request uses the renewed one.
 
 ### Third-party Claude APIs
 
