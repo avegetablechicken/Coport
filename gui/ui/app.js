@@ -646,7 +646,7 @@ function accountRow(c, scope, window, review = "") {
     return `<div class="credential-traffic"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
   }
   return `<div class="credential-traffic"><div class="traffic-identity">${identity}${review}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -670,8 +670,8 @@ function trafficSummary(view, scope, window = view, source = "") {
      <div class="strip">
        ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
        ${stat("Error Rate", rate, rateClass)}
-       ${stat("Avg. Time", fmtMs(view.avgMs))}
        ${scope === "model" && view.firstTokenSamples != null ? stat("First Token", fmtMs(view.firstTokenMs ?? null)) : ""}
+       ${stat("Avg. Time", fmtMs(view.avgMs))}
        ${stat("Received", fmtBytes(view.bytes))}
      </div>${modelTokenStats(view, scope)}</div>`;
   trafficMarkup.set(view, { key, html });
