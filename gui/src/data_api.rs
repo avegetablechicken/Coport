@@ -45,6 +45,13 @@ pub struct Stats {
     pub cache_prompt: u64,
     pub latency_total_ms: u64,
     pub latency_samples: u64,
+    /// Time to first streamed output, summed over the model calls that
+    /// streamed any. Absent from Requests, from exporters older than it, and
+    /// for readers that do not name [`FIRST_TOKEN`]; see [`SERVICES_HEADER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_total_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_samples: Option<u64>,
     pub counts: Vec<u64>,
     pub error_counts: Vec<u64>,
     pub token_counts: Vec<u64>,
@@ -139,23 +146,29 @@ fn account_digest(value: &str) -> String {
 /// or Grok rejects a whole summary naming it. Readers therefore name the
 /// further services they parse, over HTTP in this header and over SSH in this
 /// environment variable, both ignored by older exporters. Groups of a service
-/// the reader did not name are left out.
+/// the reader did not name are left out. The list also names [`FIRST_TOKEN`],
+/// the one statistic an older reader would reject; it is left out likewise.
 pub const SERVICES_HEADER: &str = "x-coport-services";
 pub const SERVICES_ENV: &str = "COPORT_SUMMARY_SERVICES";
-/// The further services this version parses.
-pub const SERVICES: &str = "antigravity,grok";
+/// The further services, and the first token statistic, this version parses.
+pub const SERVICES: &str = "antigravity,grok,first-token";
+/// Names the first token statistic in a reader's list.
+pub const FIRST_TOKEN: &str = "first-token";
 
 /// The services beyond Codex and Claude a reader parses, as it names them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReaderServices {
     pub antigravity: bool,
     pub grok: bool,
+    /// Parses `firstTokenTotalMs` and `firstTokenSamples`.
+    pub first_token: bool,
 }
 impl ReaderServices {
     /// Every service this version parses, as [`SERVICES`] names them.
     pub const ALL: Self = Self {
         antigravity: true,
         grok: true,
+        first_token: true,
     };
     /// The services a reader's comma-separated list names.
     pub fn named(list: &str) -> Self {
@@ -166,6 +179,7 @@ impl ReaderServices {
         Self {
             antigravity: names("antigravity"),
             grok: names("grok"),
+            first_token: names(FIRST_TOKEN),
         }
     }
     /// The services the reader that started this helper names.
@@ -191,9 +205,14 @@ fn for_reader(bytes: &[u8], services: ReaderServices) -> Result<Vec<u8>, String>
             .windows(quoted.len())
             .any(|part| part == quoted.as_bytes())
     };
+    let first_token = || {
+        let key = b"\"firstTokenSamples\"";
+        bytes.windows(key.len()).any(|part| part == key)
+    };
     if [Service::Antigravity, Service::Grok]
         .into_iter()
         .all(|service| services.reads(service) || !named(service))
+        && (services.first_token || !first_token())
     {
         return Ok(bytes.to_vec());
     }
@@ -205,16 +224,22 @@ fn for_reader(bytes: &[u8], services: ReaderServices) -> Result<Vec<u8>, String>
 }
 
 impl Summary {
-    /// Leaves out the groups of services a reader cannot parse.
+    /// Leaves out the groups of services, and the statistic, a reader cannot parse.
     pub fn only_for(&mut self, services: ReaderServices) {
         let keep = |group: &Group| services.reads(group.service);
-        self.groups.retain(keep);
-        for window in self
-            .windows
-            .iter_mut()
-            .chain(self.previous_windows.iter_mut())
-        {
-            window.groups.retain(keep);
+        for groups in std::iter::once(&mut self.groups).chain(
+            self.windows
+                .iter_mut()
+                .chain(self.previous_windows.iter_mut())
+                .map(|window| &mut window.groups),
+        ) {
+            groups.retain(keep);
+            if !services.first_token {
+                for group in groups.iter_mut() {
+                    group.stats.first_token_total_ms = None;
+                    group.stats.first_token_samples = None;
+                }
+            }
         }
     }
 
@@ -348,6 +373,13 @@ fn validate_groups(groups: &[Group], buckets: usize) -> Result<(), String> {
             || s.cache_read > s.cache_prompt
             || s.errors > s.requests
             || s.latency_samples > s.requests
+            || match (s.first_token_total_ms, s.first_token_samples) {
+                (None, None) => false,
+                (Some(total), Some(samples)) => {
+                    samples > s.requests || (samples == 0 && total != 0)
+                }
+                _ => true,
+            }
             || s.error_counts.iter().zip(&s.counts).any(|(e, n)| e > n)
             || [
                 s.requests,
@@ -367,6 +399,8 @@ fn validate_groups(groups: &[Group], buckets: usize) -> Result<(), String> {
             .chain(s.cached_input_tokens.iter())
             .chain(s.uncached_input_tokens.iter())
             .chain(s.cache_write_tokens.iter())
+            .chain(s.first_token_total_ms.iter())
+            .chain(s.first_token_samples.iter())
             .any(|n| *n > 9_007_199_254_740_991)
         {
             return Err("Invalid summary statistics.".into());
@@ -1039,7 +1073,7 @@ mod tests {
         let row = |service: &str, path: &str| {
             json!({"timestamp":at, "event":"model_call_finished", "model_call_id":uuid::Uuid::new_v4().to_string(),
                 "request_id":uuid::Uuid::new_v4().to_string(), "service":service, "method":"POST", "path":path,
-                "account_id":"user@example.test", "status":"200"})
+                "account_id":"user@example.test", "status":"200", "first_token_ms":"420"})
             .to_string()
                 + "\n"
         };
@@ -1138,13 +1172,131 @@ mod tests {
 
         assert_eq!(
             ReaderServices::named(" Antigravity , GROK"),
-            ReaderServices::ALL
+            ReaderServices {
+                first_token: false,
+                ..ReaderServices::ALL
+            }
         );
         assert_eq!(
-            ReaderServices::named("antigravity-next,grok-x,codex"),
+            ReaderServices::named("antigravity-next,grok-x,codex,first-token-x"),
             ReaderServices::default()
         );
         assert_eq!(ReaderServices::named(SERVICES), ReaderServices::ALL);
+        assert_eq!(
+            ReaderServices::named(" First-Token "),
+            ReaderServices {
+                first_token: true,
+                ..ReaderServices::default()
+            }
+        );
+    }
+
+    /// The first token statistic of a Models group, as a reader receives it.
+    fn first_token(summary: &Summary, body: &[u8]) -> Vec<(Option<u64>, Option<u64>)> {
+        let named = |name: &[u8]| body.windows(name.len()).any(|w| w == name);
+        let stats: Vec<_> = summary
+            .groups
+            .iter()
+            .chain(summary.windows.iter().flat_map(|w| &w.groups))
+            .map(|g| (g.stats.first_token_total_ms, g.stats.first_token_samples))
+            .collect();
+        // A reader from before First Token rejects a summary naming it.
+        assert_eq!(
+            named(b"firstToken"),
+            stats.iter().any(|s| s.0.is_some()),
+            "{stats:?}"
+        );
+        stats
+    }
+
+    /// Readers from before First Token reject a summary naming it, so only one
+    /// that names it receives it, over HTTP and SSH alike.
+    #[tokio::test]
+    async fn first_token_reaches_only_readers_that_name_it() {
+        let (dir, log, config) = antigravity_traffic();
+        let key = DataKey::new(KEY).unwrap();
+        let bytes = publish(
+            &Config::parse(config).unwrap(),
+            &log,
+            &key,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes)))));
+        for (extra, named) in [
+            ("", false),
+            ("X-Coport-Window: 30:model\r\n", false),
+            ("X-Coport-Services: antigravity,grok\r\n", false),
+            (
+                "X-Coport-Services: antigravity,grok\r\nX-Coport-Window: 30:model\r\n",
+                false,
+            ),
+            ("X-Coport-Services: first-token\r\n", true),
+            (
+                "X-Coport-Services: antigravity,grok,first-token\r\nX-Coport-Window: 30:model\r\n",
+                true,
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024 * 1024);
+            let (key, cache) = (DataKey::new(KEY).unwrap(), shared.clone());
+            let task = tokio::spawn(async move { handle(server, &key, cache).await });
+            client
+                .write_all(
+                    format!("GET /v1/summary HTTP/1.1\r\nHost: data\r\nAuthorization: Bearer {KEY}\r\n{extra}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            task.await.unwrap();
+            let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body = &response[split..];
+            let summary: Summary = serde_json::from_slice(body).unwrap();
+            summary.validate().unwrap();
+            let stats = first_token(&summary, body);
+            assert!(!stats.is_empty(), "{extra:?}");
+            let expected = if named {
+                (Some(420), Some(1))
+            } else {
+                (None, None)
+            };
+            assert!(stats.iter().all(|s| *s == expected), "{extra:?} {stats:?}");
+        }
+        #[cfg(unix)]
+        {
+            std::fs::write(dir.path().join("config.yaml"), config).unwrap();
+            prepare_identity(dir.path()).unwrap();
+            for (reader, named) in [("", false), ("antigravity,grok", false), (SERVICES, true)] {
+                let services = ReaderServices::named(reader);
+                let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+                let mut output = Vec::new();
+                stream_summary_at(
+                    dir.path(),
+                    30,
+                    crate::traffic::TrafficScope::Model,
+                    end,
+                    services,
+                    &mut output,
+                )
+                .unwrap();
+                let mut single =
+                    serde_json::to_vec(&read_summary(dir.path(), services).unwrap()).unwrap();
+                single.push(b'\n');
+                output.extend(single);
+                for line in output.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                    let frame: Summary = serde_json::from_slice(line).unwrap();
+                    frame.validate().unwrap();
+                    let stats = first_token(&frame, line);
+                    assert!(!stats.is_empty(), "{reader:?}");
+                    assert_eq!(
+                        stats.contains(&(Some(420), Some(1))),
+                        named,
+                        "{reader:?} {stats:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// As over HTTP, for the SSH helper's stream and single summary.
@@ -1390,6 +1542,41 @@ mod tests {
             ..valid
         };
         assert!(stale.validate().is_err());
+    }
+    #[test]
+    fn first_token_statistic_is_optional_but_consistent() {
+        let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let reference = "a".repeat(64);
+        let summary = |stats: serde_json::Value| {
+            let mut group = json!({"requests":2,"errors":0,"bytes":0,"inputTokens":null,"outputTokens":null,"cachedInputTokens":null,
+                "latencyTotalMs":0,"latencySamples":0,"counts":vec![0; 29].into_iter().chain([2]).collect::<Vec<u64>>(),
+                "errorCounts":vec![0; 30],"tokenCounts":vec![0; 30]});
+            group
+                .as_object_mut()
+                .unwrap()
+                .extend(stats.as_object().unwrap().clone());
+            serde_json::from_value::<Summary>(json!({"schemaVersion":1,"nodeId":uuid::Uuid::new_v4().to_string(),
+                "windowStart":end-30*60_000,"windowEnd":end,"bucketMinutes":1,
+                "groups":[{"service":"Codex","proxyRef":reference,"upstreamRef":reference,"stats":group}]}))
+            .map_err(|e| e.to_string())
+            .and_then(|summary| summary.validate().map(|_| summary))
+        };
+        // Exporters older than it omit it.
+        let older = summary(json!({})).unwrap();
+        assert_eq!(older.groups[0].stats.first_token_total_ms, None);
+        assert_eq!(older.groups[0].stats.first_token_samples, None);
+        let reported = summary(json!({"firstTokenTotalMs":900,"firstTokenSamples":2})).unwrap();
+        assert_eq!(reported.groups[0].stats.first_token_total_ms, Some(900));
+        assert!(summary(json!({"firstTokenTotalMs":0,"firstTokenSamples":0})).is_ok());
+        for invalid in [
+            json!({"firstTokenTotalMs":900}),
+            json!({"firstTokenSamples":1}),
+            json!({"firstTokenTotalMs":900,"firstTokenSamples":3}),
+            json!({"firstTokenTotalMs":900,"firstTokenSamples":0}),
+            json!({"firstTokenTotalMs":9_007_199_254_740_992u64,"firstTokenSamples":1}),
+        ] {
+            assert!(summary(invalid.clone()).is_err(), "{invalid}");
+        }
     }
     #[cfg(unix)]
     #[test]

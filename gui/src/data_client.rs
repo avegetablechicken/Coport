@@ -235,6 +235,7 @@ pub struct TrafficView {
     #[serde(flatten)]
     stats: Stats,
     avg_ms: Option<u64>,
+    first_token_ms: Option<u64>,
     cache_hit_rate: Option<f64>,
     credentials: Vec<CredentialView>,
     targets: Vec<crate::traffic_identity::Target>,
@@ -250,7 +251,15 @@ struct CredentialView {
     #[serde(flatten)]
     stats: Stats,
     avg_ms: Option<u64>,
+    first_token_ms: Option<u64>,
     cache_hit_rate: Option<f64>,
+}
+/// Over the calls that streamed output, where any source reported them.
+fn first_token_ms(stats: &Stats) -> Option<u64> {
+    stats
+        .first_token_samples
+        .filter(|samples| *samples > 0)
+        .map(|samples| stats.first_token_total_ms.unwrap_or(0) / samples)
 }
 fn empty_stats(buckets: usize) -> Stats {
     Stats {
@@ -291,6 +300,7 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
                 credential,
                 avg_ms: (stats.latency_samples > 0)
                     .then(|| stats.latency_total_ms / stats.latency_samples),
+                first_token_ms: first_token_ms(&stats),
                 cache_hit_rate: (stats.cache_prompt > 0)
                     .then(|| stats.cache_read as f64 / stats.cache_prompt as f64),
                 stats,
@@ -302,6 +312,7 @@ fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
     credentials.sort_by_key(|c| (c.anonymous, std::cmp::Reverse(c.stats.bytes)));
     TrafficView {
         avg_ms: (total.latency_samples > 0).then(|| total.latency_total_ms / total.latency_samples),
+        first_token_ms: first_token_ms(&total),
         cache_hit_rate: (total.cache_prompt > 0)
             .then(|| total.cache_read as f64 / total.cache_prompt as f64),
         stats: total,
@@ -431,6 +442,9 @@ fn add_stats(to: &mut Stats, from: &Stats) {
         (&mut to.cached_input_tokens, from.cached_input_tokens),
         (&mut to.uncached_input_tokens, from.uncached_input_tokens),
         (&mut to.cache_write_tokens, from.cache_write_tokens),
+        // Sources that did not report it, as older ones, add nothing.
+        (&mut to.first_token_total_ms, from.first_token_total_ms),
+        (&mut to.first_token_samples, from.first_token_samples),
     ] {
         if let Some(value) = from {
             *to = Some(to.unwrap_or(0).saturating_add(value));
@@ -2407,6 +2421,62 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(unknown.values().all(|g| g.anonymous_upstream));
+    }
+    #[test]
+    fn first_token_averages_the_devices_that_report_it() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let reference = crate::data_api::account_reference("Codex", &id).unwrap();
+        let accounts = BTreeMap::from([(reference.clone(), "work".into())]);
+        let device = |key: &str, proxy, upstream, first_token: Option<(u64, u64)>| {
+            let mut summary = sample(&DataKey::new(key).unwrap(), proxy, upstream);
+            summary.groups[0].account_ref = Some(reference.clone());
+            summary.groups[0].stats.requests = 2;
+            summary.groups[0].stats.counts[0] = 2;
+            summary.groups[0].stats.first_token_total_ms = first_token.map(|t| t.0);
+            summary.groups[0].stats.first_token_samples = first_token.map(|t| t.1);
+            summary
+        };
+        let current = device(KEY, "http://10.1.1.1", "https://a.example", Some((900, 2)));
+        let quiet = device(
+            &"e".repeat(64),
+            "http://10.3.3.3",
+            "https://c.example",
+            Some((0, 0)),
+        );
+        // A device from before First Token reports nothing, not zero.
+        let older = device(
+            &"f".repeat(64),
+            "http://10.2.2.2",
+            "https://b.example",
+            None,
+        );
+        let view = |summaries: &[&crate::data_api::Summary]| {
+            let maps = (BTreeMap::new(), BTreeMap::new());
+            let mut groups = BTreeMap::new();
+            for summary in summaries {
+                add_groups(
+                    &mut groups,
+                    &maps,
+                    &summary.node_id,
+                    &summary.groups,
+                    &accounts,
+                );
+            }
+            let view = traffic_view(&groups.into_values().collect::<Vec<_>>(), 30);
+            serde_json::to_value(&view).unwrap()
+        };
+        let merged = view(&[&current, &older, &quiet]);
+        assert_eq!(merged["requests"], 6);
+        assert_eq!(merged["firstTokenMs"], 450);
+        assert_eq!(merged["firstTokenSamples"], 2);
+        assert_eq!(merged["credentials"][0]["firstTokenMs"], 450);
+        let older = view(&[&older]);
+        assert!(older.get("firstTokenSamples").is_none());
+        assert!(older["firstTokenMs"].is_null());
+        assert!(older["credentials"][0].get("firstTokenSamples").is_none());
+        let quiet = view(&[&quiet]);
+        assert_eq!(quiet["firstTokenSamples"], 0);
+        assert!(quiet["firstTokenMs"].is_null());
     }
 
     #[test]

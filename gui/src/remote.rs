@@ -660,7 +660,7 @@ mod tests {
             );
             assert_eq!(
                 output.stdout,
-                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
             );
         }
     }
@@ -830,7 +830,7 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
             assert_eq!(
                 output.stdout,
-                format!("{args}|antigravity,grok\n").into_bytes()
+                format!("{args}|antigravity,grok,first-token\n").into_bytes()
             );
         }
     }
@@ -884,7 +884,7 @@ mod tests {
             );
             assert_eq!(
                 output.stdout,
-                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
             );
             assert!(output.stderr.is_empty());
             assert_eq!(std::fs::read(&marker).unwrap(), before);
@@ -912,7 +912,7 @@ mod tests {
         );
         assert_eq!(
             output.stdout,
-            b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+            b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
         );
         assert!(!dir.join("summary-executable").exists());
     }
@@ -954,7 +954,7 @@ mod tests {
             assert!(output.status.success(), "{:?}", output);
             assert_eq!(
                 output.stdout,
-                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
             );
             assert_eq!(std::fs::read(&helper).unwrap(), before);
             assert_eq!(
@@ -999,7 +999,7 @@ mod tests {
             assert!(output.status.success(), "{:?}", output);
             assert_eq!(
                 output.stdout,
-                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+                b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
             );
             assert_eq!(std::fs::read(&marker).unwrap(), before);
         }
@@ -1097,7 +1097,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(
             output.stdout,
-            b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok\"}\n"
+            b"{\"result\":\"summary-only\",\"services\":\"antigravity,grok,first-token\"}\n"
         );
         assert_eq!(
             std::fs::read(dir.join("summary-executable")).unwrap(),

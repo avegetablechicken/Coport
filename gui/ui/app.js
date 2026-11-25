@@ -665,7 +665,7 @@ function trafficSummary(view, scope, window = view, source = "") {
     rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
     rateClass = r >= 10 ? "bad" : "";
   }
-  // First Token comes only from this device's logs; other devices' summaries do not report it.
+  // Devices older than First Token do not report it, and then it is not shown.
   const html = `<div${source ? ` data-morph="summary:${esc(source)}"` : ""}>${trafficShare(view.credentials ?? [], scope, source)}${chart(view, scope, false, window)}
      <div class="strip">
        ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
@@ -680,10 +680,12 @@ function trafficSummary(view, scope, window = view, source = "") {
 
 const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "latencyTotalMs", "latencySamples"];
 const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
+/// Reported only by this version's logs and devices; older devices add nothing.
+const REPORTED_FIRST_TOKEN = ["firstTokenTotalMs", "firstTokenSamples"];
 function addTraffic(to, from, offset = 0, length = Infinity) {
   for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
   // Unreported usage stays unknown unless some part reported it.
-  for (const key of REPORTED_TOKENS) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
+  for (const key of [...REPORTED_TOKENS, ...REPORTED_FIRST_TOKEN]) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
   for (const key of ["counts", "errorCounts", "tokenCounts"]) {
     const values = from[key] ?? [];
     to[key] ||= Array(values.length).fill(0);
@@ -704,6 +706,7 @@ function bucketOffset(window, axis) {
 function finishTraffic(traffic) {
   for (const key of REPORTED_TOKENS) traffic[key] ??= null;
   traffic.avgMs = traffic.latencySamples ? Math.floor(traffic.latencyTotalMs / traffic.latencySamples) : null;
+  traffic.firstTokenMs = traffic.firstTokenSamples ? Math.floor(traffic.firstTokenTotalMs / traffic.firstTokenSamples) : null;
   traffic.cacheHitRate = traffic.cachePrompt ? traffic.cacheRead / traffic.cachePrompt : null;
   return traffic;
 }

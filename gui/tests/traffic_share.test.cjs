@@ -685,6 +685,28 @@ test('forwarding Home Traffic labels the destination and hides another source', 
   ui.homeTrafficError = 'TRAFFIC_UPDATING';
   assert.match(context.trafficBlock(), /Loading traffic…/);
 });
+test('Merged First Token averages the devices that report it; older devices add nothing', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  const view = (requests, firstToken) => ({ requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0], ...firstToken,
+    credentials: [{ service: 'Codex', credential: 'shared', requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0], ...firstToken }] });
+  const current = view(2, { firstTokenTotalMs: 900, firstTokenSamples: 2 });
+  const quiet = view(1, { firstTokenTotalMs: 0, firstTokenSamples: 0 });
+  const older = view(3, {});
+  const total = context.sumTrafficViews([current, older, quiet]);
+  assert.equal(total.requests, 6);
+  assert.deepEqual(plain([total.firstTokenTotalMs, total.firstTokenSamples, total.firstTokenMs]), [900, 2, 450]);
+  assert.equal(total.credentials[0].firstTokenMs, 450);
+  // Only older devices: not shown at all.
+  const old = context.sumTrafficViews([older]);
+  assert.equal(old.firstTokenSamples, undefined);
+  assert.equal(old.firstTokenMs, null);
+  Object.assign(context, { chart: () => '', stat: (label) => `<${label}>`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '' });
+  assert.doesNotMatch(context.trafficSummary(old, 'model'), /First Token/);
+  assert.match(context.trafficSummary(total, 'model'), /<First Token>/);
+  // Reported without streamed output: shown as unknown.
+  assert.equal(context.sumTrafficViews([quiet]).firstTokenMs, null);
+});
 test('Merged Traffic is exactly the sum of the device views', () => {
   const context = setup('model');
   loadSharedViews(context);

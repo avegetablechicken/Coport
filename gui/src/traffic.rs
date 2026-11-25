@@ -1319,10 +1319,11 @@ struct ExportWindow {
 }
 fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
     let ExportWindow {
+        options,
         groups,
         mut account_refs,
-        ..
     } = window;
+    let scope = options.scope;
     groups
         .into_iter()
         .map(|((service, _), g)| {
@@ -1348,6 +1349,10 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
                     cache_prompt: g.cache_prompt,
                     latency_total_ms: g.latency_total,
                     latency_samples: g.latency_count,
+                    first_token_total_ms: (scope == TrafficScope::Model)
+                        .then_some(g.first_token_total),
+                    first_token_samples: (scope == TrafficScope::Model)
+                        .then_some(g.first_token_count),
                     counts: g.counts,
                     error_counts: g.error_counts,
                     token_counts: g.token_counts,
@@ -1587,6 +1592,10 @@ mod tests {
                         cache_prompt: g.cache_prompt,
                         latency_total_ms: g.latency_total,
                         latency_samples: g.latency_count,
+                        first_token_total_ms: (scope == TrafficScope::Model)
+                            .then_some(g.first_token_total),
+                        first_token_samples: (scope == TrafficScope::Model)
+                            .then_some(g.first_token_count),
                         counts: g.counts,
                         error_counts: g.error_counts,
                         token_counts: g.token_counts,
