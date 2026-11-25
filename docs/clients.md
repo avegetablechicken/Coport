@@ -499,10 +499,14 @@ export AGY_CA_CERT="<config dir>/tls/proxy-ca.pem"
 The GUI's setup snippets show the exact path. Loopback URLs such as
 `CLOUD_CODE_URL` stay direct. Neither variable is documented by Google, and
 the names come from `agy` 1.5's enterprise gateway; check a token refresh in
-Activity after upgrading `agy`. What stays direct cannot be routed by Coport:
-`agy`'s telemetry (`play.googleapis.com`) trusts only Google's own roots and
-takes only `HTTPS_PROXY`, voice transcription dials `aicode.googleapis.com`
-over gRPC, and the profile picture and plugin marketplace carry no login.
+Activity after upgrading `agy`. The proxy variable reaches every HTTP client
+`agy` builds on its default transport, so its telemetry
+(`play.googleapis.com/log`, about two uploads every five seconds), profile
+picture (`lh3.googleusercontent.com`) and plugin marketplace
+(`www.gstatic.com`) also arrive at the proxy port. They carry no login, so
+Coport refuses them with 403, as any other host; Activity lists them, and
+`agy` logs `Forbidden`, serves its cached marketplace and carries on. Voice
+transcription dials `aicode.googleapis.com` over gRPC, which stays direct.
 
 As for Codex and Claude, Antigravity's token refresh is routed by Coport when
 it arrives through [the proxy port](#credential-routing-on-the-proxy-port) or at
