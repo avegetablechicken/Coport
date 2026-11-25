@@ -815,3 +815,72 @@ test('Account names start after the longest service name, Antigravity', () => {
   assert.ok(first, `service column must grow with its content: ${rule}`);
   assert.ok(Number(first[1]) >= 16 + 4 + 57, `service column too narrow: ${rule}`);
 });
+test('Ring slices carry their key and part of the turn for redraw motion', () => {
+  const { trafficShare } = setup('all');
+  const credentials = [credential('work', 3), credential('home', 1), credential('Unidentified', 1, 'Claude')];
+  const html = trafficShare(credentials, 'all', 'local');
+  assert.match(html, /class="share-ring" data-morph="ring:local" data-ring="local"/);
+  const slices = [...html.matchAll(/<path style="--slice:([^"]+)" data-slice="([^"]+)" data-width="([^"]+)"/g)].map((m) => [m[2], Number(m[3])]);
+  assert.deepEqual(slices.map((s) => s[0]), ['Codex|work', 'Codex|home', 'Claude|Unidentified']);
+  assert.ok(Math.abs(slices.reduce((sum, s) => sum + s[1], 0) - 1) < 1e-9);
+  assert.ok(Math.abs(slices[0][1] - 0.6) < 1e-9);
+  // Without a source a ring has nothing to move from.
+  assert.doesNotMatch(trafficShare(credentials, 'all'), /data-ring=/);
+});
+test('Others keeps one key while its count changes', () => {
+  const { trafficShare } = setup('all');
+  const tiny = (n) => Array.from({ length: n }, (_, i) => credential(`tiny${i}`, 1));
+  const keys = (html) => [...html.matchAll(/data-slice="([^"]+)"/g)].map((m) => m[1]);
+  const big = [credential('a', 1000), credential('b', 1000)];
+  assert.ok(keys(trafficShare([...big, ...tiny(2)], 'all', 'local')).includes('Codex|Others'));
+  assert.ok(keys(trafficShare([...big, ...tiny(3)], 'all', 'local')).includes('Codex|Others'));
+});
+test('A redrawn ring grows, shrinks, adds and removes slices without overlap', () => {
+  const { blendRing } = setup();
+  const from = [{ key: 'a', width: 0.5, color: 'A' }, { key: 'gone', width: 0.25, color: 'G' }, { key: 'b', width: 0.25, color: 'B' }];
+  const to = [{ key: 'new', width: 0.2, color: 'N' }, { key: 'a', width: 0.4, color: 'A2' }, { key: 'b', width: 0.4, color: 'B' }];
+  const parts = (progress) => plain(blendRing(from, to, progress));
+  // Gone slices stay after the slice they followed; new ones are where they will be.
+  assert.deepEqual(parts(0).map((s) => s.key), ['new', 'a', 'gone', 'b']);
+  const close = (actual, expected) => actual.forEach((s, i) => {
+    assert.ok(Math.abs(s.from - expected[i][0]) < 1e-9 && Math.abs(s.to - expected[i][1]) < 1e-9, JSON.stringify(actual));
+  });
+  close(parts(0), [[0, 0], [0, 0.5], [0.5, 0.75], [0.75, 1]]);
+  close(parts(1), [[0, 0.2], [0.2, 0.6], [0.6, 0.6], [0.6, 1]]);
+  close(parts(0.5), [[0, 0.1], [0.1, 0.55], [0.55, 0.675], [0.675, 1]]);
+  for (const progress of [0, 0.25, 0.5, 0.75, 1]) {
+    const p = parts(progress);
+    p.forEach((s, i) => {
+      assert.ok(s.to >= s.from);
+      if (i) assert.ok(Math.abs(s.from - p[i - 1].to) < 1e-12, 'slices touch, never overlap');
+    });
+    assert.ok(Math.abs(p[p.length - 1].to - 1) < 1e-9, 'the ring stays whole');
+  }
+  const colors = Object.fromEntries(parts(0.5).map((s) => [s.key, [s.fromColor ?? null, s.toColor ?? null]]));
+  assert.deepEqual(colors, { new: [null, 'N'], a: ['A', 'A2'], gone: ['G', null], b: ['B', 'B'] });
+});
+test('A slice removed first in the ring shrinks away at the start', () => {
+  const { blendRing } = setup();
+  const p = plain(blendRing([{ key: 'x', width: 0.5 }, { key: 'y', width: 0.5 }], [{ key: 'y', width: 1 }], 0));
+  assert.deepEqual(p.map((s) => s.key), ['x', 'y']);
+});
+test('A removed slice shrinks away inside its own service', () => {
+  const { blendRing } = setup();
+  const from = [{ key: 'Codex|a', width: 0.4 }, { key: 'Codex|b', width: 0.3 }, { key: 'Claude|c', width: 0.3 }];
+  const to = [{ key: 'Codex|a', width: 0.5 }, { key: 'Claude|c', width: 0.5 }];
+  assert.deepEqual(plain(blendRing(from, to, 0.5)).map((s) => [s.key, s.gone]), [['Codex|a', false], ['Codex|b', true], ['Claude|c', false]]);
+});
+test('Slices that change places are matched by rank, so the ring does not jump', () => {
+  const { matchRing, blendRing } = setup();
+  const slice = (key, width) => ({ key, slice: key, width });
+  const same = [[slice('Codex|a', 0.6), slice('Codex|b', 0.4)], [slice('Codex|a', 0.5), slice('Codex|c', 0.2), slice('Codex|b', 0.3)]];
+  assert.deepEqual(plain(matchRing(...same)), plain(same), 'unchanged order keeps configurations');
+  const from = [slice('Codex|a', 0.5), slice('Codex|b', 0.3), slice('Codex|Unidentified', 0.2)];
+  const to = [slice('Codex|b', 0.6), slice('Codex|a', 0.2), slice('Codex|new', 0.1), slice('Codex|Unidentified', 0.1)];
+  const [start, end] = plain(matchRing(from, to));
+  assert.deepEqual(start.map((s) => s.key), ['Codex|#1', 'Codex|#2', 'Codex|Unidentified']);
+  assert.deepEqual(end.map((s) => s.key), ['Codex|#1', 'Codex|#2', 'Codex|#3', 'Codex|Unidentified']);
+  // The first frame is the old ring, and each part draws the new ring's slice.
+  const first = plain(blendRing(start, end, 0));
+  assert.deepEqual(first.map((s) => [s.slice, +(s.to - s.from).toFixed(6)]), [['Codex|b', 0.5], ['Codex|a', 0.3], ['Codex|new', 0], ['Codex|Unidentified', 0.2]]);
+});

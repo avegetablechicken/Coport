@@ -1447,6 +1447,64 @@ function othersShade(service, kept) {
   return `color-mix(in srgb, var(--${service.toLowerCase()}-${SHARE_SHADES}) 70%, transparent)`;
 }
 
+/// A share ring's size in pixels, and its hole's radius as a part of the ring's.
+const SHARE_RING_SIZE = 84;
+const SHARE_RING_INNER = 0.618;
+
+/// The ring `progress` of the way from layout `from` to `to`, each a list of
+/// { key, slice, width, color } in turn order with widths summing to 1. A
+/// slice in both grows or shrinks in place; one only in `to` grows from nothing
+/// where it will be, and one only in `from` shrinks away where it was, before
+/// the slice that followed it. Gives each slice's { key, from, to } part of the
+/// turn, the slice it draws, whether it is going away, and its colors at both ends.
+function blendRing(from, to, progress) {
+  const old = new Map(from.map((s) => [s.key, s]));
+  const next = new Map(to.map((s) => [s.key, s]));
+  const order = to.map((s) => s.key);
+  for (let i = from.length - 1; i >= 0; i--) {
+    if (next.has(from[i].key)) continue;
+    let at = order.length;
+    for (let j = i + 1; j < from.length; j++) {
+      const k = order.indexOf(from[j].key);
+      if (k >= 0) { at = k; break; }
+    }
+    order.splice(at, 0, from[i].key);
+  }
+  const widths = order.map((key) => {
+    const a = old.get(key)?.width ?? 0;
+    return a + ((next.get(key)?.width ?? 0) - a) * progress;
+  });
+  const turn = widths.reduce((sum, w) => sum + w, 0) || 1;
+  let cursor = 0;
+  return order.map((key, i) => {
+    const start = cursor;
+    cursor += widths[i] / turn;
+    const slice = (next.get(key) ?? old.get(key)).slice ?? key;
+    return { key, slice, gone: !next.has(key), from: start, to: cursor, fromColor: old.get(key)?.color, toColor: next.get(key)?.color };
+  });
+}
+
+/// Slices are matched by configuration. When two have changed places, each
+/// service's slices are matched by rank instead, as their shades are, so the
+/// ring changes in place rather than jumping.
+function matchRing(from, to) {
+  const next = new Set(to.map((s) => s.key));
+  const both = from.filter((s) => next.has(s.key)).map((s) => s.key);
+  const kept = new Set(both);
+  const after = to.filter((s) => kept.has(s.key)).map((s) => s.key);
+  if (both.every((key, i) => key === after[i])) return [from, to];
+  const rank = (layout) => {
+    const counts = {};
+    return layout.map((s) => {
+      const [service, name] = s.key.split("|");
+      if (name === "Others" || name === "Unidentified") return s;
+      counts[service] = (counts[service] ?? 0) + 1;
+      return { ...s, key: `${service}|#${counts[service]}` };
+    });
+  };
+  return [rank(from), rank(to)];
+}
+
 /// A donut sector between fractions `from` and `to` of the turn, starting at
 /// 12 o'clock, with rounded corners and a gap to its neighbors.
 function ringSector(from, to, outer, inner, gap = 1.6, radius = 3) {
@@ -1506,7 +1564,7 @@ function trafficShare(credentials, scope, source = "") {
   const groups = shareGroups(visible, measure);
   const total = groups.reduce((sum, g) => sum + (g.value ?? 0), 0);
   if (!total) return "";
-  const size = 84;
+  const size = SHARE_RING_SIZE;
   const value = (n) => (n == null ? "—" : format(n));
   const slices = groups.flatMap((g) => g.slices.filter((s) => s.value > 0).map((s) => ({ ...s, service: g.service })));
   // Every slice keeps a visible minimum width, so tiny parts stay hoverable.
@@ -1520,14 +1578,15 @@ function trafficShare(credentials, scope, source = "") {
   const paths = slices.map((s, i) => {
     const from = cursor;
     cursor += widths[i] / turn;
-    return `<path style="--slice:${color(s)}" d="${ringSector(from, cursor, size / 2, (size / 2) * 0.618)}"><title>${esc(label(s))}</title></path>`;
+    // Its key and width let a redrawn ring move each slice from where it was (showRing).
+    return `<path style="--slice:${color(s)}" data-slice="${esc(`${s.service}|${s.members ? "Others" : s.name}`)}" data-width="${widths[i] / turn}" d="${ringSector(from, cursor, size / 2, (size / 2) * SHARE_RING_INNER)}"><title>${esc(label(s))}</title></path>`;
   }).join("");
   const legend = groups.map((g) => `<div class="share-group">
     <div class="share-service" title="${esc(label({ service: g.service, name: "Total", value: g.value }))}">${serviceMark(g.service)}<span>${esc(g.service)}</span><span>${value(g.value)}</span></div>
     ${g.slices.map((s) => `<div class="share-item${s.muted ? " muted" : ""}" title="${esc(label({ ...s, service: g.service }))}">
       <i style="--slice:${color(s)}"></i><span>${esc(s.name)}</span><span>${value(s.value)}</span></div>`).join("")}</div>`).join("");
   return `<div class="traffic-share">
-    <div class="share-ring"${source ? ` data-morph="ring:${esc(source)}"` : ""} title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
+    <div class="share-ring"${source ? ` data-morph="ring:${esc(source)}" data-ring="${esc(source)}"` : ""} title="${esc(`${total.toLocaleString("en-US")} ${unit}`)}"><svg viewBox="0 0 ${size} ${size}" aria-hidden="true">${paths}</svg>
       <div class="share-total"><strong>${format(total)}</strong><span>${unit}</span></div></div>
     <div class="share-legend">${legend}</div></div>`;
 }
@@ -2417,6 +2476,155 @@ new MutationObserver(() => {
   if (observedPage) fitObserver.unobserve(observedPage);
   if (page) fitObserver.observe(page);
   observedPage = page;
+}).observe($("content"), { childList: true, subtree: true });
+
+// ---------------------------------------------------------------- share rings
+
+// Every render rebuilds the rings. One whose numbers changed (a refresh, or
+// All and Models) moves its slices from what the ring of the same source last
+// showed: each grows or shrinks to its new part, new ones grow in and gone ones
+// shrink away. A render in the middle carries the motion on in the new ring.
+const ringShown = new Map();
+const RING_SVG = "http://www.w3.org/2000/svg";
+/// The `d` each slice ends with, as trafficShare drew it; also marks the rings
+/// already taken up.
+const ringFinal = new WeakMap();
+const ringEase = cubicBezier(0.32, 0.72, 0, 1);
+
+function cubicBezier(x1, y1, x2, y2) {
+  const at = (a, b, t) => 3 * a * t * (1 - t) ** 2 + 3 * b * t * t * (1 - t) + t ** 3;
+  return (x) => {
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < 24; i++) {
+      const mid = (lo + hi) / 2;
+      if (at(x1, x2, mid) < x) lo = mid;
+      else hi = mid;
+    }
+    return at(y1, y2, (lo + hi) / 2);
+  };
+}
+
+function ringLayout(ring) {
+  return [...ring.querySelectorAll("path[data-slice]:not([data-ghost])")].map((p) => ({
+    key: p.dataset.slice, slice: p.dataset.slice, width: Number(p.dataset.width), color: p.style.getPropertyValue("--slice").trim(),
+  }));
+}
+
+function sameRing(a, b) {
+  return a.length === b.length && a.every((s, i) => s.key === b[i].key && s.color === b[i].color && Math.abs(s.width - b[i].width) < 1e-6);
+}
+
+function ringProgress(motion, now) {
+  return Math.min(1, Math.max(0, (now - motion.start) / MORPH_MS));
+}
+
+/// The layout a ring shows at `now`, by slice: mid-motion, each slice where it
+/// is drawn, in the color it is heading to.
+function ringAt(shown, now) {
+  if (!shown.motion) return shown.layout;
+  const progress = ringProgress(shown.motion, now);
+  if (progress >= 1) return shown.layout;
+  const parts = blendRing(shown.motion.from, shown.motion.to, ringEase(progress));
+  const staying = new Set(parts.filter((s) => !s.gone).map((s) => s.slice));
+  return parts.filter((s) => s.to - s.from > 1e-6).map((s) => {
+    const key = s.gone && staying.has(s.slice) ? `${s.slice}|gone` : s.slice;
+    return { key, slice: key, width: s.to - s.from, color: s.toColor ?? s.fromColor };
+  });
+}
+
+function showRing(ring, now) {
+  const source = ring.dataset.ring;
+  if (ringFinal.has(ring)) return;
+  ringFinal.set(ring, true);
+  const layout = ringLayout(ring);
+  for (const path of ring.querySelectorAll("path[data-slice]")) ringFinal.set(path, path.getAttribute("d"));
+  const shown = ringShown.get(source);
+  if (shown?.motion && ringProgress(shown.motion, now) < 1 && sameRing(shown.layout, layout)) {
+    shown.motion.rings.push(ring);
+    drawRing(shown.motion, ring, now);
+    runRing(source, shown.motion);
+    return;
+  }
+  const from = shown && ringAt(shown, now);
+  // The first ring of a source, a page change (its copies show the result)
+  // and reduced motion show the numbers at once.
+  if (!from || sameRing(from, layout) || pageMotion || REDUCED_MOTION.matches || document.hidden) {
+    if (shown?.motion) cancelAnimationFrame(shown.motion.frame);
+    ringShown.set(source, { layout, motion: null });
+    return;
+  }
+  if (shown.motion) cancelAnimationFrame(shown.motion.frame);
+  const [start, end] = matchRing(from, layout);
+  const motion = { from: start, to: end, start: now, rings: [ring], frame: 0 };
+  ringShown.set(source, { layout, motion });
+  drawRing(motion, ring, now);
+  runRing(source, motion);
+}
+
+/// Draws `motion`'s rings each frame until it ends or none is shown.
+function runRing(source, motion) {
+  if (motion.frame) return;
+  const step = (time) => {
+    motion.frame = 0;
+    motion.rings = motion.rings.filter((r) => r.isConnected);
+    for (const r of motion.rings) drawRing(motion, r, time);
+    if (ringProgress(motion, time) >= 1) {
+      if (ringShown.get(source)?.motion === motion) ringShown.get(source).motion = null;
+    } else if (motion.rings.length) motion.frame = requestAnimationFrame(step);
+  };
+  motion.frame = requestAnimationFrame(step);
+}
+
+/// Draws `ring` as `motion` shows it at `now`; at the end, as it was rendered.
+function drawRing(motion, ring, now) {
+  const svg = ring.querySelector("svg");
+  if (!svg) return;
+  const progress = ringProgress(motion, now);
+  const all = [...svg.querySelectorAll("path[data-slice]")];
+  if (progress >= 1) {
+    for (const path of all) {
+      if (path.hasAttribute("data-ghost")) path.remove();
+      else {
+        delete path.dataset.blend;
+        path.style.removeProperty("fill");
+        if (ringFinal.has(path)) path.setAttribute("d", ringFinal.get(path));
+      }
+    }
+    return;
+  }
+  // Paths already moving go by their part of the motion, the rest by slice.
+  const moving = new Map(all.filter((p) => p.dataset.blend).map((p) => [p.dataset.blend, p]));
+  const drawn = new Map(all.filter((p) => !p.dataset.blend && !p.hasAttribute("data-ghost")).map((p) => [p.dataset.slice, p]));
+  const eased = ringEase(progress);
+  const outer = SHARE_RING_SIZE / 2;
+  for (const s of blendRing(motion.from, motion.to, eased)) {
+    let path = moving.get(s.key) ?? (s.gone ? null : drawn.get(s.slice));
+    if (!path) {
+      // A slice the numbers no longer have.
+      path = document.createElementNS(RING_SVG, "path");
+      path.dataset.slice = s.slice;
+      path.setAttribute("data-ghost", "");
+    }
+    path.dataset.blend = s.key;
+    svg.append(path);
+    path.setAttribute("d", ringSector(s.from, s.to, outer, outer * SHARE_RING_INNER));
+    const fill = !s.fromColor || !s.toColor || s.fromColor === s.toColor
+      ? s.toColor ?? s.fromColor
+      : `color-mix(in srgb, ${s.toColor} ${(eased * 100).toFixed(1)}%, ${s.fromColor})`;
+    path.style.setProperty("fill", fill || "var(--share-unidentified)");
+  }
+}
+
+new MutationObserver((records) => {
+  const now = performance.now();
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      const rings = node.matches(".share-ring[data-ring]") ? [node] : node.querySelectorAll(".share-ring[data-ring]");
+      for (const ring of rings) if (ring.isConnected) showRing(ring, now);
+    }
+  }
 }).observe($("content"), { childList: true, subtree: true });
 
 // ---------------------------------------------------------------- page changes
