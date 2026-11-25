@@ -463,6 +463,7 @@ impl Server {
                 log.fields.insert("profile_proxy_endpoint".into(), endpoint);
             }
             let status = response.status();
+            record_upstream_response(log, status.as_u16());
             if !status.is_success() {
                 return Err(Error::new(
                     if status.is_client_error() {
@@ -739,13 +740,18 @@ impl Server {
                     .extensions_mut()
                     .remove::<antigravity_cooldown::Inspect>()
                 {
+                    let status = upstream.status().as_u16();
                     let Some(response) = self
                         .location_cooldowns
                         .inspect(inspect, upstream, &mut log)
                         .await
                     else {
+                        // The upstream answered. Closing the client connection
+                        // does not drop that response from the log.
+                        record_upstream_response(&mut log, status);
+                        log.status = 0;
+                        log.fields.remove("status");
                         log.outcome = "request_failed";
-                        log.status = 400;
                         log.field("reason", "antigravity_location_cooldown");
                         // A service error closes HTTP/1 before it sends any response headers.
                         return Err(std::io::Error::other("Antigravity location cooldown"));
@@ -754,6 +760,7 @@ impl Server {
                 }
                 if upstream.status() == 101 {
                     let Some((upgrade, key)) = upgrade.zip(ws_key) else {
+                        record_upstream_response(&mut log, 101);
                         return Ok(reject(
                             &mut log,
                             Error::config("Unexpected upstream protocol upgrade."),
@@ -770,6 +777,7 @@ impl Server {
                             .get("sec-websocket-accept")
                             .is_none_or(|v| v.as_bytes() != accept.as_bytes())
                     {
+                        record_upstream_response(&mut log, 101);
                         return Ok(reject(
                             &mut log,
                             Error::config("Invalid upstream WebSocket handshake."),
@@ -780,8 +788,6 @@ impl Server {
                     headers.insert("upgrade", "websocket".parse().unwrap());
                     match upstream.upgrade().await {
                         Ok(upstream) => {
-                            log.status = 101;
-                            log.field("status", 101);
                             if crate::model_calls::is_model_endpoint("GET", &target) {
                                 log.field("model_transport", "websocket");
                                 log.field(
@@ -792,7 +798,7 @@ impl Server {
                                         .unwrap_or(""),
                                 );
                             }
-                            log.event("upstream_response");
+                            record_upstream_response(&mut log, 101);
                             let _ = relay.send(relay_websocket_or_tunnel(
                                 upgrade,
                                 Box::new(upstream),
@@ -806,6 +812,7 @@ impl Server {
                             return Ok(response);
                         }
                         Err(_) => {
+                            record_upstream_response(&mut log, 101);
                             return Ok(reject(
                                 &mut log,
                                 Error::config("WebSocket upgrade failed."),
@@ -814,10 +821,7 @@ impl Server {
                     }
                 }
                 let status = upstream.status();
-                log.status = status.as_u16();
-                log.field("status", status.as_u16());
-                log.field("headers_ms", log.started.elapsed().as_millis());
-                log.event("upstream_response");
+                record_upstream_response(&mut log, status.as_u16());
                 let headers = filtered_headers(upstream.headers());
                 let mut observer = log.fields.contains_key("model_call_id").then(|| {
                     crate::model_calls::record_response_encoding(&mut log, &headers);
@@ -1713,6 +1717,34 @@ fn client_tls_failure(error: &std::io::Error) -> &'static str {
             | AlertDescription::DecryptError,
         )) => "client_rejected_proxy_ca",
         _ => "client_tls_failed",
+    }
+}
+
+/// An upstream HTTP response, relayed or not. The client outcome is recorded
+/// separately when this request ends. A lookup or token refresh made on a
+/// model call's log is not that model call.
+fn record_upstream_response(log: &mut RequestLog, status: u16) {
+    log.status = status;
+    log.field("status", status);
+    log.field("headers_ms", log.started.elapsed().as_millis());
+    let method = log
+        .fields
+        .get("upstream_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let path = log
+        .fields
+        .get("upstream_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let auxiliary = log.fields.contains_key("model_call_id")
+        && !crate::model_calls::is_model_endpoint(method, path);
+    let hidden = auxiliary
+        .then(|| log.fields.remove("model_call_id"))
+        .flatten();
+    log.event("upstream_response");
+    if let Some(id) = hidden {
+        log.fields.insert("model_call_id".into(), id);
     }
 }
 

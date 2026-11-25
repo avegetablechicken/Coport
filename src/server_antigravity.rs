@@ -415,6 +415,7 @@ impl Server {
             }
         }
         let status = response.status();
+        record_upstream_response(log, status.as_u16());
         if !status.is_success() {
             return Err(Error::new(
                 if status.is_client_error() {

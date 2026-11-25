@@ -46,12 +46,12 @@ reconciliation is read-only and never rewrites retained logs.
 | `route_unavailable` | Startup credentials or mapping could not be read; later requests retry credential loading using the startup configuration. |
 | `request_received` | Request method, path without query, unique request ID, and `service`. |
 | `route_selected` | Account and proxy actually selected for this request. |
-| `upstream_response` | Upstream HTTP status and time to response headers (`headers_ms`). |
+| `upstream_response` | Every HTTP response an upstream returned, including one the proxy consumed or replaced, with its status and time to response headers (`headers_ms`). Route probes stay on `route_health`. |
 | `route_health` | Effective route eligibility, consecutive failures and feedback source (`probe` or `request`). |
 | `upstream_retry` | A bodyless GET transport failure before response headers; includes `upstream_attempts`, redacted `transport_error` category, and `retry_delay_ms`. |
 | `request_finished` | Transfer completed, including status, duration, and received bytes; check status for upstream errors. |
 | `request_cancelled` | Request processing was dropped (for example, client disconnect or shutdown). No status is logged if no response was established; the UI shows CANCEL. |
-| `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. |
+| `request_rejected` / `request_failed` | Authentication, configuration, connection, or streaming failure with diagnostic context. An Antigravity location rejection closes the client before any status, so that outcome has none; the upstream 400 is the `upstream_response`. |
 | `model_call_started` / `model_call_updated` | One HTTP model request or WebSocket `response.create`, identified by `model_call_id` separately from its connection's `request_id`. |
 | `model_call_finished` / `model_call_failed` / `model_call_cancelled` | Per-call outcome, model, response ID, duration, and reported input/output/cache token usage when available. WebSocket success requires a model terminal event delivered to the client. |
 | `model_call_incomplete` | The model ended the response early with `response.incomplete` (for example `max_output_tokens`, recorded as `incomplete_reason`). Not counted as an error. |

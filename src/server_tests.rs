@@ -1532,6 +1532,33 @@ async fn claude_profile_failures_never_forward_payload_or_cache_identity() {
         assert!(!request.contains("private-payload"));
         assert!(lookup.requests.try_recv().is_err());
         assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+        running.server.logger.flush().unwrap();
+        let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+        let lines = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let upstream = lines
+            .iter()
+            .find(|line| line["event"] == "upstream_response")
+            .unwrap_or_else(|| panic!("profile response missing from log: {raw}"));
+        assert_eq!(
+            upstream["status"],
+            match mode {
+                "profile_unauthorized" => "401",
+                "profile_invalid" => "200",
+                "profile_redirect" => "302",
+                _ => unreachable!(),
+            },
+            "{mode} {upstream}"
+        );
+        assert_eq!(upstream["upstream_path"], "/api/oauth/profile");
+        assert!(upstream.get("model_call_id").is_none(), "{upstream}");
+        let client = lines
+            .iter()
+            .find(|line| line["event"] == "request_failed" || line["event"] == "request_rejected")
+            .unwrap_or_else(|| panic!("client outcome missing from log: {raw}"));
+        assert_eq!(client["status"], expected.to_string(), "{mode} {client}");
     }
 }
 
@@ -2084,6 +2111,23 @@ async fn websocket_invalid_accept_is_rejected() {
         .await
         .unwrap();
     assert_eq!(response.status(), 502);
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let lines = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let upstream = lines
+        .iter()
+        .find(|line| line["event"] == "upstream_response")
+        .unwrap_or_else(|| panic!("upstream handshake missing from log: {raw}"));
+    assert_eq!(upstream["status"], "101");
+    assert!(upstream.get("headers_ms").is_some(), "{upstream}");
+    let rejected = lines
+        .iter()
+        .find(|line| line["event"] == "request_failed" || line["event"] == "request_rejected")
+        .unwrap_or_else(|| panic!("client rejection missing from log: {raw}"));
+    assert_eq!(rejected["status"], "502", "{rejected}");
 }
 
 #[tokio::test]
@@ -6391,6 +6435,39 @@ async fn antigravity_location_cooldown_disconnects_before_headers_and_only_delay
             .starts_with("POST /v1internal:streamGenerateContent ")
     );
     assert!(fixture.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let lines = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let upstream = lines
+        .iter()
+        .find(|line| line["event"] == "upstream_response" && line["status"] == "400")
+        .unwrap_or_else(|| panic!("upstream 400 missing from log: {raw}"));
+    assert_eq!(upstream["upstream_error_status"], "FAILED_PRECONDITION");
+    assert_eq!(
+        upstream["upstream_error_message"],
+        "User location is not supported for the API use."
+    );
+    assert!(upstream.get("headers_ms").is_some(), "{upstream}");
+    let failed = lines
+        .iter()
+        .find(|line| {
+            line["event"] == "request_failed"
+                && line["reason"] == "antigravity_location_cooldown"
+                && line["request_id"] == upstream["request_id"]
+        })
+        .unwrap_or_else(|| panic!("client close missing from log: {raw}"));
+    assert!(
+        failed.get("status").is_none(),
+        "the client was not sent the upstream 400: {failed}"
+    );
+    assert!(lines.iter().any(|line| {
+        line["event"] == "model_call_failed"
+            && line["request_id"] == upstream["request_id"]
+            && line.get("status").is_none()
+    }));
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
 

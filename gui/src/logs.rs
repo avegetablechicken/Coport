@@ -82,7 +82,8 @@ impl Entry {
     /// forms list what upstreams returned to the proxy instead.
     pub fn matches_filter(&self, filter: &str) -> bool {
         match filter {
-            "errors" => self.is_error(),
+            // An upstream status was not necessarily sent to the client.
+            "errors" => !self.is_upstream_response() && self.is_error(),
             "models" => self.is_model_call_end(),
             "all" => true,
             "upstream_requests" => self.is_upstream_response(),
@@ -91,8 +92,7 @@ impl Entry {
             _ => self.is_request_end(),
         }
     }
-    /// The status and headers an upstream answered a request with, before the
-    /// proxy relayed them.
+    /// An HTTP response an upstream returned, whether or not the proxy relayed it.
     pub fn is_upstream_response(&self) -> bool {
         self.event == "upstream_response"
     }
@@ -479,7 +479,9 @@ mod tests {
             .map(|e| e.matches_filter(filter))
         };
         assert_eq!(listed("requests"), [false, false, true, true, false]);
-        assert_eq!(listed("errors"), [false, true, true, false, false]);
+        // The 429 is the upstream's status. Client errors are statuses the
+        // proxy itself returned.
+        assert_eq!(listed("errors"), [false, false, true, false, false]);
         assert_eq!(listed("models"), [false, false, false, false, true]);
         assert_eq!(
             listed("upstream_requests"),

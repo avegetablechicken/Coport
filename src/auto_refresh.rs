@@ -84,6 +84,7 @@ impl Server {
                 headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
                 // OAuth routes always use Authorization, never an API key.
                 headers.remove("x-api-key");
+                record_upstream_response(log, response.status().as_u16());
                 drop(response);
                 self.send_via(choice, renewal.retry, native_tls, deadline, log)
                     .await
@@ -248,7 +249,7 @@ impl Server {
         let response = self
             .send_via(choice, request, false, deadline, &mut refresh_log)
             .await?;
-        refresh_log.status = response.status().as_u16();
+        record_upstream_response(&mut refresh_log, response.status().as_u16());
         if !response.status().is_success() {
             // Rejected generations stay blocked until the saved login changes.
             if matches!(response.status().as_u16(), 400 | 401 | 403) {
