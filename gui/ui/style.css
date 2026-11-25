@@ -1515,7 +1515,7 @@ html.linux.composited .route-tooltip {
   margin: 4px 2px;
   background: var(--separator);
 }
-.select-menu button:hover,
+/* Only focus lights an item: hovering moves focus (see placeMenu). */
 .select-menu button:focus {
   background: var(--accent);
   color: #fff;

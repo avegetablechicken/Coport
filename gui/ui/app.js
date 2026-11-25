@@ -1176,6 +1176,12 @@ function placeMenu(trigger, menu) {
   trigger.setAttribute("aria-expanded", "true");
   trigger.setAttribute("aria-controls", menu.id);
   document.body.append(menu);
+  // One highlight, as in a native menu: the item under the pointer takes
+  // focus, so the one focused on opening or by keys does not stay lit.
+  menu.addEventListener("pointermove", (event) => {
+    const item = event.target.closest?.("button");
+    if (item && item !== document.activeElement) item.focus({ preventScroll: true });
+  });
   const rect = trigger.getBoundingClientRect();
   menu.style.maxHeight = `${Math.max(0, window.innerHeight - 8)}px`;
   const bounds = menu.getBoundingClientRect();
