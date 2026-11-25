@@ -358,6 +358,24 @@ test('Models charts draw one baseline for every bucket without reported tokens',
   assert.match(context.chart({ ...failed, tokenCounts: [5, 0, 0] }, 'model', true), /class="chart-peak"/);
   assert.match(context.chart({ ...failed, counts: [0, 0, 0], errorCounts: [0, 0, 0] }, 'all', true), /class="chart-peak"/);
 });
+test('Models shows the average first token time after Avg. Time where this device logged it', () => {
+  const context = setup('model');
+  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: (v) => v == null ? '—' : `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '' });
+  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 650, firstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
+  for (const html of [context.accountRow(local, 'model', local), context.trafficSummary(local, 'model')]) {
+    assert.match(html, /<Avg\. Time=4000 ms>\s*<First Token=650 ms>\s*<Received=9 B>/);
+  }
+  // No streamed output is unknown, not zero.
+  const none = { ...local, firstTokenMs: null, firstTokenSamples: 0 };
+  assert.match(context.accountRow(none, 'model', none), /<First Token=—>/);
+  // Requests have no first token, and peers' summaries do not report it.
+  const remote = { ...local, firstTokenMs: undefined, firstTokenSamples: undefined };
+  for (const [view, scope] of [[local, 'all'], [remote, 'model']]) {
+    assert.doesNotMatch(context.accountRow(view, scope, view), /First Token/);
+    assert.doesNotMatch(context.trafficSummary({ ...view }, scope), /First Token/);
+  }
+});
 test('Models shows Unidentified rows whose calls all failed as one line of calls and errors', () => {
   const context = setup('model');
   Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });

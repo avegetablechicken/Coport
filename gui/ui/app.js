@@ -646,7 +646,7 @@ function accountRow(c, scope, window, review = "") {
     return `<div class="credential-traffic"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
   }
   return `<div class="credential-traffic"><div class="traffic-identity">${identity}${review}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${stat("Avg. Time", fmtMs(c.avgMs))}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Received", fmtBytes(c.bytes))}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -665,11 +665,13 @@ function trafficSummary(view, scope, window = view, source = "") {
     rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
     rateClass = r >= 10 ? "bad" : "";
   }
+  // First Token comes only from this device's logs; other devices' summaries do not report it.
   const html = `<div${source ? ` data-morph="summary:${esc(source)}"` : ""}>${trafficShare(view.credentials ?? [], scope, source)}${chart(view, scope, false, window)}
      <div class="strip">
        ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
        ${stat("Error Rate", rate, rateClass)}
        ${stat("Avg. Time", fmtMs(view.avgMs))}
+       ${scope === "model" && view.firstTokenSamples != null ? stat("First Token", fmtMs(view.firstTokenMs ?? null)) : ""}
        ${stat("Received", fmtBytes(view.bytes))}
      </div>${modelTokenStats(view, scope)}</div>`;
   trafficMarkup.set(view, { key, html });
@@ -1585,7 +1587,7 @@ function renderActivityTraffic() {
   const notes = [
     "The ring shows each credential's requests, or with Models its input plus output tokens, grouped by service; past each service's two largest, credentials under 2.5% of the ring are grouped as Others when there are at least two.",
     "Sorted by received traffic, largest first. Bars show requests, or with Models input plus output tokens; red indicates the share that failed, and each chart uses its own scale.",
-    `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
+    `${scope === "model" ? "Each HTTP model request or WebSocket generation counts once, including active calls. Tokens are reported usage, not billing totals; missing usage is not treated as zero. Input is the whole prompt, cached input included; for Claude it adds cache reads and writes to the reported input, as OpenAI reports it. Hit rate is cached input over all input tokens. First Token averages the time from the proxy receiving a call to its first streamed output, thinking included, over the calls that streamed any." : "Each HTTP request or tunnel connection counts once, including active connections."} Bytes and duration update when the call or connection ends.`,
     "Logs are retained for at least 30 days, including rotated history. Earlier records may be unavailable. Requests from a renamed configuration, one with a changed base URL, or logged before base URLs were recorded are merged and marked for review. Unidentified requests have no logged credential, or match no single current configuration. Logs are never rewritten.",
   ].join("\n\n");
   const minutes = traffic?.bucketMinutes;

@@ -66,8 +66,41 @@ struct Envelope {
     #[serde(default, deserialize_with = "deserialize_usage")]
     usage: Option<Usage>,
     error: Option<serde::de::IgnoredAny>,
+    /// Chat Completions chunks carry their output in `choices[].delta`.
+    #[serde(default, deserialize_with = "lenient")]
+    choices: Option<Vec<Choice>>,
     #[serde(flatten)]
     gemini: Gemini,
+}
+#[derive(Default, Deserialize)]
+struct Choice {
+    #[serde(default, deserialize_with = "lenient")]
+    delta: Option<ChunkDelta>,
+}
+/// Only whether a chunk delta holds output is read; its text is not kept.
+#[derive(Default, Deserialize)]
+struct ChunkDelta {
+    #[serde(default, deserialize_with = "lenient")]
+    content: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    reasoning_content: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    tool_calls: Option<Vec<serde::de::IgnoredAny>>,
+}
+impl Envelope {
+    /// A Chat Completions chunk with generated output, not just the opening
+    /// role or a closing finish reason.
+    fn chunk_output(&self) -> bool {
+        self.object.as_deref() == Some("chat.completion.chunk")
+            && self.choices.iter().flatten().any(|choice| {
+                choice.delta.as_ref().is_some_and(|d| {
+                    [&d.content, &d.reasoning_content]
+                        .iter()
+                        .any(|text| text.as_deref().is_some_and(|t| !t.is_empty()))
+                        || d.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+                })
+            })
+    }
 }
 #[derive(Default, Deserialize)]
 struct Metadata {
@@ -636,7 +669,9 @@ fn observe_event(event: Envelope, log: &mut HttpObservation) {
     {
         log.field("model_outcome", "running");
     }
-    if (event.kind.ends_with(".delta") || event.kind == "content_block_delta")
+    if (event.kind.ends_with(".delta")
+        || event.kind == "content_block_delta"
+        || event.chunk_output())
         && !log.fields.contains_key("first_token_ms")
     {
         log.field("first_token_ms", log.started.elapsed().as_millis());
@@ -1600,6 +1635,43 @@ mod tests {
         ] {
             assert!(!is_model_endpoint("GET", target), "{target}");
             assert!(!is_model_endpoint("POST", target), "{target}");
+        }
+    }
+    #[test]
+    fn chat_completion_chunks_time_the_first_output_not_the_opening_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let opening = r#"{"id":"c","object":"chat.completion.chunk","model":"grok","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#;
+        let finish = r#"{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        for (case, output) in [
+            "{\"content\":\"Hi\"}",
+            "{\"reasoning_content\":\"Think\"}",
+            "{\"tool_calls\":[{\"index\":0,\"id\":\"t\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for newline in ["\n", "\r\n"] {
+                let mut log = log_at(&dir.path().join(format!("{case}.log")));
+                let mut observer = HttpObserver::new(true, None, &mut log);
+                let event = |data: &str| format!("data: {data}{newline}{newline}");
+                for data in [opening, finish] {
+                    observer.feed(event(data).as_bytes(), &mut log);
+                }
+                assert!(
+                    !log.fields.contains_key("first_token_ms"),
+                    "{case} {newline:?}"
+                );
+                let chunk = format!(
+                    r#"{{"id":"c","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{output}}}]}}"#
+                );
+                observer.feed(event(&chunk).as_bytes(), &mut log);
+                let first = log.fields["first_token_ms"].clone();
+                observer.feed(event(&chunk).as_bytes(), &mut log);
+                observer.feed(event("[DONE]").as_bytes(), &mut log);
+                observer.finish(&mut log);
+                assert_eq!(log.fields["first_token_ms"], first, "{case} {newline:?}");
+                assert_eq!(log.fields["model_outcome"], "finished", "{case} {newline:?}");
+            }
         }
     }
     #[test]

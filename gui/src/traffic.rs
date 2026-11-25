@@ -60,7 +60,7 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
 }
 
 /// The fields traffic reads from log records; file summaries keep only these.
-const FIELDS: [&str; 19] = [
+const FIELDS: [&str; 20] = [
     "account_id",
     "credential_ref",
     "account_label",
@@ -80,6 +80,7 @@ const FIELDS: [&str; 19] = [
     "upstream_base_url",
     "proxy_endpoint",
     "proxy",
+    "first_token_ms",
 ];
 
 /// A request or model call merged from its lifecycle records. The most
@@ -663,6 +664,9 @@ pub struct CredentialTraffic {
     cache_write_tokens: Option<u64>,
     cache_hit_rate: Option<f64>,
     avg_ms: Option<u64>,
+    /// Average time to a model call's first streamed output, over the calls
+    /// that streamed any.
+    first_token_ms: Option<u64>,
     counts: Vec<u64>,
     error_counts: Vec<u64>,
     /// Reported input plus output tokens per bucket; calls without usage add nothing.
@@ -676,6 +680,10 @@ pub struct CredentialTraffic {
     latency_total: u64,
     #[serde(rename = "latencySamples")]
     latency_count: u64,
+    #[serde(rename = "firstTokenTotalMs")]
+    first_token_total: u64,
+    #[serde(rename = "firstTokenSamples")]
+    first_token_count: u64,
     cache_read: u64,
     cache_prompt: u64,
 }
@@ -750,6 +758,8 @@ fn read_at(
         add_tokens(&mut summary.cached_input_tokens, group.cached_input_tokens);
         summary.latency_total += group.latency_total;
         summary.latency_count += group.latency_count;
+        summary.first_token_total += group.first_token_total;
+        summary.first_token_count += group.first_token_count;
         summary.cache_read += group.cache_read;
         summary.cache_prompt += group.cache_prompt;
         for i in 0..bucket_count {
@@ -760,6 +770,8 @@ fn read_at(
     }
     summary.avg_ms =
         (summary.latency_count > 0).then(|| summary.latency_total / summary.latency_count);
+    summary.first_token_ms = (summary.first_token_count > 0)
+        .then(|| summary.first_token_total / summary.first_token_count);
     summary.cache_hit_rate = summary.hit_rate();
     let mut credentials: Vec<_> = groups.into_values().collect();
     for group in &mut credentials {
@@ -930,6 +942,11 @@ fn aggregate(
         group.latency_total += ms;
         group.latency_count += 1;
         group.avg_ms = Some(group.latency_total / group.latency_count);
+    }
+    if let Some(ms) = token("first_token_ms") {
+        group.first_token_total = group.first_token_total.saturating_add(ms);
+        group.first_token_count += 1;
+        group.first_token_ms = Some(group.first_token_total / group.first_token_count);
     }
 }
 
@@ -2797,6 +2814,58 @@ mod tests {
         assert_eq!(model.summary.cached_input_tokens, Some(6));
         assert_eq!(model.summary.cache_hit_rate, Some(0.2));
         assert_eq!(model.credentials.len(), 1);
+    }
+
+    #[test]
+    fn first_token_time_averages_only_calls_that_streamed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let at = (Local::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let call = |id: &str, account: &str, first: Option<&str>| {
+            let mut row = serde_json::json!({
+                "timestamp":at, "event":"model_call_finished", "model_call_id":id,
+                "method":"POST", "path":"/v1/responses", "service":"codex",
+                "provider":account, "status":"200", "duration_ms":"5000",
+            });
+            if let Some(first) = first {
+                row["first_token_ms"] = first.into();
+            }
+            row.to_string()
+        };
+        // A call without streamed output (non-streaming or failed early) is not a zero.
+        let rows = [
+            call("a", "first", Some("300")),
+            call("b", "first", Some("500")),
+            call("c", "second", Some("1000")),
+            call("d", "second", None),
+        ];
+        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+        let traffic = read(
+            &path,
+            30,
+            &configured(&["first", "second"]),
+            TrafficScope::Model,
+        )
+        .unwrap();
+        assert_eq!(traffic.summary.requests, 4);
+        assert_eq!(traffic.summary.first_token_ms, Some(600));
+        assert_eq!(traffic.summary.avg_ms, Some(5000));
+        let by_name = |name: &str| {
+            traffic
+                .credentials
+                .iter()
+                .find(|c| c.credential == name)
+                .unwrap()
+        };
+        assert_eq!(by_name("first").first_token_ms, Some(400));
+        assert_eq!(by_name("second").first_token_ms, Some(1000));
+        let json = serde_json::to_value(&traffic.summary).unwrap();
+        assert_eq!(json["firstTokenMs"], 600);
+        assert_eq!(json["firstTokenTotalMs"], 1800);
+        assert_eq!(json["firstTokenSamples"], 3);
+        std::fs::write(&path, call("e", "first", None) + "\n").unwrap();
+        let none = read(&path, 30, &configured(&["first"]), TrafficScope::Model).unwrap();
+        assert_eq!(none.summary.first_token_ms, None);
     }
 
     #[test]
