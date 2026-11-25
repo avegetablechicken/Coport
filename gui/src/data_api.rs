@@ -1252,7 +1252,9 @@ mod tests {
     /// that names it receives it, over HTTP and SSH alike.
     #[tokio::test]
     async fn first_token_reaches_only_readers_that_name_it() {
-        let (dir, log, config) = antigravity_traffic();
+        // Keep the traffic fixture alive on every platform; only Unix reads
+        // its directory directly for the SSH protocol checks below.
+        let (_dir, log, config) = antigravity_traffic();
         let key = DataKey::new(KEY).unwrap();
         let bytes = publish(
             &Config::parse(config).unwrap(),
@@ -1311,14 +1313,14 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            std::fs::write(dir.path().join("config.yaml"), config).unwrap();
-            prepare_identity(dir.path()).unwrap();
+            std::fs::write(_dir.path().join("config.yaml"), config).unwrap();
+            prepare_identity(_dir.path()).unwrap();
             for (reader, named) in [("", false), ("antigravity,grok", false), (SERVICES, true)] {
                 let services = ReaderServices::named(reader);
                 let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
                 let mut output = Vec::new();
                 stream_summary_at(
-                    dir.path(),
+                    _dir.path(),
                     30,
                     crate::traffic::TrafficScope::Model,
                     end,
@@ -1327,7 +1329,7 @@ mod tests {
                 )
                 .unwrap();
                 let mut single =
-                    serde_json::to_vec(&read_summary(dir.path(), services).unwrap()).unwrap();
+                    serde_json::to_vec(&read_summary(_dir.path(), services).unwrap()).unwrap();
                 single.push(b'\n');
                 output.extend(single);
                 for line in output.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
