@@ -1,5 +1,5 @@
 //! Copool subscription endpoints and identity learned from successful OAuth renewals.
-use super::{CLIENT_ID, DEFAULT_BASE, Grok, ISSUER};
+use super::{CLIENT_ID, DEFAULT_BASE, Grok};
 use crate::{
     Error, Result,
     config::Choice,
@@ -99,21 +99,30 @@ impl Grok {
         };
         let file: Value = serde_json::from_slice(raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&raw))
             .map_err(|_| Error::config("Invalid Grok auth_file."))?;
-        let login = if file["key"].is_string()
-            && file["oidc_issuer"]
-                .as_str()
-                .is_none_or(|issuer| issuer == ISSUER)
+        // Grok Build files its login by issuer: xAI's own, or xAI's through
+        // this listener's issuer scope; either may hold the token.
+        let logins: Vec<&Value> = if file["key"].is_string()
+            && file["oidc_issuer"].as_str().is_none_or(super::xai_issuer)
             && file["oidc_client_id"]
                 .as_str()
                 .is_none_or(|id| id == CLIENT_ID)
         {
-            &file
+            vec![&file]
         } else {
-            &file[format!("{ISSUER}::{CLIENT_ID}")]
+            file.as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(key, _)| super::xai_login_key(key))
+                .map(|(_, login)| login)
+                .collect()
         };
-        if login[if refresh { "refresh_token" } else { "key" }].as_str() != Some(token) {
+        let field = if refresh { "refresh_token" } else { "key" };
+        let Some(login) = logins
+            .into_iter()
+            .find(|login| login[field].as_str() == Some(token))
+        else {
             return Ok(None);
-        }
+        };
         Ok(GrokAccount::from_fields(
             login["user_id"].as_str().unwrap_or(""),
             login["team_id"].as_str(),
@@ -202,13 +211,23 @@ impl Grok {
 
     /// Copool always asks for the official subscription URLs. Translate those
     /// and scoped base-URL requests to the configured base, preserving only
-    /// the supported paths. OAuth renewal always stays at the xAI issuer.
-    pub(crate) fn endpoint(&self, target: &str) -> Option<(Url, bool)> {
+    /// the supported paths. OAuth requests always stay at the xAI issuer:
+    /// renewal at its token endpoint, which also completes a device sign-in,
+    /// and, for Grok Build's issuer scope, the device code and discovery
+    /// document.
+    pub(crate) fn endpoint(&self, target: &str) -> Option<(Url, Endpoint)> {
         let scoped = target.strip_prefix("/grok/");
         let rest = scoped.or_else(|| target.strip_prefix('/'))?;
-        const TOKEN: &str = "https://auth.x.ai/oauth2/token";
-        if rest == TOKEN || scoped == Some("oauth2/token") {
-            return Some((Url::parse(TOKEN).unwrap(), true));
+        if rest == super::TOKEN_URL || scoped == Some("oauth2/token") {
+            return Some((Url::parse(super::TOKEN_URL).unwrap(), Endpoint::Token));
+        }
+        for (url, endpoint) in [
+            (super::DEVICE_CODE_URL, Endpoint::DeviceCode),
+            (super::DISCOVERY_URL, Endpoint::Discovery),
+        ] {
+            if scoped == Some(url) {
+                return Some((Url::parse(url).unwrap(), endpoint));
+            }
         }
         let url = Url::parse(&self.base_url.account).ok()?;
         let base = url.as_str().trim_end_matches('/');
@@ -225,12 +244,29 @@ impl Grok {
                     "/billing" | "/billing?format=credits" | "/settings"
                 )
             })?;
-        Some((Url::parse(&format!("{base}{suffix}")).ok()?, false))
+        Some((
+            Url::parse(&format!("{base}{suffix}")).ok()?,
+            Endpoint::Usage,
+        ))
     }
+}
+
+/// The Grok endpoints Coport serves outside model requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    /// `POST` xAI's token endpoint: a renewal, or a device sign-in's token.
+    Token,
+    /// `POST` a device code for a sign-in.
+    DeviceCode,
+    /// `GET` xAI's discovery document, which names the token endpoint.
+    Discovery,
+    /// `GET` subscription billing or settings.
+    Usage,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::ISSUER;
     use super::*;
     use crate::config::Config;
     use serde_json::json;
@@ -261,25 +297,56 @@ mod tests {
             "/grok/https://cli-chat-proxy.grok.com/v1/billing?format=credits",
             "/https://gateway.example.com:8443/custom/billing?format=credits",
         ] {
-            let (url, refresh) = config.grok.endpoint(target).unwrap();
-            assert!(!refresh);
+            let (url, endpoint) = config.grok.endpoint(target).unwrap();
+            assert_eq!(endpoint, Endpoint::Usage);
             assert_eq!(
                 url.as_str(),
                 "https://gateway.example.com:8443/custom/billing?format=credits"
             );
         }
-        let (url, refresh) = config
-            .grok
-            .endpoint("/grok/https://auth.x.ai/oauth2/token")
-            .unwrap();
-        assert!(refresh);
-        assert_eq!(url.as_str(), "https://auth.x.ai/oauth2/token");
+        for (target, kind, expected) in [
+            (
+                "/grok/https://auth.x.ai/oauth2/token",
+                Endpoint::Token,
+                super::super::TOKEN_URL,
+            ),
+            (
+                "/grok/oauth2/token",
+                Endpoint::Token,
+                super::super::TOKEN_URL,
+            ),
+            (
+                "/https://auth.x.ai/oauth2/token",
+                Endpoint::Token,
+                super::super::TOKEN_URL,
+            ),
+            (
+                "/grok/https://auth.x.ai/oauth2/device/code",
+                Endpoint::DeviceCode,
+                super::super::DEVICE_CODE_URL,
+            ),
+            (
+                "/grok/https://auth.x.ai/.well-known/openid-configuration",
+                Endpoint::Discovery,
+                super::super::DISCOVERY_URL,
+            ),
+        ] {
+            let (url, endpoint) = config.grok.endpoint(target).unwrap();
+            assert_eq!((endpoint, url.as_str()), (kind, expected), "{target}");
+        }
         for target in [
             "/grok/https://api.x.ai/v1/settings",
             "/grok/https://gateway.example.com:8443/custom/oauth2/token",
             "/grok/https://gateway.example.com:8443/customized/settings",
             "/grok/billing?format=other",
             "/grok/v1/settings/other",
+            // The issuer scope serves only what Grok Build asks for, and only
+            // under `/grok`.
+            "/https://auth.x.ai/oauth2/device/code",
+            "/https://auth.x.ai/.well-known/openid-configuration",
+            "/grok/https://auth.x.ai/.well-known/openid-configuration?x=1",
+            "/grok/https://auth.x.ai/.well-known/jwks.json",
+            "/grok/https://auth.x.ai/oauth2/device/code/x",
         ] {
             assert!(config.grok.endpoint(target).is_none(), "{target}");
         }

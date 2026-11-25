@@ -658,6 +658,43 @@ session API, `base_url.api_key` (with a name or `fallback`) and each URL route's
 host are decrypted as `/grok/https://<host>/...`. Account routes also cover
 `auth.x.ai` for client-initiated token renewal. The client saves the renewed login.
 
+### Grok Build sign-in and renewal
+
+Grok Build has no setting for its token endpoint, which it reaches directly
+before a request once its access token expires, even one to Coport. It reads
+the endpoint from its issuer's discovery document, and the issuer can be set.
+With account routes, `account_fallback` or `fallback`, point it at Coport in
+the same file:
+
+```toml
+[auth.oauth2]
+issuer = "http://127.0.0.1:8787/grok/https://auth.x.ai"
+```
+
+`GROK_OAUTH2_ISSUER` sets the same for one session. Coport fetches
+`/.well-known/openid-configuration` from xAI and returns it with its
+`token_endpoint` and `device_authorization_endpoint` under this issuer; the
+issuer and other endpoints stay xAI's. Renewals then arrive as
+`POST /grok/https://auth.x.ai/oauth2/token` and take the login's route as on the
+proxy port.
+
+Grok Build files its login by issuer, so a login saved before the change is
+not found under the new one: run `grok login --device-auth` once. A browser
+sign-in fails with `InvalidIssuer`, because xAI's ID token names
+`https://auth.x.ai`; a device sign-in does not check it. Coport forwards the
+device code request (`/oauth2/device/code`) and its token polls (only Grok
+Build's client ID, as a URL-encoded form). With no credential to route by, the
+discovery document and device sign-in take the first saved login's account
+route, else `default`, `account_fallback` or `fallback`, and are refused with
+403 when none applies. A successful device sign-in's tokens are learned for
+their account as a renewal's are. Coport finds the login under either issuer, so
+`account_auth_file_only: true` keeps working. The browser still opens the
+verification page directly.
+
+Neither the issuer path nor the device flow is documented as a proxy interface
+by xAI; check a renewal in Activity after upgrading Grok Build. Inside a
+decrypted CONNECT to `auth.x.ai`, the document is returned unchanged.
+
 ## Copool Grok subscription usage
 
 Set `connect_credential_routing: true` in Coport and add a Grok route to the

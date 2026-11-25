@@ -127,6 +127,25 @@ test('Connect gives agy its endpoint variables, and its own proxy and CA with th
   const html = context.connectBlock();
   assert.ok(html.includes('AGY_LLM_GATEWAY_PROXY_URL=') && html.includes('AGY_CA_CERT='));
 });
+test('Connect points Grok Build at this issuer only when Grok logins are routed', () => {
+  const context = setup();
+  const base = 'http://127.0.0.1:19427';
+  const grok = `${base}/grok/v1`;
+  Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
+  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  const endpoints = `[endpoints]\ncli_chat_proxy_base_url = "${grok}"\nxai_api_base_url = "${grok}"`;
+  const fallbacks = (proxies) => [{ key: 'accountFallback', proxies }, { key: 'fallback', proxies: null }, { key: 'accountProbe', proxies: ['none'] }];
+  const snap = (accountRoutes, proxies) => ({ urls: { base, grok }, config: { details: { editable: {}, grok: { accountRoutes, fallbacks: fallbacks(proxies) } } } });
+  // API keys alone, or an account probe, leave renewal where it was.
+  assert.equal(context.grokConfig(snap([], null)), endpoints);
+  assert.equal(context.grokConfig({ urls: { base, grok }, config: {} }), endpoints);
+  const issuer = `${endpoints}\n\n[auth.oauth2]\nissuer = "${base}/grok/https://auth.x.ai"`;
+  assert.equal(context.grokConfig(snap([{ selector: 'a@example.com' }], null)), issuer);
+  assert.equal(context.grokConfig(snap([], ['us'])), issuer);
+  context.ui.snap = snap([{ selector: 'a@example.com' }], null);
+  const html = context.connectBlock();
+  assert.ok(html.includes('[auth.oauth2]') && html.includes('grok login --device-auth'));
+});
 test('Grok accounts form their own group in its hue after Antigravity', () => {
   const { shareGroups } = setup();
   const groups = shareGroups([credential('x@example.com', 10, 'Grok'), credential('g@example.com', 40, 'Antigravity'), credential('c', 20)], requests);

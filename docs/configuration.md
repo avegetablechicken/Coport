@@ -470,7 +470,9 @@ key to that upstream; one naming `base_url.account`, `cli-chat-proxy.grok.com`,
 
 Grok Build and Copool initiate token renewal themselves. With a Grok account
 route, the proxy port accepts `POST https://auth.x.ai/oauth2/token` and routes it
-by the refresh token. See [Copool subscription usage](clients.md#copool-grok-subscription-usage)
+by the refresh token, as does the listener at `/grok/https://auth.x.ai/oauth2/token`
+for a Grok Build whose issuer points there (see [Grok Build sign-in and
+renewal](clients.md#grok-build-sign-in-and-renewal)). See [Copool subscription usage](clients.md#copool-grok-subscription-usage)
 for first use and token rotation. `auto_refresh_access_token` does not apply to Grok. `account_probe`
 and `mcp_fallback` are not supported. As for Codex with `account_auth_file_only:
 true`, the desktop app's routing page marks the saved logins' routes active and

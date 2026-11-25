@@ -17,6 +17,7 @@ use crate::{
     refresh_routes::RefreshRoutes,
 };
 mod copool;
+pub(crate) use copool::Endpoint;
 pub use copool::GrokAccount;
 pub const API: &str = "https://cli-chat-proxy.grok.com";
 pub const ISSUER: &str = AUTH_ORIGIN;
@@ -34,6 +35,15 @@ pub const DEFAULT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 pub const DEFAULT_API_BASE: &str = "https://api.x.ai/v1";
 /// xAI OAuth issuer, reserved for Grok Build token renewal.
 pub const AUTH_ORIGIN: &str = "https://auth.x.ai";
+/// Where Grok Build's `[auth.oauth2] issuer` points to reach xAI's sign-in
+/// through this listener: `<listener>/grok/https://auth.x.ai`.
+pub const ISSUER_SCOPE: &str = "/grok/https://auth.x.ai";
+/// xAI's token endpoint: renewals, and sign-ins with a device code.
+pub const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+/// xAI's device authorization endpoint, under the issuer as Grok Build asks.
+pub const DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+/// xAI's OpenID discovery document, which names the token endpoint.
+pub const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 /// The route name records give an API key `fallback` carried, as Claude's
 /// `claude-api-key-fallback`.
 pub const API_KEY_FALLBACK: &str = "grok-api-key-fallback";
@@ -119,6 +129,42 @@ impl GrokIdentity {
     }
 }
 
+/// Whether an issuer Grok Build saved a login under is xAI's: its own, or
+/// xAI's reached through this listener's issuer scope. The scope is part of
+/// the key Grok Build files the login under, so both name the same account.
+pub(crate) fn xai_issuer(issuer: &str) -> bool {
+    issuer == ISSUER
+        || (issuer.starts_with("http://") || issuer.starts_with("https://"))
+            && issuer.ends_with(ISSUER_SCOPE)
+}
+
+/// Whether an `auth.json` key, `<issuer>::<client id>`, files Grok Build's
+/// own xAI login.
+pub(crate) fn xai_login_key(key: &str) -> bool {
+    key.rsplit_once("::")
+        .is_some_and(|(issuer, client)| client == CLIENT_ID && xai_issuer(issuer))
+}
+
+/// xAI's discovery document as Grok Build reads it through this listener:
+/// the token and device endpoints, which carry its refresh token and
+/// sign-in, point at `base`, the listener the request reached; the issuer
+/// and every other endpoint stay xAI's.
+pub(crate) fn discovery_through(document: &mut Value, base: &str) {
+    let Some(fields) = document.as_object_mut() else {
+        return;
+    };
+    for field in ["token_endpoint", "device_authorization_endpoint"] {
+        if let Some(value) = fields.get_mut(field) {
+            if let Some(url) = value
+                .as_str()
+                .filter(|url| [TOKEN_URL, DEVICE_CODE_URL].contains(url))
+            {
+                *value = format!("{base}/grok/{url}").into();
+            }
+        }
+    }
+}
+
 /// The parts of a saved login Coport uses.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Login {
@@ -149,9 +195,8 @@ pub(crate) fn parse_logins(text: &str) -> Option<Vec<Login>> {
         return Some(vec![login]);
     }
     let object = value.as_object()?;
-    let xai = format!("{AUTH_ORIGIN}::");
     let mut entries: Vec<_> = object.iter().collect();
-    entries.sort_by_key(|(key, _)| !key.starts_with(&xai));
+    entries.sort_by_key(|(key, _)| !xai_login_key(key));
     Some(entries.into_iter().filter_map(|(_, v)| login(v)).collect())
 }
 
@@ -420,6 +465,30 @@ impl Grok {
                 (saved && self.routing.account.contains_key("default")).then(|| "default".into())
             })
             .or_else(|| crate::identity::routing_account_label(&self.routing, "", &[], ""))
+    }
+
+    /// The route of xAI sign-in requests no saved credential names: the
+    /// discovery document a renewal reads first, and a device sign-in. They
+    /// take the first saved login's account route (an account renewing
+    /// itself, or signing in again), else `default`, `account_fallback` or
+    /// `fallback`.
+    pub(crate) fn issuer_route(&self) -> Result<(&Choice, String)> {
+        let (logins, _) = self.logins();
+        logins
+            .iter()
+            .find_map(|login| self.account_label(&login.identity, true))
+            .or_else(|| {
+                self.routing
+                    .account
+                    .contains_key("default")
+                    .then(|| "default".into())
+            })
+            .or_else(|| crate::identity::routing_account_label(&self.routing, "", &[], ""))
+            .and_then(|label| Some((self.account_choice(&label)?, label)))
+            .ok_or(Error::new(
+                403,
+                "Grok sign-in needs a saved login's account route, a default account route or a fallback.",
+            ))
     }
 
     fn account_choice(&self, label: &str) -> Option<&Choice> {
@@ -812,6 +881,99 @@ pub(crate) mod tests {
         // CRLF files read the same.
         let crlf = auth_json("saved", "a@example.com").replace(',', ",\r\n");
         assert_eq!(parse_logins(&crlf).unwrap()[0].access_token, "saved");
+    }
+
+    #[test]
+    fn the_issuer_scope_files_xais_login_and_moves_only_its_token_endpoints() {
+        for (issuer, xai) in [
+            ("https://auth.x.ai", true),
+            ("http://127.0.0.1:8787/grok/https://auth.x.ai", true),
+            ("https://localhost:8787/grok/https://auth.x.ai", true),
+            ("https://auth.x.ai/", false),
+            ("https://idp.example.com", false),
+            ("/grok/https://auth.x.ai", false),
+            ("http://127.0.0.1:8787/grok/https://auth.x.ai/", false),
+        ] {
+            assert_eq!(xai_issuer(issuer), xai, "{issuer}");
+        }
+        assert!(xai_login_key(&format!(
+            "http://127.0.0.1:8787{ISSUER_SCOPE}::{CLIENT_ID}"
+        )));
+        assert!(!xai_login_key(&format!(
+            "http://127.0.0.1:8787{ISSUER_SCOPE}::other"
+        )));
+        // A login filed under the issuer scope reads first, as xAI's own.
+        let text = serde_json::json!({
+            "https://idp.example.com::other": {"key": "other-issuer-token"},
+            format!("http://127.0.0.1:8787{ISSUER_SCOPE}::{CLIENT_ID}"): {"key": "scoped", "user_id": USER_ID},
+        })
+        .to_string();
+        assert_eq!(parse_logins(&text).unwrap()[0].access_token, "scoped");
+
+        let mut document = serde_json::json!({
+            "issuer": "https://auth.x.ai",
+            "authorization_endpoint": "https://accounts.x.ai/oauth2/auth",
+            "token_endpoint": TOKEN_URL,
+            "device_authorization_endpoint": DEVICE_CODE_URL,
+            "jwks_uri": "https://auth.x.ai/.well-known/jwks.json",
+        });
+        discovery_through(&mut document, "http://127.0.0.1:8787");
+        assert_eq!(
+            document["token_endpoint"],
+            "http://127.0.0.1:8787/grok/https://auth.x.ai/oauth2/token"
+        );
+        assert_eq!(
+            document["device_authorization_endpoint"],
+            "http://127.0.0.1:8787/grok/https://auth.x.ai/oauth2/device/code"
+        );
+        for field in ["issuer", "authorization_endpoint", "jwks_uri"] {
+            assert!(
+                !document[field].as_str().unwrap().contains("127.0.0.1"),
+                "{field}"
+            );
+        }
+        // Endpoints Coport does not serve, and documents that are not
+        // objects, are left as they are.
+        let mut other = serde_json::json!({"token_endpoint": "https://auth.x.ai/oauth2/token2"});
+        discovery_through(&mut other, "http://127.0.0.1:8787");
+        assert_eq!(other["token_endpoint"], "https://auth.x.ai/oauth2/token2");
+        let mut list = serde_json::json!([TOKEN_URL]);
+        discovery_through(&mut list, "http://127.0.0.1:8787");
+        assert_eq!(list, serde_json::json!([TOKEN_URL]));
+    }
+
+    #[test]
+    fn sign_in_takes_the_saved_logins_route_then_default_then_a_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let label = |extra: &str| {
+            config(home.path(), extra)
+                .grok
+                .issuer_route()
+                .map(|(_, label)| label)
+                .map_err(|e| e.status)
+        };
+        let routes = "  routing:\n    account:\n      a@example.com: none\n      default: none\n    account_fallback: none\n";
+        // Without a saved login: `default`, then the fallbacks.
+        assert_eq!(label(routes), Ok("default".into()));
+        assert_eq!(
+            label("  routing:\n    account: {a@example.com: none}\n    fallback: none\n"),
+            Ok("fallback".into())
+        );
+        assert_eq!(
+            label("  routing:\n    account: {a@example.com: none}\n"),
+            Err(403)
+        );
+        // A saved login takes its own account's route.
+        std::fs::write(
+            home.path().join("auth.json"),
+            auth_json("saved", "A@Example.com"),
+        )
+        .unwrap();
+        assert_eq!(label(routes), Ok("a@example.com".into()));
+        assert_eq!(
+            label("  routing:\n    account: {other@example.com: none}\n"),
+            Err(403)
+        );
     }
 
     #[test]

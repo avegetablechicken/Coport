@@ -170,6 +170,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     // The ID token names the user and team. The access token is opaque.
                     let body = if request.starts_with("POST /oauth2/token ") {
                         r#"{"id_token":"h.eyJzdWIiOiJhbGljZSIsInRlYW1faWQiOiJ0ZWFtIn0.s","access_token":"issued-access","refresh_token":"issued-refresh"}"#
+                    } else if request.starts_with("GET /.well-known/openid-configuration ") {
+                        r#"{"issuer":"https://auth.x.ai","authorization_endpoint":"https://accounts.x.ai/oauth2/auth","token_endpoint":"https://auth.x.ai/oauth2/token","device_authorization_endpoint":"https://auth.x.ai/oauth2/device/code","jwks_uri":"https://auth.x.ai/.well-known/jwks.json"}"#
+                    } else if request.starts_with("POST /oauth2/device/code ") {
+                        r#"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://accounts.x.ai/device","interval":5}"#
                     } else if request.starts_with("GET /v1/billing?format=credits ") {
                         r#"{"creditUsagePercent":42}"#
                     } else {
@@ -6475,6 +6479,214 @@ async fn grok_renewals_are_learned_while_the_saved_login_policy_is_on() {
             .unwrap()
             .starts_with("CONNECT cli-chat-proxy.grok.com:443 ")
     );
+}
+
+/// Grok Build's `[auth.oauth2] issuer` pointing at `/grok/https://auth.x.ai`
+/// sends its sign-in and renewal here: the discovery document names this
+/// listener's token and device endpoints, a device sign-in takes the saved
+/// login's route and is learned, and the login Grok Build files under that
+/// issuer renews under the saved-login policy. Only the fixture proxy is
+/// reached.
+#[tokio::test]
+async fn grok_issuer_scope_serves_discovery_device_sign_in_and_renewal() {
+    let mut mapped = fixture("http", "grok").await;
+    let mapped_url = format!("http://{}", mapped.addr);
+    let state = tempfile::tempdir().unwrap();
+    let routes = state.path().join(crate::refresh_routes::GROK_FILE);
+    let auth = state.path().join("auth.json");
+    let xai_key = format!("{}::{}", crate::grok::ISSUER, crate::grok::CLIENT_ID);
+    let saved = json!({"user_id":"alice","team_id":"team","key":"old-access","refresh_token":"old-refresh"});
+    std::fs::write(&auth, json!({&xai_key: saved}).to_string()).unwrap();
+    let config = format!(
+        "connect_credential_routing: true\nproxies:\n  mapped: {mapped_url}\ngrok:\n  auth_file: {}\n  routing:\n    account: {{alice/team: mapped}}\n",
+        serde_json::to_string(&auth).unwrap()
+    );
+    let running = running_with_server(
+        &config,
+        |_| {},
+        |server| {
+            server.with_grok_routes(crate::refresh_routes::RefreshRoutes::load(routes.clone()))
+        },
+    )
+    .await;
+    trust(&running, &mapped, &mapped_url);
+    let issuer = format!("{}{}", running.url, crate::grok::ISSUER_SCOPE);
+    let reached = |mapped: &mut Fixture| {
+        let connect = mapped.requests.try_recv().unwrap();
+        assert!(connect.starts_with("CONNECT auth.x.ai:443 "), "{connect}");
+        mapped.requests.try_recv().unwrap()
+    };
+
+    let reply = http()
+        .get(format!("{issuer}/.well-known/openid-configuration"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    let document: serde_json::Value =
+        serde_json::from_slice(&reply.bytes().await.unwrap()).unwrap();
+    assert_eq!(document["token_endpoint"], format!("{issuer}/oauth2/token"));
+    assert_eq!(
+        document["device_authorization_endpoint"],
+        format!("{issuer}/oauth2/device/code")
+    );
+    assert_eq!(document["issuer"], "https://auth.x.ai");
+    assert_eq!(
+        document["authorization_endpoint"],
+        "https://accounts.x.ai/oauth2/auth"
+    );
+    assert_eq!(
+        document["jwks_uri"],
+        "https://auth.x.ai/.well-known/jwks.json"
+    );
+    assert!(reached(&mut mapped).starts_with("GET /.well-known/openid-configuration "));
+
+    let reply = http()
+        .post(format!("{issuer}/oauth2/device/code"))
+        .form(&[
+            ("client_id", crate::grok::CLIENT_ID),
+            ("scope", "openid offline_access"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(reply.text().await.unwrap().contains("ABCD-EFGH"));
+    assert!(reached(&mut mapped).starts_with("POST /oauth2/device/code "));
+
+    let device = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("client_id", crate::grok::CLIENT_ID),
+        ("device_code", "device-secret"),
+    ];
+    let reply = http()
+        .post(format!("{issuer}/oauth2/token"))
+        .form(&device)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(reply.text().await.unwrap().contains("issued-refresh"));
+    let request = reached(&mut mapped);
+    assert!(request.starts_with("POST /oauth2/token "));
+    assert!(request.ends_with("device_code=device-secret"));
+    let learned =
+        crate::refresh_routes::RefreshRoutes::<crate::grok::GrokAccount>::load(routes.clone());
+    assert_eq!(
+        learned.identity("issued-refresh").unwrap().user_id(),
+        "alice"
+    );
+
+    // Grok Build files the new login under the issuer it was given; the
+    // saved-login policy finds it there for the renewal.
+    let scoped_key = format!("{issuer}::{}", crate::grok::CLIENT_ID);
+    let signed_in = json!({"user_id":"alice","team_id":"team","key":"issued-access","refresh_token":"issued-refresh","oidc_issuer":issuer});
+    std::fs::write(
+        &auth,
+        json!({&xai_key: saved, &scoped_key: signed_in}).to_string(),
+    )
+    .unwrap();
+    let reply = http()
+        .post(format!("{issuer}/oauth2/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", crate::grok::CLIENT_ID),
+            ("refresh_token", "issued-refresh"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    reply.bytes().await.unwrap();
+    assert!(reached(&mut mapped).ends_with("refresh_token=issued-refresh"));
+
+    // Inside a decrypted CONNECT the client already reaches xAI's token
+    // endpoint through the proxy port, so the document is xAI's own.
+    let reply = proxy_port_client(&running)
+        .get(crate::grok::DISCOVERY_URL)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    let document: serde_json::Value =
+        serde_json::from_slice(&reply.bytes().await.unwrap()).unwrap();
+    assert_eq!(document["token_endpoint"], crate::grok::TOKEN_URL);
+    assert!(reached(&mut mapped).starts_with("GET /.well-known/openid-configuration "));
+
+    // Anything else is refused before any connection.
+    let refused = [
+        (
+            "POST",
+            "/oauth2/token",
+            vec![
+                ("grant_type", "authorization_code"),
+                ("client_id", crate::grok::CLIENT_ID),
+                ("code", "code"),
+            ],
+            403,
+        ),
+        (
+            "POST",
+            "/oauth2/token",
+            vec![
+                device[0],
+                device[1],
+                device[2],
+                ("refresh_token", "old-refresh"),
+            ],
+            403,
+        ),
+        (
+            "POST",
+            "/oauth2/token",
+            vec![device[0], ("client_id", "another-client"), device[2]],
+            403,
+        ),
+        (
+            "POST",
+            "/oauth2/token",
+            vec![device[0], device[1], device[2], device[2]],
+            400,
+        ),
+        (
+            "POST",
+            "/oauth2/device/code",
+            vec![("client_id", "another-client")],
+            403,
+        ),
+        ("GET", "/oauth2/token", vec![], 405),
+        ("GET", "/oauth2/device/code", vec![], 405),
+        ("POST", "/.well-known/openid-configuration", vec![], 405),
+        ("GET", "/.well-known/jwks.json", vec![], 404),
+    ];
+    for (method, path, form, status) in refused {
+        let reply = http()
+            .request(method.parse().unwrap(), format!("{issuer}{path}"))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), status, "{method} {path} {form:?}");
+    }
+    let reply = http()
+        .post(format!("{issuer}/oauth2/device/code"))
+        .header("content-type", "application/json")
+        .body(json!({"client_id": crate::grok::CLIENT_ID}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 415);
+    assert!(mapped.requests.try_recv().is_err());
+    running.server.logger.flush().unwrap();
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    for secret in [
+        "device-secret",
+        "issued-access",
+        "issued-refresh",
+        "old-refresh",
+    ] {
+        assert!(!log.contains(secret), "{secret}");
+    }
 }
 
 #[tokio::test]

@@ -867,7 +867,7 @@ function connectBlock() {
        ${snippet("CA for the HTTPS chatgpt_base_url: add to the system trust store, or set SSL_CERT_FILE in ~/.codex/.env", s.urls.caCertificate)}
        ${snippet("~/.claude/settings.json, merged into existing settings", `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${s.urls.claude}"\n  }\n}`)}
        ${snippet("Antigravity CLI (agy): environment, so its Google login requests come here", agyEnvironment(s))}
-       ${snippet("~/.grok/config.toml, so Grok Build's login and API key requests come here", `[endpoints]\ncli_chat_proxy_base_url = "${s.urls.grok}"\nxai_api_base_url = "${s.urls.grok}"`)}
+       ${snippet(grokAccountRouting(s) ? "~/.grok/config.toml, so Grok Build's requests, sign-in and token renewal come here; then sign in with grok login --device-auth" : "~/.grok/config.toml, so Grok Build's login and API key requests come here", grokConfig(s))}
        ${ui.snap.config.details?.editable?.connect_credential_routing ? `
        ${snippet("Proxy port for clients using their original API URLs; set HTTPS_PROXY to the listener", `HTTPS_PROXY=${s.urls.base}\nNODE_EXTRA_CA_CERTS=${s.urls.proxyCaCertificate}\nCODEX_CA_CERTIFICATE=${s.urls.proxyCaCertificate}`)}` : ""}
      </details>`
@@ -891,6 +891,20 @@ function agyEnvironment(s) {
   if (s.config.details?.editable?.connect_credential_routing) {
     lines.push(`AGY_LLM_GATEWAY_PROXY_URL=${s.urls.base}`, `AGY_CA_CERT="${s.urls.proxyCaCertificate}"`);
   }
+  return lines.join("\n");
+}
+
+// With account routes, Grok Build's issuer points here too, so its token
+// renewal takes the login's route without HTTPS_PROXY. The issuer names the
+// key Grok Build files its login under, so a device sign-in follows.
+function grokAccountRouting(s) {
+  const grok = s.config.details?.grok;
+  return !!grok && (grok.accountRoutes.length > 0 || grok.fallbacks.some((f) => (f.key === "accountFallback" || f.key === "fallback") && f.proxies));
+}
+
+function grokConfig(s) {
+  const lines = ["[endpoints]", `cli_chat_proxy_base_url = "${s.urls.grok}"`, `xai_api_base_url = "${s.urls.grok}"`];
+  if (grokAccountRouting(s)) lines.push("", "[auth.oauth2]", `issuer = "${s.urls.base}/grok/https://auth.x.ai"`);
   return lines.join("\n");
 }
 
