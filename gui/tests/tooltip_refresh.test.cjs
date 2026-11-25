@@ -5,11 +5,16 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
-const between = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 
 // Run the real renderPage and content observer: refreshing replaces the
 // hovered/focused node, as innerHTML does in the panel's WebView.
-function panel(page = 'main') {
+function panel(page = 'main', script = source) {
+  const between = (start, end) => {
+    const from = script.indexOf(start);
+    const to = script.indexOf(end, from);
+    assert.ok(from >= 0 && to > from, `source section: ${start} … ${end}`);
+    return script.slice(from, to);
+  };
   const events = {}, windowEvents = {}, timers = new Map(), microtasks = [];
   let timerId = 0, observer, owners = [], hit = 0;
   let rows = [{ key: 'account-a', tip: '50.0 tok/s' }];
@@ -74,9 +79,10 @@ function panel(page = 'main') {
     MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },
   };
   vm.createContext(context);
-  vm.runInContext(between('let routeTooltipTimer;', '\nfunction routingBlock('), context);
+  vm.runInContext(between('let routeTooltipTimer;', 'function routingBlock('), context);
   vm.runInContext(between('function renderPage() {', '/// A block:'), context);
-  vm.runInContext(between('new MutationObserver(() => {\n  refreshRouteTooltip()', '// ---------------------------------------------------------------- share rings'), context);
+  vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(refreshRouteTooltip)'), context);
+  assert.equal(typeof observer, 'function', 'content observer is registered');
   content.innerHTML = '';
   const redraw = () => { context.renderPage(); while (microtasks.length) microtasks.shift()(); observer(); };
   const hover = () => events.pointerover({ target: owners[hit], clientX: 106, clientY: 126 });
@@ -84,6 +90,27 @@ function panel(page = 'main') {
   return { context, doc, tip, timers, events, windowEvents, content, redraw, hover, flush,
     owner: () => owners[hit], rows: value => { rows = value; }, hit: value => { hit = value; }, observe: () => observer(),
     flushMicrotasks: () => { while (microtasks.length) microtasks.shift()(); } };
+}
+
+// Exercise both checkout formats on every platform, without normalizing the
+// source passed to the VM or weakening the tooltip behavior assertions.
+for (const [format, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+  for (const page of ['main', 'devices', 'activity']) {
+    test(`${format} ${page}: the content observer updates a tooltip after repeated refreshes`, () => {
+      const p = panel(page, source.replace(/\r?\n/g, newline));
+      p.hover(); p.flush();
+      for (let i = 0; i < 3; i++) {
+        p.rows([{ key: 'account-a', tip: `${60 + i}.0 tok/s` }]);
+        // An asynchronous content replacement must be handled by the observer
+        // itself, without renderPage's tooltip restoration helping it.
+        p.content.innerHTML = '';
+        p.observe();
+        assert.equal(p.tip.hidden, false);
+        assert.equal(p.tip.textContent, `${60 + i}.0 tok/s`);
+        assert.equal(p.owner()['aria-describedby'], 'route-tooltip');
+      }
+    });
+  }
 }
 
 for (const page of ['main', 'devices', 'activity']) {
