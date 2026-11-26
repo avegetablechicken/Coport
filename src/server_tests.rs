@@ -1700,6 +1700,33 @@ async fn mcp_strips_credentials_and_only_forwards_protocol_headers() {
     assert_eq!(route["service"], "codex");
 }
 
+// A request its Route's endpoint checks refuse is still recorded with that
+// Route, so it counts against the account it was routed to.
+#[tokio::test]
+async fn a_request_its_route_refuses_is_recorded_with_that_route() {
+    let running = running(
+        "codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+    )
+    .await;
+    let response = http()
+        .get(format!("{}/backend-api/wham/usage", running.url))
+        .bearer_auth("sk-0123456789abcdefghijklmnopqrstuvwxyz")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    running.server.logger.flush().unwrap();
+    let logs = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let rejected = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| entry["event"] == "request_rejected")
+        .unwrap();
+    assert_eq!(rejected["upstream_base_url"], "https://upstream.invalid/v1");
+    assert_eq!(rejected["credential_match"], "unmatched");
+    assert!(rejected.get("credential_ref").is_some());
+}
+
 #[tokio::test]
 async fn request_limits_duplicates_and_chunked_upload() {
     let mut fixture = fixture("direct", "redirect").await;

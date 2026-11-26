@@ -4,6 +4,7 @@ use crate::{
     grok::{ApiRoute, Endpoint, GrokAccount, GrokRoute, GrokTarget},
     refresh_routes::RefreshRoutes,
 };
+use hyper::http::request::Parts;
 
 impl Server {
     pub fn with_grok_routes(mut self, routes: RefreshRoutes<GrokAccount>) -> Self {
@@ -260,7 +261,7 @@ impl Adapter for super::pipeline::Grok {
 
     async fn plan(
         server: &Server,
-        incoming: &mut Request<Incoming>,
+        parts: &mut Parts,
         target: &Target,
     ) -> Result<Plan<(Url, Endpoint), Route>> {
         let settings = &server.config.grok;
@@ -276,7 +277,7 @@ impl Adapter for super::pipeline::Grok {
         let path = rest.split('?').next().unwrap_or(rest);
         if path.ends_with("/oauth2/token")
             || rest.starts_with("/https://auth.x.ai/")
-            || incoming.method() == "GET" && path.ends_with("/chat/completions")
+            || parts.method == "GET" && path.ends_with("/chat/completions")
             || raw
                 .split_once('?')
                 .is_some_and(|(path, _)| settings.endpoint(path).is_some())
@@ -285,13 +286,13 @@ impl Adapter for super::pipeline::Grok {
         }
         Ok(Plan::Route(
             match settings
-                .resolve(incoming.headers(), rest, &server.grok_routes)
+                .resolve(&parts.headers, rest, &server.grok_routes)
                 .await?
             {
                 GrokTarget::Account(route) => Route::Account(route),
                 GrokTarget::Api(route) => {
-                    let key = incoming
-                        .headers()
+                    let key = parts
+                        .headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.strip_prefix("Bearer "))
@@ -318,11 +319,7 @@ impl Adapter for super::pipeline::Grok {
         false
     }
 
-    async fn account(
-        _: &Server,
-        _: &Request<Incoming>,
-        _: &Target,
-    ) -> Result<std::convert::Infallible> {
+    async fn account(_: &Server, _: &Parts, _: &Target) -> Result<std::convert::Infallible> {
         unreachable!("every Grok Route is planned")
     }
 
@@ -361,13 +358,7 @@ impl Adapter for super::pipeline::Grok {
         }
     }
 
-    fn build(
-        _: &Server,
-        route: Route,
-        _: &Request<Incoming>,
-        _: &Target,
-        _: &mut RequestLog,
-    ) -> Result<Relay> {
+    fn build(_: &Server, route: Route, _: &Parts, _: &Target, _: &mut RequestLog) -> Result<Relay> {
         let (url, proxy, native_tls, token) = match route {
             Route::Account(route) => (route.url, route.proxy, false, route.token),
             Route::Api(route, key) => (route.url, route.proxy, route.custom_upstream, key),

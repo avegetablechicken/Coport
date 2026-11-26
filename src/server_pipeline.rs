@@ -8,6 +8,7 @@ use super::*;
 use crate::claude::ClaudeIdentity;
 use antigravity_cooldown::Scope;
 use auto_refresh::{Renewal, Snapshot};
+use hyper::http::request::Parts;
 
 /// What one App contributes to forwarding its requests.
 pub(super) trait Adapter {
@@ -23,7 +24,7 @@ pub(super) trait Adapter {
     /// names. May reject it, or rewrite its headers.
     async fn plan(
         server: &Server,
-        incoming: &mut Request<Incoming>,
+        parts: &mut Parts,
         target: &Target,
     ) -> Result<Plan<Self::Own, Self::Route>>;
 
@@ -40,11 +41,7 @@ pub(super) trait Adapter {
 
     /// The account Route, with no remote request: the rotation lock may be
     /// held.
-    async fn account(
-        server: &Server,
-        incoming: &Request<Incoming>,
-        target: &Target,
-    ) -> Result<Self::Pending>;
+    async fn account(server: &Server, parts: &Parts, target: &Target) -> Result<Self::Pending>;
 
     /// The access token of the Saved login the Route may renew.
     fn saved_login(pending: &Self::Pending) -> Option<&str>;
@@ -65,7 +62,7 @@ pub(super) trait Adapter {
     fn build(
         server: &Server,
         route: Self::Route,
-        incoming: &Request<Incoming>,
+        parts: &Parts,
         target: &Target,
         log: &mut RequestLog,
     ) -> Result<Relay>;
@@ -246,14 +243,17 @@ impl Server {
 
     async fn pipeline<A: Adapter>(
         &self,
-        mut incoming: Request<Incoming>,
+        incoming: Request<Incoming>,
         target: &Target,
         app: Service,
         websocket: bool,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        let (route, snapshot) = match A::plan(self, &mut incoming, target).await? {
-            Plan::Own(own) => return A::own(self, incoming, own, log).await,
+        let (mut parts, body) = incoming.into_parts();
+        let (route, snapshot) = match A::plan(self, &mut parts, target).await? {
+            Plan::Own(own) => {
+                return A::own(self, Request::from_parts(parts, body), own, log).await;
+            }
             Plan::Route(route) => (route, None),
             Plan::Account => {
                 // Only a Model call renews its Saved login; it routes under the
@@ -266,21 +266,21 @@ impl Server {
                     None
                 };
                 if renews {
-                    if let Some(token) = incoming
-                        .headers()
+                    if let Some(token) = parts
+                        .headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.strip_prefix("Bearer "))
                     {
                         if let Some(current) = self.refreshed_alias(app, token).await {
-                            incoming.headers_mut().insert(
+                            parts.headers.insert(
                                 "authorization",
                                 format!("Bearer {current}").parse().unwrap(),
                             );
                         }
                     }
                 }
-                let pending = A::account(self, &incoming, target).await?;
+                let pending = A::account(self, &parts, target).await?;
                 let snapshot = match A::saved_login(&pending).filter(|_| renews) {
                     Some(token) => self.refresh_snapshot(app, token).await,
                     None => None,
@@ -292,21 +292,22 @@ impl Server {
             }
         };
         A::record(self, &route).stamp(log);
-        let relay = A::build(self, route, &incoming, target, log)?;
-        self.send(incoming, target, relay, websocket, snapshot, log)
+        let relay = A::build(self, route, &parts, target, log)?;
+        self.send(parts, body, target, relay, websocket, snapshot, log)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send(
         &self,
-        incoming: Request<Incoming>,
+        parts: Parts,
+        body: Incoming,
         target: &Target,
         relay: Relay,
         websocket: bool,
         snapshot: Option<Snapshot>,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
         // Drain the input before waiting so Hyper can observe a disconnected
         // client and cancel its pending call throughout the cooldown.
@@ -430,3 +431,146 @@ pub(super) struct Codex;
 pub(super) struct Claude;
 pub(super) struct Antigravity;
 pub(super) struct Grok;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key long and varied enough to be referenced across devices.
+    const KEY: &str = "sk-0123456789abcdefghijklmnopqrstuvwxyz";
+
+    fn server(yaml: &str) -> (Server, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse(&format!(
+            "listen_port: 7889\nrequest_timeout_seconds: 3\n{yaml}"
+        ))
+        .unwrap();
+        let logger = Arc::new(Logger::new(dir.path().join("proxy.log")));
+        (Server::new(config, logger), dir)
+    }
+
+    /// The Relay and record an App's adapter gives a request it routes before
+    /// any account: an API key or URL route.
+    async fn planned<A: Adapter>(
+        server: &Server,
+        raw: &str,
+        headers: &[(&str, &str)],
+    ) -> (Relay, RouteRecord) {
+        let target = Target::new("POST", raw);
+        let mut request = Request::builder().method("POST").uri(raw);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut parts = request.body(()).unwrap().into_parts().0;
+        let Ok(Plan::Route(route)) = A::plan(server, &mut parts, &target).await else {
+            panic!("{raw} is not routed before its account");
+        };
+        let record = A::record(server, &route);
+        let mut log = RequestLog {
+            logger: server.logger.clone(),
+            fields: Default::default(),
+            started: Instant::now(),
+            status: 0,
+            bytes: 0,
+            outcome: "test_finished",
+        };
+        let relay = A::build(server, route, &parts, &target, &mut log).unwrap();
+        (relay, record)
+    }
+
+    #[tokio::test]
+    async fn codex_url_routes_relay_the_supplied_key_to_their_upstream() {
+        let bearer = format!("Bearer {KEY}");
+        let (server, _dir) =
+            server("codex:\n  routing:\n    api_key:\n      'https://api.invalid/v1': none\n");
+        for raw in [
+            "/https://api.invalid/v1/responses",
+            "/codex/https://api.invalid/v1/responses",
+        ] {
+            let (relay, record) =
+                planned::<Codex>(&server, raw, &[("authorization", bearer.as_str())]).await;
+            assert_eq!(relay.url.as_str(), "https://api.invalid/v1/responses");
+            assert_eq!(relay.proxy.label(), "none");
+            assert!(relay.native_tls && relay.cooldown.is_none());
+            assert!(matches!(
+                relay.credential,
+                Credential::Codex { ref token, account_id: None } if token == KEY
+            ));
+            assert_eq!(
+                record.upstream_base_url.as_deref(),
+                Some("https://api.invalid/v1")
+            );
+            assert!(record.credential_ref.is_some() && record.account_id.is_none());
+            assert!(!record.configured);
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_url_routes_keep_the_api_key_and_renew_nothing() {
+        let (server, _dir) = server(
+            "claude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n",
+        );
+        let (relay, record) = planned::<Claude>(
+            &server,
+            "/anthropic/https://gateway.invalid/v1/messages",
+            &[("x-api-key", KEY)],
+        )
+        .await;
+        assert_eq!(relay.url.as_str(), "https://gateway.invalid/v1/messages");
+        assert!(relay.native_tls && !relay.renews && relay.claude_identity.is_none());
+        assert!(matches!(
+            relay.credential,
+            Credential::Claude(ref route) if route.token == KEY && !route.bearer
+        ));
+        assert_eq!(
+            record.provider.as_deref(),
+            Some("https://gateway.invalid/v1")
+        );
+        assert!(record.credential_ref.is_some() && record.account_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn antigravity_api_keys_pass_as_sent_under_a_location_cooldown() {
+        let (server, _dir) = server(
+            "antigravity:\n  routing:\n    api_key:\n      relay.invalid/antigravity: none\n",
+        );
+        let (relay, record) = planned::<Antigravity>(
+            &server,
+            "/https://relay.invalid/antigravity/v1beta/models/g:generateContent",
+            &[("x-goog-api-key", KEY)],
+        )
+        .await;
+        assert_eq!(
+            relay.url.as_str(),
+            "https://relay.invalid/antigravity/v1beta/models/g:generateContent"
+        );
+        assert!(matches!(relay.credential, Credential::AsSent));
+        assert!(relay.cooldown.is_some() && !relay.renews);
+        assert_eq!(
+            record.provider.as_deref(),
+            Some("relay.invalid/antigravity")
+        );
+        assert!(record.credential_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn grok_api_routes_relay_the_supplied_key() {
+        let bearer = format!("Bearer {KEY}");
+        let (server, _dir) =
+            server("grok:\n  homes: []\n  routing:\n    api_key:\n      grok.invalid/v1: none\n");
+        let (relay, record) = planned::<Grok>(
+            &server,
+            "/https://grok.invalid/v1/chat/completions",
+            &[("authorization", bearer.as_str())],
+        )
+        .await;
+        assert_eq!(
+            relay.url.as_str(),
+            "https://grok.invalid/v1/chat/completions"
+        );
+        assert!(matches!(relay.credential, Credential::Bearer(ref key) if key == KEY));
+        assert!(!relay.renews && relay.cooldown.is_none());
+        assert_eq!(record.provider.as_deref(), Some("grok.invalid/v1"));
+        assert!(record.credential_ref.is_some());
+    }
+}

@@ -3,6 +3,7 @@
 use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::claude::ClaudeRoute;
+use hyper::http::request::Parts;
 
 impl Adapter for Claude {
     type Own = ();
@@ -11,7 +12,7 @@ impl Adapter for Claude {
 
     async fn plan(
         server: &Server,
-        incoming: &mut Request<Incoming>,
+        parts: &mut Parts,
         target: &Target,
     ) -> Result<Plan<(), ClaudeRoute>> {
         if target.kind() == Kind::TokenRefresh {
@@ -21,7 +22,7 @@ impl Adapter for Claude {
             match server
                 .config
                 .claude
-                .explicit_api_route(incoming.headers(), target.rest())?
+                .explicit_api_route(&parts.headers, target.rest())?
             {
                 Some(route) => Plan::Route(route),
                 None => Plan::Account,
@@ -88,12 +89,8 @@ impl Adapter for Claude {
         true
     }
 
-    async fn account(
-        server: &Server,
-        incoming: &Request<Incoming>,
-        target: &Target,
-    ) -> Result<ClaudeRoute> {
-        let route = server.config.claude.resolve(incoming.headers()).await?;
+    async fn account(server: &Server, parts: &Parts, target: &Target) -> Result<ClaudeRoute> {
+        let route = server.config.claude.resolve(&parts.headers).await?;
         // Validate against the matched credential's upstream, before any
         // OAuth profile lookup. Named settings can override the global base.
         route.url(target.rest())?;
@@ -145,7 +142,7 @@ impl Adapter for Claude {
     fn build(
         _: &Server,
         route: ClaudeRoute,
-        incoming: &Request<Incoming>,
+        parts: &Parts,
         target: &Target,
         _: &mut RequestLog,
     ) -> Result<Relay> {
@@ -163,7 +160,7 @@ impl Adapter for Claude {
                     "Claude usage requires a matched OAuth account.",
                 ));
             }
-            if incoming.method() != "GET" {
+            if parts.method != "GET" {
                 return Err(Error::new(405, "Claude usage supports GET only."));
             }
         }

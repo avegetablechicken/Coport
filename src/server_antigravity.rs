@@ -9,6 +9,7 @@ use crate::{
     antigravity::{Antigravity, AntigravityIdentity, AntigravityRoute, ApiCredential, ApiRoute},
     refresh_routes::RefreshRoutes,
 };
+use hyper::http::request::Parts;
 use std::collections::BTreeMap;
 
 /// Google identities by access token, with last use for bounded LRU eviction.
@@ -390,14 +391,10 @@ impl Adapter for super::pipeline::Antigravity {
     type Pending = (AntigravityRoute, Url);
     type Route = Route;
 
-    async fn plan(
-        server: &Server,
-        incoming: &mut Request<Incoming>,
-        target: &Target,
-    ) -> Result<Plan<(), Route>> {
+    async fn plan(server: &Server, parts: &mut Parts, target: &Target) -> Result<Plan<(), Route>> {
         let settings = &server.config.antigravity;
         let api_target = target.rest();
-        if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
+        if let Some(route) = settings.api_route(&parts.headers, api_target)? {
             let url = route.url(api_target)?;
             return Ok(Plan::Route(Route::Api(route, url)));
         }
@@ -405,7 +402,7 @@ impl Adapter for super::pipeline::Antigravity {
         // Claude's `x-api-key`; a Bearer token stays a Google login.
         if settings.serves_api_keys() {
             if let Some((key, credential)) =
-                crate::antigravity::api_credential(incoming.headers(), api_target)?
+                crate::antigravity::api_credential(&parts.headers, api_target)?
                     .filter(|(_, credential)| *credential != ApiCredential::Bearer)
             {
                 let route = settings
@@ -435,8 +432,8 @@ impl Adapter for super::pipeline::Antigravity {
         // agy's scope check names its token in the query: route by it as by
         // a Bearer header, which must name the same token if both are sent.
         if let Some(token) = crate::antigravity::query_token(rest)? {
-            let bearer = incoming
-                .headers()
+            let bearer = parts
+                .headers
                 .get("authorization")
                 .map(|v| v.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")));
             match bearer {
@@ -444,7 +441,7 @@ impl Adapter for super::pipeline::Antigravity {
                     let value = format!("Bearer {token}")
                         .parse()
                         .map_err(|_| Error::new(401, "Invalid credential."))?;
-                    incoming.headers_mut().insert("authorization", value);
+                    parts.headers.insert("authorization", value);
                 }
                 Some(Some(bearer)) if bearer == token => {}
                 Some(_) => {
@@ -474,13 +471,13 @@ impl Adapter for super::pipeline::Antigravity {
 
     async fn account(
         server: &Server,
-        incoming: &Request<Incoming>,
+        parts: &Parts,
         target: &Target,
     ) -> Result<(AntigravityRoute, Url)> {
         let settings = &server.config.antigravity;
         let route = settings
             .resolve(
-                incoming.headers(),
+                &parts.headers,
                 &server.antigravity_refresh_routes,
                 &server.antigravity_renewed,
             )
@@ -542,13 +539,13 @@ impl Adapter for super::pipeline::Antigravity {
     fn build(
         _: &Server,
         route: Route,
-        incoming: &Request<Incoming>,
+        parts: &Parts,
         _: &Target,
         _: &mut RequestLog,
     ) -> Result<Relay> {
         Ok(match route {
             Route::Api(route, url) => Relay {
-                cooldown: Scope::model(incoming.method(), &url, || {
+                cooldown: Scope::model(&parts.method, &url, || {
                     Scope::new(&route.upstream, &route.key)
                 }),
                 url,
@@ -563,7 +560,7 @@ impl Adapter for super::pipeline::Antigravity {
                 claude_identity: None,
             },
             Route::Account(route, url) => Relay {
-                cooldown: Scope::model(incoming.method(), &url, || {
+                cooldown: Scope::model(&parts.method, &url, || {
                     let login = route
                         .identity
                         .as_ref()

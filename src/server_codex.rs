@@ -2,6 +2,7 @@
 //! URL route; OpenAI's docs MCP by a login when one is sent.
 use super::pipeline::{Adapter, Codex, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
+use hyper::http::request::Parts;
 
 /// A Codex Route: its credential's, or none for the docs MCP's fallback.
 pub(super) struct CodexRoute {
@@ -10,8 +11,8 @@ pub(super) struct CodexRoute {
     docs: bool,
 }
 
-fn header<'a>(incoming: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
-    incoming.headers().get(name).and_then(|h| h.to_str().ok())
+fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    parts.headers.get(name).and_then(|h| h.to_str().ok())
 }
 
 impl Adapter for Codex {
@@ -21,7 +22,7 @@ impl Adapter for Codex {
 
     async fn plan(
         server: &Server,
-        incoming: &mut Request<Incoming>,
+        parts: &mut Parts,
         target: &Target,
     ) -> Result<Plan<(), CodexRoute>> {
         if target.kind() == Kind::TokenRefresh {
@@ -31,7 +32,7 @@ impl Adapter for Codex {
         if crate::url_routing::match_route(&server.config.codex.routing.api_key, rest)?.is_some() {
             if let Some(route) = server
                 .config
-                .resolve_url(header(incoming, "authorization"), rest)?
+                .resolve_url(header(parts, "authorization"), rest)?
             {
                 return Ok(Plan::Route(CodexRoute {
                     proxy: route.proxy.clone(),
@@ -89,13 +90,9 @@ impl Adapter for Codex {
         true
     }
 
-    async fn account(
-        server: &Server,
-        incoming: &Request<Incoming>,
-        target: &Target,
-    ) -> Result<CodexRoute> {
-        let auth = header(incoming, "authorization");
-        let account = header(incoming, "chatgpt-account-id");
+    async fn account(server: &Server, parts: &Parts, target: &Target) -> Result<CodexRoute> {
+        let auth = header(parts, "authorization");
+        let account = header(parts, "chatgpt-account-id");
         let path = target.rest().split('?').next().unwrap_or("");
         if path == MCP_PATH {
             return Ok(match server.config.resolve(auth, false).await {
@@ -169,7 +166,7 @@ impl Adapter for Codex {
     fn build(
         server: &Server,
         route: CodexRoute,
-        incoming: &Request<Incoming>,
+        parts: &Parts,
         target: &Target,
         log: &mut RequestLog,
     ) -> Result<Relay> {
@@ -179,7 +176,7 @@ impl Adapter for Codex {
         if path.starts_with("/mcp/") && !docs {
             return Err(Error::new(404, "Unknown MCP endpoint."));
         }
-        if docs && !matches!(incoming.method().as_str(), "GET" | "POST" | "DELETE") {
+        if docs && !matches!(parts.method.as_str(), "GET" | "POST" | "DELETE") {
             return Err(Error::new(405, "MCP supports GET, POST and DELETE."));
         }
         if docs {
@@ -213,7 +210,7 @@ impl Adapter for Codex {
                     "Account usage queries require a matched ChatGPT login credential.",
                 ));
             }
-            if incoming.method() != method {
+            if parts.method != method {
                 return Err(Error::new(
                     405,
                     if method == "GET" {
