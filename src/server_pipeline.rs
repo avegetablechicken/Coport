@@ -466,14 +466,7 @@ mod tests {
             panic!("{raw} is not routed before its account");
         };
         let record = A::record(server, &route);
-        let mut log = RequestLog {
-            logger: server.logger.clone(),
-            fields: Default::default(),
-            started: Instant::now(),
-            status: 0,
-            bytes: 0,
-            outcome: "test_finished",
-        };
+        let mut log = RequestLog::for_test(server.logger.clone(), 0);
         let relay = A::build(server, route, &parts, &target, &mut log).unwrap();
         (relay, record)
     }

@@ -269,14 +269,12 @@ mod tests {
 
     fn log() -> (tempfile::TempDir, RequestLog) {
         let dir = tempfile::tempdir().unwrap();
-        let log = RequestLog {
-            logger: Arc::new(Logger::new(dir.path().join("log"))),
-            fields: Default::default(),
-            started: Instant::now(),
-            status: 0,
-            bytes: 0,
-            outcome: "request_finished",
-        };
+        let log = RequestLog::auxiliary(
+            Arc::new(Logger::new(dir.path().join("log"))),
+            "request",
+            Default::default(),
+            Outcome::Finished,
+        );
         (dir, log)
     }
 

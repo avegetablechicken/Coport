@@ -236,14 +236,12 @@ impl Server {
     ) -> Option<L::Identity> {
         L::directory(self)
             .discover(token, async {
-                let mut log = RequestLog {
-                    logger: self.logger.clone(),
-                    fields: json!({"service": L::SERVICE}).as_object().unwrap().clone(),
-                    started: Instant::now(),
-                    status: 0,
-                    bytes: 0,
-                    outcome: "account_probe_failed",
-                };
+                let mut log = RequestLog::auxiliary(
+                    self.logger.clone(),
+                    "account_probe",
+                    json!({"service": L::SERVICE}).as_object().unwrap().clone(),
+                    Outcome::Failed,
+                );
                 let result = tokio::time::timeout(
                     Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
                     self.account_lookup::<L>(token, proxy, &mut log),
@@ -251,8 +249,8 @@ impl Server {
                 .await
                 .unwrap_or_else(|_| Err(Error::config(L::TEXTS.timeout)));
                 match &result {
-                    Ok(_) => log.outcome = "account_probe_finished",
-                    Err(error) => log.field("reason", error.message),
+                    Ok(_) => log.finish(),
+                    Err(error) => log.fail(error.message),
                 }
                 result
             })

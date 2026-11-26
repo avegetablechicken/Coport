@@ -229,7 +229,14 @@ impl Server {
             .insert("accept", "application/json".parse().unwrap());
         attempt.failed = Some((generation.clone(), Instant::now(), false));
         let path = request.url().path().to_owned();
-        let mut refresh_log = RequestLog { logger: self.logger.clone(), fields: json!({"request_id":uuid::Uuid::new_v4().to_string(), "service":snapshot.service.name(), "method":"POST", "path":path, "reason":"automatic_oauth_refresh"}).as_object().unwrap().clone(), started:Instant::now(), status:0, bytes:0, outcome:"oauth_refresh_finished" };
+        let fields = json!({"request_id":uuid::Uuid::new_v4().to_string(), "service":snapshot.service.name(), "method":"POST", "path":path, "reason":"automatic_oauth_refresh"});
+        // Its status, not its last event, says whether the renewal succeeded.
+        let mut refresh_log = RequestLog::auxiliary(
+            self.logger.clone(),
+            "oauth_refresh",
+            fields.as_object().unwrap().clone(),
+            Outcome::Finished,
+        );
         let response = self
             .send_via(
                 choice,

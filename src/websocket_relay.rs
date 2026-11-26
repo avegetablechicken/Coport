@@ -1,7 +1,7 @@
 //! Responses WebSocket relay with protocol-phase deadlines. CONNECT uses relay.rs.
 use crate::{
     config::WebSocketTimeouts,
-    logger::RequestLog,
+    logger::{Outcome, RequestLog},
     model_calls::WsCalls,
     observation_memory::{Buffer, Exhausted},
 };
@@ -419,9 +419,9 @@ pub(super) async fn run<A, B>(
     let normal = exit.peer_close && matches!(exit.code, 1000 | 1001 | 1005)
         || exit.stage == "websocket_inter_turn_idle_timeout";
     log.outcome = if normal {
-        "request_finished"
+        Outcome::Finished
     } else {
-        "request_failed"
+        Outcome::Failed
     };
     log.bytes = trace.received as usize;
     log.field("sent_bytes", trace.sent);
@@ -528,7 +528,15 @@ mod tests {
         result
     }
     fn log(path: std::path::PathBuf) -> RequestLog {
-        RequestLog {logger:Arc::new(Logger::new(path)),fields:serde_json::from_value(json!({"request_id":"ws-connection","path":"/v1/responses","method":"GET","provider":"test","status":"101"})).unwrap(),started:std::time::Instant::now(),status:101,bytes:0,outcome:"request_cancelled"}
+        let fields = json!({"request_id":"ws-connection","path":"/v1/responses","method":"GET","provider":"test","status":"101"});
+        let mut log = RequestLog::auxiliary(
+            Arc::new(Logger::new(path)),
+            "request",
+            serde_json::from_value(fields).unwrap(),
+            Outcome::Cancelled,
+        );
+        log.status = 101;
+        log
     }
     struct TestLog {
         dir: tempfile::TempDir,
@@ -563,7 +571,7 @@ mod tests {
         let (up, server) = tokio::io::duplex(capacity);
         let task = tokio::spawn(async move {
             run(down, up, &mut log, &settings).await;
-            MapResult(log.fields.clone(), log.outcome.to_owned())
+            MapResult(log.fields.clone(), log.last_event())
         });
         (dir, client, server, task)
     }

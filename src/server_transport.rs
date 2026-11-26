@@ -526,8 +526,8 @@ impl Server {
             // First actual send, after local cooldown and route preparation.
             // Auxiliary requests share this log but must not start model timing.
             // Keep this origin across transport retries and credential renewal.
-            if upstream == Upstream::ModelCall && !log.fields.contains_key("upstream_started_ms") {
-                log.field("upstream_started_ms", log.started.elapsed().as_millis());
+            if upstream == Upstream::ModelCall {
+                log.upstream_started();
             }
             match client.execute(outgoing).await {
                 Ok(response) => {
@@ -549,7 +549,7 @@ impl Server {
             {
                 break;
             }
-            let mut fields = log.fields.clone();
+            let mut fields = log.record();
             fields.insert("transport_error".into(), json!(failure.reason));
             fields.insert(
                 "retry_delay_ms".into(),
@@ -669,14 +669,7 @@ mod tests {
             config,
             Arc::new(Logger::new(dir.path().join("proxy.log"))),
         ));
-        let log = || RequestLog {
-            logger: server.logger.clone(),
-            fields: Default::default(),
-            started: Instant::now(),
-            status: 200,
-            bytes: 0,
-            outcome: "test_finished",
-        };
+        let log = || RequestLog::for_test(server.logger.clone(), 200);
         let cold = |mut log| {
             let (server, url) = (server.clone(), url.clone());
             tokio::spawn(async move {

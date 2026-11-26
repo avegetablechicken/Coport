@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     config::{Choice, Config, redacted_endpoint},
-    logger::{Logger, RequestLog},
+    logger::{Logger, Outcome, RequestLog},
     routing::{
         MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
         query_url, refresh_token, upstream_url,
@@ -465,12 +465,14 @@ impl Server {
         } else {
             target.split('?').next().unwrap_or("/")
         };
-        let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":logged_path}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
+        let mut log =
+            RequestLog::received(self.logger.clone(), incoming.method().as_str(), logged_path);
+        let head = incoming.method() == hyper::Method::HEAD;
         // What the request is needs no configuration, so even a request
         // refused below is recorded as the Model call it asked for.
         let target = crate::target::Target::new(incoming.method().as_str(), &target);
         if target.kind() == Kind::ModelCall {
-            log.field("model_call_id", uuid::Uuid::new_v4());
+            log.model_call(uuid::Uuid::new_v4());
             log.field("model_transport", "http");
         }
         crate::request_ids::headers(incoming.headers(), &mut log.fields);
@@ -547,8 +549,7 @@ impl Server {
                         record_upstream_response(&mut log, status, relayed);
                         log.status = 0;
                         log.fields.remove("status");
-                        log.outcome = "request_failed";
-                        log.field("reason", "antigravity_location_cooldown");
+                        log.fail("antigravity_location_cooldown");
                         // A service error closes HTTP/1 before it sends any response headers.
                         return Err(std::io::Error::other("Antigravity location cooldown"));
                     };
@@ -598,6 +599,7 @@ impl Server {
                             let _ = relay.send(relay_websocket_or_tunnel(
                                 upgrade,
                                 Box::new(upstream),
+                                target.kind() == Kind::ModelWebSocket,
                                 log,
                                 self.config.request_timeout_seconds,
                                 self.config.websocket.clone(),
@@ -632,12 +634,11 @@ impl Server {
                         &mut log,
                     )
                 });
-                let no_body =
-                    log.fields["method"] == "HEAD" || matches!(status.as_u16(), 204 | 304);
+                let no_body = head || matches!(status.as_u16(), 204 | 304);
                 let mut response = Response::builder().status(status);
                 *response.headers_mut().unwrap() = headers;
                 if no_body {
-                    log.outcome = "request_finished";
+                    log.finish();
                     return Ok(response.body(empty()).unwrap());
                 }
                 let mut stream = upstream.bytes_stream();
@@ -650,22 +651,17 @@ impl Server {
                                 if let Some(observer) = observer.as_mut() { observer.feed(&bytes, &mut log); }
                                 yield Ok::<_,std::io::Error>(Frame::data(bytes));
                             }
-                            Err(_)=> { log.outcome="request_failed"; log.field("reason","transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
+                            Err(_)=> { log.fail("transport_error"); yield Err(std::io::Error::other("Upstream stream failed")); return; }
                         }
                     }
                     if let Some(observer) = observer.as_mut() { observer.finish(&mut log); }
-                    log.outcome="request_finished";
+                    log.finish();
                     drop(log);
                 };
                 Ok(response.body(StreamBody::new(body).boxed_unsync()).unwrap())
             }
             Err(e) => {
-                log.status = e.status;
-                log.outcome = "request_failed";
-                if e.status < 500 {
-                    log.outcome = "request_rejected";
-                }
-                log.field("reason", e.message);
+                log.refuse(&e);
                 Ok(response(
                     e.status,
                     &json!({"error":{"message":e.message}}).to_string(),
@@ -780,17 +776,11 @@ impl Server {
             };
             match tokio::time::timeout(Duration::from_secs(30), handshake).await {
                 Ok(Ok(tls)) => {
-                    log.outcome = "request_finished";
+                    log.finish();
                     self.serve_http(tls, Some(destination), Some(log)).await;
                 }
-                Ok(Err(reason)) => {
-                    log.outcome = "request_failed";
-                    log.field("reason", reason);
-                }
-                Err(_) => {
-                    log.outcome = "request_failed";
-                    log.field("reason", "client_tls_timeout");
-                }
+                Ok(Err(reason)) => log.fail(reason),
+                Err(_) => log.fail("client_tls_timeout"),
             }
         })
     }
@@ -1054,41 +1044,32 @@ fn record_upstream_response(log: &mut RequestLog, status: u16, upstream: Upstrea
     log.status = status;
     log.field("status", status);
     log.field("headers_ms", log.started.elapsed().as_millis());
-    let hidden = (upstream == Upstream::Auxiliary)
-        .then(|| log.fields.remove("model_call_id"))
-        .flatten();
-    log.event("upstream_response");
-    if let Some(id) = hidden {
-        log.fields.insert("model_call_id".into(), id);
+    if upstream == Upstream::Auxiliary {
+        log.auxiliary_event("upstream_response");
+    } else {
+        log.event("upstream_response");
     }
 }
 
 fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {
-    log.status = error.status;
-    log.outcome = "request_failed";
-    if error.status < 500 {
-        log.outcome = "request_rejected";
-    }
-    log.field("reason", error.message);
+    log.refuse(&error);
     response(
         error.status,
         &json!({"error":{"message":error.message}}).to_string(),
     )
 }
 
+/// A Responses WebSocket (`model_websocket`) is relayed observing its
+/// Model calls; any other upgrade, byte for byte.
 fn relay_websocket_or_tunnel(
     upgrade: hyper::upgrade::OnUpgrade,
     upstream: crate::tunnel::Socket,
+    model_websocket: bool,
     mut log: RequestLog,
     seconds: f64,
     settings: crate::config::WebSocketTimeouts,
 ) -> Relay {
-    if log
-        .fields
-        .get("model_transport")
-        .and_then(serde_json::Value::as_str)
-        != Some("websocket")
-    {
+    if !model_websocket {
         return relay_stream(upgrade, upstream, log, seconds);
     }
     Box::pin(async move {
@@ -1097,15 +1078,11 @@ fn relay_websocket_or_tunnel(
                 websocket_relay::run(TokioIo::new(downstream), upstream, &mut log, &settings).await
             }
             result => {
-                log.outcome = "request_failed";
-                log.field(
-                    "reason",
-                    if result.is_err() {
-                        "upgrade_timeout"
-                    } else {
-                        "upgrade_failed"
-                    },
-                );
+                log.fail(if result.is_err() {
+                    "upgrade_timeout"
+                } else {
+                    "upgrade_failed"
+                });
             }
         }
     })
@@ -1122,15 +1099,11 @@ fn relay_stream(
         let downstream = match tokio::time::timeout(idle, upgrade).await {
             Ok(Ok(downstream)) => downstream,
             result => {
-                log.outcome = "request_failed";
-                log.field(
-                    "reason",
-                    if result.is_err() {
-                        "upgrade_timeout"
-                    } else {
-                        "upgrade_failed"
-                    },
-                );
+                log.fail(if result.is_err() {
+                    "upgrade_timeout"
+                } else {
+                    "upgrade_failed"
+                });
                 return;
             }
         };
@@ -1141,11 +1114,9 @@ fn relay_stream(
         log.bytes = progress.received as usize;
         log.field("sent_bytes", progress.sent);
         match result {
-            Ok(()) => log.outcome = "request_finished",
+            Ok(()) => log.finish(),
             Err(error) => {
-                log.outcome = "request_failed";
-                log.field(
-                    "reason",
+                log.fail(
                     if progress.failure.is_none() && error.kind() == std::io::ErrorKind::TimedOut {
                         "tunnel_idle_timeout"
                     } else {

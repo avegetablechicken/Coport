@@ -1768,6 +1768,65 @@ async fn a_request_its_route_refuses_is_recorded_with_that_route() {
 }
 
 #[tokio::test]
+async fn request_records_keep_their_events_and_fields() {
+    let running = running(
+        "codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+    )
+    .await;
+    let key = "sk-0123456789abcdefghijklmnopqrstuvwxyz";
+    // A Model call whose upstream cannot be reached, then a refused request.
+    let failed = http()
+        .post(format!("{}/v1/responses", running.url))
+        .bearer_auth(key)
+        .body(r#"{"model":"m","input":"x"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 502);
+    let refused = http()
+        .get(format!("{}/backend-api/wham/usage", running.url))
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    running.server.logger.flush().unwrap();
+    let logs = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let shapes: Vec<String> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.get("request_id").is_some())
+        .map(|entry| {
+            let entry = entry.as_object().unwrap();
+            let keys: Vec<_> = entry
+                .keys()
+                .filter(|key| *key != "timestamp")
+                .map(String::as_str)
+                .collect();
+            format!("{}: {}", entry["event"].as_str().unwrap(), keys.join(" "))
+        })
+        .collect();
+    // The panel reads these events and fields; a change here is a change
+    // to what it shows.
+    let call = "client_request_id event method model_call_id model_transport path request_id service session_id";
+    let routed = "client_request_id credential_match credential_ref event method model model_call_id model_transport path provider proxy proxy_endpoint request_id service session_id upstream_base_url upstream_method upstream_path";
+    let ended = "client_request_id credential_match credential_ref duration_ms event method model model_call_id model_transport path provider proxy proxy_endpoint reason received_bytes request_id service session_id status transport_error upstream_attempts upstream_base_url upstream_method upstream_path upstream_started_ms";
+    assert_eq!(
+        shapes,
+        [
+            format!("request_received: {call}"),
+            format!("model_call_started: {call}"),
+            format!("route_selected: {routed}"),
+            format!("model_call_updated: {routed}"),
+            format!("request_failed: {ended}"),
+            format!("model_call_failed: {ended}"),
+            "request_received: client_request_id event method path request_id service session_id".into(),
+            "request_rejected: client_request_id credential_match credential_ref duration_ms event method path provider reason received_bytes request_id service session_id status upstream_base_url".into(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn request_limits_duplicates_and_chunked_upload() {
     let mut fixture = fixture("direct", "redirect").await;
     let running = running(
@@ -2414,22 +2473,8 @@ async fn unavailable_proxy_recovers_while_idle() {
     let running = running(&format!("proxies:\n  test: {endpoint}\n")).await;
     let choice = Choice::List(vec!["test".into()]);
     let url = Url::parse("http://example.invalid/private?secret=yes").unwrap();
-    let mut log = RequestLog {
-        logger: running.server.logger.clone(),
-        fields: Default::default(),
-        started: Instant::now(),
-        status: 200,
-        bytes: 0,
-        outcome: "test_finished",
-    };
-    let mut concurrent_log = RequestLog {
-        logger: running.server.logger.clone(),
-        fields: Default::default(),
-        started: Instant::now(),
-        status: 200,
-        bytes: 0,
-        outcome: "test_finished",
-    };
+    let mut log = RequestLog::for_test(running.server.logger.clone(), 200);
+    let mut concurrent_log = RequestLog::for_test(running.server.logger.clone(), 200);
     let (first, second) = tokio::join!(
         running.server.select(&choice, &url, &mut log),
         running.server.select(&choice, &url, &mut concurrent_log),
@@ -2898,14 +2943,7 @@ async fn forwarded_first_token_origin_excludes_profile_and_survives_retry() {
         }
     });
     let running = running("").await;
-    let mut log = RequestLog {
-        logger: running.server.logger.clone(),
-        fields: Default::default(),
-        started: Instant::now(),
-        status: 200,
-        bytes: 0,
-        outcome: "test_finished",
-    };
+    let mut log = RequestLog::for_test(running.server.logger.clone(), 200);
     let mut origin = None;
     for (method, path) in [
         (hyper::Method::GET, "/api/oauth/profile"),
@@ -2952,14 +2990,7 @@ async fn cold_selection_consumes_the_request_budget_and_logs_eligibility_separat
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
     let running = running(&format!("proxies:\n  slow: {endpoint}\n")).await;
-    let mut log = RequestLog {
-        logger: running.server.logger.clone(),
-        fields: Default::default(),
-        started: Instant::now(),
-        status: 502,
-        bytes: 0,
-        outcome: "test_finished",
-    };
+    let mut log = RequestLog::for_test(running.server.logger.clone(), 502);
     let request = reqwest::Request::new(
         hyper::Method::GET,
         Url::parse("http://example.invalid/api").unwrap(),

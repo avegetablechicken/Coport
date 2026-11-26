@@ -252,7 +252,7 @@ fn terminal(kind: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn http_event(log: &RequestLog, event: &str) {
-    if !log.fields.contains_key("model_call_id") {
+    if !log.is_model_call() {
         return;
     }
     let mapped = match event {
@@ -280,7 +280,7 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
         }
         _ => return,
     };
-    log.logger.write(mapped, log.fields.clone());
+    log.logger.write(mapped, log.record());
 }
 
 pub(crate) fn observe_request(bytes: &[u8], log: &mut RequestLog) {
@@ -1195,9 +1195,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn log_at(path: &std::path::Path) -> RequestLog {
-        RequestLog { logger: Arc::new(Logger::new(path.to_owned())),
-            fields: serde_json::from_value(json!({"request_id":"connection", "method":"GET", "path":"/v1/responses", "provider":"account", "status":"101"})).unwrap(),
-            started: Instant::now(), status: 101, bytes: 0, outcome: "request_finished" }
+        let fields = json!({"request_id":"connection", "method":"GET", "path":"/v1/responses", "provider":"account", "status":"101"});
+        let mut log = RequestLog::auxiliary(
+            Arc::new(Logger::new(path.to_owned())),
+            "request",
+            serde_json::from_value(fields).unwrap(),
+            crate::logger::Outcome::Finished,
+        );
+        log.status = 101;
+        log
     }
     fn records(path: &std::path::Path) -> Vec<Value> {
         std::fs::read_to_string(path)
@@ -1341,11 +1347,15 @@ mod tests {
         let path = dir.path().join("proxy.log");
         for outcome in ["request_finished", "request_failed"] {
             let mut log = log_at(&path);
-            log.field("model_call_id", outcome);
+            log.model_call(outcome);
             crate::request_ids::headers(&hyper::HeaderMap::new(), &mut log.fields);
             log.event("request_received");
             observe_request(br#"{"metadata":{"user_id":"user_PRIVATE_account_PRIVATE_session_550e8400-e29b-41d4-a716-446655440000"},"request_id":"client-http","model":"test","input":"PRIVATE"}"#, &mut log);
-            log.outcome = outcome;
+            log.outcome = if outcome == "request_failed" {
+                crate::logger::Outcome::Failed
+            } else {
+                crate::logger::Outcome::Finished
+            };
             log.status = if outcome == "request_failed" {
                 502
             } else {
@@ -1576,7 +1586,7 @@ mod tests {
         {
             let mut log = log_at(&path);
             log.status = 200;
-            log.field("model_call_id", "http");
+            log.model_call("http");
             log.field("model_transport", "http");
             log.event("request_received");
             let mut observer = HttpObserver::new(true, None, &mut log);
@@ -1802,7 +1812,7 @@ mod tests {
         ] {
             let mut log = log_at(&path);
             log.status = 200;
-            log.field("model_call_id", "http");
+            log.model_call("http");
             let mut observer = HttpObserver::new(true, Some(encoding), &mut log);
             observer.feed(&body, &mut log);
             observer.finish(&mut log);
@@ -1828,7 +1838,7 @@ mod tests {
         ] {
             let mut log = log_at(&path);
             log.status = 200;
-            log.field("model_call_id", "http");
+            log.model_call("http");
             let mut observer = HttpObserver::new(true, None, &mut log);
             if let Some(kind) = terminal {
                 observer.feed(
@@ -2015,7 +2025,7 @@ mod tests {
         {
             let mut log = log_at(&path);
             log.status = 200;
-            log.field("model_call_id", "http");
+            log.model_call("http");
             let mut observer = HttpObserver::new(true, None, &mut log);
             observer.feed(
                 b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"cut\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",

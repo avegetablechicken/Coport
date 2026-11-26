@@ -353,6 +353,19 @@ pub fn open_private(path: &Path) -> std::io::Result<File> {
     }
     Ok(file)
 }
+/// How a Request record ended, which names its last event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Dropped before it ended: a client disconnect or shutdown.
+    Cancelled,
+    Finished,
+    Failed,
+    /// Refused with a client error.
+    Rejected,
+}
+
+/// A Request record: fields written as the request goes, each phase an
+/// event, and its last event named by its kind and `Outcome` when dropped.
 pub struct RequestLog {
     pub logger: std::sync::Arc<Logger>,
     pub fields: Map<String, Value>,
@@ -360,15 +373,119 @@ pub struct RequestLog {
     /// Zero means no response status was established.
     pub status: u16,
     pub bytes: usize,
-    pub outcome: &'static str,
+    pub outcome: Outcome,
+    /// `request` for a client's request, else an Auxiliary request's own
+    /// kind; it begins the last event's name.
+    kind: &'static str,
+    /// The Model call this record is, whose ID every event but an
+    /// Auxiliary request's carries.
+    model_call: Option<String>,
+    /// Whether a Model call's first upstream send is already timed.
+    upstream_started: bool,
 }
 impl RequestLog {
+    /// A client's request, received: until it ends it counts as cancelled.
+    pub fn received(logger: std::sync::Arc<Logger>, method: &str, path: &str) -> Self {
+        let fields =
+            json!({"request_id": uuid::Uuid::new_v4().to_string(), "method": method, "path": path});
+        Self::auxiliary(
+            logger,
+            "request",
+            fields.as_object().unwrap().clone(),
+            Outcome::Cancelled,
+        )
+    }
+    /// A record of `kind` that starts with `fields` and, unless changed,
+    /// ends as `outcome`.
+    pub fn auxiliary(
+        logger: std::sync::Arc<Logger>,
+        kind: &'static str,
+        fields: Map<String, Value>,
+        outcome: Outcome,
+    ) -> Self {
+        Self {
+            logger,
+            fields,
+            started: Instant::now(),
+            status: 0,
+            bytes: 0,
+            outcome,
+            kind,
+            model_call: None,
+            upstream_started: false,
+        }
+    }
+
+    /// An empty record that ends as `test_finished`, with `status`.
+    #[cfg(test)]
+    pub fn for_test(logger: std::sync::Arc<Logger>, status: u16) -> Self {
+        let mut log = Self::auxiliary(logger, "test", Map::new(), Outcome::Finished);
+        log.status = status;
+        log
+    }
+
+    pub fn finish(&mut self) {
+        self.outcome = Outcome::Finished;
+    }
+    pub fn fail(&mut self, reason: impl ToString) {
+        self.outcome = Outcome::Failed;
+        self.field("reason", reason);
+    }
+    /// Answered with `error`: rejected when it is a client error, else failed.
+    pub fn refuse(&mut self, error: &crate::Error) {
+        self.status = error.status;
+        self.outcome = if error.status < 500 {
+            Outcome::Rejected
+        } else {
+            Outcome::Failed
+        };
+        self.field("reason", error.message);
+    }
+
+    /// Make this record the Model call `id`.
+    pub fn model_call(&mut self, id: impl ToString) {
+        self.model_call = Some(id.to_string());
+    }
+    pub fn is_model_call(&self) -> bool {
+        self.model_call.is_some()
+    }
+    /// Time a Model call's first upstream send; later sends are retries.
+    pub fn upstream_started(&mut self) {
+        if !self.upstream_started {
+            self.upstream_started = true;
+            self.field("upstream_started_ms", self.started.elapsed().as_millis());
+        }
+    }
+
+    /// The fields an event of this record writes, with its Model call's ID.
+    pub fn record(&self) -> Map<String, Value> {
+        let mut fields = self.fields.clone();
+        if let Some(id) = &self.model_call {
+            fields.insert("model_call_id".into(), json!(id));
+        }
+        fields
+    }
     pub fn event(&self, event: &str) {
-        self.logger.write(event, self.fields.clone());
+        self.logger.write(event, self.record());
         crate::model_calls::http_event(self, event);
+    }
+    /// An event of an Auxiliary request made on this record: not its Model
+    /// call's.
+    pub fn auxiliary_event(&self, event: &str) {
+        self.logger.write(event, self.fields.clone());
     }
     pub fn field(&mut self, key: &str, value: impl ToString) {
         self.fields.insert(key.into(), json!(value.to_string()));
+    }
+    /// The name of the event this record ends with.
+    pub fn last_event(&self) -> String {
+        let outcome = match self.outcome {
+            Outcome::Cancelled => "cancelled",
+            Outcome::Finished => "finished",
+            Outcome::Failed => "failed",
+            Outcome::Rejected => "rejected",
+        };
+        format!("{}_{outcome}", self.kind)
     }
 }
 impl Drop for RequestLog {
@@ -376,13 +493,13 @@ impl Drop for RequestLog {
         if self.status != 0 {
             self.field("status", self.status);
         }
-        if self.outcome == "request_cancelled" {
+        if self.outcome == Outcome::Cancelled {
             // Includes client disconnects and shutdown cancellation, not a gateway response.
             self.field("reason", "request_dropped");
         }
         self.field("received_bytes", self.bytes);
         self.field("duration_ms", self.started.elapsed().as_millis());
-        self.event(self.outcome);
+        self.event(&self.last_event());
     }
 }
 
@@ -663,6 +780,59 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("proxy.log.1")).unwrap(),
             "previous log"
+        );
+    }
+
+    #[test]
+    fn a_records_outcome_names_its_last_event_and_auxiliary_events_name_no_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let logger = std::sync::Arc::new(Logger::new(path.clone()));
+        let refused = |status| crate::Error::new(status, "refused");
+        let received = || RequestLog::received(logger.clone(), "POST", "/v1/responses");
+        {
+            let mut log = received();
+            log.model_call("call");
+            log.auxiliary_event("upstream_response");
+            log.event("route_selected");
+            log.refuse(&refused(403));
+        }
+        received().refuse(&refused(502));
+        received().fail("broken");
+        received().finish();
+        drop(received());
+        RequestLog::auxiliary(logger.clone(), "account_probe", Map::new(), Outcome::Failed)
+            .finish();
+        logger.flush().unwrap();
+        let records: Vec<_> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                let text = |key: &str| record[key].as_str().unwrap_or("-").to_owned();
+                [
+                    text("event"),
+                    text("model_call_id"),
+                    text("status"),
+                    text("reason"),
+                ]
+                .join(" ")
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                "upstream_response - - -",
+                "route_selected call - -",
+                "model_call_updated call - -",
+                "request_rejected call 403 refused",
+                "model_call_failed call 403 refused",
+                "request_failed - 502 refused",
+                "request_failed - - broken",
+                "request_finished - - -",
+                "request_cancelled - - request_dropped",
+                "account_probe_finished - - -",
+            ]
         );
     }
 }
