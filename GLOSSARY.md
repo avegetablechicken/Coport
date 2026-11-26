@@ -50,6 +50,16 @@ _Avoid_: background probe
 Whether an **App**'s account route has a login on this computer that it serves: active when local data says so, remote when only an **Account lookup** does, unknown while a login is unread or unidentified, probe failed when **Account discovery** failed for one, and inactive otherwise.
 _Avoid_: route state, account state
 
+### Running
+
+**Daemon**:
+The background process that runs the proxy for the desktop app on this computer. It outlives the app's window, and at most one runs per data directory.
+_Avoid_: backend, service, helper
+
+**Restart**:
+Replacing the running **Daemon** with a new one. The new configuration and credentials are checked before the old one stops. Unless forced, the Restart waits for the old one's requests in flight. If the new one does not become healthy, the previous program runs again. One Restart runs at a time; another started meanwhile joins it.
+_Avoid_: reload, relaunch
+
 ### Traffic
 
 **Traffic totals**:
