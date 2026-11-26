@@ -42,21 +42,24 @@ impl Device {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug)]
 pub enum Action {
     Status,
     Start,
     Stop,
-    Restart,
+    Restart(crate::daemon_lifecycle::Wait),
 }
 impl Action {
+    /// How long `--control restart` waits for requests in flight by default.
+    pub const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "status" => Some(Self::Status),
             "start" => Some(Self::Start),
             "stop" => Some(Self::Stop),
-            "restart" => Some(Self::Restart),
+            "restart" => Some(Self::Restart(crate::daemon_lifecycle::Wait::Idle(
+                Self::RESTART_WAIT,
+            ))),
             _ => None,
         }
     }
@@ -70,56 +73,64 @@ pub struct ControlStatus {
 
 /// Executed on the destination machine, using that user's existing GUI data.
 pub fn control(action: Action) -> io::Result<ControlStatus> {
-    control_in(action, &crate::settings::app_dir())
+    control_in(action, &crate::settings::app_dir(), &mut |_| {})
 }
 
-pub fn control_in(action: Action, dir: &Path) -> io::Result<ControlStatus> {
-    control_at(action, dir, &std::env::current_exe()?)
+/// `action` on the Daemon serving `dir`; a Restart reports to `progress`.
+pub fn control_in(
+    action: Action,
+    dir: &Path,
+    progress: &mut dyn FnMut(crate::daemon_lifecycle::Progress),
+) -> io::Result<ControlStatus> {
+    control_at(action, dir, &std::env::current_exe()?, progress)
 }
 
-fn control_at(action: Action, dir: &Path, binary: &Path) -> io::Result<ControlStatus> {
-    let found = crate::daemon::Client::discover(dir);
-    // Never start over an unresponsive daemon which still holds its lock.
-    if found.is_none() && dir.join("daemon.lock").exists() {
-        let lock = crate::daemon::lock_file(&dir.join("daemon.lock"))?;
-        lock.try_lock().map_err(|_| {
-            io::Error::other("The daemon is unresponsive; inspect it on the remote device.")
-        })?;
-    }
-    if matches!(action, Action::Restart) || (matches!(action, Action::Start) && found.is_none()) {
-        coport::config::Config::read(&dir.join("config.yaml"))
-            .and_then(|config| config.check_external_data())
-            .map_err(io::Error::other)?;
-    }
-    match action {
-        Action::Status => {}
-        Action::Stop | Action::Restart => {
+fn control_at(
+    action: Action,
+    dir: &Path,
+    binary: &Path,
+    progress: &mut dyn FnMut(crate::daemon_lifecycle::Progress),
+) -> io::Result<ControlStatus> {
+    use crate::daemon_lifecycle::{Launch, Lifecycle, Wait};
+    let lifecycle = Lifecycle::new(dir.to_owned(), binary.to_owned());
+    let found = lifecycle.find()?;
+    let wait = match action {
+        Action::Status => None,
+        Action::Stop => {
             if let Some((client, _)) = &found {
                 client.stop()?;
             }
+            return Ok(ControlStatus {
+                running: false,
+                daemon: None,
+            });
         }
-        Action::Start => {}
-    }
-    if matches!(action, Action::Restart) || (matches!(action, Action::Start) && found.is_none()) {
-        let (_, status) = crate::daemon::start(
-            binary,
-            dir,
-            &dir.join("config.yaml"),
-            &dir.join("logs/proxy.log"),
-        )?;
-        return Ok(ControlStatus {
-            running: true,
-            daemon: Some(status),
-        });
-    }
-    let status = if matches!(action, Action::Stop) {
-        None
-    } else {
-        found.map(|(_, status)| status)
+        Action::Start if found.is_some() => None,
+        Action::Start => Some(Wait::Force),
+        Action::Restart(wait) => Some(wait),
     };
+    let Some(wait) = wait else {
+        let daemon = found.map(|(_, status)| status);
+        return Ok(ControlStatus {
+            running: daemon.is_some(),
+            daemon,
+        });
+    };
+    let (config, log) = (dir.join("config.yaml"), dir.join("logs/proxy.log"));
+    let launch = Launch {
+        config: &config,
+        log: &log,
+    };
+    let restarted = lifecycle.restart(launch, wait, progress)?;
+    if let Some(reason) = restarted.rolled_back {
+        return Err(io::Error::other(format!(
+            "The new proxy daemon failed, so the previous one runs again as PID {}: {reason}",
+            restarted.status.pid
+        )));
+    }
     Ok(ControlStatus {
-        running: status.is_some(),
-        daemon: status,
+        running: true,
+        daemon: Some(restarted.status),
     })
 }
 
@@ -1128,8 +1139,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = crate::daemon::lock_file(&dir.path().join("daemon.lock")).unwrap();
         lock.try_lock().unwrap();
-        for action in [Action::Status, Action::Start, Action::Stop, Action::Restart] {
-            assert!(control_at(action, dir.path(), Path::new("missing-binary")).is_err());
+        for action in [
+            Action::Status,
+            Action::Start,
+            Action::Stop,
+            Action::Restart(crate::daemon_lifecycle::Wait::Force),
+        ] {
+            assert!(
+                control_at(action, dir.path(), Path::new("missing-binary"), &mut |_| {}).is_err()
+            );
         }
     }
     #[test]
@@ -1139,14 +1157,20 @@ mod tests {
         let (_signal, thread) = crate::daemon::tests::serve_in_thread(dir.path());
         let (_, status) = crate::daemon::tests::wait_for_daemon(dir.path());
         for action in [Action::Status, Action::Start] {
-            let result = control_at(action, dir.path(), Path::new("missing-binary")).unwrap();
+            let result =
+                control_at(action, dir.path(), Path::new("missing-binary"), &mut |_| {}).unwrap();
             assert!(result.running);
             assert_eq!(result.daemon.unwrap().pid, status.pid);
         }
         assert!(
-            !control_at(Action::Stop, dir.path(), Path::new("missing-binary"))
-                .unwrap()
-                .running
+            !control_at(
+                Action::Stop,
+                dir.path(),
+                Path::new("missing-binary"),
+                &mut |_| {}
+            )
+            .unwrap()
+            .running
         );
         thread.join().unwrap().unwrap();
     }
@@ -1155,7 +1179,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for action in [Action::Status, Action::Stop] {
             assert!(
-                !control_at(action, dir.path(), Path::new("missing-binary"))
+                !control_at(action, dir.path(), Path::new("missing-binary"), &mut |_| {})
                     .unwrap()
                     .running
             );

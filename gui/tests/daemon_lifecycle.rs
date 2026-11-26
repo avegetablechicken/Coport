@@ -1,4 +1,8 @@
-use coport_gui::{daemon, proxy::Controller};
+use coport_gui::{
+    daemon,
+    daemon_lifecycle::{Launch, Lifecycle, Progress, Wait},
+    proxy::Controller,
+};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -11,6 +15,16 @@ use tokio_rustls::rustls;
 
 fn helper() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coportd"))
+}
+
+/// Starts the daemon at `binary` for `dir` now, as a Restart does.
+fn start(
+    binary: &Path,
+    dir: &Path,
+    config: &Path,
+    log: &Path,
+) -> std::io::Result<(daemon::Client, daemon::Status)> {
+    Lifecycle::new(dir.to_owned(), binary.to_owned()).spawn(Launch { config, log })
 }
 
 fn controller(dir: &Path) -> Controller {
@@ -164,7 +178,7 @@ fn ssh_discovery_survives_removal_of_running_daemon_installation() {
     fixture(&state);
     let installed = home.path().join("coportd");
     std::fs::copy(helper(), &installed).unwrap();
-    let (client, before) = daemon::start(
+    let (client, before) = start(
         &installed,
         &state,
         &state.join("config.yaml"),
@@ -367,7 +381,7 @@ fn unauthenticated_stop_is_rejected_and_duplicate_daemon_cannot_bind() {
     let dir = tempfile::tempdir().unwrap();
     let _cleanup = Cleanup(dir.path().to_owned());
     fixture(dir.path());
-    let (client, status) = daemon::start(
+    let (client, status) = start(
         &helper(),
         dir.path(),
         &dir.path().join("config.yaml"),
@@ -434,7 +448,7 @@ fn proxy_tests_use_daemon_configuration_and_authenticated_control() {
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!("proxies:\n  test: {endpoint}\n"));
     std::fs::write(&config_path, config).unwrap();
-    let (client, status) = daemon::start(
+    let (client, status) = start(
         &helper(),
         dir.path(),
         &config_path,
@@ -506,7 +520,7 @@ fn metadata_uses_daemon_then_local_only_after_daemon_stops() {
         "listen_port: {port}\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{daemon_home_yaml}]\n  routing:\n    account: {{daemon-account: none}}\nclaude:\n  config_dirs: []\n"
     );
     std::fs::write(&config_path, &daemon_config).unwrap();
-    let (client, status) = daemon::start(
+    let (client, status) = start(
         &helper(),
         dir.path(),
         &config_path,
@@ -672,7 +686,7 @@ printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let (client, status) = daemon::start(
+    let (client, status) = start(
         &wrapper,
         dir.path(),
         &dir.path().join("config.yaml"),
@@ -745,7 +759,7 @@ printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
         assert_eq!(failed.traffic.connections, 4); // health probes are excluded
         client.set_forwarding_restore(true).await.unwrap();
         client.stop().unwrap();
-        let (client, restored) = daemon::start(&wrapper, dir.path(), &dir.path().join("config.yaml"), &dir.path().join("proxy.log")).unwrap();
+        let (client, restored) = start(&wrapper, dir.path(), &dir.path().join("config.yaml"), &dir.path().join("proxy.log")).unwrap();
         assert!(client.status().unwrap().forwarding_restore);
         assert!(restored.forwarding.is_some());
         // Restore selects remote mode before accepting the first request, even offline.
@@ -839,8 +853,7 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     let timestamp = (chrono::Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
     let rows: String = (0..100).map(|index| format!("{}\n", serde_json::json!({"event":"model_call_finished","timestamp":timestamp,"model_call_id":format!("fixture-{index}"),"service":"claude","status":"200","input_tokens":"10","output_tokens":"5"}))).collect();
     std::fs::write(&log, rows).unwrap();
-    let (client, _) =
-        daemon::start(&helper(), dir.path(), &dir.path().join("config.yaml"), &log).unwrap();
+    let (client, _) = start(&helper(), dir.path(), &dir.path().join("config.yaml"), &log).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     // The explicit account_probe authorizes one background discovery attempt.
     // Wait for that cycle, then prove display reads cause no additional I/O.
@@ -922,5 +935,197 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
     assert!(
         matches!(forbidden.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "Stopped-daemon metadata fallback contacted an upstream"
+    );
+}
+
+/// A configuration whose requests to `upstream.invalid` go through a proxy
+/// that accepts connections and never answers, so they stay in flight. The
+/// returned listener is that proxy.
+fn hanging_fixture(dir: &Path) -> (u16, TcpListener) {
+    let hang = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = free_port();
+    let config = format!(
+        "listen_port: {port}\nrequest_timeout_seconds: 60\nproxies:\n  hang: http://127.0.0.1:{}\ncodex:\n  homes: []\n  routing:\n    api_key:\n      upstream.invalid: hang\nclaude:\n  config_dirs: []\n",
+        hang.local_addr().unwrap().port()
+    );
+    std::fs::write(dir.join("config.yaml"), config).unwrap();
+    (port, hang)
+}
+
+/// A request to the daemon on `port` that stays in flight until dropped.
+fn hanging_request(port: u16, client: &daemon::Client) -> TcpStream {
+    let before = client.status().unwrap().requests_in_flight.unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(b"GET /codex/https://upstream.invalid/v1/models HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret\r\n\r\n")
+        .unwrap();
+    wait_for(|| client.status().unwrap().requests_in_flight == Some(before + 1));
+    stream
+}
+
+#[test]
+fn a_restart_waits_for_requests_in_flight_and_a_forced_restart_joins_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    let (port, _hang) = hanging_fixture(dir.path());
+    let config = dir.path().join("config.yaml");
+    let log = dir.path().join("proxy.log");
+    let (client, first) = start(&helper(), dir.path(), &config, &log).unwrap();
+    let request = hanging_request(port, &client);
+    let restart = |wait: Wait, heard: std::sync::mpsc::Sender<Progress>| {
+        let (dir, config, log) = (dir.path().to_owned(), config.clone(), log.clone());
+        std::thread::spawn(move || {
+            Lifecycle::new(dir, helper()).restart(
+                Launch {
+                    config: &config,
+                    log: &log,
+                },
+                wait,
+                &mut |progress| heard.send(progress).unwrap(),
+            )
+        })
+    };
+
+    // Requests that outlast the wait cancel the Restart.
+    let (heard, progress) = std::sync::mpsc::channel();
+    let cancelled = restart(Wait::Idle(Duration::from_secs(1)), heard);
+    let error = cancelled.join().unwrap().err().unwrap().to_string();
+    assert!(error.contains("1 request(s) still in flight"), "{error}");
+    assert_eq!(progress.iter().collect::<Vec<_>>(), [Progress::Waiting(1)]);
+    assert_eq!(client.status().unwrap().pid, first.pid);
+
+    // The Restart goes ahead once they end.
+    let (heard, progress) = std::sync::mpsc::channel();
+    let waiting = restart(Wait::Idle(Duration::from_secs(30)), heard);
+    assert_eq!(progress.recv().unwrap(), Progress::Waiting(1));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!waiting.is_finished());
+    drop(request);
+    let second = waiting.join().unwrap().unwrap().status;
+    assert_ne!(second.pid, first.pid);
+    assert_eq!(
+        progress.iter().collect::<Vec<_>>(),
+        [Progress::Stopping, Progress::Stopped]
+    );
+
+    // The GUI's Restart never waits: it forces the waiting one and joins it.
+    let (client, _) = daemon::Client::discover(dir.path()).unwrap();
+    let mut request = hanging_request(port, &client);
+    let (heard, progress) = std::sync::mpsc::channel();
+    let waiting = restart(Wait::Idle(Duration::from_secs(60)), heard);
+    assert_eq!(progress.recv().unwrap(), Progress::Waiting(1));
+    let mut gui = controller(dir.path());
+    gui.try_start(&config, log.clone()).unwrap();
+    let third = waiting.join().unwrap().unwrap().status;
+    assert_ne!(third.pid, second.pid);
+    assert_eq!(gui.daemon_status().unwrap().pid, third.pid);
+    // The forced Restart interrupted the request.
+    request
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(request.read(&mut [0; 64]).is_ok());
+}
+
+#[test]
+fn a_second_control_restart_forces_the_waiting_one() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    let (port, _hang) = hanging_fixture(dir.path());
+    let (client, first) = start(
+        &helper(),
+        dir.path(),
+        &dir.path().join("config.yaml"),
+        &dir.path().join("proxy.log"),
+    )
+    .unwrap();
+    let _request = hanging_request(port, &client);
+    let control = |args: &[&str]| {
+        Command::new(helper())
+            .arg("--control")
+            .args(args)
+            .arg("--state-dir")
+            .arg(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut waiting = control(&["restart", "--wait-idle", "60"]);
+    let mut notes = std::io::BufReader::new(waiting.stderr.take().unwrap()).lines();
+    let note = notes.next().unwrap().unwrap();
+    assert!(
+        note.starts_with("Waiting for 1 request(s) in flight"),
+        "{note}"
+    );
+    let forced = control(&["restart", "--force"]).wait_with_output().unwrap();
+    assert!(forced.status.success(), "{forced:?}");
+    assert!(String::from_utf8_lossy(&forced.stderr).contains("Another restart is in progress"));
+    let waited = waiting.wait_with_output().unwrap();
+    assert!(waited.status.success(), "{waited:?}");
+    let notes: Vec<_> = notes.map(Result::unwrap).collect();
+    assert_eq!(
+        notes,
+        [
+            "Stopping the proxy daemon.",
+            "Starting the new proxy daemon."
+        ]
+    );
+    let pid = |output: &std::process::Output| {
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["daemon"]["pid"]
+            .as_u64()
+            .unwrap() as u32
+    };
+    assert_eq!(pid(&forced), pid(&waited));
+    assert_ne!(pid(&waited), first.pid);
+    assert_eq!(
+        daemon::Client::discover(dir.path()).unwrap().1.pid,
+        pid(&waited)
+    );
+    assert!(
+        !Command::new(helper())
+            .args(["--control", "restart", "--wait-idle", "0", "--state-dir"])
+            .arg(dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_daemon_that_fails_to_start_gives_way_to_the_previous_program() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    fixture(dir.path());
+    let config = dir.path().join("config.yaml");
+    let log = dir.path().join("proxy.log");
+    let previous = dir.path().join("previous-install/coportd");
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::copy(helper(), &previous).unwrap();
+    let (_, first) = start(&previous, dir.path(), &config, &log).unwrap();
+    // Only the running image is left of the previous program.
+    std::fs::remove_dir_all(previous.parent().unwrap()).unwrap();
+    let broken = dir.path().join("broken-coportd");
+    std::fs::write(&broken, "#!/bin/sh\necho broken build >&2\nexit 3\n").unwrap();
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let restarted = Lifecycle::new(dir.path().to_owned(), broken)
+        .restart(
+            Launch {
+                config: &config,
+                log: &log,
+            },
+            Wait::Force,
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(restarted.rolled_back.unwrap().contains("broken build"));
+    assert_ne!(restarted.status.pid, first.pid);
+    assert_eq!(
+        daemon::Client::discover(dir.path()).unwrap().1.pid,
+        restarted.status.pid
     );
 }

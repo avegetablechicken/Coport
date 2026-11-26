@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::io::Write;
+
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--capabilities") {
@@ -78,16 +80,17 @@ fn main() {
         return;
     }
     if args.len() >= 2 && args[0] == "--control" {
-        let dir = helper_directory(&args, 2);
-        let result = args[1]
-            .to_str()
-            .and_then(coport_gui::remote::Action::parse)
-            .ok_or_else(|| std::io::Error::other("Expected status, start, stop or restart"))
-            .and_then(|action| coport_gui::remote::control_in(action, &dir?));
+        let result = control(&args[1..]);
         match result {
-            Ok(status) => println!("{}", serde_json::to_string(&status).unwrap()),
+            Ok(status) => {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "{}",
+                    serde_json::to_string(&status).unwrap()
+                );
+            }
             Err(error) => {
-                eprintln!("{error}");
+                let _ = writeln!(std::io::stderr(), "{error}");
                 std::process::exit(1);
             }
         }
@@ -95,7 +98,7 @@ fn main() {
     }
     if args.len() != 3 {
         eprintln!(
-            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart> [--state-dir PATH] | --summary [--state-dir PATH] | --summary-stream --window MINUTES model|all [--state-dir PATH] | --forward [--state-dir PATH] | --capabilities [--state-dir PATH]"
+            "Usage: coportd <state-dir> <config-path> <log-path> | --control <status|start|stop|restart [--force | --wait-idle SECONDS]> [--state-dir PATH] | --summary [--state-dir PATH] | --summary-stream --window MINUTES model|all [--state-dir PATH] | --forward [--state-dir PATH] | --capabilities [--state-dir PATH]"
         );
         std::process::exit(2);
     }
@@ -130,4 +133,60 @@ fn helper_directory(
     Err(std::io::Error::other(
         "Expected --state-dir with an absolute path",
     ))
+}
+
+/// `--control ACTION [--force | --wait-idle SECONDS] [--state-dir PATH]`.
+/// Output is best effort: a Restart goes on when its terminal is gone.
+fn control(args: &[std::ffi::OsString]) -> std::io::Result<coport_gui::remote::ControlStatus> {
+    use coport_gui::{
+        daemon_lifecycle::{Progress, Wait},
+        remote::Action,
+    };
+    let mut action = args[0]
+        .to_str()
+        .and_then(Action::parse)
+        .ok_or_else(|| std::io::Error::other("Expected status, start, stop or restart"))?;
+    let mut rest = &args[1..];
+    if let Action::Restart(wait) = &mut action {
+        match rest.first().and_then(|arg| arg.to_str()) {
+            Some("--force") => {
+                *wait = Wait::Force;
+                rest = &rest[1..];
+            }
+            Some("--wait-idle") => {
+                let seconds = rest
+                    .get(1)
+                    .and_then(|arg| arg.to_str())
+                    .and_then(|arg| arg.parse().ok())
+                    .filter(|seconds| (1..=3600).contains(seconds))
+                    .ok_or_else(|| std::io::Error::other("Expected --wait-idle 1 to 3600"))?;
+                *wait = Wait::Idle(std::time::Duration::from_secs(seconds));
+                rest = &rest[2..];
+            }
+            _ => {}
+        }
+    }
+    let mut command = vec![args[0].clone()];
+    command.extend_from_slice(rest);
+    let dir = helper_directory(&command, 1)?;
+    coport_gui::remote::control_in(action, &dir, &mut |progress| {
+        let note = match progress {
+            Progress::Joining => "Another restart is in progress; waiting for it.".to_owned(),
+            Progress::Waiting(requests) => format!(
+                "Waiting for {requests} request(s) in flight; run restart --force to interrupt them."
+            ),
+            Progress::Stopping => {
+                // Past this point an interrupted restart would leave nothing
+                // serving: finish it, even if the terminal goes away.
+                #[cfg(unix)]
+                for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM] {
+                    // SAFETY: ignoring a signal installs no handler code.
+                    unsafe { libc::signal(signal, libc::SIG_IGN) };
+                }
+                "Stopping the proxy daemon.".to_owned()
+            }
+            Progress::Stopped => "Starting the new proxy daemon.".to_owned(),
+        };
+        let _ = writeln!(std::io::stderr(), "{note}");
+    })
 }

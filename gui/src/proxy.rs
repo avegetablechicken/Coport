@@ -1,7 +1,7 @@
 //! Prefer daemon tests; fall back locally only when no daemon is running.
 
 use crate::daemon;
-use coport::config::Config;
+use crate::daemon_lifecycle::{Launch, Lifecycle, Progress, Wait};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -73,8 +73,7 @@ pub struct Controller {
     shared: Arc<Mutex<Shared>>,
     running: Option<Running>,
     notify: Notify,
-    daemon_dir: PathBuf,
-    daemon_binary: PathBuf,
+    lifecycle: Lifecycle,
     attached: Option<daemon::Status>,
 }
 
@@ -108,11 +107,10 @@ impl Controller {
             shared,
             running: None,
             notify,
-            daemon_dir,
-            daemon_binary,
+            lifecycle: Lifecycle::new(daemon_dir, daemon_binary),
             attached: None,
         };
-        if let Some((client, status)) = daemon::Client::discover(&controller.daemon_dir) {
+        if let Some((client, status)) = controller.lifecycle.discover() {
             controller.attach(client, status);
         }
         controller
@@ -134,37 +132,41 @@ impl Controller {
         let _ = self.try_start(config_path, log_path);
     }
 
+    /// Restart the Daemon to run `config_path`, or start one. It is
+    /// stopped at once, interrupting its requests in flight.
     pub fn try_start(&mut self, config_path: &Path, log_path: PathBuf) -> Result<(), String> {
-        // Validate before stopping the working listener.
-        if let Err(error) =
-            Config::read(config_path).and_then(|config| config.check_external_data())
-        {
-            let message = error.message.to_string();
-            if !self.is_running() {
-                self.lock().phase = Some(Phase::Failed(message.clone()));
-                (self.notify)();
-            }
-            return Err(message);
-        }
-        // Never launch a replacement unless the old listener has stopped.
-        self.stop()?;
-        let result = daemon::start(
-            &self.daemon_binary,
-            &self.daemon_dir,
-            config_path,
-            &log_path,
-        )
-        .map_err(|e| e.to_string());
+        let lifecycle = self.lifecycle.clone();
+        let launch = Launch {
+            config: config_path,
+            log: &log_path,
+        };
+        let mut stopping = false;
+        let result = lifecycle.restart(launch, Wait::Force, &mut |progress| match progress {
+            Progress::Stopping => stopping = true,
+            Progress::Stopped => self.forget_stopped(),
+            Progress::Joining | Progress::Waiting(_) => {}
+        });
         match result {
-            Ok((client, status)) => self.attach(client, status),
-            Err(message) => {
-                self.lock().phase = Some(Phase::Failed(message.clone()));
+            Ok(restarted) => {
+                self.attach(restarted.client, restarted.status);
                 (self.notify)();
-                return Err(message);
+                match restarted.rolled_back {
+                    Some(reason) => Err(format!(
+                        "The new proxy daemon failed, so the previous one runs again: {reason}"
+                    )),
+                    None => Ok(()),
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                // A failed check leaves the running daemon as it was.
+                if stopping || !self.is_running() {
+                    self.lock().phase = Some(Phase::Failed(message.clone()));
+                    (self.notify)();
+                }
+                Err(message)
             }
         }
-        (self.notify)();
-        Ok(())
     }
 
     fn attach(&mut self, client: daemon::Client, status: daemon::Status) {
@@ -229,7 +231,7 @@ impl Controller {
         // A daemon this GUI lost track of, such as one that answered discovery
         // too slowly at launch, would otherwise keep its port and never stop.
         if self.running.is_none()
-            && let Some((client, status)) = daemon::Client::discover(&self.daemon_dir)
+            && let Some((client, status)) = self.lifecycle.discover()
         {
             self.attach(client, status);
         }
@@ -245,17 +247,22 @@ impl Controller {
                 (self.notify)();
                 return Err(message);
             }
-            if let Some(running) = self.running.take() {
-                running.monitor.abort();
-            }
-            self.attached = None;
-            let mut shared = self.lock();
-            shared.generation += 1;
-            shared.phase = Some(Phase::Stopped);
-            drop(shared);
-            (self.notify)();
+            self.forget_stopped();
         }
         Ok(())
+    }
+
+    /// The attached daemon stopped.
+    fn forget_stopped(&mut self) {
+        if let Some(running) = self.running.take() {
+            running.monitor.abort();
+        }
+        self.attached = None;
+        let mut shared = self.lock();
+        shared.generation += 1;
+        shared.phase = Some(Phase::Stopped);
+        drop(shared);
+        (self.notify)();
     }
 
     /// Release the GUI's control connection without stopping the independent process.
@@ -293,7 +300,7 @@ impl Controller {
             );
             return;
         };
-        let directory = self.daemon_dir.clone();
+        let directory = self.lifecycle.dir().to_owned();
         let endpoint = endpoint.to_owned();
         let started = (Instant::now(), SystemTime::now());
         {

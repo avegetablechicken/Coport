@@ -601,7 +601,7 @@ pub fn quit_app(app: AppHandle) {
 async fn local_daemon() -> Result<Option<(coport_gui::daemon::Client, coport_gui::daemon::Status)>>
 {
     tauri::async_runtime::spawn_blocking(|| {
-        coport_gui::daemon::Client::discover(&coport_gui::settings::app_dir())
+        coport_gui::daemon_lifecycle::Lifecycle::local().discover()
     })
     .await
     .map_err(|error| error.to_string())

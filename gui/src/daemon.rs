@@ -8,7 +8,6 @@ use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -67,6 +66,9 @@ pub struct Status {
     pub config_path: PathBuf,
     pub log_path: PathBuf,
     pub config_modified: Option<SystemTime>,
+    /// Client requests the daemon is serving; absent from older daemons.
+    #[serde(default)]
+    pub requests_in_flight: Option<usize>,
 }
 
 /// Credential-routed origins the stored proxy CA does not cover, which stay
@@ -423,7 +425,7 @@ pub fn binary_path() -> io::Result<PathBuf> {
     }))
 }
 
-fn private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -445,89 +447,6 @@ pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
-}
-
-/// Detaches at spawn, not at GUI exit. No pipes or runtime tasks owned by the
-/// GUI are required to keep the listener or in-flight requests alive.
-pub fn start(binary: &Path, dir: &Path, config: &Path, log: &Path) -> io::Result<(Client, Status)> {
-    std::fs::create_dir_all(dir)?;
-    let stderr = private_file(&dir.join("daemon.stderr.log"))?;
-    let mut command = Command::new(binary);
-    command
-        .arg(dir)
-        .arg(config)
-        .arg(log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe and does not access Rust state.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    }
-    let mut child = command.spawn().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "Cannot start {}: {e}. Keep the daemon executable beside the GUI.",
-                binary.display()
-            ),
-        )
-    })?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(code) = child.try_wait()? {
-            let path = dir.join("daemon.stderr.log");
-            // The log is appended across starts; its last line is this exit's reason.
-            let reason = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| {
-                    text.lines()
-                        .rev()
-                        .find(|l| !l.trim().is_empty())
-                        .map(str::to_owned)
-                })
-                .map(|line| format!(": {line}"))
-                .unwrap_or_default();
-            return Err(io::Error::other(format!(
-                "Proxy daemon exited ({code}){reason}; see {}",
-                path.display()
-            )));
-        }
-        if let Some((client, status)) = Client::discover(dir)
-            && status.pid == child.id()
-        {
-            // Reap while the GUI is alive; dropping this thread on GUI exit has
-            // no effect on the independently running child.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok((client, status));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Proxy daemon did not become ready",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 struct Registration {
@@ -582,6 +501,7 @@ async fn handle_control(
                 uptime_ms: started.elapsed().as_millis() as u64,
                 forwarding: routing.status(),
                 forwarding_restore: routing.restore_enabled(),
+                requests_in_flight: Some(server.requests_in_flight()),
                 ..Status::clone(&status)
             })),
             Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
@@ -783,6 +703,7 @@ async fn serve_until(
         metadata_supported: true,
         credential_checks_supported: true,
         passive_account_states_supported: true,
+        requests_in_flight: None,
         port,
         uptime_ms: 0,
         proxy_ca,
@@ -1029,6 +950,7 @@ pub(crate) mod tests {
                     metadata_supported: false,
                     credential_checks_supported: false,
                     passive_account_states_supported: false,
+                    requests_in_flight: None,
                     port,
                     uptime_ms: 0,
                     proxy_ca: None,
