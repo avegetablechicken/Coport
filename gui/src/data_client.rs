@@ -204,22 +204,25 @@ pub struct MergedGroup {
     anonymous_upstream: bool,
     stats: Stats,
 }
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SourceExclusion {
     Duplicate,
     NotRefreshed,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceState {
+    /// The configured device this source reads; never sent to the panel.
+    #[serde(skip)]
+    device_id: Option<String>,
     name: String,
     included: bool,
     exclusion: Option<SourceExclusion>,
     error: Option<String>,
     traffic: Option<crate::traffic_stats::View>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Merged {
     pub window_start: i64,
@@ -228,6 +231,57 @@ pub struct Merged {
     pub minutes: u64,
     pub scope: crate::traffic::TrafficScope,
     pub bucket_minutes: u64,
+    /// This device's traffic, in the frame of the range the panel asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<crate::traffic_stats::View>,
+    /// The forwarded device's live traffic, shown in place of its last summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<LiveDevice>,
+    /// Merged Traffic: this device and every other device, each given once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<crate::traffic_stats::View>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDevice {
+    pub device: String,
+    pub traffic: crate::traffic_stats::View,
+}
+impl Merged {
+    /// Completes this range's frame with this device's traffic and the
+    /// forwarded device's live traffic, and adds Merged Traffic: each device
+    /// once, the forwarded one by its live view rather than its last summary,
+    /// a duplicate entry not at all (ADR-0001). Without this device's traffic
+    /// there is no Merged Traffic yet.
+    pub fn with_devices(
+        &mut self,
+        local: Option<&crate::traffic_stats::View>,
+        forwarded: Option<&ForwardedTraffic>,
+    ) {
+        let live_id = forwarded.map(|live| live.device_id.as_str());
+        let duplicate = self.sources.iter().any(|source| {
+            source.device_id.as_deref() == live_id
+                && source.exclusion == Some(SourceExclusion::Duplicate)
+        });
+        self.local = local.cloned();
+        self.forwarded = forwarded.filter(|_| !duplicate).map(|live| LiveDevice {
+            device: live.device_id.clone(),
+            traffic: live.traffic.clone(),
+        });
+        let live = self.forwarded.as_ref();
+        self.traffic = local.and_then(|local| {
+            let peers = self
+                .sources
+                .iter()
+                .filter(|source| live.is_none() || source.device_id.as_deref() != live_id)
+                .filter_map(|source| source.traffic.as_ref());
+            crate::traffic_stats::merge(
+                std::iter::once(local)
+                    .chain(live.map(|live| &live.traffic))
+                    .chain(peers),
+            )
+        });
+    }
 }
 /// One device's traffic from its merged groups. Accounts are told apart by
 /// their label, and every unlabelled upstream of a service is one Unidentified.
@@ -416,7 +470,7 @@ fn add_groups(
 }
 /// The forwarded device's traffic, labelled as Devices labels that device.
 /// Only this machine's configuration, cached labels and logs are read.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardedTraffic {
     device_id: String,
@@ -729,6 +783,7 @@ async fn render_views(
             view.sources = sources
                 .iter()
                 .map(|source| SourceState {
+                    device_id: source.device_id.clone(),
                     name: source.name.clone(),
                     included: false,
                     exclusion: Some(SourceExclusion::NotRefreshed),
@@ -1166,8 +1221,8 @@ fn merge_selections(
         .map(|&(minutes, scope)| merge_fetched(context, fetched, minutes, scope, end))
         .collect()
 }
-/// Each device's view of one range/category at the shared boundary. Totals
-/// across devices are their sum, taken where the views are shown.
+/// Each device's view of one range/category at the shared boundary; see
+/// `Merged::with_devices` for this device's and Merged Traffic.
 fn merge_fetched(
     context: &MergeContext,
     fetched: &Fetched,
@@ -1214,6 +1269,7 @@ fn merge_fetched(
             Err(error) => (false, Some(error.clone())),
         };
         states.push(SourceState {
+            device_id: source.device_id.clone(),
             name,
             included,
             exclusion,
@@ -1223,6 +1279,9 @@ fn merge_fetched(
     }
     states.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Merged {
+        local: None,
+        forwarded: None,
+        traffic: None,
         window_start: end - minutes as i64 * 60_000,
         window_end: end,
         sources: states,
@@ -1252,6 +1311,90 @@ mod tests {
     }
     fn add_stats(to: &mut Stats, from: &Stats) {
         crate::traffic_stats::add(to, from)
+    }
+
+    #[test]
+    fn merged_traffic_counts_each_device_once_with_the_forwarded_one_live() {
+        use crate::traffic_stats::{Account, View, Window};
+        let window = Window {
+            start: 0,
+            end: 60_000,
+            bucket_minutes: 1,
+        };
+        let traffic = |requests: u64| {
+            View::reported_by_peer(
+                crate::traffic::TrafficScope::Model,
+                window,
+                vec![Account::new(
+                    Service::Codex,
+                    "shared".into(),
+                    Vec::new(),
+                    Stats {
+                        requests,
+                        ..empty_stats(1)
+                    },
+                )],
+            )
+        };
+        let source = |id: &str, requests: Option<u64>, exclusion| SourceState {
+            device_id: Some(id.into()),
+            name: id.into(),
+            included: requests.is_some(),
+            exclusion,
+            error: None,
+            traffic: requests.map(traffic),
+        };
+        let mut merged = Merged {
+            window_start: window.start,
+            window_end: window.end,
+            sources: vec![
+                source("peer", Some(10), None),
+                source("forwarded", Some(100), None),
+                source("copy", None, Some(SourceExclusion::Duplicate)),
+            ],
+            minutes: 1,
+            scope: crate::traffic::TrafficScope::Model,
+            bucket_minutes: 1,
+            local: None,
+            forwarded: None,
+            traffic: None,
+        };
+        let live = |device: &str| ForwardedTraffic {
+            device_id: device.into(),
+            name: device.into(),
+            fetched_at: 0,
+            error: None,
+            scope: crate::traffic::TrafficScope::Model,
+            window_start: window.start,
+            window_end: window.end,
+            bucket_minutes: 1,
+            traffic: traffic(1000),
+        };
+        let local = traffic(1);
+        // Without this device's traffic there is no Merged Traffic yet.
+        merged.with_devices(None, Some(&live("forwarded")));
+        assert!(merged.traffic.is_none());
+        // The forwarded device's live view replaces its last summary.
+        merged.with_devices(Some(&local), Some(&live("forwarded")));
+        let total = merged.traffic.as_ref().unwrap();
+        assert_eq!(total.stats.requests, 1 + 10 + 1000);
+        assert_eq!(total.credentials[0].stats.requests, 1011);
+        assert_eq!(merged.forwarded.as_ref().unwrap().device, "forwarded");
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["local"]["requests"], 1);
+        assert_eq!(json["forwarded"]["traffic"]["requests"], 1000);
+        assert_eq!(json["traffic"]["requests"], 1011);
+        assert!(json["sources"][0].get("deviceId").is_none());
+        // A duplicate entry is never counted, live or not.
+        merged.with_devices(Some(&local), Some(&live("copy")));
+        assert!(merged.forwarded.is_none());
+        assert_eq!(
+            merged.traffic.as_ref().unwrap().stats.requests,
+            1 + 10 + 100
+        );
+        // Without forwarding every device's summary counts.
+        merged.with_devices(Some(&local), None);
+        assert_eq!(merged.traffic.as_ref().unwrap().stats.requests, 111);
     }
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     #[tokio::test]
@@ -1764,8 +1907,8 @@ mod tests {
 
     #[tokio::test]
     async fn merged_views_leave_this_device_to_its_card() {
-        // Merged Traffic adds this device's card to the peers' views; a merged
-        // view that counted local traffic too would count it twice.
+        // Peers' views never count this device: `Merged::with_devices` adds it
+        // once, beside them, and only then Merged Traffic exists.
         let (_dir, log, _) = archived_traffic_fixture();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let first = std::sync::Mutex::new(None);

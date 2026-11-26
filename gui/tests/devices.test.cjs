@@ -130,7 +130,7 @@ test('each device renders full Traffic metrics and an offline peer leaves other 
   Object.assign(h, { chart: () => '<svg class="chart"></svg>', stat: (name, value) => `${name}:${value};`, fmtMs: v => `${v} ms`, fmtBytes: v => `${v} B`, modelTokenStats: t => `Input Tokens:${t.inputTokens};Hit Rate:${t.cacheHitRate};`, trafficShare: () => '<div class="traffic-share">Account usage</div>', serviceMark: () => '', message: (kind, value) => value, ICON: { chevron: '' } });
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
-  const traffic = { requests: 5, errors: 1, avgMs: 200, bytes: 1234, outputTps: 50, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
+  const traffic = { requests: 5, errors: 1, errorRate: 0.2, avgMs: 200, bytes: 1234, outputTps: 50, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
   h.ui.devices = [{ id: 'online', name: 'Online', ssh: { host: 'online' }, data: { transport: 'ssh' } }, { id: 'offline', name: 'Offline', ssh: { host: 'offline' }, data: { transport: 'ssh' } }];
   h.ui.localTrafficViews = { '30:model': { ...traffic, start: 0, end: 1800000, bucketMinutes: 1 } };
   h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 1800000, bucketMinutes: 1, sources: [{ name: 'Online', traffic }, { name: 'Offline', error: 'Unavailable' }] };
@@ -848,8 +848,11 @@ test('a periodic refresh keeps shown peers until they answer instead of flashing
   const pending = [];
   const h = devicesHarness((command, args) => command === 'get_merged_data' ? new Promise((resolve, reject) => pending.push({ args, resolve, reject })) : Promise.resolve([]));
   h.ui.localTrafficViews = { '30:model': { requests: 1, start: 0, end: 60_000, bucketMinutes: 1, counts: [1], errorCounts: [0], tokenCounts: [0], credentials: [] } };
+  const counted = requests => ({ requests, start: 0, end: 60_000, bucketMinutes: 1, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
+  // Each frame of the range comes completed with this device and Merged Traffic.
   const view = (requests, error) => ({ minutes: 30, scope: 'model', start: 0, end: 60_000, bucketMinutes: 1,
-    sources: [{ name: 'MS', included: !error, ...(error ? { error } : { traffic: { requests, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] } }) }] });
+    local: counted(1), traffic: counted(1 + requests),
+    sources: [{ name: 'MS', included: !error, ...(error ? { error } : { traffic: counted(requests) }) }] });
   const shown = view(5);
   h.ui.deviceTrafficViews = { '30:model': shown };
   h.selectDeviceTraffic();
@@ -1128,43 +1131,49 @@ test('forwarding evidence never changes an HTTP statistics connection or starts 
   assert.equal(h.deviceConnectionStatus(http).state,'failed');
 });
 
-test('Merged Traffic adds exactly the views the device cards show', () => {
+test('Merged Traffic and every card show the views of one completed frame', () => {
   const shown = [];
   const h = devicesHarness(async () => []);
   h.deviceTrafficContent = (traffic, scope, key) => { shown.push([key, traffic]); return `${key}:${traffic.requests};`; };
   h.message = (_, text) => text;
-  const view = (requests) => ({ requests, errors: 0, bytes: requests, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
+  const view = (requests) => ({ requests, errors: 0, bytes: requests, start: 0, end: 60000, bucketMinutes: 1, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }, { id: 'fw', name: 'Forwarded', ssh: { host: 'fw' } }, { id: 'dup', name: 'Duplicate', ssh: { host: 'dup' } }];
-  h.ui.localTrafficViews = { '30:model': { ...view(1), start: 0, end: 180000, bucketMinutes: 1 } };
-  // The forwarded device's card is the daemon's live view, newer than the last refresh.
+  // Shared views read for Home differ from the frame's; the frame wins once completed.
+  h.ui.localTrafficViews = { '30:model': view(100) };
   h.ui.snap.forwarding = { deviceId: 'fw' };
-  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(4), device: 'fw', start: 0, end: 120000, bucketMinutes: 1 } };
-  h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, sources: [
+  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(400), device: 'fw' } };
+  const frame = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, sources: [
     { name: 'MS', included: true, traffic: view(2) },
     { name: 'Forwarded', included: true, traffic: view(3) },
     { name: 'Duplicate', included: false, exclusion: 'duplicate' },
   ] };
-  const cards = h.devicesPage();
-  assert.match(cards, /local:1;[\s\S]*device\/ms:2;[\s\S]*device\/fw:4;/);
+  // Until the backend completes the frame, shared views fill their cards and Merged Traffic waits.
+  h.ui.mergedData = frame;
+  assert.match(h.devicesPage(), /local:100;[\s\S]*device\/ms:2;[\s\S]*device\/fw:400;/);
+  assert.match(h.mergedDataBlock(), /Loading traffic…/);
+  // The forwarded device's card is its live view; Merged Traffic is the backend's sum of these cards.
+  Object.assign(frame, { local: view(1), forwarded: { device: 'fw', traffic: view(4) }, traffic: view(7) });
+  shown.length = 0;
+  assert.match(h.devicesPage(), /local:1;[\s\S]*device\/ms:2;[\s\S]*device\/fw:4;/);
   const merged = h.mergedDataBlock();
-  // 1 + 2 + 4: the forwarded device counts once, as its card shows it; the duplicate not at all.
   assert.match(merged, /merged:7;/);
-  assert.equal(JSON.stringify(shown.find(([key]) => key === 'merged')[1].counts), '[7]');
+  assert.equal(shown.find(([key]) => key === 'merged')[1], frame.traffic);
   assert.match(merged, /Duplicate: Already counted via another entry/);
+  assert.doesNotMatch(merged, /Loading traffic…/);
 });
 
-test('a forwarded device already counted via another entry is not added again', () => {
-  const shown = [];
+test('a forwarded device already counted via another entry gets no card', () => {
   const h = devicesHarness(async () => []);
-  h.deviceTrafficContent = (traffic, scope, key) => { shown.push([key, traffic]); return `${key}:${traffic.requests};`; };
+  h.deviceTrafficContent = (traffic, scope, key) => `${key}:${traffic.requests};`;
   h.message = (_, text) => text;
-  const view = (requests) => ({ requests, errors: 0, bytes: requests, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
+  const view = (requests) => ({ requests, errors: 0, bytes: requests, start: 0, end: 60000, bucketMinutes: 1, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
   // Both entries point at one machine; the HTTP entry is listed first and counted.
   h.ui.devices = [{ id: 'http', name: 'Machine HTTP', data: { transport: 'http', url: 'https://example.invalid' } }, { id: 'fw', name: 'Machine SSH', ssh: { host: 'fw' } }];
-  h.ui.localTrafficViews = { '30:model': { ...view(1), start: 0, end: 60000, bucketMinutes: 1 } };
   h.ui.snap.forwarding = { deviceId: 'fw' };
-  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(4), device: 'fw', start: 0, end: 60000, bucketMinutes: 1 } };
-  h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, sources: [
+  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(4), device: 'fw' } };
+  h.ui.localTrafficViews = { '30:model': view(1) };
+  // The backend leaves the duplicate's live view out of the frame and the sum.
+  h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, local: view(1), traffic: view(5), sources: [
     { name: 'Machine HTTP', included: true, traffic: view(4) },
     { name: 'Machine SSH', included: false, exclusion: 'duplicate' },
   ] };
@@ -1172,23 +1181,32 @@ test('a forwarded device already counted via another entry is not added again', 
   assert.doesNotMatch(cards, /device\/fw:/);
   assert.match(cards, /Already counted via another entry/);
   assert.match(h.mergedDataBlock(), /merged:5;/);
+  // Before completion the shared live view is not shown for a duplicate either.
+  delete h.ui.mergedData.local;
+  assert.doesNotMatch(h.devicesPage(), /device\/fw:/);
 });
 
 test('between refreshes the Devices timer reads no statistics for peers', async () => {
   const calls = [];
   const h = devicesHarness(async (command, args) => { calls.push(command); return command === 'get_devices' ? [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }] : []; });
   h.ui.page = 'devices';
-  h.ui.deviceTrafficViews = { '30:model': { minutes: 30, scope: 'model', sources: [] } };
+  const frame = () => ({ '30:model': { minutes: 30, scope: 'model', local: { requests: 1, credentials: [] }, loadedAt: Date.now(), sources: [] } });
+  h.ui.deviceTrafficViews = frame();
   h.ui.deviceRemoteAttemptAt = Date.now();
   h.ui.localTrafficViews = { '30:model': { requests: 1, credentials: [], loadedAt: Date.now() } };
   for (let i = 0; i < 3; i++) await h.loadDevices();
   // Peers' views stay as they are, and this device's fresh view is reused.
   assert.ok(!calls.includes('get_merged_data'));
   assert.ok(!calls.includes('get_traffic'));
+  // A frame older than the shared reuse time is completed again from the cache.
+  h.ui.deviceTrafficViews['30:model'].loadedAt -= 15000;
+  await h.loadDevices();
+  assert.equal(calls.filter((command) => command === 'get_merged_data').length, 1);
+  h.ui.deviceTrafficViews = frame();
   // Once due, the next tick refreshes peers.
   h.ui.deviceRemoteAttemptAt = Date.now() - 30000;
   await h.loadDevices();
-  assert.equal(calls.filter((command) => command === 'get_merged_data').length, 1);
+  assert.equal(calls.filter((command) => command === 'get_merged_data').length, 2);
 });
 
 

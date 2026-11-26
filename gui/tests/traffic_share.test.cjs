@@ -420,18 +420,18 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   const context = setup('model');
   Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
-  const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
+  const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, errorRate: 1, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
   const brief = context.accountRow(failed, 'model', failed, '<review>');
   assert.equal(brief.replace(/ data-tip-scope="[^"]*"/, ''), '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
-    + '<span class="traffic-brief"><span>16 calls · <span class="bad">100.0% errors</span></span><review></span></div></div>');
-  assert.match(context.accountRow({ ...failed, requests: 1, errors: 1 }, 'model', failed), />1 call · </);
+    + '<span class="traffic-brief"><span>16 calls · <span class="bad">100% errors</span></span><review></span></div></div>');
+  assert.match(context.accountRow({ ...failed, requests: 1, errors: 1, errorRate: 1 }, 'model', failed), />1 call · </);
   const full = (html) => /class="chart-bar"/.test(html) && /<Avg\. Time=/.test(html) && !/Received|brief/.test(html);
   // Requests keep the full row, and so does a named account that only failed.
   assert.ok(full(context.accountRow(failed, 'all', failed)));
   assert.ok(full(context.accountRow({ ...failed, credential: 'work' }, 'model', failed)));
   assert.match(context.accountRow({ ...failed, credential: 'work' }, 'model', failed), /<tokens>/);
   // One successful call keeps the full row.
-  const mixed = { ...failed, errors: 15, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
+  const mixed = { ...failed, errors: 15, errorRate: 15 / 16, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
   assert.ok(full(context.accountRow(mixed, 'model', mixed)));
   // Activity and Devices account rows both go through it.
   for (const [from, to] of [['function renderActivityTraffic(', '\nconst SEARCH_MODES'], ['function deviceTrafficContent(', '\ndocument.addEventListener("toggle"']]) {
@@ -730,47 +730,31 @@ test('forwarding Home Traffic labels the destination and hides another source', 
   ui.homeTrafficError = 'TRAFFIC_UPDATING';
   assert.match(context.trafficBlock(), /Loading traffic…/);
 });
-test('Merged First Token averages the devices that report it; older devices add nothing', () => {
+test('First Token shows where a device reports it, formatting the backend average', () => {
   const context = setup('model');
   loadSharedViews(context);
-  const view = (requests, firstToken) => ({ requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0], ...firstToken,
-    credentials: [{ service: 'Codex', credential: 'shared', requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0], ...firstToken }] });
-  const current = view(2, { firstTokenTotalMs: 900, firstTokenSamples: 2 });
-  const quiet = view(1, { firstTokenTotalMs: 0, firstTokenSamples: 0 });
-  const older = view(3, {});
-  const total = context.sumTrafficViews([current, older, quiet]);
-  assert.equal(total.requests, 6);
-  assert.deepEqual(plain([total.firstTokenTotalMs, total.firstTokenSamples, total.firstTokenMs]), [900, 2, 450]);
-  assert.equal(total.credentials[0].firstTokenMs, 450);
-  // Only older devices: not shown at all.
-  const old = context.sumTrafficViews([older]);
-  assert.equal(old.firstTokenSamples, undefined);
-  assert.equal(old.firstTokenMs, null);
-  Object.assign(context, { chart: () => '', stat: (label) => `<${label}>`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '' });
-  assert.doesNotMatch(context.trafficSummary(old, 'model'), /First Token/);
-  assert.match(context.trafficSummary(total, 'model'), /<First Token>/);
-  // Reported without streamed output: shown as unknown.
-  assert.equal(context.sumTrafficViews([quiet]).firstTokenMs, null);
+  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
+  assert.equal(context.firstTokenStat({ firstTokenSamples: 2, firstTokenMs: 450 }, 'model'), '<First Token=450 ms>');
+  // A measured zero is valid; reported without streamed output is unknown.
+  assert.equal(context.firstTokenStat({ firstTokenSamples: 1, firstTokenMs: 0 }, 'model'), '<First Token=0 ms>');
+  assert.equal(context.firstTokenStat({ firstTokenSamples: 0, firstTokenMs: null }, 'model'), '<First Token=—>');
+  assert.equal(context.firstTokenStat({ forwardedFirstTokenSamples: 0, firstTokenMs: null }, 'model'), '<First Token=—>');
+  // Older devices do not report it: not shown at all, nor with All.
+  assert.equal(context.firstTokenStat({ firstTokenMs: null }, 'model'), '');
+  assert.equal(context.firstTokenStat({ firstTokenSamples: 2, firstTokenMs: 450 }, 'all'), '');
+  Object.assign(context, { chart: () => '', fmtBytes: String, modelTokenStats: () => '' });
+  assert.doesNotMatch(context.trafficSummary({ requests: 3, credentials: [] }, 'model'), /First Token/);
+  assert.match(context.trafficSummary({ requests: 3, firstTokenSamples: 2, firstTokenMs: 450, credentials: [] }, 'model'), /<First Token=450 ms>/);
 });
-test('Output TPS merges paired generation totals and renders unknown measurements', () => {
+test('Output TPS renders the backend rate and unknown measurements', () => {
   const context = setup('model');
   loadSharedViews(context);
   Object.assign(context, { ICON: { warning: '!' }, stat: (label, value) => `<stat>${label}=${value}</stat>` });
   vm.runInContext(source.slice(source.indexOf('function modelTokenStats('), source.indexOf('const SHARE_SERVICES')), context);
-  const view = (tokens, ms) => ({ outputTokens: 9999, latencyTotalMs: 99999,
-    outputTpsTokens: tokens, outputTpsDurationMs: ms,
-    credentials: [{ service: 'Codex', credential: 'work', outputTpsTokens: tokens, outputTpsDurationMs: ms }] });
-  const total = context.sumTrafficViews([view(100, 2000), view(300, 8000), view(undefined, undefined), view(0, 0)]);
-  assert.equal(total.outputTps, 40);
-  assert.equal(total.credentials[0].outputTps, 40);
+  const total = { outputTps: 40, credentials: [] };
   assert.match(context.outputTpsStat(total, 'model'), /Output TPS[^]*=40\.0 tok\/s/);
-  assert.match(context.outputTpsStat(total.credentials[0], 'model'), /Output TPS[^]*=40\.0 tok\/s/);
   assert.doesNotMatch(context.modelTokenStats(total, 'model'), /Output TPS/);
-  for (const unknown of [view(undefined, undefined), view(0, 0)]) {
-    const merged = context.sumTrafficViews([unknown]);
-    assert.equal(merged.outputTps, null);
-    assert.match(context.outputTpsStat(merged, 'model'), /Output TPS[^]*=—/);
-  }
+  for (const outputTps of [null, undefined, NaN]) assert.match(context.outputTpsStat({ outputTps }, 'model'), /Output TPS[^]*=—/);
   assert.equal(context.modelTokenStats(total, 'all'), '');
   assert.equal(context.outputTpsStat(total, 'all'), '');
 });
@@ -799,79 +783,24 @@ test('Output TPS replaces Received in the summary and account row, leaving four 
 test('Output TPS warning tooltip adds the total-duration rate without changing the main value', () => {
   const context = setup('model');
   context.stat = (label, value) => `${label}<value>${value}</value>`;
-  const stats = { outputTokens: 1000, latencyTotalMs: 20000, outputTps: 66.6 };
+  const stats = { outputTpsFromStart: 50, outputTps: 66.6 };
   const html = context.outputTpsStat(stats, 'model');
   assert.match(html, /^Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="tooltip-\d+" data-tip="From request start instead of the first token: 50\.0 tok\/s\."/);
   assert.match(html, /aria-label="From request start instead of the first token: 50\.0 tok\/s\."/);
   assert.match(html, />!<\/span><value>66\.6 tok\/s<\/value>$/);
-  for (const fields of [
-    { outputTokens: null }, { outputTokens: 0 }, { outputTokens: NaN }, { outputTokens: Infinity },
-    { latencyTotalMs: undefined }, { latencyTotalMs: 0 }, { latencyTotalMs: -1 }, { latencyTotalMs: Infinity },
-  ]) {
+  for (const fields of [{ outputTpsFromStart: null }, { outputTpsFromStart: undefined }, { outputTpsFromStart: NaN }, { outputTpsFromStart: Infinity }]) {
     const unknown = context.outputTpsStat({ ...stats, ...fields }, 'model');
     assert.match(unknown, /data-tip="From request start instead of the first token: —\."/);
     assert.match(unknown, /<value>66\.6 tok\/s<\/value>$/);
   }
-  loadSharedViews(context);
-  const merged = context.sumTrafficViews([
-    { outputTokens: 100, latencyTotalMs: 1000, outputTpsTokens: 99, outputTpsDurationMs: 500 },
-    { outputTokens: 300, latencyTotalMs: 9000, outputTpsTokens: 299, outputTpsDurationMs: 7500 },
-  ]);
+  const merged = { outputTpsFromStart: 40, outputTps: 49.75 };
   assert.match(context.outputTpsStat(merged, 'model'), /data-tip="From request start instead of the first token: 40\.0 tok\/s\."/);
-  assert.equal(merged.outputTps, 49.75);
   const keyOf = html => html.match(/data-tip-key="([^"]+)"/)[1];
   const identity = JSON.stringify(['account', 'local', 'Codex', 'private@example.test']);
   const first = context.outputTpsStat(stats, 'model', identity);
   assert.doesNotMatch(first, /private@example/);
   assert.equal(keyOf(first), keyOf(context.outputTpsStat(merged, 'model', identity)));
   assert.notEqual(keyOf(first), keyOf(context.outputTpsStat(stats, 'model', JSON.stringify(['account', 'remote', 'Codex', 'private@example.test']))));
-});
-test('Merged Traffic is exactly the sum of the device views', () => {
-  const context = setup('model');
-  loadSharedViews(context);
-  const stats = (requests, extra = {}) => ({ requests, errors: 1, bytes: requests * 10, latencyTotalMs: requests * 100, latencySamples: requests, cacheRead: 1, cachePrompt: 4,
-    counts: [requests, 0], errorCounts: [1, 0], tokenCounts: [0, requests], inputTokens: null, outputTokens: null, ...extra });
-  const local = { ...stats(3, { inputTokens: 30 }), targets: [{ name: 'target' }], credentials: [
-    { service: 'Codex', credential: 'shared', ...stats(2, { inputTokens: 20 }), sources: [{ name: 'old', reason: 'renamed' }] },
-    { service: 'Codex', credential: 'Unidentified', ...stats(1, { inputTokens: 10 }) },
-  ] };
-  const peer = { ...stats(5), credentials: [
-    { service: 'Codex', credential: 'Unidentified', ...stats(1) },
-    { service: 'Codex', credential: 'shared', ...stats(4) },
-  ] };
-  const total = context.sumTrafficViews([local, peer]);
-  assert.deepEqual(plain([total.requests, total.errors, total.bytes, total.counts, total.errorCounts, total.tokenCounts]), [8, 2, 80, [8, 0], [2, 0], [0, 8]]);
-  assert.equal(total.avgMs, 100);
-  assert.equal(total.cacheHitRate, 2 / 8);
-  // Usage reported by some devices counts; none reported stays unknown.
-  assert.equal(total.inputTokens, 30);
-  assert.equal(total.outputTokens, null);
-  // An account named alike on both devices is one account; Unidentified is one entry, last.
-  assert.deepEqual(plain(total.credentials.map((c) => [c.credential, c.requests, c.bytes])), [['shared', 6, 60], ['Unidentified', 2, 20]]);
-  assert.deepEqual(plain(total.credentials[0].sources), [{ name: 'old', reason: 'renamed' }]);
-  assert.deepEqual(plain(total.targets), [{ name: 'target' }]);
-  // The same views are not added again on the next render.
-  assert.equal(context.sumTrafficViews([local, peer]), total);
-  assert.notEqual(context.sumTrafficViews([local]), total);
-});
-test('Merged Traffic lines up parts read at different times by time, not index', () => {
-  const context = setup('all');
-  loadSharedViews(context);
-  const minute = 60_000;
-  const part = (counts) => ({ requests: counts.reduce((a, b) => a + b, 0), errors: 0, bytes: 0, counts, errorCounts: counts.map(() => 0), tokenCounts: counts.map(() => 0),
-    credentials: [{ service: 'Codex', credential: 'shared', requests: 1, counts, errorCounts: counts.map(() => 0), tokenCounts: counts.map(() => 0) }] });
-  // This device was read now; the peer at the last refresh, two minutes earlier.
-  const axis = { start: 10 * minute, end: 14 * minute, bucketMinutes: 1 };
-  const peerWindow = { windowStart: 8 * minute, windowEnd: 12 * minute, bucketMinutes: 1 };
-  const local = part([1, 1, 1, 1]);
-  const peer = part([10, 20, 30, 40]);
-  const total = context.sumTrafficViews([local, peer], [axis, peerWindow], axis);
-  // Peer minutes 10 and 11 land on the axis' first two bars; its older ones fall off,
-  // and the two recent minutes it has not reported yet stay as this device alone.
-  assert.deepEqual(plain(total.counts), [31, 41, 1, 1]);
-  assert.deepEqual(plain(total.credentials[0].counts), [31, 41, 1, 1]);
-  // Aligned windows add index by index, and a changed window is not served from cache.
-  assert.deepEqual(plain(context.sumTrafficViews([local, peer], [axis, axis], axis).counts), [11, 21, 31, 41]);
 });
 test('an unchanged view reuses its markup', () => {
   const context = setup('all');
@@ -1041,60 +970,11 @@ test('a recentered ring slides from where it was drawn to its new place', () => 
   assert.equal(moves.length, 0);
 });
 
-test('First Token displays the corrected number without a tooltip', () => {
-  const context = setup('model');
-  loadSharedViews(context);
-  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
-  const stats = { firstTokenTotalMs: 3000, firstTokenSamples: 1,
-    forwardedFirstTokenTotalMs: 3000, forwardedFirstTokenSamples: 1,
-    cooldownTotalMs: 120000, cooldownSamples: 1 };
-  const part = s => ({ ...s, credentials: [{ service: 'Antigravity', credential: 'work', ...s }] });
-  const total = context.sumTrafficViews([part(stats), part({ firstTokenTotalMs: 900, firstTokenSamples: 1 }), part({})]);
-  for (const view of [total, total.credentials[0]]) {
-    assert.equal(context.firstTokenStat(view, 'model'), '<First Token=1950 ms>');
-  }
-  assert.equal(context.firstTokenStat(context.sumTrafficViews([part(stats)]), 'model'), '<First Token=3000 ms>');
-  // Historic samples retain their weight beside corrected new samples.
-  assert.equal(total.firstTokenTotalMs, 3900);
-  assert.equal(total.firstTokenSamples, 2);
-  assert.equal(context.firstTokenStat({ firstTokenSamples: 0 }, 'model'), '<First Token=—>');
-  assert.equal(context.firstTokenStat(total, 'all'), '');
-});
-
-test('First Token preserves existing measurements without forwarding samples on summaries and accounts', () => {
-  const context = setup('model');
-  loadSharedViews(context);
-  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
-  const old = { firstTokenTotalMs: 1300, firstTokenSamples: 2 };
-  const part = s => ({ ...s, credentials: [{ service: 'Codex', credential: 'work', ...s }] });
-  const total = context.sumTrafficViews([part(old), part({ forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 0 })]);
-  for (const view of [total, total.credentials[0], { firstTokenMs: 650 }]) {
-    assert.equal(context.firstTokenStat(view, 'model'), '<First Token=650 ms>');
-  }
-  // A measured zero is valid; an absent measurement is not zero.
-  assert.equal(context.firstTokenStat({ firstTokenMs: 0 }, 'model'), '<First Token=0 ms>');
-  assert.equal(context.firstTokenStat({ ...old, forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 1 }, 'model'), '<First Token=650 ms>');
-  assert.equal(context.firstTokenStat({ firstTokenTotalMs: 0, firstTokenSamples: 1, forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 1 }, 'model'), '<First Token=0 ms>');
-});
-
-test('First Token keeps all 4358 successful samples when only 92 have forwarding timings', () => {
-  const context = setup('model');
-  loadSharedViews(context);
-  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
-  const part = (service, firstTokenTotalMs, firstTokenSamples, forwardedFirstTokenTotalMs, forwardedFirstTokenSamples) => {
-    const stats = { firstTokenTotalMs, firstTokenSamples, forwardedFirstTokenTotalMs, forwardedFirstTokenSamples };
-    return { ...stats, credentials: [{ service, credential: 'work', ...stats }] };
-  };
-  // Aggregate-only reproduction of the frozen 24-hour audit; no identities.
-  const total = context.sumTrafficViews([
-    part('Codex', 7533138, 1023, 709946, 92),
-    part('Antigravity', 16230735, 2763, 0, 0),
-    part('Claude', 958942, 393),
-    part('Grok', 616150, 179),
-  ]);
-  assert.equal(total.firstTokenTotalMs, 25338965);
-  assert.equal(total.firstTokenSamples, 4358);
-  assert.equal(total.forwardedFirstTokenSamples, 92);
-  assert.equal(context.firstTokenStat(total, 'model'), '<First Token=5814 ms>');
-  assert.equal(context.firstTokenStat(total.credentials.find(c => c.service === 'Codex'), 'model'), '<First Token=7363 ms>');
+test('Error rates say a little is not none and nearly all is not all', () => {
+  const { fmtErrorRate } = setup();
+  const rate = (errors, requests) => fmtErrorRate({ errors, requests, errorRate: requests ? errors / requests : null });
+  for (const [errors, requests, shown] of [
+    [0, 0, '—'], [0, 10, '0%'], [1, 2000, '<0.1%'], [1, 1000, '0.1%'], [23, 1000, '2.3%'],
+    [995, 10000, '10%'], [37, 100, '37%'], [9996, 10000, '>99%'], [10, 10, '100%'], [1, 1, '100%'],
+  ]) assert.equal(rate(errors, requests), shown, `${errors}/${requests}`);
 });

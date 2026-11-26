@@ -647,7 +647,7 @@ function chart(stats, scope, showPeak = false, window = stats) {
 /// that succeeded keeps the full row.
 function accountRow(c, scope, window, review = "", source = "local") {
   const identityKey = JSON.stringify(["account", source, c.service, c.credential]);
-  const rate = c.requests ? (100 * c.errors / c.requests).toFixed(1) + "%" : "—";
+  const rate = fmtErrorRate(c);
   const identity = `<span class="traffic-service">${serviceMark(c.service)}${esc(c.service)}</span><strong>${esc(maskAccountName(c.credential))}</strong>`;
   if (scope === "model" && c.credential === "Unidentified" && c.requests > 0 && c.errors >= c.requests) {
     const calls = `${c.requests.toLocaleString("en-US")} ${c.requests === 1 ? "call" : "calls"}`;
@@ -668,37 +668,42 @@ function tooltipScopeKey(key) {
   if (!keys.has(key)) keys.set(key, `tooltip-${keys.size}`);
   return keys.get(key);
 }
+/// Traffic metrics come derived from the backend; the panel only formats them.
+/// First Token shows wherever a device reports it, before any call streamed too.
 function firstTokenStat(stats, scope) {
-  if (scope !== "model" || (stats.firstTokenSamples == null && stats.forwardedFirstTokenSamples == null && !Number.isFinite(stats.firstTokenMs))) return "";
-  const average = (total, samples) => samples > 0 && Number.isFinite(total) ? Math.floor(total / samples) : null;
-  // The backend selects a timing per successful call, including historic
-  // samples. Never replace that population with its forwarded-only subset.
-  const first = average(stats.firstTokenTotalMs, stats.firstTokenSamples) ?? (Number.isFinite(stats.firstTokenMs) ? stats.firstTokenMs : null);
-  const forwarded = average(stats.forwardedFirstTokenTotalMs, stats.forwardedFirstTokenSamples);
-  return stat("First Token", fmtMs(first ?? forwarded));
+  if (scope !== "model" || (stats.firstTokenSamples == null && stats.forwardedFirstTokenSamples == null)) return "";
+  return stat("First Token", fmtMs(Number.isFinite(stats.firstTokenMs) ? stats.firstTokenMs : null));
 }
 function outputTpsStat(stats, scope, key = "output-tps") {
   if (scope !== "model") return "";
-  const average = Number.isFinite(stats.outputTokens) && stats.outputTokens > 0
-    && Number.isFinite(stats.latencyTotalMs) && stats.latencyTotalMs > 0
-    ? stats.outputTokens * 1000 / stats.latencyTotalMs : null;
-  const averageText = average == null || !Number.isFinite(average) ? "—" : average.toFixed(1) + " tok/s";
+  const average = stats.outputTpsFromStart;
+  const averageText = Number.isFinite(average) ? average.toFixed(1) + " tok/s" : "—";
   const tip = `From request start instead of the first token: ${averageText}.`;
   const label = `Output TPS<span class="info-tip stat-tip" tabindex="0" data-tip-key="${tooltipScopeKey(key)}" data-tip="${esc(tip)}" aria-label="${esc(tip)}">${ICON.warning}</span>`;
   const value = stats.outputTps == null || !Number.isFinite(stats.outputTps) ? "—" : stats.outputTps.toFixed(1) + " tok/s";
   return stat(label, value);
 }
+/// An error rate as every view shows it: a little is never 0% and nearly all
+/// is never 100%. Unknown without requests.
+function fmtErrorRate(stats) {
+  const rate = stats.errorRate;
+  if (!Number.isFinite(rate)) return "—";
+  if (stats.errors >= stats.requests) return "100%";
+  const percent = 100 * rate;
+  if (percent <= 0) return "0%";
+  if (percent < 0.1) return "<0.1%";
+  const tenth = Math.round(percent * 10) / 10;
+  if (tenth < 10) return `${tenth.toFixed(1)}%`;
+  const whole = Math.round(percent);
+  return whole >= 100 ? ">99%" : `${whole}%`;
+}
 function trafficSummary(view, scope, window = view, source = "") {
   const key = `${scope}|${window.start ?? window.windowStart}|${window.end ?? window.windowEnd}|${window.bucketMinutes}|${source}|${accountNamesMasked()}`;
   const cached = trafficMarkup.get(view);
   if (cached?.key === key) return cached.html;
-  let rate = "—";
-  let rateClass = "";
-  if (view.requests) {
-    const r = (view.errors / view.requests) * 100;
-    rate = `${r.toFixed(r > 0 && r < 10 ? 1 : 0)}%`;
-    rateClass = r >= 10 ? "bad" : "";
-  }
+  const rate = fmtErrorRate(view);
+  // Overall health turns red at a tenth of requests failing.
+  const rateClass = view.errorRate >= 0.1 ? "bad" : "";
   // Devices older than First Token do not report it, and then it is not shown.
   const html = `<div${source ? ` data-morph="summary:${esc(source)}"` : ""}>${trafficShare(view.credentials ?? [], scope, source)}${chart(view, scope, false, window)}
      <div class="strip">
@@ -712,75 +717,12 @@ function trafficSummary(view, scope, window = view, source = "") {
   return html;
 }
 
-const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "latencyTotalMs", "latencySamples"];
-const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
-/// Reported only by this version's logs and devices; older devices add nothing.
-const REPORTED_FIRST_TOKEN = ["firstTokenTotalMs", "firstTokenSamples", "forwardedFirstTokenTotalMs", "forwardedFirstTokenSamples", "cooldownTotalMs", "cooldownSamples"];
-const REPORTED_OUTPUT_TPS = ["outputTpsTokens", "outputTpsDurationMs"];
-function addTraffic(to, from, offset = 0, length = Infinity) {
-  for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
-  // Unreported usage stays unknown unless some part reported it.
-  for (const key of [...REPORTED_TOKENS, ...REPORTED_FIRST_TOKEN, ...REPORTED_OUTPUT_TPS]) if (from[key] != null) to[key] = (to[key] ?? 0) + from[key];
-  for (const key of ["counts", "errorCounts", "tokenCounts"]) {
-    const values = from[key] ?? [];
-    to[key] ||= Array(values.length).fill(0);
-    values.forEach((value, i) => {
-      const slot = i + offset;
-      if (slot >= 0 && slot < length) to[key][slot] = (to[key][slot] || 0) + value;
-    });
-  }
-}
-/// Where a part's first bucket lands on the axis. Parts read at different
-/// times cover different windows, so their bars line up by time, not index.
-function bucketOffset(window, axis) {
-  const start = (w) => w.start ?? w.windowStart;
-  if (!window || !axis || window === axis) return 0;
-  const offset = Math.round((start(window) - start(axis)) / (axis.bucketMinutes * 60_000));
-  return Number.isFinite(offset) ? offset : 0;
-}
-function finishTraffic(traffic) {
-  for (const key of REPORTED_TOKENS) traffic[key] ??= null;
-  traffic.avgMs = traffic.latencySamples ? Math.floor(traffic.latencyTotalMs / traffic.latencySamples) : null;
-  traffic.firstTokenMs = traffic.firstTokenSamples ? Math.floor(traffic.firstTokenTotalMs / traffic.firstTokenSamples) : null;
-  traffic.outputTps = traffic.outputTpsDurationMs > 0 && traffic.outputTpsTokens != null ? traffic.outputTpsTokens * 1000 / traffic.outputTpsDurationMs : null;
-  traffic.cacheHitRate = traffic.cachePrompt ? traffic.cacheRead / traffic.cachePrompt : null;
-  return traffic;
-}
-let lastTrafficSum = null;
-/// Merged Traffic is exactly the sum of the views its device cards show: an
-/// account with the same name on several devices is one account, and each
-/// service's Unidentified traffic is one entry. Bars add bucket by bucket on
-/// the axis window; an older part's missing recent buckets stay empty.
-function sumTrafficViews(views, windows = [], axis = null) {
-  const offsets = views.map((_, i) => bucketOffset(windows[i], axis));
-  const end = axis && (axis.end ?? axis.windowEnd);
-  const length = axis ? Math.ceil((end - (axis.start ?? axis.windowStart)) / (axis.bucketMinutes * 60_000)) : NaN;
-  const buckets = Number.isFinite(length) ? length : Infinity;
-  if (lastTrafficSum?.views.length === views.length && lastTrafficSum.buckets === buckets
-      && lastTrafficSum.views.every((view, i) => view === views[i] && lastTrafficSum.offsets[i] === offsets[i])) return lastTrafficSum.total;
-  const total = { counts: [], errorCounts: [], tokenCounts: [] };
-  const accounts = new Map();
-  views.forEach((view, i) => {
-    addTraffic(total, view, offsets[i], buckets);
-    for (const c of view.credentials ?? []) {
-      const key = `${c.service}\0${c.credential}`;
-      if (!accounts.has(key)) accounts.set(key, { service: c.service, credential: c.credential, sources: [], counts: [], errorCounts: [], tokenCounts: [] });
-      const account = accounts.get(key);
-      addTraffic(account, c, offsets[i], buckets);
-      account.sources.push(...(c.sources ?? []));
-    }
-  });
-  // As each device orders them: known accounts by received bytes, Unidentified last.
-  total.credentials = [...accounts.values()].map(finishTraffic)
-    .sort((a, b) => (a.credential === "Unidentified") - (b.credential === "Unidentified") || b.bytes - a.bytes);
-  total.targets = views.find((view) => view.targets?.length)?.targets ?? [];
-  finishTraffic(total);
-  lastTrafficSum = { views: [...views], offsets, buckets, total };
-  return total;
-}
-
 /// A view read within this long is reused by every page that shows it.
 const TRAFFIC_REUSE_MS = 15000;
+/// A Devices frame completed with this device's traffic within the shared reuse time.
+function trafficFrameFresh(frame) {
+  return !!frame?.local && Date.now() - (frame.loadedAt || 0) < TRAFFIC_REUSE_MS;
+}
 
 /// One read per view: a fresh view is reused and a read in flight is joined,
 /// so Home, Activity and Devices never read the same traffic twice.
@@ -2035,8 +1977,9 @@ async function loadMergedData(force = false, refreshRemote = false) {
     // Failed attempts count too, so an unreachable peer is not retried sooner.
     ui.deviceRemoteAttemptAt = Date.now();
   }
-  let completed = false;
+  let completed = false, completeSelected = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
+  const requestedKey = `${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`;
   try {
     const onUpdate = new Channel();
     onUpdate.onmessage = data => {
@@ -2044,6 +1987,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
       relabelDeviceViews(data, requestedDevices, ui.devices || []);
       ui.deviceTrafficViews ||= Object.create(null);
       for (const view of data) {
+        view.loadedAt = Date.now();
         const key = `${view.minutes}:${view.scope}`;
         if (!dropsShownPeers(view, ui.deviceTrafficViews[key])) ui.deviceTrafficViews[key] = view;
       }
@@ -2058,6 +2002,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
     });
     if (request !== ui.mergedDataRequest) return;
     if (Array.isArray(data)) {
+      for (const view of data) view.loadedAt = Date.now();
       relabelDeviceViews(data, requestedDevices, ui.devices || []);
       ui.deviceTrafficViews = Object.fromEntries(data.map(view => [`${view.minutes}:${view.scope}`, view]));
       selectDeviceTraffic();
@@ -2065,6 +2010,9 @@ async function loadMergedData(force = false, refreshRemote = false) {
     ui.mergedDataLatest = ui.mergedData || ui.deviceTrafficViews?.["30:model"] || ui.mergedDataLatest;
     if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
     ui.mergedDataError = ""; ui.mergedDataUpdating = false;
+    // A range chosen during a refresh gets its peers from it, and this device from a read now.
+    const key = `${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`;
+    completeSelected = refreshRemote && key !== requestedKey && !ui.deviceTrafficViews?.[key]?.local;
   } catch (e) {
     if (request === ui.mergedDataRequest) {
       // A cache read retries on its own; a refresh needs the user to press Refresh again.
@@ -2079,6 +2027,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
       ui.mergedDataLoading = ui.mergedDataRemote = false;
       if (ui.page === "devices" || ui.page === "settings") render();
       if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
+      if (completeSelected) loadMergedData(true);
     }
   }
 }
@@ -2100,16 +2049,11 @@ function mergedDataBlock() {
   let body = `<div class="devices-traffic-range">${range}</div>`;
   if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
   if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
-  const { local, cards, scope } = deviceCardViews();
-  const parts = [...(local ? [{ view: local, window: local }] : []), ...cards.values()];
-  // Peers still loading are added once they arrive; the sum so far stays visible.
-  if (!local || (!data && ui.mergedDataLoading)) body += `<div class="placeholder">Loading traffic…</div>`;
-  if (local) {
-    // The newest part sets the time axis; older parts show their delay in the last bars.
-    const end = (window) => window.end ?? window.windowEnd;
-    const window = parts.reduce((latest, part) => end(part.window) > end(latest) ? part.window : latest, local);
-    body += deviceTrafficContent(sumTrafficViews(parts.map((part) => part.view), parts.map((part) => part.window), window), scope, "merged", window);
-  }
+  // The backend adds every device once on the newest one's time axis; peers
+  // still loading are added once they arrive, and the sum so far stays visible.
+  const { merged, scope } = deviceCardViews();
+  if (!merged) body += `<div class="placeholder">Loading traffic…</div>`;
+  else body += deviceTrafficContent(merged, scope, "merged", merged);
   if (data) {
     for (const source of data.sources) {
       if (source.error === "TRAFFIC_UPDATING") body += `<div class="placeholder">${esc(source.name)}: Loading traffic…</div>`;
@@ -2210,7 +2154,8 @@ async function loadDevices(refreshRemote = false) {
     // refreshes the peers' views stay as they are, so they are not merged again.
     const due = refreshRemote || Date.now() - (ui.deviceRemoteAttemptAt || 0) >= DEVICE_REFRESH_MS;
     const remote = due && !(ui.mergedDataLoading && ui.mergedDataRemote);
-    const missing = !ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`];
+    // This device's traffic in the frame is reused as briefly as every page reuses it.
+    const missing = !trafficFrameFresh(ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`]);
     ui.deviceStartupRefreshDone = true;
     await Promise.all([local, loadDeviceCards(), (remote || missing) && loadMergedData(remote, remote)]);
 
@@ -2306,23 +2251,29 @@ function forwardingRestoreSettings() {
   return `<div class="row device-forwarding-row"><span class="row-label"${tip}>Restore on startup</span><button class="switch" role="switch" aria-checked="${!!ui.snap.forwardingRestore}" aria-label="Restore forwarding on startup"${tip} data-action="forwarding-restore" ${ui.forwardingRestoreBusy || !ui.snap.forwardingRestoreSupported ? "disabled" : ""}></button></div>` + (ui.snap.forwardingRestoreError ? message("warn", esc(ui.snap.forwardingRestoreError)) : "");
 }
 /// The views the Devices cards show for the selected range and category: this
-/// device's own, the forwarded device's from the daemon, other peers' from the
-/// last refresh. Each card and Merged Traffic use exactly these objects.
+/// device's own, the forwarded device's live view, other peers' from the last
+/// refresh. Until the backend completes the range's frame with this device
+/// (ADR-0001), its own and the forwarded device's shared views fill their
+/// cards and Merged Traffic waits.
 function deviceCardViews() {
   const minutes = ui.deviceTrafficMinutes || 30;
   const scope = ui.trafficScope || "model";
   const data = ui.mergedData?.minutes === minutes && ui.mergedData.scope === scope ? ui.mergedData : null;
-  const forwarded = ui.snap?.forwarding?.deviceId;
+  // A frame completed for this range carries this device and the forwarded
+  // device's live view beside the peers, and Merged Traffic is their sum.
+  const complete = !!data?.local;
+  const forwarded = complete ? data.forwarded?.device : ui.snap?.forwarding?.deviceId;
   const cards = new Map();
   for (const device of ui.devices) {
     const source = data?.sources.find((source) => source.name === device.name);
     // A device already counted via another entry gets no view, live or not.
     if (source?.exclusion === "duplicate") continue;
-    const live = device.id === forwarded && ui.forwardedTrafficViews?.[`${device.id}:${minutes}:${scope}`];
-    if (live?.device === device.id) { cards.set(device.id, { view: live, window: live }); continue; }
-    if (source?.traffic) cards.set(device.id, { view: source.traffic, window: data });
+    const live = device.id !== forwarded ? null : complete ? data.forwarded.traffic
+      : ui.forwardedTrafficViews?.[`${device.id}:${minutes}:${scope}`];
+    if (live && (complete || live.device === device.id)) { cards.set(device.id, { view: live, window: live }); continue; }
+    if (source?.traffic) cards.set(device.id, { view: source.traffic, window: source.traffic.end != null ? source.traffic : data });
   }
-  return { local: ui.localTrafficViews?.[`${minutes}:${scope}`], cards, scope };
+  return { local: complete ? data.local : ui.localTrafficViews?.[`${minutes}:${scope}`], cards, merged: complete ? data.traffic : null, scope };
 }
 function devicesPage() {
   const local = ui.snap.phase;
@@ -3351,10 +3302,12 @@ document.addEventListener("change", async (event) => {
       ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
     } else { setTrafficMinutes(Number(event.target.value)); }
     const cards = loadDeviceCards();
-    if (selectDeviceTraffic()) { render(); await cards; return; }
+    const shown = selectDeviceTraffic();
     // A remote refresh delivers every range when it completes. A cache read now
     // would supersede it and show peers as not refreshed, so wait for it instead.
-    if (ui.mergedDataLoading && ui.mergedDataRemote) { ui.mergedData = null; render(); await cards; return; }
+    if (ui.mergedDataLoading && ui.mergedDataRemote) { if (!shown) ui.mergedData = null; render(); await cards; return; }
+    if (shown && trafficFrameFresh(ui.mergedData)) { render(); await cards; return; }
+    // A cached frame shows at once while a read completes it with this device.
     const loading = loadMergedData(true); render(); await Promise.all([loading, cards]);
     return;
   }
