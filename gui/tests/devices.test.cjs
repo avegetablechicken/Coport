@@ -1198,8 +1198,8 @@ test('between refreshes the Devices timer reads no statistics for peers', async 
   // Peers' views stay as they are, and this device's fresh view is reused.
   assert.ok(!calls.includes('get_merged_data'));
   assert.ok(!calls.includes('get_traffic'));
-  // A frame older than the shared reuse time is completed again from the cache.
-  h.ui.deviceTrafficViews['30:model'].loadedAt -= 15000;
+  // A frame older than the Devices cadence is completed again from the cache.
+  h.ui.deviceTrafficViews['30:model'].loadedAt -= 30000;
   await h.loadDevices();
   assert.equal(calls.filter((command) => command === 'get_merged_data').length, 1);
   h.ui.deviceTrafficViews = frame();

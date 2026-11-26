@@ -872,9 +872,11 @@ async fn forwarded_summary() -> std::collections::BTreeMap<String, coport_gui::d
 }
 /// This device's and the forwarded device's traffic for the selected range,
 /// read beside the peers'. Each frame of that range carries them and Merged
-/// Traffic; a part arriving after the peers' last frame publishes it again.
+/// Traffic, so the range's frames wait until both were read; the peers' last
+/// frame by then is published as they arrive.
 #[derive(Default)]
 struct DeviceParts {
+    read: bool,
     local: Option<coport_gui::traffic_stats::View>,
     forwarded: Option<coport_gui::data_client::ForwardedTraffic>,
     last: Option<coport_gui::data_client::Merged>,
@@ -923,7 +925,15 @@ pub async fn get_merged_data(
             if let Some(view) = views.iter().find(|view| selected(view)) {
                 parts.last = Some(view.clone());
             }
-            complete(&mut views, &parts);
+            if parts.read {
+                complete(&mut views, &parts);
+            } else {
+                // A frame without this device would replace a completed one.
+                views.retain(|view| !selected(view));
+                if views.is_empty() {
+                    return Ok(());
+                }
+            }
         }
         send(views)
     };
@@ -941,6 +951,7 @@ pub async fn get_merged_data(
             forwarding_device_traffic(&state, minutes, scope),
         );
         let mut parts = parts.lock().unwrap();
+        parts.read = true;
         parts.local = local.ok();
         parts.forwarded = forwarded;
         drop(parts);

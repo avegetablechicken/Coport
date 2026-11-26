@@ -719,10 +719,12 @@ function trafficSummary(view, scope, window = view, source = "") {
 
 /// A view read within this long is reused by every page that shows it.
 const TRAFFIC_REUSE_MS = 15000;
-/// A Devices frame completed with this device's traffic within the shared reuse time.
+/// A Devices frame completed with this device's traffic, read within the
+/// Devices cadence; a Devices visit reads it again only after that.
 function trafficFrameFresh(frame) {
-  return !!frame?.local && Date.now() - (frame.loadedAt || 0) < TRAFFIC_REUSE_MS;
+  return !!frame?.local && Date.now() - (frame.loadedAt || 0) < DEVICE_FRAME_MS;
 }
+const DEVICE_FRAME_MS = 30000;
 
 /// One read per view: a fresh view is reused and a read in flight is joined,
 /// so Home, Activity and Devices never read the same traffic twice.
