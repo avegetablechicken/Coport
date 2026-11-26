@@ -2631,7 +2631,7 @@ mod tests {
         let credentials = view["credentials"].as_array().unwrap();
         assert_eq!(credentials.len(), 1);
         assert_eq!(credentials[0]["credential"], "Known local account");
-        assert_eq!(view["summary"]["requests"], 1);
+        assert_eq!(view["requests"], 1);
     }
     #[test]
     fn credential_order_matches_activity_traffic_with_unknown_accounts_last() {
@@ -2943,8 +2943,8 @@ mod tests {
         assert!(result.sources[0].included, "{:?}", result.sources[0].error);
         assert_eq!(result.bucket_minutes, 15);
         let local = local_traffic(&config_for_views, &log, &labels_for_views, 360);
-        assert_eq!(local["summary"]["counts"].as_array().unwrap().len(), 24);
-        assert_eq!(local["summary"]["requests"], 1);
+        assert_eq!(local["counts"].as_array().unwrap().len(), 24);
+        assert_eq!(local["requests"], 1);
         let remote = result.sources[0].traffic.as_ref().unwrap();
         assert_eq!(remote.stats.requests, 1);
         assert_eq!(remote.avg_ms, Some(200));
@@ -2983,7 +2983,7 @@ mod tests {
         }).to_string() + "\n").unwrap();
         // This device's card carries the review that Merged Traffic keeps.
         let value = local_traffic(&config, &log, &BTreeMap::new(), 30);
-        assert_eq!(value["summary"]["requests"], 1);
+        assert_eq!(value["requests"], 1);
         assert_eq!(value["credentials"][0]["credential"], "myServer");
         assert_eq!(value["credentials"][0]["sources"][0]["name"], "api");
         assert_eq!(value["credentials"][0]["sources"][0]["reason"], "renamed");

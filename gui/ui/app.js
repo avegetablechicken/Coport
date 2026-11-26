@@ -809,10 +809,9 @@ function resetTrafficViews() {
   ui.forwardedTrafficLoads = Object.create(null);
 }
 
+/// This device's traffic is one flat view: its window, totals and metrics.
 function localTrafficView(traffic, scope) {
-  return {
-    ...traffic.summary, start: traffic.start, end: traffic.end, bucketMinutes: traffic.bucketMinutes, credentials: traffic.credentials, targets: traffic.targets, scope,
-  };
+  return { ...traffic, scope };
 }
 
 /// This device's traffic, as Home, Activity and This Device show it.

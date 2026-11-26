@@ -111,6 +111,17 @@ pub struct Target {
     base: String,
     label: String,
 }
+#[cfg(test)]
+impl Target {
+    pub fn named(name: &str) -> Self {
+        Self {
+            service: "Codex".into(),
+            name: name.into(),
+            base: String::new(),
+            label: name.into(),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Identities {

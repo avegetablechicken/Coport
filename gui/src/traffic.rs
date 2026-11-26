@@ -1,6 +1,7 @@
 //! Activity traffic is read from retained logs, independently of the capped UI list.
 use crate::logs::Entry;
-use crate::traffic_identity::{Identities, Reason, Resolution, Source, Target, UNIDENTIFIED};
+use crate::traffic_identity::{Identities, Reason, Resolution, Source, UNIDENTIFIED};
+use crate::traffic_stats::count;
 use chrono::{DateTime, Local};
 use coport::routing::Service;
 use serde::{Deserialize, Serialize};
@@ -625,19 +626,6 @@ fn summarize_file(
     }))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Traffic {
-    scope: TrafficScope,
-    start: i64,
-    end: i64,
-    bucket_minutes: u64,
-    credentials: Vec<CredentialTraffic>,
-    summary: CredentialTraffic,
-    /// Current configurations that historical traffic can be assigned to.
-    targets: Vec<Target>,
-}
-
 /// Logged configuration identity counted in a group without an exact match.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -648,53 +636,39 @@ pub struct SourceTraffic {
     reason: Option<Reason>,
     requests: u64,
 }
+#[cfg(test)]
+impl SourceTraffic {
+    pub fn new(name: &str, base: Option<String>, reason: Option<Reason>, requests: u64) -> Self {
+        Self {
+            name: name.into(),
+            base,
+            reason,
+            requests,
+        }
+    }
+}
 
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialTraffic {
-    service: String,
+/// One account's totals while a window is counted.
+struct CredentialTraffic {
+    service: Service,
     credential: String,
-    requests: u64,
-    errors: u64,
-    bytes: u64,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cached_input_tokens: Option<u64>,
-    /// Claude only: reported input without cache reads or writes.
-    uncached_input_tokens: Option<u64>,
-    /// Claude only: input written to the prompt cache.
-    cache_write_tokens: Option<u64>,
-    cache_hit_rate: Option<f64>,
-    avg_ms: Option<u64>,
-    /// Average time to first streamed output, over successful model calls
-    /// that streamed any.
-    first_token_ms: Option<u64>,
-    output_tps: Option<f64>,
-    output_tps_tokens: u64,
-    output_tps_duration_ms: u64,
-    counts: Vec<u64>,
-    error_counts: Vec<u64>,
-    /// Reported input plus output tokens per bucket; calls without usage add nothing.
-    token_counts: Vec<u64>,
-    sources: Vec<SourceTraffic>,
-    #[serde(skip)]
+    stats: crate::data_api::Stats,
     source_counts: BTreeMap<Source, (Option<Reason>, u64)>,
-    /// Raw totals under the names `data_api::Stats` uses, so views from this
-    /// device and from peers add up exactly.
-    #[serde(rename = "latencyTotalMs")]
-    latency_total: u64,
-    #[serde(rename = "latencySamples")]
-    latency_count: u64,
-    #[serde(rename = "firstTokenTotalMs")]
-    first_token_total: u64,
-    #[serde(rename = "firstTokenSamples")]
-    first_token_count: u64,
-    forwarded_first_token_total_ms: u64,
-    forwarded_first_token_samples: u64,
-    cooldown_total_ms: u64,
-    cooldown_samples: u64,
-    cache_read: u64,
-    cache_prompt: u64,
+}
+impl CredentialTraffic {
+    fn into_account(self) -> crate::traffic_stats::Account {
+        let sources = self
+            .source_counts
+            .into_iter()
+            .map(|(source, (reason, requests))| SourceTraffic {
+                name: source.name,
+                base: source.base,
+                reason,
+                requests,
+            })
+            .collect();
+        crate::traffic_stats::Account::new(self.service, self.credential, sources, self.stats)
+    }
 }
 
 pub fn read(
@@ -703,7 +677,7 @@ pub fn read(
     labels: &BTreeMap<(String, String), String>,
     scope: TrafficScope,
     identities: &Identities,
-) -> Result<Traffic, String> {
+) -> Result<crate::traffic_stats::View, String> {
     read_at(
         ReadSource::Path(path),
         minutes,
@@ -720,7 +694,7 @@ fn read_at(
     scope: TrafficScope,
     identities: &Identities,
     end: i64,
-) -> Result<Traffic, String> {
+) -> Result<crate::traffic_stats::View, String> {
     let bucket_minutes = match minutes {
         30 => 1,
         360 => 15,
@@ -730,7 +704,6 @@ fn read_at(
         43200 => 1440,
         _ => return Err("Unsupported traffic range".into()),
     };
-    let bucket_count = (minutes / bucket_minutes) as usize;
     let start = end - minutes as i64 * 60_000;
     let mut groups = BTreeMap::new();
     let mut labels = labels.clone();
@@ -752,84 +725,19 @@ fn read_at(
             resolved,
         );
     }
-    let mut summary = CredentialTraffic {
-        counts: vec![0; bucket_count],
-        error_counts: vec![0; bucket_count],
-        token_counts: vec![0; bucket_count],
-        ..Default::default()
-    };
-    for group in groups.values() {
-        summary.requests += group.requests;
-        summary.errors += group.errors;
-        summary.bytes += group.bytes;
-        add_tokens(&mut summary.input_tokens, group.input_tokens);
-        add_tokens(&mut summary.output_tokens, group.output_tokens);
-        add_tokens(&mut summary.cached_input_tokens, group.cached_input_tokens);
-        summary.latency_total += group.latency_total;
-        summary.latency_count += group.latency_count;
-        summary.first_token_total += group.first_token_total;
-        summary.first_token_count += group.first_token_count;
-        summary.forwarded_first_token_total_ms += group.forwarded_first_token_total_ms;
-        summary.forwarded_first_token_samples += group.forwarded_first_token_samples;
-        summary.cooldown_total_ms += group.cooldown_total_ms;
-        summary.cooldown_samples += group.cooldown_samples;
-        summary.output_tps_tokens = summary
-            .output_tps_tokens
-            .saturating_add(group.output_tps_tokens);
-        summary.output_tps_duration_ms = summary
-            .output_tps_duration_ms
-            .saturating_add(group.output_tps_duration_ms);
-        summary.cache_read += group.cache_read;
-        summary.cache_prompt += group.cache_prompt;
-        for i in 0..bucket_count {
-            summary.counts[i] += group.counts[i];
-            summary.error_counts[i] += group.error_counts[i];
-            summary.token_counts[i] += group.token_counts[i];
-        }
-    }
-    summary.avg_ms =
-        (summary.latency_count > 0).then(|| summary.latency_total / summary.latency_count);
-    summary.first_token_ms = (summary.first_token_count > 0)
-        .then(|| summary.first_token_total / summary.first_token_count);
-    summary.cache_hit_rate = summary.hit_rate();
-    summary.output_tps = crate::data_api::output_tps(
-        Some(summary.output_tps_tokens),
-        Some(summary.output_tps_duration_ms),
-    );
-    let mut credentials: Vec<_> = groups.into_values().collect();
-    for group in &mut credentials {
-        group.cache_hit_rate = group.hit_rate();
-        group.sources = std::mem::take(&mut group.source_counts)
-            .into_iter()
-            .map(|(source, (reason, requests))| SourceTraffic {
-                name: source.name,
-                base: source.base,
-                reason,
-                requests,
-            })
-            .collect();
-    }
-    credentials.sort_by_key(|group| {
-        (
-            group.credential == UNIDENTIFIED,
-            std::cmp::Reverse(group.bytes),
-        )
-    });
-    Ok(Traffic {
+    Ok(crate::traffic_stats::View::counted_here(
         scope,
-        start,
-        end,
-        bucket_minutes,
-        credentials,
-        summary,
-        targets: identities.targets(),
-    })
-}
-
-impl CredentialTraffic {
-    fn hit_rate(&self) -> Option<f64> {
-        (self.cache_prompt > 0).then(|| self.cache_read as f64 / self.cache_prompt as f64)
-    }
+        crate::traffic_stats::Window {
+            start,
+            end,
+            bucket_minutes,
+        },
+        groups
+            .into_values()
+            .map(CredentialTraffic::into_account)
+            .collect(),
+        identities.targets(),
+    ))
 }
 
 fn add_tokens(total: &mut Option<u64>, value: Option<u64>) {
@@ -901,19 +809,18 @@ fn aggregate(
     let source = resolved.and_then(|r| r.source);
     let bucket_count = ((end - start) as u64).div_ceil(bucket_minutes * 60_000) as usize;
     let claude = service == Service::Claude;
-    let group = groups
+    let traffic = groups
         .entry((service, credential.clone()))
         .or_insert_with(|| CredentialTraffic {
-            service: service.label().to_owned(),
+            service,
             credential,
-            counts: vec![0; bucket_count],
-            error_counts: vec![0; bucket_count],
-            token_counts: vec![0; bucket_count],
-            ..Default::default()
+            stats: crate::traffic_stats::empty(bucket_count),
+            source_counts: BTreeMap::new(),
         });
     if let Some((source, reason)) = source {
-        group.source_counts.entry(source).or_insert((reason, 0)).1 += 1;
+        traffic.source_counts.entry(source).or_insert((reason, 0)).1 += 1;
     }
+    let group = &mut traffic.stats;
     let slot = ((time - start) / (bucket_minutes as i64 * 60_000)) as usize;
     group.counts[slot] += 1;
     group.requests += 1;
@@ -962,9 +869,8 @@ fn aggregate(
         .duration_ms()
         .filter(|_| e.get("method") != Some("CONNECT"))
     {
-        group.latency_total += ms;
-        group.latency_count += 1;
-        group.avg_ms = Some(group.latency_total / group.latency_count);
+        group.latency_total_ms += ms;
+        group.latency_samples += 1;
     }
     // Output before cancellation/failure is still logged, but only completed
     // successful calls contribute to first-token and cooldown averages.
@@ -977,20 +883,16 @@ fn aggregate(
     if let Some(ms) = token("first_token_ms").filter(|_| successful_call) {
         // Select a timing for each call before adding it. Choosing a whole
         // forwarded-only aggregate would silently discard historic samples.
-        group.first_token_total = group
-            .first_token_total
-            .saturating_add(forwarded.unwrap_or(ms));
-        group.first_token_count += 1;
-        group.first_token_ms = Some(group.first_token_total / group.first_token_count);
+        count(&mut group.first_token_total_ms, forwarded.unwrap_or(ms));
+        count(&mut group.first_token_samples, 1);
     }
     if let Some(ms) = forwarded.filter(|_| successful_call) {
-        group.forwarded_first_token_total_ms =
-            group.forwarded_first_token_total_ms.saturating_add(ms);
-        group.forwarded_first_token_samples += 1;
+        count(&mut group.forwarded_first_token_total_ms, ms);
+        count(&mut group.forwarded_first_token_samples, 1);
     }
     if let Some(ms) = token("location_cooldown_actual_ms").filter(|_| successful_call) {
-        group.cooldown_total_ms = group.cooldown_total_ms.saturating_add(ms);
-        group.cooldown_samples += 1;
+        count(&mut group.cooldown_total_ms, ms);
+        count(&mut group.cooldown_samples, 1);
     }
     // Use paired measurements, never divide all usage by timings from only
     // some calls. Active, failed and non-streaming calls have no output rate.
@@ -1004,12 +906,8 @@ fn aggregate(
     {
         // The first token precedes the measured interval. Request completion
         // approximates the last token, so this includes any stream tail delay.
-        group.output_tps_tokens = group.output_tps_tokens.saturating_add(output - 1);
-        group.output_tps_duration_ms = group.output_tps_duration_ms.saturating_add(duration);
-        group.output_tps = crate::data_api::output_tps(
-            Some(group.output_tps_tokens),
-            Some(group.output_tps_duration_ms),
-        );
+        count(&mut group.output_tps_tokens, output - 1);
+        count(&mut group.output_tps_duration_ms, duration);
     }
 }
 
@@ -1399,37 +1297,10 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
                     .remove(&(service, g.credential.clone()))
                     .filter(|refs| refs.len() == 1)
                     .and_then(|refs| refs.into_iter().next().flatten()),
-                stats: coport_gui::data_api::Stats {
-                    requests: g.requests,
-                    errors: g.errors,
-                    bytes: g.bytes,
-                    input_tokens: g.input_tokens,
-                    output_tokens: g.output_tokens,
-                    cached_input_tokens: g.cached_input_tokens,
-                    uncached_input_tokens: g.uncached_input_tokens,
-                    cache_write_tokens: g.cache_write_tokens,
-                    cache_read: g.cache_read,
-                    cache_prompt: g.cache_prompt,
-                    latency_total_ms: g.latency_total,
-                    latency_samples: g.latency_count,
-                    first_token_total_ms: (scope == TrafficScope::Model)
-                        .then_some(g.first_token_total),
-                    first_token_samples: (scope == TrafficScope::Model)
-                        .then_some(g.first_token_count),
-                    forwarded_first_token_total_ms: (scope == TrafficScope::Model)
-                        .then_some(g.forwarded_first_token_total_ms),
-                    forwarded_first_token_samples: (scope == TrafficScope::Model)
-                        .then_some(g.forwarded_first_token_samples),
-                    cooldown_total_ms: (scope == TrafficScope::Model)
-                        .then_some(g.cooldown_total_ms),
-                    cooldown_samples: (scope == TrafficScope::Model).then_some(g.cooldown_samples),
-                    output_tps_tokens: (scope == TrafficScope::Model)
-                        .then_some(g.output_tps_tokens),
-                    output_tps_duration_ms: (scope == TrafficScope::Model)
-                        .then_some(g.output_tps_duration_ms),
-                    counts: g.counts,
-                    error_counts: g.error_counts,
-                    token_counts: g.token_counts,
+                stats: {
+                    let mut stats = g.stats;
+                    crate::traffic_stats::reported(&mut stats, scope);
+                    stats
                 },
             }
         })
@@ -1653,38 +1524,10 @@ mod tests {
                         .remove(&(service, g.credential.clone()))
                         .filter(|refs| refs.len() == 1)
                         .and_then(|refs| refs.into_iter().next().flatten()),
-                    stats: coport_gui::data_api::Stats {
-                        requests: g.requests,
-                        errors: g.errors,
-                        bytes: g.bytes,
-                        input_tokens: g.input_tokens,
-                        output_tokens: g.output_tokens,
-                        cached_input_tokens: g.cached_input_tokens,
-                        uncached_input_tokens: g.uncached_input_tokens,
-                        cache_write_tokens: g.cache_write_tokens,
-                        cache_read: g.cache_read,
-                        cache_prompt: g.cache_prompt,
-                        latency_total_ms: g.latency_total,
-                        latency_samples: g.latency_count,
-                        first_token_total_ms: (scope == TrafficScope::Model)
-                            .then_some(g.first_token_total),
-                        first_token_samples: (scope == TrafficScope::Model)
-                            .then_some(g.first_token_count),
-                        forwarded_first_token_total_ms: (scope == TrafficScope::Model)
-                            .then_some(g.forwarded_first_token_total_ms),
-                        forwarded_first_token_samples: (scope == TrafficScope::Model)
-                            .then_some(g.forwarded_first_token_samples),
-                        cooldown_total_ms: (scope == TrafficScope::Model)
-                            .then_some(g.cooldown_total_ms),
-                        cooldown_samples: (scope == TrafficScope::Model)
-                            .then_some(g.cooldown_samples),
-                        output_tps_tokens: (scope == TrafficScope::Model)
-                            .then_some(g.output_tps_tokens),
-                        output_tps_duration_ms: (scope == TrafficScope::Model)
-                            .then_some(g.output_tps_duration_ms),
-                        counts: g.counts,
-                        error_counts: g.error_counts,
-                        token_counts: g.token_counts,
+                    stats: {
+                        let mut stats = g.stats;
+                        crate::traffic_stats::reported(&mut stats, scope);
+                        stats
                     },
                 }
             })
@@ -1938,7 +1781,7 @@ mod tests {
                                 .unwrap();
                                 if scope == TrafficScope::Model && minutes == 30 {
                                     assert_eq!(
-                                        result.summary.input_tokens,
+                                        result.stats.input_tokens,
                                         Some(requests as u64 * 10)
                                     );
                                 }
@@ -2107,9 +1950,9 @@ mod tests {
         assert_eq!(actual, expected);
         eprintln!("6000 lifecycle rows: separate={separate_time:?}, batched={batch_time:?}");
         // Finished lifecycle information after a boundary must stay excluded.
-        assert_eq!(actual[0]["summary"]["inputTokens"], 30000);
-        assert_eq!(actual[2]["summary"]["inputTokens"], 20000);
-        assert_eq!(actual[4]["summary"]["inputTokens"], 10000);
+        assert_eq!(actual[0]["inputTokens"], 30000);
+        assert_eq!(actual[2]["inputTokens"], 20000);
+        assert_eq!(actual[4]["inputTokens"], 10000);
     }
 
     #[test]
@@ -2145,7 +1988,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             1
         );
@@ -2160,7 +2003,7 @@ mod tests {
             next_end,
         )
         .unwrap()
-        .summary
+        .stats
         .requests;
         assert_eq!(
             count, 2,
@@ -2177,7 +2020,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             1
         );
@@ -2192,7 +2035,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             1
         );
@@ -2248,7 +2091,7 @@ mod tests {
             end,
         )
         .unwrap();
-        assert_eq!(frozen.summary.requests, 1);
+        assert_eq!(frozen.stats.requests, 1);
         let fresh = Snapshot::load(&path, end).unwrap();
         assert_eq!(
             read_at(
@@ -2260,7 +2103,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             2
         );
@@ -2277,7 +2120,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             3
         );
@@ -2293,7 +2136,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             2
         );
@@ -2376,8 +2219,8 @@ mod tests {
             let labels = configured(&["myServer"]);
             for scope in [TrafficScope::All, TrafficScope::Model] {
                 let traffic = super::read(&path, 30, &labels, scope, &identities).unwrap();
-                assert_eq!(traffic.summary.requests, 10);
-                assert_eq!(traffic.summary.bytes, 100);
+                assert_eq!(traffic.stats.requests, 10);
+                assert_eq!(traffic.stats.bytes, 100);
                 assert_eq!(traffic.credentials.len(), 4);
                 assert_eq!(traffic.targets.len(), 4);
                 use Reason::*;
@@ -2426,10 +2269,10 @@ mod tests {
                     let group = traffic
                         .credentials
                         .iter()
-                        .find(|g| g.service == service && g.credential == label)
+                        .find(|g| g.service.label() == service && g.credential == label)
                         .unwrap();
-                    assert_eq!(group.requests, count);
-                    assert_eq!(group.counts.iter().sum::<u64>(), count);
+                    assert_eq!(group.stats.requests, count);
+                    assert_eq!(group.stats.counts.iter().sum::<u64>(), count);
                     assert_eq!(logged_sources(group), sources);
                 }
             }
@@ -2441,7 +2284,7 @@ mod tests {
                 &Default::default(),
             )
             .unwrap();
-            assert_eq!(unknown.summary.requests, 10);
+            assert_eq!(unknown.stats.requests, 10);
             assert!(
                 unknown
                     .credentials
@@ -2453,7 +2296,9 @@ mod tests {
         }
     }
 
-    fn logged_sources(group: &CredentialTraffic) -> Vec<(&str, Option<&str>, Option<Reason>)> {
+    fn logged_sources(
+        group: &crate::traffic_stats::Account,
+    ) -> Vec<(&str, Option<&str>, Option<Reason>)> {
         group
             .sources
             .iter()
@@ -2553,7 +2398,7 @@ mod tests {
             &config,
             &key,
             ExportOptions {
-                end: traffic.end,
+                end: traffic.window.end,
                 minutes: 30,
                 scope: TrafficScope::All,
                 limit: 24,
@@ -2565,16 +2410,16 @@ mod tests {
         for local in &traffic.credentials {
             let reference = key.reference(
                 "upstream",
-                &format!("{}\0{}", local.service, local.credential),
+                &format!("{}\0{}", local.service.label(), local.credential),
             );
             let remote = exported
                 .iter()
                 .find(|g| g.upstream_ref == reference)
                 .unwrap();
-            assert_eq!(remote.stats.requests, local.requests);
-            assert_eq!(remote.stats.bytes, local.bytes);
-            assert_eq!(remote.stats.counts, local.counts);
-            assert_eq!(remote.stats.token_counts, local.token_counts);
+            assert_eq!(remote.stats.requests, local.stats.requests);
+            assert_eq!(remote.stats.bytes, local.stats.bytes);
+            assert_eq!(remote.stats.counts, local.stats.counts);
+            assert_eq!(remote.stats.token_counts, local.stats.token_counts);
         }
     }
 
@@ -2590,7 +2435,7 @@ mod tests {
         minutes: u64,
         labels: &BTreeMap<(String, String), String>,
         scope: TrafficScope,
-    ) -> Result<Traffic, String> {
+    ) -> Result<crate::traffic_stats::View, String> {
         super::read(path, minutes, labels, scope, &Default::default())
     }
 
@@ -2627,18 +2472,18 @@ mod tests {
             TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(model.summary.requests, 5);
-        assert_eq!(model.summary.errors, 1);
-        assert_eq!(model.summary.bytes, 100);
-        assert_eq!(model.summary.input_tokens, Some(10));
-        assert_eq!(model.summary.counts.iter().sum::<u64>(), 5);
+        assert_eq!(model.stats.requests, 5);
+        assert_eq!(model.stats.errors, 1);
+        assert_eq!(model.stats.bytes, 100);
+        assert_eq!(model.stats.input_tokens, Some(10));
+        assert_eq!(model.stats.counts.iter().sum::<u64>(), 5);
         let old = model
             .credentials
             .iter()
             .filter(|c| c.credential == "old")
             .collect::<Vec<_>>();
-        assert_eq!(old.iter().map(|c| c.requests).sum::<u64>(), 4);
-        assert!(old.iter().all(|c| c.input_tokens.is_none()));
+        assert_eq!(old.iter().map(|c| c.stats.requests).sum::<u64>(), 4);
+        assert!(old.iter().all(|c| c.stats.input_tokens.is_none()));
     }
 
     #[test]
@@ -2764,21 +2609,21 @@ mod tests {
             .iter()
             .map(|c| {
                 (
-                    c.service.as_str(),
+                    c.service.label(),
                     c.credential.as_str(),
-                    c.requests,
-                    c.avg_ms,
+                    c.stats.requests,
+                    c.metrics.avg_ms,
                 )
             })
             .collect();
         // The CONNECT and its first request share the account; a tunnel's
         // duration never enters the latency.
         assert_eq!(groups, [("Codex", "acct@example.invalid", 2, Some(100))]);
-        assert_eq!(all.summary.requests, 2);
+        assert_eq!(all.stats.requests, 2);
         assert_eq!(
             read(&path, 30, &labels, TrafficScope::Model)
                 .unwrap()
-                .summary
+                .stats
                 .requests,
             0
         );
@@ -2827,9 +2672,11 @@ mod tests {
             let traffic = read(&path, 30, &BTreeMap::new(), scope).unwrap();
             let mut services = BTreeMap::new();
             for credential in &traffic.credentials {
-                *services.entry(credential.service.clone()).or_insert(0) += credential.requests;
+                *services
+                    .entry(credential.service.label().to_owned())
+                    .or_insert(0) += credential.stats.requests;
             }
-            assert_eq!(traffic.summary.requests, services.values().sum::<u64>());
+            assert_eq!(traffic.stats.requests, services.values().sum::<u64>());
             services
         };
         assert_eq!(
@@ -2860,14 +2707,14 @@ mod tests {
         assert_eq!(
             read(&path, 30, &BTreeMap::new(), TrafficScope::Model)
                 .unwrap()
-                .summary
+                .stats
                 .requests,
             1
         );
         assert_eq!(
             read(&path, 30, &BTreeMap::new(), TrafficScope::All)
                 .unwrap()
-                .summary
+                .stats
                 .requests,
             2
         );
@@ -2900,14 +2747,14 @@ mod tests {
         std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
         let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
         let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
-        assert_eq!(all.summary.requests, 3);
-        assert_eq!(model.summary.requests, 3);
-        assert_eq!(model.summary.errors, 1);
-        assert_eq!(model.summary.input_tokens, Some(30));
-        assert_eq!(model.summary.output_tokens, Some(15));
-        assert_eq!(model.summary.token_counts.iter().sum::<u64>(), 45);
-        assert_eq!(model.summary.cached_input_tokens, Some(6));
-        assert_eq!(model.summary.cache_hit_rate, Some(0.2));
+        assert_eq!(all.stats.requests, 3);
+        assert_eq!(model.stats.requests, 3);
+        assert_eq!(model.stats.errors, 1);
+        assert_eq!(model.stats.input_tokens, Some(30));
+        assert_eq!(model.stats.output_tokens, Some(15));
+        assert_eq!(model.stats.token_counts.iter().sum::<u64>(), 45);
+        assert_eq!(model.stats.cached_input_tokens, Some(6));
+        assert_eq!(model.metrics.cache_hit_rate, Some(0.2));
         assert_eq!(model.credentials.len(), 1);
     }
 
@@ -3022,15 +2869,16 @@ mod tests {
             for _ in 0..2 {
                 let traffic =
                     read(&path, 30, &configured(&["a", "b"]), TrafficScope::Model).unwrap();
-                assert_eq!(traffic.summary.output_tps_tokens, 400);
-                assert_eq!(traffic.summary.output_tps_duration_ms, 10_000);
-                assert_eq!(traffic.summary.output_tps, Some(40.0));
+                assert_eq!(traffic.stats.output_tps_tokens, Some(400));
+                assert_eq!(traffic.stats.output_tps_duration_ms, Some(10_000));
+                assert_eq!(traffic.metrics.output_tps, Some(40.0));
                 assert_eq!(
                     traffic
                         .credentials
                         .iter()
                         .find(|c| c.credential == "a")
                         .unwrap()
+                        .metrics
                         .output_tps,
                     Some(50.0)
                 );
@@ -3046,7 +2894,7 @@ mod tests {
                     &config,
                     &key,
                     ExportOptions {
-                        end: traffic.end,
+                        end: traffic.window.end,
                         minutes: 30,
                         scope: TrafficScope::Model,
                         limit: 24,
@@ -3083,7 +2931,7 @@ mod tests {
             assert_eq!(
                 read(&path, 30, &BTreeMap::new(), TrafficScope::Model)
                     .unwrap()
-                    .summary
+                    .metrics
                     .output_tps,
                 None
             );
@@ -3126,15 +2974,21 @@ mod tests {
             std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
             for _ in 0..2 {
                 let traffic = read(&path, 30, &configured(&["work"]), TrafficScope::Model).unwrap();
-                for stats in [&traffic.summary, &traffic.credentials[0]] {
+                for (stats, metrics) in [
+                    (&traffic.stats, &traffic.metrics),
+                    (
+                        &traffic.credentials[0].stats,
+                        &traffic.credentials[0].metrics,
+                    ),
+                ] {
                     assert_eq!(stats.requests, 10);
-                    assert_eq!(stats.first_token_count, 2);
-                    assert_eq!(stats.first_token_total, 3900);
-                    assert_eq!(stats.first_token_ms, Some(1950));
-                    assert_eq!(stats.forwarded_first_token_samples, 1);
-                    assert_eq!(stats.forwarded_first_token_total_ms, 3000);
-                    assert_eq!(stats.cooldown_samples, 1);
-                    assert_eq!(stats.cooldown_total_ms, 120000);
+                    assert_eq!(stats.first_token_samples, Some(2));
+                    assert_eq!(stats.first_token_total_ms, Some(3900));
+                    assert_eq!(metrics.first_token_ms, Some(1950));
+                    assert_eq!(stats.forwarded_first_token_samples, Some(1));
+                    assert_eq!(stats.forwarded_first_token_total_ms, Some(3000));
+                    assert_eq!(stats.cooldown_samples, Some(1));
+                    assert_eq!(stats.cooldown_total_ms, Some(120000));
                 }
                 // HTTP and SSH export the same success-only populations.
                 let config = coport::config::Config::parse(
@@ -3147,7 +3001,7 @@ mod tests {
                     &config,
                     &key,
                     ExportOptions {
-                        end: traffic.end,
+                        end: traffic.window.end,
                         minutes: 30,
                         scope: TrafficScope::Model,
                         limit: 24,
@@ -3188,14 +3042,14 @@ mod tests {
             }).to_string()).collect::<Vec<_>>();
         std::fs::write(&path, rows.join("\n") + "\n").unwrap();
         let traffic = read(&path, 30, &configured(&["work"]), TrafficScope::Model).unwrap();
-        assert_eq!(traffic.summary.requests, 4);
-        assert_eq!(traffic.summary.errors, 2);
-        assert_eq!(traffic.summary.first_token_count, 1);
-        assert_eq!(traffic.summary.first_token_ms, Some(300));
-        assert_eq!(traffic.summary.forwarded_first_token_samples, 1);
-        assert_eq!(traffic.summary.forwarded_first_token_total_ms, 300);
-        assert_eq!(traffic.summary.cooldown_samples, 1);
-        assert_eq!(traffic.summary.cooldown_total_ms, 100);
+        assert_eq!(traffic.stats.requests, 4);
+        assert_eq!(traffic.stats.errors, 2);
+        assert_eq!(traffic.stats.first_token_samples, Some(1));
+        assert_eq!(traffic.metrics.first_token_ms, Some(300));
+        assert_eq!(traffic.stats.forwarded_first_token_samples, Some(1));
+        assert_eq!(traffic.stats.forwarded_first_token_total_ms, Some(300));
+        assert_eq!(traffic.stats.cooldown_samples, Some(1));
+        assert_eq!(traffic.stats.cooldown_total_ms, Some(100));
     }
 
     #[test]
@@ -3229,9 +3083,9 @@ mod tests {
             TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(traffic.summary.requests, 4);
-        assert_eq!(traffic.summary.first_token_ms, Some(600));
-        assert_eq!(traffic.summary.avg_ms, Some(5000));
+        assert_eq!(traffic.stats.requests, 4);
+        assert_eq!(traffic.metrics.first_token_ms, Some(600));
+        assert_eq!(traffic.metrics.avg_ms, Some(5000));
         let by_name = |name: &str| {
             traffic
                 .credentials
@@ -3239,15 +3093,15 @@ mod tests {
                 .find(|c| c.credential == name)
                 .unwrap()
         };
-        assert_eq!(by_name("first").first_token_ms, Some(400));
-        assert_eq!(by_name("second").first_token_ms, Some(1000));
-        let json = serde_json::to_value(&traffic.summary).unwrap();
+        assert_eq!(by_name("first").metrics.first_token_ms, Some(400));
+        assert_eq!(by_name("second").metrics.first_token_ms, Some(1000));
+        let json = serde_json::to_value(&traffic).unwrap();
         assert_eq!(json["firstTokenMs"], 600);
         assert_eq!(json["firstTokenTotalMs"], 1800);
         assert_eq!(json["firstTokenSamples"], 3);
         std::fs::write(&path, call("e", "first", None) + "\n").unwrap();
         let none = read(&path, 30, &configured(&["first"]), TrafficScope::Model).unwrap();
-        assert_eq!(none.summary.first_token_ms, None);
+        assert_eq!(none.metrics.first_token_ms, None);
     }
 
     #[test]
@@ -3277,9 +3131,9 @@ mod tests {
             TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(active.summary.requests, 1);
-        assert_eq!(active.summary.errors, 0);
-        assert_eq!(active.summary.avg_ms, None);
+        assert_eq!(active.stats.requests, 1);
+        assert_eq!(active.stats.errors, 0);
+        assert_eq!(active.metrics.avg_ms, None);
         assert_eq!(active.credentials[0].credential, "model-account");
 
         // The end is read before its start in the rotated file, and duplicated
@@ -3298,12 +3152,12 @@ mod tests {
             TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(completed.summary.requests, 1);
-        assert_eq!(completed.summary.errors, 1);
-        assert_eq!(completed.summary.bytes, 128);
-        assert_eq!(completed.summary.avg_ms, Some(60000));
+        assert_eq!(completed.stats.requests, 1);
+        assert_eq!(completed.stats.errors, 1);
+        assert_eq!(completed.stats.bytes, 128);
+        assert_eq!(completed.metrics.avg_ms, Some(60000));
         assert_eq!(completed.credentials[0].credential, "model-account");
-        assert_eq!(completed.summary.counts, active.summary.counts);
+        assert_eq!(completed.stats.counts, active.stats.counts);
     }
 
     #[test]
@@ -3331,8 +3185,8 @@ mod tests {
         .unwrap();
         let model = read(&path, 30, &BTreeMap::new(), TrafficScope::Model).unwrap();
         let all = read(&path, 30, &BTreeMap::new(), TrafficScope::All).unwrap();
-        assert_eq!(model.summary.requests, 1);
-        assert_eq!(all.summary.requests, 2);
+        assert_eq!(model.stats.requests, 1);
+        assert_eq!(all.stats.requests, 2);
     }
 
     #[test]
@@ -3433,23 +3287,23 @@ mod tests {
             TrafficScope::Model,
         )
         .unwrap();
-        assert_eq!(all.summary.requests, 6);
+        assert_eq!(all.stats.requests, 6);
         assert_eq!(all.credentials.len(), 2);
-        assert_eq!(model.summary.requests, 3);
-        assert_eq!(model.summary.errors, 1);
-        assert_eq!(model.summary.bytes, 110);
-        assert_eq!(model.summary.avg_ms, Some(26));
-        let summary = serde_json::to_value(&model.summary).unwrap();
+        assert_eq!(model.stats.requests, 3);
+        assert_eq!(model.stats.errors, 1);
+        assert_eq!(model.stats.bytes, 110);
+        assert_eq!(model.metrics.avg_ms, Some(26));
+        let summary = serde_json::to_value(&model.stats).unwrap();
         assert_eq!(
             summary["latencyTotalMs"].as_u64().unwrap()
                 / summary["latencySamples"].as_u64().unwrap(),
             26
         );
-        assert_eq!(model.summary.counts.iter().sum::<u64>(), 3);
-        assert_eq!(model.summary.error_counts.iter().sum::<u64>(), 1);
+        assert_eq!(model.stats.counts.iter().sum::<u64>(), 3);
+        assert_eq!(model.stats.error_counts.iter().sum::<u64>(), 1);
         assert_eq!(model.credentials.len(), 1);
         assert_eq!(model.credentials[0].credential, "model");
-        assert_eq!(model.credentials[0].counts, model.summary.counts);
+        assert_eq!(model.credentials[0].stats.counts, model.stats.counts);
     }
 
     #[test]
@@ -3474,13 +3328,13 @@ mod tests {
         )
         .unwrap();
         let result = read(&path, 30, &configured(&["account"]), TrafficScope::All).unwrap();
-        assert_eq!(result.summary.requests, 3);
+        assert_eq!(result.stats.requests, 3);
         assert_eq!(result.credentials.len(), 2);
         assert!(
             result
                 .credentials
                 .iter()
-                .all(|group| group.service == "Codex")
+                .all(|group| group.service.label() == "Codex")
         );
         assert_eq!(
             result
@@ -3488,6 +3342,7 @@ mod tests {
                 .iter()
                 .find(|group| group.credential == "Unidentified")
                 .unwrap()
+                .stats
                 .requests,
             2
         );
@@ -3514,12 +3369,12 @@ mod tests {
         )
         .unwrap();
         let monthly = read(&path, 43200, &BTreeMap::new(), TrafficScope::All).unwrap();
-        assert_eq!(monthly.summary.requests, 2);
-        assert_eq!(monthly.credentials[0].service, "Claude");
+        assert_eq!(monthly.stats.requests, 2);
+        assert_eq!(monthly.credentials[0].service.label(), "Claude");
         assert_eq!(
             read(&path, 30, &BTreeMap::new(), TrafficScope::All)
                 .unwrap()
-                .summary
+                .stats
                 .requests,
             1
         );
@@ -3565,7 +3420,7 @@ mod tests {
                             end,
                         )
                         .unwrap()
-                        .summary
+                        .stats
                         .requests
                     })
                 })
@@ -3589,7 +3444,7 @@ mod tests {
                 end
             )
             .unwrap()
-            .summary
+            .stats
             .requests,
             first
         );
@@ -3638,7 +3493,7 @@ mod tests {
         let errors = || {
             read(&path, 43200, &BTreeMap::new(), TrafficScope::All)
                 .unwrap()
-                .summary
+                .stats
                 .errors
         };
         assert_eq!(errors(), 0);
@@ -3723,28 +3578,31 @@ mod tests {
             (43200, 1440, 30),
         ] {
             let traffic = read(&path, range, &configured(&["a", "b"]), TrafficScope::All).unwrap();
-            assert_eq!(traffic.bucket_minutes, bucket_minutes);
-            assert_eq!(traffic.summary.counts.len(), bars);
-            assert_eq!(traffic.summary.error_counts.len(), bars);
+            assert_eq!(traffic.window.bucket_minutes, bucket_minutes);
+            assert_eq!(traffic.stats.counts.len(), bars);
+            assert_eq!(traffic.stats.error_counts.len(), bars);
             assert_eq!(
-                traffic.summary.counts.iter().sum::<u64>(),
-                traffic.summary.requests
+                traffic.stats.counts.iter().sum::<u64>(),
+                traffic.stats.requests
             );
             for group in &traffic.credentials {
-                assert_eq!(group.counts.len(), bars);
-                assert_eq!(group.error_counts.len(), bars);
-                assert_eq!(group.error_counts.iter().sum::<u64>(), group.errors);
+                assert_eq!(group.stats.counts.len(), bars);
+                assert_eq!(group.stats.error_counts.len(), bars);
+                assert_eq!(
+                    group.stats.error_counts.iter().sum::<u64>(),
+                    group.stats.errors
+                );
             }
             assert_eq!(traffic.credentials.len(), 2);
-            assert_eq!(traffic.summary.requests, if range == 30 { 2 } else { 3 });
-            assert_eq!(traffic.summary.errors, 1);
-            assert_eq!(traffic.summary.avg_ms, Some(20));
+            assert_eq!(traffic.stats.requests, if range == 30 { 2 } else { 3 });
+            assert_eq!(traffic.stats.errors, 1);
+            assert_eq!(traffic.metrics.avg_ms, Some(20));
             let a = &traffic.credentials[0];
-            assert_eq!(a.requests, if range == 30 { 1 } else { 2 });
-            assert_eq!(a.counts.iter().sum::<u64>(), a.requests);
-            assert_eq!(a.bytes, a.requests * 100);
-            assert_eq!(a.avg_ms, Some(20));
-            assert_eq!(traffic.credentials[1].errors, 1);
+            assert_eq!(a.stats.requests, if range == 30 { 1 } else { 2 });
+            assert_eq!(a.stats.counts.iter().sum::<u64>(), a.stats.requests);
+            assert_eq!(a.stats.bytes, a.stats.requests * 100);
+            assert_eq!(a.metrics.avg_ms, Some(20));
+            assert_eq!(traffic.credentials[1].stats.errors, 1);
         }
         assert!(read(&path, 31, &configured(&["a", "b"]), TrafficScope::All).is_err());
         assert!(
@@ -4052,15 +3910,15 @@ mod tests {
         let codex = traffic
             .credentials
             .iter()
-            .find(|g| g.service == "Codex")
+            .find(|g| g.service.label() == "Codex")
             .unwrap();
         assert_eq!(codex.credential, "user@example.test");
-        assert_eq!(codex.requests, 2);
+        assert_eq!(codex.stats.requests, 2);
         assert_eq!(
             traffic
                 .credentials
                 .iter()
-                .find(|g| g.service == "Claude")
+                .find(|g| g.service.label() == "Claude")
                 .unwrap()
                 .credential,
             "Unidentified"
@@ -4071,7 +3929,7 @@ mod tests {
             traffic
                 .credentials
                 .iter()
-                .find(|g| g.service == "Codex")
+                .find(|g| g.service.label() == "Codex")
                 .unwrap()
                 .credential,
             "current-name"
@@ -4113,9 +3971,9 @@ mod tests {
         }
         assert_eq!(groups.len(), 2);
         let codex = &groups[&(Service::Codex, "Unidentified".into())];
-        assert_eq!(codex.counts[0], 2);
-        assert_eq!(codex.counts[29], 1);
-        assert_eq!(codex.errors, 3);
+        assert_eq!(codex.stats.counts[0], 2);
+        assert_eq!(codex.stats.counts[29], 1);
+        assert_eq!(codex.stats.errors, 3);
     }
 
     #[test]
@@ -4151,15 +4009,16 @@ mod tests {
             model
                 .credentials
                 .iter()
-                .find(|c| c.service == service)
+                .find(|c| c.service.label() == service)
                 .unwrap()
+                .metrics
                 .cache_hit_rate
         };
         assert_eq!(rate("Claude"), Some(0.6));
         assert_eq!(rate("Codex"), Some(0.25));
-        assert_eq!(model.summary.cache_hit_rate, Some(40.0 / 90.0));
+        assert_eq!(model.metrics.cache_hit_rate, Some(40.0 / 90.0));
         // Raw totals use the peer `Stats` names, so Merged Traffic adds them exactly.
-        let summary = serde_json::to_value(&model.summary).unwrap();
+        let summary = serde_json::to_value(&model.stats).unwrap();
         assert_eq!(
             (
                 summary["cacheRead"].as_u64(),
@@ -4171,37 +4030,44 @@ mod tests {
             let group = model
                 .credentials
                 .iter()
-                .find(|c| c.service == service)
+                .find(|c| c.service.label() == service)
                 .unwrap();
-            (group.input_tokens, group.cached_input_tokens)
+            (group.stats.input_tokens, group.stats.cached_input_tokens)
         };
         // Claude: 10 uncached + 30 read + 10 written; Codex input already includes its 10 cached.
         assert_eq!(input("Claude"), (Some(50), Some(30)));
         assert_eq!(input("Codex"), (Some(40), Some(10)));
-        assert_eq!(model.summary.input_tokens, Some(90));
-        assert_eq!(model.summary.cached_input_tokens, Some(40));
+        assert_eq!(model.stats.input_tokens, Some(90));
+        assert_eq!(model.stats.cached_input_tokens, Some(40));
         // Bars use the same input plus output tokens; the call without usage adds nothing.
-        assert_eq!(model.summary.token_counts.iter().sum::<u64>(), 90);
+        assert_eq!(model.stats.token_counts.iter().sum::<u64>(), 90);
         let claude = model
             .credentials
             .iter()
-            .find(|c| c.service == "Claude")
+            .find(|c| c.service.label() == "Claude")
             .unwrap();
-        assert_eq!(claude.token_counts.iter().sum::<u64>(), 50);
+        assert_eq!(claude.stats.token_counts.iter().sum::<u64>(), 50);
         // The parts of Claude input are kept for its tooltip; Codex has none.
         assert_eq!(
-            (claude.uncached_input_tokens, claude.cache_write_tokens),
+            (
+                claude.stats.uncached_input_tokens,
+                claude.stats.cache_write_tokens
+            ),
             (Some(10), Some(10))
         );
         let codex = model
             .credentials
             .iter()
-            .find(|c| c.service == "Codex")
+            .find(|c| c.service.label() == "Codex")
             .unwrap();
         assert_eq!(
-            (codex.uncached_input_tokens, codex.cache_write_tokens),
+            (
+                codex.stats.uncached_input_tokens,
+                codex.stats.cache_write_tokens
+            ),
             (None, None)
         );
-        assert_eq!(model.summary.uncached_input_tokens, None);
+        // The summary's totals are its accounts' sums, Claude's included.
+        assert_eq!(model.stats.uncached_input_tokens, Some(10));
     }
 }

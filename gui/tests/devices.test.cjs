@@ -342,7 +342,7 @@ test('switching range during a remote refresh waits for it instead of reading th
   const local = [];
   const h = harness((command, args) => {
     if (command === 'get_merged_data') return new Promise(resolve => pending.push({ args, resolve }));
-    if (command === 'get_traffic') { local.push(args); return Promise.resolve({ summary: { requests: 7 }, credentials: [], targets: [] }); }
+    if (command === 'get_traffic') { local.push(args); return Promise.resolve({ requests: 7, credentials: [], targets: [] }); }
     return Promise.resolve([]);
   });
   h.Channel = class {};
@@ -425,7 +425,7 @@ test('waiting for a range keeps peer errors, statuses and queued work intact', a
     calls.push([command, args]);
     if (command === 'get_merged_data') return new Promise(resolve => pending.push({ args, resolve }));
     if (command === 'get_devices') return Promise.resolve([{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }]);
-    if (command === 'get_traffic') return Promise.resolve({ summary: { requests: 3 }, credentials: [], targets: [] });
+    if (command === 'get_traffic') return Promise.resolve({ requests: 3, credentials: [], targets: [] });
     return Promise.resolve([]);
   });
   const refresh = h.loadMergedData(true, true);

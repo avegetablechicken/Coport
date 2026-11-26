@@ -221,7 +221,7 @@ pub async fn get_traffic(
     state: State<'_, AppState>,
     minutes: u64,
     scope: Option<crate::traffic::TrafficScope>,
-) -> Result<crate::traffic::Traffic> {
+) -> Result<coport_gui::traffic_stats::View> {
     let (path, config, task) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();

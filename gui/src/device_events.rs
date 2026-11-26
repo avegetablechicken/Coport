@@ -334,7 +334,7 @@ mod tests {
                     .unwrap();
             let traffic = serde_json::to_value(traffic).unwrap();
             for metric in ["requests", "errors", "bytes"] {
-                assert_eq!(traffic["summary"][metric], 0);
+                assert_eq!(traffic[metric], 0);
             }
         }
         let mut entries = 0;

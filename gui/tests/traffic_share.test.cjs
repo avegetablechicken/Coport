@@ -328,7 +328,7 @@ test('home traffic keeps the category it was read for', async () => {
   loadHome(context);
   const load = context.loadHomeTraffic();
   ui.trafficScope = 'model';
-  pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, summary: { requests: 3 }, credentials: [credential('a', 3)] });
+  pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, requests: 3, credentials: [credential('a', 3)] });
   await load;
   assert.equal(pending[0].query.scope, 'all');
   assert.equal(ui.homeTraffic.scope, 'all');
@@ -897,7 +897,7 @@ test('Home, Activity and This Device share one read of the same traffic', async 
   vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
   const reads = [context.loadHomeTraffic(), context.loadTraffic(), context.loadLocalTraffic(30, 'all')];
   assert.equal(pending.length, 1);
-  pending[0].resolve({ start: 0, end: 1800000, bucketMinutes: 1, summary: { requests: 4 }, credentials: [], targets: [] });
+  pending[0].resolve({ start: 0, end: 1800000, bucketMinutes: 1, requests: 4, credentials: [], targets: [] });
   const [, , card] = await Promise.all(reads);
   assert.equal(ui.homeTraffic, card);
   assert.equal(ui.traffic, card);
@@ -917,11 +917,11 @@ test('a reset while reading discards the old result and reads again', async () =
   const read = context.loadLocalTraffic(30, 'all');
   // Traffic is reassigned while the read runs.
   context.resetTrafficViews();
-  pending[0].resolve({ summary: { requests: 1 }, credentials: [] });
+  pending[0].resolve({ requests: 1, credentials: [] });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(pending.length, 2, 'the stale result is read again');
   assert.equal(ui.localTrafficViews['30:all'], undefined);
-  pending[1].resolve({ summary: { requests: 2 }, credentials: [] });
+  pending[1].resolve({ requests: 2, credentials: [] });
   assert.equal((await read).requests, 2);
   assert.equal(ui.localTrafficViews['30:all'].requests, 2);
 });
