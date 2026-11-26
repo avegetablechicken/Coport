@@ -30,6 +30,10 @@ _Avoid_: side request, probe
 What Coport writes down about one request as it goes: received, routed, sent upstream and answered, then ended as finished, rejected, failed or cancelled. A **Model call**'s record also carries the call's ID; an **Auxiliary request** made for it does not.
 _Avoid_: request log, log entry
 
+**Activity Log**:
+The app's list of **Request records** in a time range, newest first, filtered by kind and searched, a page at a time. While the range reaches the present it lists new records as they are written. It shows either what clients received or what upstreams returned.
+_Avoid_: request log, history
+
 **Route**:
 The upstream a request is sent to, the proxy it goes through and the credential it carries, chosen by its **App** from the credential or the target the client sent.
 _Avoid_: destination, path
