@@ -966,9 +966,8 @@ function proxiesBlock() {
           // A reachable proxy with failing destinations is not fully available.
           const routeFailing = state === "ok" && p.routeFailures?.length > 0;
           const dot = routeFailing ? "warn" : ({ ok: "running", error: "failed" }[state] ?? "");
-          let value = `<span class="faint">—</span>`;
-          if (state === "pending") value = `<span class="spinner"></span>`;
-          else if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
+          let value = state === "pending" ? "" : `<span class="faint">—</span>`;
+          if (state === "ok") value = probe.ms == null ? "Available" : `${probe.ms} ms`;
           else if (state === "error") value = `<span class="bad">Unreachable</span>`;
           else if (state === "unavailable") value = "Unverified";
           // Plain HTTP is the common case; other schemes stay visible.
@@ -981,7 +980,7 @@ function proxiesBlock() {
           return `<div class="row proxy" data-tip-scope="proxy:${esc(p.name)}">
             <span class="dot ${dot}" ${probe?.error ? `data-tip="${esc(probe.error)}"` : ""}></span>
             <span class="proxy-heading">${tag(p.name)}<span class="row-value">${value}</span></span>
-            <button class="icon-btn" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}">${ICON.restart}</button>
+            <button class="icon-btn${state === "pending" ? " probing" : ""}" data-action="probe" data-name="${esc(p.name)}" data-tip="Test" aria-label="Test ${esc(p.name)}" aria-busy="${state === "pending"}">${ICON.restart}</button>
             <span class="row-sub">${esc(shown)}${exit}</span>
             ${routeFailing ? `<span class="row-sub proxy-route-warning">Route unavailable: ${p.routeFailures.map(esc).join(", ")}</span>` : ""}
           </div>`;

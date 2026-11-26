@@ -12,7 +12,7 @@ function renderProxies(proxies) {
     ui: { snap: { config: { details: { proxies } } } },
     block: (_title, _aside, body) => body,
     flag: () => "", tag: (name) => name, esc: (value) => value,
-    ICON: { restart: "" },
+    ICON: { restart: '<svg data-icon="restart"></svg>' },
   });
 }
 
@@ -76,7 +76,7 @@ test("LAN proxy renders the measured exit IP", () => {
 test("route failures appear only after the proxy itself is reachable", () => {
   const proxy = { local: true, routeFailures: ["https://chatgpt.com/"] };
   const pending = render({ state: "pending" }, proxy);
-  assert.match(pending, /class="spinner"/);
+  assert.match(pending, /class="icon-btn probing"/);
   assert.doesNotMatch(pending, /Route unavailable:/);
   assert.doesNotMatch(pending, /Unreachable|Available/);
   const measured = render({ state: "ok", ms: 42, exitIp: "203.0.113.5" }, proxy);
@@ -99,6 +99,22 @@ test("route failures appear only after the proxy itself is reachable", () => {
   assert.match(recovered, /dot warn/);
   // Destinations recovering restores the available indicator.
   assert.match(render({ state: "ok", ms: 50 }, { ...proxy, routeFailures: [] }), /dot running/);
+});
+
+test("proxy refresh spins the existing button icon only while pending", () => {
+  for (const state of ["idle", "pending", "ok", "error", "unavailable"]) {
+    const html = render({ state });
+    const button = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/)[0];
+    assert.equal(button.includes('class="icon-btn probing"'), state === "pending");
+    assert.match(button, new RegExp(`aria-busy="${state === "pending"}"`));
+    assert.match(button, /<svg data-icon="restart"><\/svg>/);
+    assert.equal((html.match(/<svg\b/g) || []).length, 1);
+    assert.doesNotMatch(html, /class="spinner"/);
+    if (state === "pending") assert.doesNotMatch(html, /—/);
+    if (state === "idle") assert.match(html, /<span class="faint">—<\/span>/);
+  }
+  const css = fs.readFileSync(path.join(__dirname, "../ui/style.css"), "utf8");
+  assert.match(css, /\.icon-btn\.probing svg\s*\{\s*animation: spin /);
 });
 
 test("unavailable daemon is not reported as an unreachable proxy", () => {

@@ -979,13 +979,7 @@ button.req:hover .req-path {
   user-select: text;
 }
 
-.spinner {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  border: 1.5px solid var(--track);
-  border-top-color: var(--secondary);
+.icon-btn.probing svg {
   animation: spin 800ms linear infinite;
 }
 
