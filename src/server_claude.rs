@@ -1,9 +1,10 @@
 //! Claude's requests: routed by the Claude login or API key they carry, or a
 //! configured URL route for an explicit upstream.
-use super::identity_directory::{Directory, Lookup, Texts};
+use super::identity_directory::{Directory, Lookup, State, Texts};
 use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::claude::{ClaudeIdentity, ClaudeRoute};
+use crate::route_activation::Login;
 use hyper::http::request::Parts;
 
 /// Claude's Account lookup: its OAuth profile.
@@ -30,6 +31,58 @@ impl Lookup for Claude {
     }
     fn identity(answer: &serde_json::Value) -> Result<ClaudeIdentity> {
         ClaudeIdentity::profile(answer)
+    }
+}
+
+impl Server {
+    /// Claude's logins for Route activation: local OAuth metadata or a
+    /// source's route name first, then what Account lookups found. Never
+    /// probes or runs a shell.
+    pub(super) async fn claude_logins(&self) -> Vec<Login> {
+        let claude = &self.config.claude;
+        let routing = &claude.routing;
+        // Without a fallback, an unnamed login's route waits on discovery.
+        let discovers = routing.account_default().is_none() && routing.account_probe.is_some();
+        let mut logins = Vec::new();
+        for (source, account) in claude.account_sources() {
+            let Ok(token) = account.claude_token_with_shell(false).await else {
+                // A login-shell variable is not read for display; it may exist.
+                if matches!(account, crate::config::AccountSource::Env(_)) {
+                    logins.push(Login::Unreadable);
+                }
+                continue;
+            };
+            let label = |identity: &ClaudeIdentity| {
+                crate::identity::routing_account_label(
+                    routing,
+                    &identity.account_id,
+                    &identity.usernames,
+                    &source,
+                )
+            };
+            // Local OAuth identity takes precedence over a configured source label.
+            let local = match account.claude_identity() {
+                Some(identity) => label(&identity),
+                None => routing
+                    .account
+                    .contains_key(&source)
+                    .then(|| source.clone()),
+            };
+            if let Some(route) = local {
+                logins.push(Login::Active(route));
+                continue;
+            }
+            // Until its account is known, an unnamed login could belong to any
+            // route no other evidence settles. A failure stays the latest
+            // result after its retry delay.
+            logins.extend(match self.claude_identities.state(&token).await {
+                State::Known(identity) => label(&identity).map(Login::Remote),
+                State::Failed if discovers => Some(Login::ProbeFailed),
+                State::Unknown if discovers => Some(Login::Unidentified),
+                State::Failed | State::Unknown => None,
+            });
+        }
+        logins
     }
 }
 

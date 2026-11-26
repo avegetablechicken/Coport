@@ -705,32 +705,20 @@ impl Grok {
         crate::routing::upstream_url(&self.base_url.account, rest, false)
     }
 
-    /// As Codex's with saved logins only: each saved login's route is
-    /// active, the others inactive; unknown while a home cannot be read.
-    pub fn route_states(&self) -> BTreeMap<String, &'static str> {
-        if !self.file_only() || self.routing.account.is_empty() {
-            return BTreeMap::new();
-        }
-        let mut states: BTreeMap<String, &'static str> = self
-            .routing
-            .account
-            .keys()
-            .map(|name| (name.clone(), "inactive"))
-            .collect();
+    /// The saved logins for Route activation, as Codex's: each names its
+    /// account's route; one that cannot be read leaves the others unknown.
+    pub(crate) fn route_logins(&self) -> Vec<crate::route_activation::Login> {
+        use crate::route_activation::Login as Activation;
         let (logins, unavailable) = self.logins();
-        for login in logins {
-            if let Some(label) = self.account_label(&login.identity, true) {
-                if let Some(state) = states.get_mut(&label) {
-                    *state = "active";
-                }
-            }
-        }
+        let mut found: Vec<_> = logins
+            .iter()
+            .filter_map(|login| self.account_label(&login.identity, true))
+            .map(Activation::Active)
+            .collect();
         if unavailable {
-            for state in states.values_mut().filter(|s| **s == "inactive") {
-                *state = "unknown";
-            }
+            found.push(Activation::Unreadable);
         }
-        states
+        found
     }
 
     /// Display labels of the saved logins' accounts, keyed as records name
@@ -1210,6 +1198,10 @@ pub(crate) mod tests {
         assert_eq!(status(both), 409);
     }
 
+    fn route_states(grok: &Grok) -> BTreeMap<String, &'static str> {
+        crate::route_activation::route_activation(grok.routing.account.keys(), grok.route_logins())
+    }
+
     #[tokio::test]
     async fn route_states_mark_saved_logins_active() {
         let home = tempfile::tempdir().unwrap();
@@ -1219,7 +1211,7 @@ pub(crate) mod tests {
         )
         .grok;
         assert_eq!(
-            grok.route_states().into_iter().collect::<Vec<_>>(),
+            route_states(&grok).into_iter().collect::<Vec<_>>(),
             [
                 ("alice@example.com".into(), "inactive"),
                 ("bob@example.com".into(), "inactive")
@@ -1230,8 +1222,8 @@ pub(crate) mod tests {
             auth_json("t", "Alice@example.com"),
         )
         .unwrap();
-        assert_eq!(grok.route_states()["alice@example.com"], "active");
-        assert_eq!(grok.route_states()["bob@example.com"], "inactive");
+        assert_eq!(route_states(&grok)["alice@example.com"], "active");
+        assert_eq!(route_states(&grok)["bob@example.com"], "inactive");
         let mut labels = BTreeMap::new();
         grok.login_labels(&mut labels);
         assert_eq!(
@@ -1240,7 +1232,7 @@ pub(crate) mod tests {
         );
         assert!(grok.check_credentials().await.is_ok());
         std::fs::write(home.path().join("auth.json"), "{").unwrap();
-        assert_eq!(grok.route_states()["bob@example.com"], "unknown");
+        assert_eq!(route_states(&grok)["bob@example.com"], "unknown");
         assert!(grok.check_credentials().await.is_err());
         std::fs::remove_file(home.path().join("auth.json")).unwrap();
         assert!(grok.check_credentials().await.is_err());

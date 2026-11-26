@@ -732,86 +732,35 @@ impl Config {
         }
         result
     }
-    /// Local route activation, not upstream token validity. Archived logins are
-    /// deliberately excluded: only configured sources can admit requests. This
-    /// never runs a login shell, so an environment source this process cannot
-    /// read leaves the remaining routes `unknown` rather than `inactive`.
-    pub async fn account_route_states(&self) -> [BTreeMap<String, &'static str>; 2] {
-        let initial = |required: bool, routing: &crate::config::Routing| {
-            routing
-                .account
-                .keys()
-                .filter(|_| required)
-                .map(|name| (name.clone(), "inactive"))
-                .collect::<BTreeMap<_, _>>()
-        };
-        let unconfirmed = |states: &mut BTreeMap<String, &'static str>| {
-            for state in states.values_mut() {
-                if *state == "inactive" {
-                    *state = "unknown";
-                }
-            }
-        };
-        let mut codex = initial(self.codex.account_auth_file_only, &self.codex.routing);
-        if !codex.is_empty() {
-            let mut unread = false;
-            for (source, account) in self.codex.account_sources() {
-                match self
-                    .codex
-                    .account_identity_with_shell(&account, false)
-                    .await
-                {
-                    Ok(identity) => {
-                        if let Some(label) = routing_account_label(
-                            &self.codex.routing,
-                            &identity.account_id,
-                            &identity.usernames,
-                            &source,
-                        ) {
-                            codex.insert(label, "active");
-                        }
-                    }
-                    Err(_) => unread |= matches!(account, AccountSource::Env(_)),
-                }
-            }
-            if unread {
-                unconfirmed(&mut codex);
-            }
-        }
-        let mut claude = initial(self.claude.account_auth_file_only, &self.claude.routing);
-        if !claude.is_empty() {
-            for (source, account) in self.claude.account_sources() {
-                if account.claude_token_with_shell(false).await.is_err() {
-                    if matches!(account, AccountSource::Env(_)) {
-                        unconfirmed(&mut claude);
-                    }
-                    continue;
-                }
-                let identity = account.claude_identity();
-                let label = match &identity {
-                    Some(identity) => routing_account_label(
-                        &self.claude.routing,
+    /// Codex's logins for Route activation, from local data only. Archived
+    /// logins are deliberately excluded: only configured sources can admit
+    /// requests. This never runs a login shell, so an environment source this
+    /// process cannot read is `Unreadable`.
+    pub(crate) async fn codex_logins(&self) -> Vec<crate::route_activation::Login> {
+        use crate::route_activation::Login;
+        let mut logins = Vec::new();
+        for (source, account) in self.codex.account_sources() {
+            match self
+                .codex
+                .account_identity_with_shell(&account, false)
+                .await
+            {
+                Ok(identity) => logins.extend(
+                    routing_account_label(
+                        &self.codex.routing,
                         &identity.account_id,
                         &identity.usernames,
                         &source,
-                    ),
-                    None => self
-                        .claude
-                        .routing
-                        .account
-                        .contains_key(&source)
-                        .then_some(source),
-                };
-                if let Some(label) = label {
-                    claude.insert(label, "active");
-                } else if self.claude.routing.account_default().is_none()
-                    && self.claude.routing.account_probe.is_some()
-                {
-                    unconfirmed(&mut claude);
+                    )
+                    .map(Login::Active),
+                ),
+                Err(_) if matches!(account, AccountSource::Env(_)) => {
+                    logins.push(Login::Unreadable)
                 }
+                Err(_) => {}
             }
         }
-        [codex, claude]
+        logins
     }
 
     /// Safe display names for recorded account IDs, using routing's selector precedence.
@@ -1088,6 +1037,15 @@ mod tests {
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 
+    /// Route activation as the proxy reports it for `config`.
+    async fn activation(config: &Config) -> [BTreeMap<String, &'static str>; 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = std::sync::Arc::new(crate::logger::Logger::new(dir.path().join("proxy.log")));
+        crate::server::Server::new(config.clone(), logger)
+            .account_route_states()
+            .await
+    }
+
     #[tokio::test]
     async fn route_activation_tracks_saved_logins_and_file_only_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -1101,12 +1059,12 @@ mod tests {
             "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{}]\n  routing:\n    account: {{first: none, second: none}}\nclaude:\n  config_dirs: [{}]\n  routing:\n    account: {{'user@example.com': none}}\n",
             serde_json::to_string(dir.path()).unwrap(), serde_json::to_string(dir.path()).unwrap()
         )).unwrap();
-        let states = config.account_route_states().await;
+        let states = activation(&config).await;
         assert_eq!(states[0]["first"], "active");
         assert_eq!(states[0]["second"], "inactive");
         assert_eq!(states[1]["user@example.com"], "inactive");
         std::fs::write(&auth, saved("second")).unwrap();
-        let states = config.account_route_states().await;
+        let states = activation(&config).await;
         assert_eq!(states[0]["first"], "inactive");
         assert_eq!(states[0]["second"], "active");
         std::fs::write(
@@ -1115,42 +1073,27 @@ mod tests {
         )
         .unwrap();
         config.claude.routing.account_probe = Some(crate::config::Choice::One("none".into()));
-        assert_eq!(
-            config.account_route_states().await[1]["user@example.com"],
-            "unknown"
-        );
+        assert_eq!(activation(&config).await[1]["user@example.com"], "unknown");
         std::fs::write(
             dir.path().join(".claude.json"),
             r#"{"oauthAccount":{"accountUuid":"uuid","emailAddress":"user@example.com"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            config.account_route_states().await[1]["user@example.com"],
-            "active"
-        );
+        assert_eq!(activation(&config).await[1]["user@example.com"], "active");
         // Local OAuth identity takes precedence over a configured source label.
         config
             .claude
             .routing
             .account
             .insert("default".into(), crate::config::Choice::One("none".into()));
-        let states = config.account_route_states().await;
+        let states = activation(&config).await;
         assert_eq!(states[1]["user@example.com"], "active");
         assert_eq!(states[1]["default"], "inactive");
         std::fs::write(dir.path().join(".credentials.json"), "{}").unwrap();
-        assert_eq!(
-            config.account_route_states().await[1]["user@example.com"],
-            "inactive"
-        );
+        assert_eq!(activation(&config).await[1]["user@example.com"], "inactive");
         config.codex.account_auth_file_only = false;
         config.claude.account_auth_file_only = false;
-        assert!(
-            config
-                .account_route_states()
-                .await
-                .iter()
-                .all(BTreeMap::is_empty)
-        );
+        assert!(activation(&config).await.iter().all(BTreeMap::is_empty));
     }
     #[tokio::test]
     async fn route_activation_never_runs_a_shell_for_environment_sources() {
@@ -1159,7 +1102,7 @@ mod tests {
             "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {default: none, first: none}\nclaude:\n  config_dirs: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {default: none}\n",
         )
         .unwrap();
-        let states = config.account_route_states().await;
+        let states = activation(&config).await;
         assert!(
             states[0].values().all(|state| *state == "unknown"),
             "{states:?}"

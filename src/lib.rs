@@ -17,6 +17,7 @@ mod oauth_credentials;
 mod observation_memory;
 pub mod refresh_routes;
 mod request_ids;
+mod route_activation;
 pub mod routing;
 pub mod server;
 pub mod service;

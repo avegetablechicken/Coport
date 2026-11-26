@@ -116,10 +116,10 @@ use transport::*;
 #[path = "auto_refresh.rs"]
 mod auto_refresh;
 
+use identity_directory::Directory;
 #[cfg(test)]
 use identity_directory::FAILED_PROBE_RETRY;
 pub use identity_directory::Profiles;
-use identity_directory::{Directory, State};
 /// Claude accounts by OAuth access token, which servers rebuilt in one
 /// process share.
 pub type ClaudeProfiles = Profiles<crate::claude::ClaudeIdentity>;
@@ -199,80 +199,41 @@ impl Server {
         self
     }
 
-    /// Resolve locally unknown account routes from identities that requests or
-    /// background discovery already learned. Reading states never probes or runs
-    /// a shell. Remote success retains its distinct state so the UI can keep
-    /// warning that the local OAuth metadata did not match.
+    /// Route activation of each App's account routes, from local data and
+    /// accounts that requests or Account discovery already looked up. Reading
+    /// it never probes or runs a shell. A route only a lookup names stays
+    /// `remote`, so the UI can warn that local OAuth metadata did not match.
     pub async fn account_route_states(
         &self,
     ) -> [std::collections::BTreeMap<String, &'static str>; 4] {
-        let [codex, claude] = self.claude_route_states().await;
-        [
-            codex,
-            claude,
-            self.antigravity_route_states().await,
-            self.config.grok.route_states(),
-        ]
-    }
-    async fn claude_route_states(&self) -> [std::collections::BTreeMap<String, &'static str>; 2] {
-        let mut states = self.config.account_route_states().await;
-        if !states[1].values().any(|state| *state == "unknown") {
-            return states;
+        use crate::route_activation::route_activation;
+        let config = &self.config;
+        // Only file-only Apps report activation, and only with account routes,
+        // so no credential store is read otherwise.
+        fn routes(
+            reported: bool,
+            routing: &crate::config::Routing,
+        ) -> Option<impl Iterator<Item = &String>> {
+            (reported && !routing.account.is_empty()).then_some(routing.account.keys())
         }
-        let mut confirmed = Vec::new();
-        let (mut failed, mut pending) = (false, false);
-        for (source, account) in self.config.claude.account_sources() {
-            let Ok(token) = account.claude_token_with_shell(false).await else {
-                // A login-shell variable is not read for display; it may exist.
-                pending |= matches!(account, crate::config::AccountSource::Env(_));
-                continue;
-            };
-            let matched_local = account.claude_identity().is_some_and(|identity| {
-                crate::identity::routing_account_label(
-                    &self.config.claude.routing,
-                    &identity.account_id,
-                    &identity.usernames,
-                    &source,
-                )
-                .is_some()
-            });
-            if matched_local
-                || self.config.claude.routing.account.contains_key(&source)
-                || self.config.claude.routing.account_default().is_some()
-            {
-                continue;
-            }
-            match self.claude_identities.state(&token).await {
-                State::Known(identity) => confirmed.extend(crate::identity::routing_account_label(
-                    &self.config.claude.routing,
-                    &identity.account_id,
-                    &identity.usernames,
-                    &source,
-                )),
-                // Until its identity is known, an unmatched token could belong
-                // to any route that no other evidence settles. The retry delay
-                // does not expire a failure: it stays the latest result.
-                State::Failed => failed = true,
-                State::Unknown => pending = true,
-            }
+        let (codex, claude, antigravity, grok) = (
+            &config.codex,
+            &config.claude,
+            &config.antigravity,
+            &config.grok,
+        );
+        let mut states: [std::collections::BTreeMap<String, &'static str>; 4] = Default::default();
+        if let Some(routes) = routes(codex.account_auth_file_only, &codex.routing) {
+            states[0] = route_activation(routes, config.codex_logins().await);
         }
-        for state in states[1].values_mut() {
-            if *state == "unknown" {
-                *state = if failed {
-                    "probe_failed"
-                } else if pending {
-                    "unknown"
-                } else {
-                    "inactive"
-                };
-            }
+        if let Some(routes) = routes(claude.account_auth_file_only, &claude.routing) {
+            states[1] = route_activation(routes, self.claude_logins().await);
         }
-        for label in confirmed {
-            if let Some(state) = states[1].get_mut(&label) {
-                if *state != "active" {
-                    *state = "remote";
-                }
-            }
+        if let Some(routes) = routes(antigravity.account_auth_file_only, &antigravity.routing) {
+            states[2] = route_activation(routes, self.antigravity_logins().await);
+        }
+        if let Some(routes) = routes(grok.file_only(), &grok.routing) {
+            states[3] = route_activation(routes, grok.route_logins());
         }
         states
     }

@@ -177,40 +177,27 @@ impl Server {
         Ok(Some((login, identity)))
     }
 
-    /// As for Codex and Claude, the states of Antigravity's account routes
-    /// with saved logins only: the saved login's route is active, others
-    /// inactive, and unknown while an explicit probe has yet to name it.
-    /// Never probes.
-    pub(super) async fn antigravity_route_states(&self) -> BTreeMap<String, &'static str> {
+    /// Antigravity's login for Route activation: its saved login only, whose
+    /// account is recorded, learned or looked up. Never probes.
+    pub(super) async fn antigravity_logins(&self) -> Vec<crate::route_activation::Login> {
+        use crate::route_activation::Login;
         let settings = &self.config.antigravity;
-        // Without account routes there is nothing to report, and the
-        // credential store is not read.
-        if !settings.account_auth_file_only || settings.routing.account.is_empty() {
-            return BTreeMap::new();
-        }
-        let mut states: BTreeMap<String, &'static str> = settings
-            .routing
-            .account
-            .keys()
-            .map(|name| (name.clone(), "inactive"))
-            .collect();
         let Ok(Some((login, identity))) = self.antigravity_saved_login().await else {
-            return states;
+            return Vec::new();
         };
         if identity.is_none() && settings.routing.account_probe.is_some() {
-            let failed = matches!(
-                self.antigravity_identities.state(&login.access_token).await,
-                State::Failed
-            );
-            for state in states.values_mut() {
-                *state = if failed { "probe_failed" } else { "unknown" };
-            }
-            return states;
+            return vec![
+                match self.antigravity_identities.state(&login.access_token).await {
+                    State::Failed => Login::ProbeFailed,
+                    _ => Login::Unidentified,
+                },
+            ];
         }
-        if let Some(label) = settings.login_label(identity.as_ref()) {
-            states.insert(label, "active");
-        }
-        states
+        settings
+            .login_label(identity.as_ref())
+            .map(Login::Active)
+            .into_iter()
+            .collect()
     }
 
     /// Display labels of Antigravity accounts already identified. Never

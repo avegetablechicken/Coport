@@ -39,8 +39,12 @@ An **Auxiliary request** that asks an **App**'s upstream which account an access
 _Avoid_: profile lookup, userinfo
 
 **Account discovery**:
-**Account lookups** Coport makes in the background for the logins it knows, to show their account labels and route states. It runs only where the user names a proxy for it, and does not retry a failed lookup for a while.
+**Account lookups** Coport makes in the background for the logins it knows, to show their account labels and **Route activation**. It runs only where the user names a proxy for it, and does not retry a failed lookup for a while.
 _Avoid_: background probe
+
+**Route activation**:
+Whether an **App**'s account route has a login on this computer that it serves: active when local data says so, remote when only an **Account lookup** does, unknown while a login is unread or unidentified, probe failed when **Account discovery** failed for one, and inactive otherwise.
+_Avoid_: route state, account state
 
 ### Traffic
 

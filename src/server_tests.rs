@@ -965,6 +965,34 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
 }
 
 #[tokio::test]
+async fn a_looked_up_account_is_remote_without_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    // No account_probe or fallback: nothing here looks accounts up.
+    let running = running(&format!("claude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n      other@example.invalid: none\n", serde_json::to_string(dir.path()).unwrap())).await;
+    let states = || async { running.server.account_route_states().await[1].clone() };
+    assert_eq!(states().await["remote@example.invalid"], "inactive");
+    // A server before a configuration change looked the saved login up.
+    let identity = crate::claude::ClaudeIdentity::profile(
+        &json!({"account":{"uuid":"remote-account", "email":"remote@example.invalid"}}),
+    )
+    .unwrap();
+    running
+        .server
+        .claude_identities
+        .remember("saved-secret", async { Ok(identity) })
+        .await
+        .unwrap();
+    let states = states().await;
+    assert_eq!(states["remote@example.invalid"], "remote");
+    assert_eq!(states["other@example.invalid"], "inactive");
+}
+
+#[tokio::test]
 async fn a_requests_account_lookup_settles_a_failed_discovery() {
     let mut lookup = fixture("http", "profile_retry_identity").await;
     let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
