@@ -213,7 +213,10 @@ async function refresh() {
     invoke("get_state"),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
-  if (request !== ui.refreshRequest) return;
+  // A later request still in flight must not discard this completed snapshot.
+  // In particular, Restart waits until its fresh configuration is displayed.
+  if (request < (ui.appliedRefreshRequest || 0)) return;
+  ui.appliedRefreshRequest = request;
   ui.snap = snap;
   if (ui.devicesLoaded) setDeviceForwarders(snap.forwarding ? [snap.forwarding] : []);
   ui.recent = recent.rows.slice(0, 5);
@@ -3152,15 +3155,18 @@ async function act(action, el) {
       }
       await refresh();
       break;
-    case "restart":
+    case "restart": {
+      let restarted = false;
       try {
         await invoke("restart_proxy");
-        toast("Proxy restarted");
+        restarted = true;
       } catch (e) {
         toast(String(e));
       }
       await refresh();
+      if (restarted) toast("Proxy restarted");
       break;
+    }
     case "proxy-ca-replace":
       try {
         const trusted = await invoke("replace_proxy_ca");

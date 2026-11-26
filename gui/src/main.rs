@@ -168,6 +168,7 @@ fn main() {
                 forwarding_operations: Default::default(),
                 merged_cache: Default::default(),
             });
+            tauri::async_runtime::spawn(commands::monitor_config(app.handle().clone()));
             tauri::async_runtime::spawn(commands::monitor_credentials(app.handle().clone()));
             tauri::async_runtime::spawn(commands::monitor_proxies(app.handle().clone()));
             tauri::async_runtime::spawn(commands::monitor_account_states(app.handle().clone()));

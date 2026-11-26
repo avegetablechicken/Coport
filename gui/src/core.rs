@@ -49,6 +49,57 @@ struct ConfigCache {
     checked: Option<Instant>,
     exists: bool,
     parsed: Option<Result<Config, String>>,
+    /// Configuration accepted by the attached daemon, retained across edits.
+    applied: Option<Config>,
+}
+
+impl ConfigCache {
+    /// Lifecycle completion bypasses both the polling interval and file stamp:
+    /// another reader may have populated the cache while the proxy restarted.
+    fn refresh(&mut self, path: PathBuf, force: bool) -> bool {
+        let due = self
+            .checked
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if !force && self.path == path && !due {
+            return false;
+        }
+        self.checked = Some(Instant::now());
+        let stamp = file_stamp(&path);
+        if !force && self.path == path && self.stamp == stamp && self.parsed.is_some() {
+            return false;
+        }
+        self.exists = path.is_file();
+        self.parsed = Some(match std::fs::read_to_string(&path) {
+            Ok(text) => parse_config(&text),
+            Err(_) => Err("Cannot read configuration file.".to_owned()),
+        });
+        self.path = path;
+        self.stamp = stamp;
+        true
+    }
+
+    fn activate(&mut self, stamp: Option<SystemTime>) {
+        // When attaching after an external edit, the file cannot describe the
+        // running daemon. Do not present that pending file as applied.
+        self.applied = (self.stamp == stamp)
+            .then(|| self.parsed.as_ref()?.as_ref().ok().cloned())
+            .flatten();
+    }
+
+    fn loaded(&self, attached: bool) -> Option<&Config> {
+        if attached {
+            self.applied.as_ref()
+        } else {
+            self.parsed.as_ref()?.as_ref().ok()
+        }
+    }
+
+    fn invalidate(&mut self) {
+        *self = Self {
+            applied: self.applied.take(),
+            ..Self::default()
+        };
+    }
 }
 
 /// Parses configuration text; YAML syntax errors keep their location.
@@ -136,7 +187,8 @@ impl Core {
             credential_updated: None,
             notify,
             started_stamp,
-            attached_pid: attached.map(|s| s.pid),
+            // The first read must adopt the daemon's configuration as well.
+            attached_pid: None,
             activity_scan: None,
         }
     }
@@ -152,37 +204,28 @@ impl Core {
 
     /// Re-reads the config file when it changes on disk (checked at most 1/s).
     pub(crate) fn refresh_config(&mut self) {
-        let path = self.config_path();
-        let cache = &mut self.config;
-        let due = cache
-            .checked
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(1));
-        if cache.path == path && !due {
-            return;
+        self.sync_daemon();
+        if self.config.refresh(self.config_path(), false) {
+            if self.attached_pid.is_none() {
+                self.reset_account_probe();
+            }
+            // A file change updates the restart notice, not the applied view.
+            (self.notify)();
         }
-        cache.checked = Some(Instant::now());
-        let stamp = file_stamp(&path);
-        if cache.path == path && cache.stamp == stamp && cache.parsed.is_some() {
-            return;
-        }
-        cache.exists = path.is_file();
-        self.account_probe = None;
-        self.account_states_pending = false;
-        self.credential_reports.clear();
-        self.credential_error = None;
-        self.credential_pending = false;
-        self.credential_updated = None;
-        cache.parsed = Some(match std::fs::read_to_string(&path) {
-            Ok(text) => parse_config(&text),
-            Err(_) => Err("Cannot read configuration file.".to_owned()),
-        });
-        cache.path = path;
-        cache.stamp = stamp;
+    }
+
+    /// Publish the configuration and daemon identity before Restart completes.
+    pub(crate) fn refresh_after_restart(&mut self) {
+        self.config.refresh(self.config_path(), true);
+        self.sync_daemon();
+        (self.notify)();
     }
 
     pub fn invalidate_config(&mut self) {
-        self.config = ConfigCache::default();
-        self.reset_account_probe();
+        self.config.invalidate();
+        if self.attached_pid.is_none() {
+            self.reset_account_probe();
+        }
     }
 
     fn reset_account_probe(&mut self) {
@@ -295,7 +338,7 @@ impl Core {
     }
 
     pub(crate) fn loaded_config(&self) -> Option<&Config> {
-        self.config.parsed.as_ref()?.as_ref().ok()
+        self.config.loaded(self.attached_pid.is_some())
     }
 
     /// Port clients should use: the live listener, else the configured one.
@@ -333,6 +376,7 @@ impl Core {
         if pid != self.attached_pid {
             if let Some(status) = status {
                 let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                self.config.refresh(self.config_path(), true);
                 self.started_stamp = Some(
                     if canonical(&status.config_path) == canonical(&self.config_path()) {
                         status.config_modified
@@ -340,7 +384,10 @@ impl Core {
                         Some(SystemTime::UNIX_EPOCH)
                     },
                 );
+                self.config.activate(self.started_stamp.flatten());
                 self.logs.set_path(status.log_path);
+            } else {
+                self.config.applied = None;
             }
             self.attached_pid = pid;
             self.reset_account_probe();
@@ -451,7 +498,7 @@ impl Core {
                 changed_since_start,
                 details: self.loaded_config().map(|c| {
                     let mut result = details(c, &self.controller.probes_for(&c.proxies));
-                    if matches!(phase, Phase::Running { .. }) && !changed_since_start {
+                    if matches!(phase, Phase::Running { .. }) {
                         sync_route_health(&mut result, &stats.route_health, SystemTime::now());
                     }
                     result
@@ -1035,6 +1082,162 @@ impl From<Entry> for EntryDto {
 mod tests {
     use super::{Urls, matches_search, parse_config, proxy_ca_notice, replace_config};
     use crate::logs::Entry;
+
+    #[test]
+    fn restart_refresh_bypasses_recent_reads_and_unchanged_timestamps() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            let config = |name| {
+                [
+                    "listen_port: 8787".to_owned(),
+                    "request_timeout_seconds: 30".to_owned(),
+                    "proxies:".to_owned(),
+                    "  original: http://127.0.0.1:12345".to_owned(),
+                    format!("  {name}: http://127.0.0.1:12346"),
+                    String::new(),
+                ]
+                .join(newline)
+            };
+            std::fs::write(
+                &path,
+                [
+                    "listen_port: 8787",
+                    "request_timeout_seconds: 30",
+                    "proxies:",
+                    "  original: http://127.0.0.1:12345",
+                    "",
+                ]
+                .join(newline),
+            )
+            .unwrap();
+            let mut cache = super::ConfigCache::default();
+            assert!(cache.refresh(path.clone(), false));
+            let stamp = cache.stamp.unwrap();
+            cache.activate(Some(stamp));
+            // Repeat in one process, including same-size edits with a preserved
+            // timestamp. No sleep, user config, daemon or upstream is involved.
+            for name in ["added1", "added2"] {
+                let applied_names = cache.loaded(true).unwrap().proxies.clone();
+                std::fs::write(&path, config(name)).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(stamp))
+                    .unwrap();
+                cache.checked = Some(std::time::Instant::now());
+                assert!(!cache.refresh(path.clone(), false));
+                assert!(cache.refresh(path.clone(), true));
+                assert_eq!(cache.loaded(true).unwrap().proxies, applied_names);
+                let parsed = cache.parsed.as_ref().unwrap().as_ref().unwrap();
+                let details = super::details(parsed, &Default::default());
+                assert_eq!(details.proxies.len(), 2);
+                assert!(details.proxies.iter().any(|p| p.name == name));
+                assert_eq!(parsed.proxies[name], "http://127.0.0.1:12346");
+                assert!(!cache.refresh(path.clone(), false));
+                // Settings edits/imports and a restart in progress invalidate
+                // the draft only, never the currently running configuration.
+                cache.invalidate();
+                assert_eq!(cache.loaded(true).unwrap().proxies, applied_names);
+                assert!(cache.refresh(path.clone(), false));
+                assert_eq!(cache.loaded(true).unwrap().proxies, applied_names);
+                // Only adopting the successfully started daemon applies it.
+                cache.activate(Some(stamp));
+                assert!(cache.loaded(true).unwrap().proxies.contains_key(name));
+            }
+            let applied_names = cache.loaded(true).unwrap().proxies.clone();
+            std::fs::write(&path, "proxies: [invalid").unwrap();
+            assert!(cache.refresh(path.clone(), true));
+            assert!(cache.parsed.as_ref().unwrap().is_err());
+            assert_eq!(cache.loaded(true).unwrap().proxies, applied_names);
+            std::fs::remove_file(&path).unwrap();
+            assert!(cache.refresh(path, true));
+            assert!(!cache.exists);
+            assert!(cache.parsed.as_ref().unwrap().is_err());
+            assert_eq!(cache.loaded(true).unwrap().proxies, applied_names);
+        }
+    }
+
+    #[test]
+    fn automatic_draft_refresh_never_applies_edits_to_a_running_proxy() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            let mut cache = super::ConfigCache::default();
+            let mut started = None;
+            let mut applied_details = None;
+            for revision in 0..4 {
+                let text = format!(
+                    "listen_port: {}\nrequest_timeout_seconds: {}\nconnect_credential_routing: {}\nproxies:\n  exit{revision}: http://127.0.0.1:12345\ncodex:\n  base_url:\n    api_key: https://upstream{revision}.example/v1\n  routing:\n    fallback: exit{revision}\n",
+                    8787 + revision,
+                    30 + revision,
+                    revision % 2 == 1,
+                )
+                .replace('\n', newline);
+                std::fs::write(&path, text).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + revision),
+                    ))
+                    .unwrap();
+                cache.checked = None;
+                assert!(cache.refresh(path.clone(), false));
+                if revision == 0 {
+                    started = cache.stamp;
+                    cache.activate(started);
+                    applied_details = Some(
+                        serde_json::to_value(super::details(
+                            cache.loaded(true).unwrap(),
+                            &Default::default(),
+                        ))
+                        .unwrap(),
+                    );
+                }
+                // Every displayed configuration field remains applied: proxy
+                // names, routes, upstreams, HTTPS instructions and Settings.
+                for _ in 0..3 {
+                    cache.checked = None;
+                    assert!(!cache.refresh(path.clone(), false));
+                    assert!(cache.loaded(true).unwrap().proxies.contains_key("exit0"));
+                    assert_eq!(
+                        serde_json::to_value(super::details(
+                            cache.loaded(true).unwrap(),
+                            &Default::default(),
+                        ))
+                        .unwrap(),
+                        *applied_details.as_ref().unwrap(),
+                    );
+                    assert!(
+                        cache
+                            .loaded(false)
+                            .unwrap()
+                            .proxies
+                            .contains_key(&format!("exit{revision}"))
+                    );
+                }
+            }
+            assert_ne!(cache.stamp, started);
+            // A fresh GUI cannot infer the running config from a pending file.
+            cache.activate(started);
+            assert!(cache.loaded(true).is_none());
+            // A successful restart supplies the matching new stamp.
+            cache.activate(cache.stamp);
+            assert!(cache.loaded(true).unwrap().proxies.contains_key("exit3"));
+            let applied = super::details(cache.loaded(true).unwrap(), &Default::default());
+            assert_eq!(applied.listen_port, 8790);
+            assert_eq!(applied.timeout_secs, 33.0);
+            assert_eq!(applied.editable["connect_credential_routing"], true);
+            assert_ne!(
+                serde_json::to_value(applied).unwrap(),
+                applied_details.unwrap()
+            );
+        }
+    }
 
     #[test]
     fn keeping_the_proxy_ca_silences_only_the_same_notice() {

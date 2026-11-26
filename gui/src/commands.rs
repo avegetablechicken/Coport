@@ -15,6 +15,18 @@ use tauri::{AppHandle, Manager, State};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// Detect pending edits without applying them or running any network checks.
+pub(crate) async fn monitor_config(app: AppHandle) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        app.state::<AppState>()
+            .core
+            .lock()
+            .unwrap()
+            .refresh_config();
+    }
+}
+
 /// Runs independently of WebView visibility, including GUI-only operation.
 pub(crate) async fn monitor_credentials(app: AppHandle) {
     loop {
@@ -376,6 +388,9 @@ pub async fn restart_proxy(app: AppHandle, state: State<'_, AppState>) -> Result
     let result = completion
         .await
         .map_err(|_| "The proxy control worker stopped.".to_owned())?;
+    if result.is_ok() {
+        state.core.lock().unwrap().refresh_after_restart();
+    }
     tray::sync(&app);
     result
 }

@@ -79,6 +79,71 @@ test('a failed asynchronous restart does not display success', async () => {
   assert.equal(refreshed, true);
 });
 
+test('Settings shows applied values until restart, rather than pending file values', () => {
+  const ui = { snap: { config: {
+    editable: { listen_port: 9999, request_timeout_seconds: 60 },
+    details: { editable: { listen_port: 8787, request_timeout_seconds: 30 }, proxies: [{ name: 'running' }] },
+  } } };
+  const context = { ui, esc: String, block: (_, __, body) => body, ICON: { chevron: '' }, otherLogins: () => '' };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function configSettings()'), source.indexOf('const OTHER_LOGIN_PROVIDERS')), context);
+  const html = context.configSettings();
+  assert.match(html, /id="config-listen_port"[^>]*value="8787"/);
+  assert.match(html, /id="config-request_timeout_seconds"[^>]*value="30"/);
+  assert.equal(ui.snap.config.details.editable.listen_port, 8787);
+  assert.deepEqual(ui.snap.config.details.proxies, [{ name: 'running' }]);
+});
+
+test('Restart publishes new proxies before announcing success, including concurrent refreshes', async () => {
+  const pending = [];
+  const messages = [];
+  const rendered = [];
+  const snap = name => ({ config: { details: { proxies: [{ name }] } } });
+  const ui = { page: 'settings', refreshRequest: 0, snap: snap('old'), proxies: { old: { name: 'old' } }, homeTrafficFetchedAt: Date.now() };
+  const context = {
+    ui, tagColors: () => ({}),
+    cachedTraffic: () => null, homeTrafficDevice: () => null, loadHomeTraffic() {},
+    changePage: update => update(), $: () => ({ scrollTop: 0 }),
+    invoke: async command => {
+      if (command === 'get_state') return new Promise(resolve => pending.push(resolve));
+      if (command === 'get_activity') return { rows: [] };
+      assert.equal(command, 'restart_proxy');
+    },
+    toast: message => messages.push([message, Object.keys(ui.proxies)]),
+    render: () => rendered.push(Object.keys(ui.proxies)),
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;')), context);
+  vm.runInContext(source.slice(source.indexOf('async function act('), source.indexOf('// Any scroll or input')), context);
+  const old = context.refresh();
+  const restarting = context.act('restart');
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 2);
+  assert.deepEqual(messages, []);
+  // A state-changed event starts a later read before Restart's read returns.
+  const eventRefresh = context.refresh();
+  pending[1](snap('new'));
+  await restarting;
+  assert.deepEqual(messages, [['Proxy restarted', ['new']]]);
+  assert.deepEqual(rendered, [['new']]);
+  // Returning Home immediately uses the new configuration, without a timer.
+  await context.act('page', { dataset: { page: 'main' } });
+  assert.equal(ui.page, 'main');
+  assert.deepEqual(rendered.at(-1), ['new']);
+  // An older response cannot put the pre-restart config back on screen.
+  pending[0](snap('old'));
+  await old;
+  assert.deepEqual(Object.keys(ui.proxies), ['new']);
+  pending[2](snap('new'));
+  await eventRefresh;
+  // A second restart in this same panel also publishes its new config first.
+  const again = context.act('restart');
+  await new Promise(setImmediate);
+  pending[3](snap('newer'));
+  await again;
+  assert.deepEqual(messages[1], ['Proxy restarted', ['newer']]);
+});
+
 test('tray updates dispatch before taking locks or calling native setters', () => {
   const tray = fs.readFileSync(path.join(__dirname, '../src/tray.rs'), 'utf8');
   const sync = tray.match(/pub fn sync\(app: &AppHandle\) \{[\s\S]*?\r?\n\}/)[0];
