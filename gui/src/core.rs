@@ -463,14 +463,6 @@ impl Core {
                     error: Some(message.clone()),
                 },
             },
-            stats: StatsDto {
-                requests: stats.requests,
-                errors: stats.errors,
-                bytes: stats.bytes,
-                avg_ms: stats.avg_latency_ms,
-                per_minute: stats.per_minute.to_vec(),
-                errors_per_minute: stats.errors_per_minute.to_vec(),
-            },
             routes: self.credential_reports.clone(),
             credential_error: self.credential_error.clone(),
             urls: Urls {
@@ -817,7 +809,6 @@ pub struct Snapshot {
     account_states_error: Option<String>,
     version: &'static str,
     phase: PhaseDto,
-    stats: StatsDto,
     routes: Vec<coport::server::CredentialReport>,
     credential_error: Option<String>,
     urls: Urls,
@@ -877,17 +868,6 @@ struct PhaseDto {
     port: u16,
     uptime_secs: u64,
     error: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StatsDto {
-    requests: u64,
-    errors: u64,
-    bytes: u64,
-    avg_ms: Option<u64>,
-    per_minute: Vec<u32>,
-    errors_per_minute: Vec<u32>,
 }
 
 #[derive(Serialize)]
