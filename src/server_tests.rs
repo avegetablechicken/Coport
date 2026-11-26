@@ -1948,6 +1948,73 @@ async fn disconnect_cancels_upstream_and_stream_timeout_does_not_replay() {
     }
 }
 
+/// Waits until `server` counts `expected` requests in flight.
+async fn in_flight(server: &Server, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.requests_in_flight() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} in flight, not {expected}", server.requests_in_flight()));
+}
+
+#[tokio::test]
+async fn requests_stay_in_flight_while_a_response_streams_or_a_relay_is_open() {
+    let mut sse = fixture("direct", "sse").await;
+    let streaming = running(
+        "codex:\n  routing:\n    fallback: none\n  base_url:\n    api_key: https://upstream.invalid/v1\n",
+    )
+    .await;
+    trust(&streaming, &sse, "none");
+    let health = http()
+        .get(format!("{}/health", streaming.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    assert_eq!(streaming.server.requests_in_flight(), 0);
+    let response = http()
+        .post(format!("{}/responses", streaming.url))
+        .bearer_auth("model-secret")
+        .send()
+        .await
+        .unwrap();
+    let mut stream = response.bytes_stream();
+    assert_eq!(stream.next().await.unwrap().unwrap(), "data: first\n\n");
+    assert!(sse.requests.recv().await.unwrap().starts_with("POST"));
+    in_flight(&streaming.server, 1).await;
+    drop(stream);
+    in_flight(&streaming.server, 0).await;
+
+    let mut relay = fixture("http", "websocket_hold").await;
+    let endpoint = format!("http://127.0.0.1:{}", relay.addr.port());
+    let relaying = running(&format!(
+        "proxies:\n  selected: {endpoint}\ncodex:\n  routing:\n    api_key:\n      upstream.invalid: selected\n"
+    ))
+    .await;
+    trust(&relaying, &relay, &endpoint);
+    let mut socket = tokio::net::TcpStream::connect(relaying.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    socket.write_all(b"GET /codex/https://upstream.invalid/v1/socket HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer ws-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let head = read_response_head(&mut socket).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(relay.requests.recv().await.unwrap().starts_with("CONNECT"));
+    assert!(
+        relay
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /v1/socket ")
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(relaying.server.requests_in_flight(), 1);
+    drop(socket);
+    in_flight(&relaying.server, 0).await;
+}
+
 #[tokio::test]
 async fn claude_oauth_usage_and_refresh_preserve_json_and_headers() {
     let mut fixture = fixture("http", "oauth_json").await;

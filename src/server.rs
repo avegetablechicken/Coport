@@ -144,6 +144,8 @@ pub struct Server {
     credential_proxy: Option<crate::credential_proxy::CredentialProxy>,
     /// The bound port, which absolute-form requests name to address this listener.
     local_port: std::sync::OnceLock<u16>,
+    /// Client requests whose Request record has not ended.
+    requests_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Server {
     pub fn new(config: Config, logger: Arc<Logger>) -> Self {
@@ -165,7 +167,15 @@ impl Server {
             tls: None,
             credential_proxy: None,
             local_port: std::sync::OnceLock::new(),
+            requests_in_flight: Default::default(),
         }
+    }
+    /// Client requests received and not yet ended: a response still
+    /// streaming and an open WebSocket each count until they close.
+    /// Auxiliary requests are part of the request they serve.
+    pub fn requests_in_flight(&self) -> usize {
+        self.requests_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     /// Also accept TLS on the listening port; plain HTTP keeps working.
     pub fn with_tls(mut self, tls: tokio_rustls::TlsAcceptor) -> Self {
@@ -467,6 +477,7 @@ impl Server {
         };
         let mut log =
             RequestLog::received(self.logger.clone(), incoming.method().as_str(), logged_path);
+        log.in_flight(&self.requests_in_flight);
         let head = incoming.method() == hyper::Method::HEAD;
         // What the request is needs no configuration, so even a request
         // refused below is recorded as the Model call it asked for.

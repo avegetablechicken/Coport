@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -382,6 +382,16 @@ pub struct RequestLog {
     model_call: Option<String>,
     /// Whether a Model call's first upstream send is already timed.
     upstream_started: bool,
+    /// The count of open client requests this record is one of.
+    in_flight: Option<InFlight>,
+}
+
+/// One request counted in flight until it is dropped.
+struct InFlight(Arc<AtomicUsize>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 impl RequestLog {
     /// A client's request, received: until it ends it counts as cancelled.
@@ -413,7 +423,13 @@ impl RequestLog {
             kind,
             model_call: None,
             upstream_started: false,
+            in_flight: None,
         }
+    }
+    /// Count this record in `requests` until it ends.
+    pub fn in_flight(&mut self, requests: &Arc<AtomicUsize>) {
+        requests.fetch_add(1, Ordering::AcqRel);
+        self.in_flight = Some(InFlight(requests.clone()));
     }
 
     /// An empty record that ends as `test_finished`, with `status`.
