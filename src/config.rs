@@ -1069,7 +1069,8 @@ codex:
         assert!(
             c.resolve_url(
                 Some("Bearer key"),
-                "/codex/https://provider.invalid/v1/responses"
+                crate::target::Target::new("POST", "/codex/https://provider.invalid/v1/responses")
+                    .rest()
             )
             .unwrap()
             .is_some()

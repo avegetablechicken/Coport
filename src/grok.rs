@@ -234,13 +234,6 @@ pub enum GrokTarget {
     Api(ApiRoute),
 }
 
-/// The Grok scope of a request target, without its prefix.
-pub fn target(target: &str) -> Option<&str> {
-    target
-        .strip_prefix("/grok")
-        .filter(|rest| rest.starts_with('/'))
-}
-
 /// Whether a target names an upstream URL rather than a path.
 fn explicit(target: &str) -> bool {
     target.starts_with("/https://") || target.starts_with("/http://")

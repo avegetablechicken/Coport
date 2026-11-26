@@ -254,40 +254,12 @@ pub struct ClaudeRoute {
 
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://platform.claude.com/v1/oauth/token";
 
+/// Whether a target, without its scope, is Claude's Token refresh.
 pub fn token_refresh(target: &str) -> bool {
-    let target = ["/anthropic", "/claude"]
-        .into_iter()
-        .find_map(|prefix| {
-            target
-                .strip_prefix(prefix)
-                .filter(|rest| rest.starts_with('/'))
-        })
-        .unwrap_or(target);
     matches!(
         target,
         "/v1/oauth/token" | "/https://platform.claude.com/v1/oauth/token"
     )
-}
-
-/// The namespace covers every Claude Code endpoint. Unprefixed Messages and
-/// OAuth endpoints also work; ambiguous endpoints such as /v1/models use /anthropic.
-pub fn target(target: &str) -> Option<&str> {
-    for prefix in ["/anthropic", "/claude"] {
-        if target
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
-        {
-            return target.strip_prefix(prefix);
-        }
-    }
-    let path = target.split('?').next().unwrap_or("");
-    let path = if path.starts_with("/https://") {
-        Url::parse(&path[1..]).ok()?.path().to_owned()
-    } else {
-        path.to_owned()
-    };
-    (path == "/v1/messages" || path.starts_with("/v1/messages/") || path.starts_with("/api/oauth/"))
-        .then_some(target)
 }
 
 impl Claude {
@@ -1015,20 +987,6 @@ mod tests {
         assert_eq!(rejected.err().unwrap().status, 502);
     }
 
-    #[test]
-    fn refresh_endpoint_is_exact_and_separate_from_codex() {
-        for path in [
-            "/oauth/token",
-            "/codex/https://platform.claude.com/v1/oauth/token",
-            "/https://platform.claude.com.evil.invalid/v1/oauth/token",
-            "/https://platform.claude.com:444/v1/oauth/token",
-            "/anthropic/v1/oauth/token?redirect=evil",
-            "/anthropic-evil/v1/oauth/token",
-        ] {
-            assert!(!token_refresh(path), "{path}");
-        }
-    }
-
     #[tokio::test]
     async fn configured_directories_resolve_saved_credentials_and_local_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -1168,20 +1126,34 @@ claude:
         ] {
             for prefix in ["/anthropic", "/claude"] {
                 let prefixed = format!("{prefix}{path}");
-                assert_eq!(target(&prefixed), Some(path));
+                let target = crate::target::Target::new("POST", &prefixed);
                 assert_eq!(
-                    c.url(target(&prefixed).unwrap()).unwrap().as_str(),
+                    crate::target::logged_service(&prefixed),
+                    crate::routing::Service::Claude
+                );
+                assert_eq!(target.rest(), path);
+                assert_eq!(
+                    c.url(target.rest()).unwrap().as_str(),
                     format!("https://api.anthropic.com{path}")
                 );
             }
         }
-        assert!(target("/v1/responses").is_none());
-        assert!(target("/v1/models").is_none());
-        assert!(target("/claude-evil/v1/messages").is_none());
-        assert!(target("/anthropic-evil/v1/messages").is_none());
+        // Unscoped, only Messages and OAuth paths are Claude's.
+        for path in [
+            "/v1/responses",
+            "/v1/models",
+            "/claude-evil/v1/messages",
+            "/anthropic-evil/v1/messages",
+        ] {
+            assert_eq!(
+                crate::target::logged_service(path),
+                crate::routing::Service::Codex,
+                "{path}"
+            );
+        }
         assert_eq!(
-            target("/v1/messages?beta=true"),
-            Some("/v1/messages?beta=true")
+            crate::target::logged_service("/v1/messages?beta=true"),
+            crate::routing::Service::Claude
         );
         for path in [
             "//evil.invalid/v1/messages",
@@ -1454,7 +1426,11 @@ claude:
                 "/https://182.92.106.196:6060/v1/models",
                 "/anthropic/https://182.92.106.196:6060/v1/messages",
             ] {
-                let route = c.explicit_api_route(&headers, path).unwrap().unwrap();
+                let target = crate::target::Target::new("POST", path);
+                let route = c
+                    .explicit_api_route(&headers, target.rest())
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(route.proxy.label(), "none");
                 assert!(!route.oauth && !route.needs_profile && !route.matched_account);
                 let mut forwarded = crate::server::filtered_headers(&headers);

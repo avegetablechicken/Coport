@@ -1,14 +1,7 @@
 //! Explicit, configured third-party Claude API upstreams.
 
+/// A target, without its scope, naming an explicit upstream.
 pub(crate) fn explicit_target(target: &str) -> Option<&str> {
-    let target = ["/anthropic", "/claude"]
-        .into_iter()
-        .find_map(|prefix| {
-            target
-                .strip_prefix(prefix)
-                .filter(|rest| rest.starts_with('/'))
-        })
-        .unwrap_or(target);
     target.starts_with("/https://").then_some(target)
 }
 

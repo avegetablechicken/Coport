@@ -8,13 +8,14 @@ impl Server {
     pub(super) async fn forward_grok(
         &self,
         incoming: Request<Incoming>,
-        target: &str,
+        target: &Target,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         let settings = &self.config.grok;
         // Proxy tunnels and scoped base URLs share the credential router.
-        let scoped = crate::grok::target(target).map(crate::antigravity::named_upstream_target);
-        let rest = scoped.as_deref().unwrap_or(target);
+        let rest = target.rest();
+        let model_call = target.kind() == Kind::ModelCall;
+        let target = target.raw();
         if !settings.configured() {
             return Err(Error::new(404, "Grok routing is not configured."));
         }
@@ -37,8 +38,14 @@ impl Server {
             .resolve(incoming.headers(), rest, &self.grok_routes)
             .await?
         {
-            GrokTarget::Account(route) => self.forward_grok_account(incoming, route, log).await,
-            GrokTarget::Api(route) => self.forward_grok_api(incoming, route, log).await,
+            GrokTarget::Account(route) => {
+                self.forward_grok_account(incoming, route, model_call, log)
+                    .await
+            }
+            GrokTarget::Api(route) => {
+                self.forward_grok_api(incoming, route, model_call, log)
+                    .await
+            }
         }
     }
 
@@ -46,6 +53,7 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         route: GrokRoute,
+        model_call: bool,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         // As Codex's account requests: the account and its route, no provider.
@@ -61,8 +69,16 @@ impl Server {
         }
         log.field("credential_match", credential_match(route.configured));
         let headers = self.grok_headers(&incoming, &route.token)?;
-        self.send_grok(incoming, headers, route.url, &route.proxy, false, log)
-            .await
+        self.send_grok(
+            incoming,
+            headers,
+            route.url,
+            &route.proxy,
+            false,
+            model_call,
+            log,
+        )
+        .await
     }
 
     /// An xAI API or gateway request, as Codex's and Claude's API key
@@ -71,6 +87,7 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         route: ApiRoute,
+        model_call: bool,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         log.field("provider", &route.selector);
@@ -95,6 +112,7 @@ impl Server {
             route.url,
             &route.proxy,
             route.custom_upstream,
+            model_call,
             log,
         )
         .await
@@ -119,11 +137,12 @@ impl Server {
         url: Url,
         proxy: &Choice,
         custom_upstream: bool,
+        model_call: bool,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
-        if log.fields.contains_key("model_call_id") {
+        if model_call {
             crate::model_calls::observe_request(&bytes, log);
         }
         let mut request = reqwest::Request::new(parts.method, url);

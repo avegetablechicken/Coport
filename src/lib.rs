@@ -20,6 +20,7 @@ mod request_ids;
 pub mod routing;
 pub mod server;
 pub mod service;
+pub mod target;
 mod tunnel;
 pub mod url_routing;
 

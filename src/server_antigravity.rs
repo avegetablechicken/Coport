@@ -32,17 +32,14 @@ impl Server {
     pub(super) async fn forward_antigravity(
         &self,
         mut incoming: Request<Incoming>,
-        target: &str,
+        target: &Target,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         let settings = &self.config.antigravity;
-        // An unprefixed target is Antigravity's only through an API key route.
-        let scoped =
-            crate::antigravity::target(target).map(crate::antigravity::named_upstream_target);
-        let api_target = scoped.as_deref().unwrap_or(target);
+        let api_target = target.rest();
         if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
             return self
-                .forward_antigravity_api(incoming, api_target, route, log)
+                .forward_antigravity_api(incoming, target, route, log)
                 .await;
         }
         // A key in `x-goog-api-key` or `key` is a Gemini API key, routed as
@@ -56,18 +53,20 @@ impl Server {
                     .resolve_api_key(key, credential, api_target)
                     .await?;
                 return self
-                    .forward_antigravity_api(incoming, api_target, route, log)
+                    .forward_antigravity_api(incoming, target, route, log)
                     .await;
             }
         }
         if !settings.enabled() {
             return Err(Error::new(404, "Antigravity routing is not configured."));
         }
-        let rest = scoped
-            .as_deref()
-            .ok_or(Error::config("Unroutable Antigravity request target."))?;
+        // An unprefixed target is Antigravity's only through an API key route.
+        if !target.scoped() {
+            return Err(Error::config("Unroutable Antigravity request target."));
+        }
+        let rest = target.rest();
         if crate::antigravity::token_host(rest) {
-            if !crate::antigravity::token_refresh(rest) {
+            if target.kind() != Kind::TokenRefresh {
                 return Err(Error::new(
                     404,
                     "Only Antigravity's token refresh is served on oauth2.googleapis.com.",
@@ -99,9 +98,8 @@ impl Server {
             }
         }
         // As for Codex and Claude: only the saved login's model calls renew it.
-        let auto_refresh = self.config.auto_refresh_access_token
-            && settings.saved_login
-            && crate::model_calls::is_model_endpoint(incoming.method().as_str(), target);
+        let auto_refresh =
+            self.config.auto_refresh_access_token && settings.saved_login && target.model_call();
         let rotation_guard = if auto_refresh {
             Some(self.auto_refresh.rotation.read().await)
         } else {
@@ -177,7 +175,7 @@ impl Server {
         // Drain the input before waiting so Hyper can observe a disconnected
         // client and cancel its pending call throughout the cooldown.
         self.location_cooldowns.wait(scope.as_ref(), log).await;
-        if log.fields.contains_key("model_call_id") {
+        if target.kind() == Kind::ModelCall {
             crate::model_calls::observe_request(&bytes, log);
         }
         let mut headers = filtered_headers(&parts.headers);
@@ -207,11 +205,11 @@ impl Server {
     async fn forward_antigravity_api(
         &self,
         incoming: Request<Incoming>,
-        target: &str,
+        target: &Target,
         route: ApiRoute,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        let url = route.url(target)?;
+        let url = route.url(target.rest())?;
         log.field("provider", &route.selector);
         log.field("upstream_base_url", &route.upstream);
         if let Some(reference) =
@@ -228,7 +226,7 @@ impl Server {
         // Drain the input before waiting so Hyper can observe a disconnected
         // client and cancel its pending call throughout the cooldown.
         self.location_cooldowns.wait(scope.as_ref(), log).await;
-        if log.fields.contains_key("model_call_id") {
+        if target.kind() == Kind::ModelCall {
             crate::model_calls::observe_request(&bytes, log);
         }
         let mut headers = filtered_headers(&parts.headers);

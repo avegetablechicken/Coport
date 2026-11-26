@@ -4,8 +4,9 @@ use crate::{
     logger::{Logger, RequestLog},
     routing::{
         MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
-        query_url, refresh_token, token_refresh, upstream_url,
+        query_url, refresh_token, upstream_url,
     },
+    target::{Kind, Target},
 };
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
@@ -674,7 +675,10 @@ impl Server {
             target.split('?').next().unwrap_or("/")
         };
         let mut log=RequestLog { logger:self.logger.clone(), fields:json!({"request_id":uuid::Uuid::new_v4().to_string(),"method":incoming.method().as_str(),"path":logged_path}).as_object().unwrap().clone(), started:Instant::now(),status:0,bytes:0,outcome:"request_cancelled" };
-        if incoming.method() == "POST" && crate::model_calls::is_model_endpoint("POST", &target) {
+        // What the request is needs no configuration, so even a request
+        // refused below is recorded as the Model call it asked for.
+        let target = crate::target::Target::new(incoming.method().as_str(), &target);
+        if target.kind() == Kind::ModelCall {
             log.field("model_call_id", uuid::Uuid::new_v4());
             log.field("model_transport", "http");
         }
@@ -688,7 +692,7 @@ impl Server {
         // The app is decided once, before any record: routing follows it and
         // every record logs it. A CONNECT takes the app of the first request
         // in its tunnel; requests this listener does not serve have none.
-        let service = (valid && !connect).then(|| self.config.request_service(&target));
+        let service = (valid && !connect).then(|| self.config.app(&target));
         if let Some(Ok(service)) = &service {
             log.field("service", service.name());
         }
@@ -788,7 +792,7 @@ impl Server {
                     headers.insert("upgrade", "websocket".parse().unwrap());
                     match upstream.upgrade().await {
                         Ok(upstream) => {
-                            if crate::model_calls::is_model_endpoint("GET", &target) {
+                            if target.kind() == Kind::ModelWebSocket {
                                 log.field("model_transport", "websocket");
                                 log.field(
                                     "websocket_extensions",
@@ -823,7 +827,7 @@ impl Server {
                 let status = upstream.status();
                 record_upstream_response(&mut log, status.as_u16());
                 let headers = filtered_headers(upstream.headers());
-                let mut observer = log.fields.contains_key("model_call_id").then(|| {
+                let mut observer = (target.kind() == Kind::ModelCall).then(|| {
                     crate::model_calls::record_response_encoding(&mut log, &headers);
                     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
                     crate::model_calls::HttpObserver::new(
@@ -880,7 +884,7 @@ impl Server {
     async fn forward(
         &self,
         mut incoming: Request<Incoming>,
-        target: &str,
+        target: &Target,
         service: Service,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
@@ -918,17 +922,16 @@ impl Server {
             }
             return self.forward_grok(incoming, target, log).await;
         }
-        // `service` was decided from this target by `Config::request_service`.
+        // `service` was decided from this target by `Config::app`.
         let claude = service == Service::Claude;
-        let target = crate::routing::codex_target(target);
+        let model_call = target.model_call();
+        let http_model_call = target.kind() == Kind::ModelCall;
+        if target.kind() == Kind::TokenRefresh {
+            return self.forward_token_refresh(incoming, log, claude).await;
+        }
+        let target = target.rest();
         let path = target.split('?').next().unwrap_or("");
         let docs = path == MCP_PATH;
-        if claude && crate::claude::token_refresh(target) {
-            return self.forward_token_refresh(incoming, log, true).await;
-        }
-        if !claude && token_refresh(target) {
-            return self.forward_token_refresh(incoming, log, false).await;
-        }
         let explicit_api_route = if claude {
             self.config
                 .claude
@@ -953,7 +956,7 @@ impl Server {
         let auto_refresh_model = self.config.auto_refresh_access_token
             && explicit_api_route.is_none()
             && explicit_codex_route.is_none()
-            && crate::model_calls::is_model_endpoint(incoming.method().as_str(), target);
+            && model_call;
         let rotation_guard = if auto_refresh_model {
             Some(self.auto_refresh.rotation.read().await)
         } else {
@@ -974,15 +977,8 @@ impl Server {
                 }
             }
         }
-        let claude_target = if claude {
-            Some(
-                crate::claude::target(target)
-                    .or_else(|| crate::claude_api::explicit_target(target))
-                    .ok_or(Error::config("Unroutable Claude request target."))?,
-            )
-        } else {
-            None
-        };
+        // Every target the App decision gives Claude is one of its own.
+        let claude_target = claude.then_some(target);
         let claude_route = if claude_target.is_some() {
             Some(if let Some(route) = explicit_api_route {
                 route
@@ -1168,7 +1164,7 @@ impl Server {
         drop(rotation_guard);
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
-        if log.fields.contains_key("model_call_id") {
+        if http_model_call {
             crate::model_calls::observe_request(&bytes, log);
         }
         let mut headers = filtered_headers(&parts.headers);

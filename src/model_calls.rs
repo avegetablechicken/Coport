@@ -9,47 +9,7 @@ use std::{
     time::Instant,
 };
 
-pub fn is_model_endpoint(method: &str, raw: &str) -> bool {
-    let raw = raw.split('?').next().unwrap_or("");
-    let path = raw
-        .strip_prefix("/codex/")
-        .or_else(|| raw.strip_prefix("/anthropic/"))
-        .or_else(|| raw.strip_prefix("/claude/"))
-        .or_else(|| raw.strip_prefix("/antigravity/"))
-        .or_else(|| raw.strip_prefix("/grok/"))
-        .unwrap_or(raw)
-        .trim_start_matches('/');
-    // Only explicit upstream targets are URLs; `v1internal:x` would parse as one.
-    let url = (path.starts_with("https://") || path.starts_with("http://"))
-        .then(|| url::Url::parse(path).ok())
-        .flatten();
-    let path = url
-        .as_ref()
-        .map(|u| u.path())
-        .unwrap_or(path)
-        .trim_matches('/');
-    let ends = |suffix: &str| path == suffix || path.ends_with(&format!("/{suffix}"));
-    // Gemini methods, as Cloud Code's `v1internal:streamGenerateContent`.
-    let gemini = path
-        .rsplit('/')
-        .next()
-        .and_then(|last| last.rsplit_once(':'))
-        .is_some_and(|(_, method)| matches!(method, "generateContent" | "streamGenerateContent"));
-    match method {
-        "POST" if gemini => true,
-        "POST" => [
-            "responses",
-            "responses/compact",
-            "messages",
-            "chat/completions",
-            "completions",
-        ]
-        .iter()
-        .any(|s| ends(s)),
-        "GET" => ends("responses"),
-        _ => false,
-    }
-}
+pub use crate::target::is_model_endpoint;
 
 // Unknown fields (including prompts, generated text, and tool arguments) are
 // skipped by serde and never copied into log records.
@@ -1278,39 +1238,6 @@ mod tests {
         }
     }
     #[test]
-    fn model_category_matches_inference_not_management_endpoints() {
-        for (method, path, expected) in [
-            ("POST", "/v1/responses", true),
-            ("POST", "/backend-api/codex/responses/compact", true),
-            (
-                "GET",
-                "/codex/https://example.invalid/v1/responses?model=x",
-                true,
-            ),
-            ("POST", "/anthropic/v1/messages", true),
-            (
-                "POST",
-                "/claude/https://example.invalid/api/v1/messages",
-                true,
-            ),
-            ("POST", "/v1/chat/completions", true),
-            ("POST", "/v1/completions", true),
-            ("POST", "/anthropic/v1/messages/count_tokens", false),
-            ("GET", "/v1/responses/response-id", false),
-            ("GET", "/backend-api/wham/usage", false),
-            ("GET", "/anthropic/api/oauth/usage", false),
-            ("POST", "/anthropic/v1/oauth/token", false),
-            ("POST", "/backend-api/codex/analytics-events/events", false),
-            ("POST", "/mcp/openaiDeveloperDocs", false),
-            ("GET", "/v1/models", false),
-            ("CONNECT", "api.anthropic.com:443", false),
-            ("POST", "/v1/not-responses", false),
-        ] {
-            assert_eq!(is_model_endpoint(method, path), expected, "{method} {path}");
-        }
-    }
-
-    #[test]
     fn websocket_call_ids_do_not_leak_between_turns_or_from_upstream() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
@@ -1689,26 +1616,6 @@ mod tests {
         assert_eq!(log.fields["model_outcome"], "failed");
     }
     #[test]
-    fn grok_builds_responses_and_chat_completions_are_model_calls() {
-        for target in [
-            "/grok/v1/responses",
-            "/grok/v1/chat/completions",
-            "/grok/chat/completions",
-            "/grok/https://cli-chat-proxy.grok.com/v1/responses",
-            "/grok/https://gateway.example.com/v1/responses",
-        ] {
-            assert!(is_model_endpoint("POST", target), "{target}");
-        }
-        for target in [
-            "/grok/v1/models",
-            "/grok/v1/settings",
-            "/grok/v1/billing?format=credits",
-        ] {
-            assert!(!is_model_endpoint("GET", target), "{target}");
-            assert!(!is_model_endpoint("POST", target), "{target}");
-        }
-    }
-    #[test]
     fn chat_completion_chunks_time_the_first_output_not_the_opening_role() {
         let dir = tempfile::tempdir().unwrap();
         let opening = r#"{"id":"c","object":"chat.completion.chunk","model":"grok","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#;
@@ -1746,23 +1653,7 @@ mod tests {
         }
     }
     #[test]
-    fn gemini_methods_and_responses_are_model_calls() {
-        for target in [
-            "/antigravity/v1internal:streamGenerateContent?alt=sse",
-            "/antigravity/v1internal:generateContent",
-            "/antigravity/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "/v1beta/models/gemini-3-pro:generateContent",
-        ] {
-            assert!(is_model_endpoint("POST", target), "{target}");
-            assert!(!is_model_endpoint("GET", target), "{target}");
-        }
-        for target in [
-            "/antigravity/v1internal:loadCodeAssist",
-            "/antigravity/v1internal:countTokens",
-            "/antigravity/v1internal:generateContentX",
-        ] {
-            assert!(!is_model_endpoint("POST", target), "{target}");
-        }
+    fn gemini_responses_cut_short_are_incomplete() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = log_at(&dir.path().join("proxy.log"));
         // An unwrapped, non-streaming Gemini response cut short by its limit.
