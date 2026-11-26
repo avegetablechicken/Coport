@@ -4,6 +4,28 @@ Coport is a local proxy that routes coding agents' traffic through chosen upstre
 
 ## Language
 
+### Requests
+
+**App**:
+The coding agent a proxied request belongs to: Codex, Claude, Antigravity or Grok. Coport decides it once per request, from the request's target, and routes and records the request by it.
+_Avoid_: service, client, provider
+
+**Scoped target**:
+A request target that names its **App** in a leading prefix, such as `/antigravity/…` or `/anthropic/…`. What follows the prefix is the target the **App** asked for.
+_Avoid_: prefixed path, namespaced target
+
+**Model call**:
+A request that asks a model to generate output: a Responses, Messages, Chat Completions, Completions or Gemini generateContent call, or a Responses WebSocket connection.
+_Avoid_: model request, inference
+
+**Token refresh**:
+A request that renews an **App**'s login at its OAuth token endpoint, whether a client sends it through Coport or Coport sends it itself.
+_Avoid_: OAuth refresh, renewal request
+
+**Auxiliary request**:
+A request Coport sends upstream while serving a client's request that is not that request itself, such as an account lookup or a **Token refresh** made before retrying a **Model call**.
+_Avoid_: side request, probe
+
 ### Traffic
 
 **Traffic totals**:
