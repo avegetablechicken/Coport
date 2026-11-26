@@ -26,6 +26,10 @@ _Avoid_: OAuth refresh, renewal request
 A request Coport sends upstream while serving a client's request that is not that request itself, such as an account lookup or a **Token refresh** made before retrying a **Model call**.
 _Avoid_: side request, probe
 
+**Request record**:
+What Coport writes down about one request as it goes: received, routed, sent upstream and answered, then ended as finished, rejected, failed or cancelled. A **Model call**'s record also carries the call's ID; an **Auxiliary request** made for it does not.
+_Avoid_: request log, log entry
+
 **Route**:
 The upstream a request is sent to, the proxy it goes through and the credential it carries, chosen by its **App** from the credential or the target the client sent.
 _Avoid_: destination, path
