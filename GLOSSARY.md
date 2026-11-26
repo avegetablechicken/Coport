@@ -34,6 +34,14 @@ _Avoid_: destination, path
 An **App**'s OAuth login stored on this computer where the **App** keeps it. When a **Model call** carrying its access token is rejected as expired, Coport renews it with a **Token refresh** and sends the call again.
 _Avoid_: credential file, stored token
 
+**Account lookup**:
+An **Auxiliary request** that asks an **App**'s upstream which account an access token belongs to. Its answer is remembered for that token, since a token's account never changes.
+_Avoid_: profile lookup, userinfo
+
+**Account discovery**:
+**Account lookups** Coport makes in the background for the logins it knows, to show their account labels and route states. It runs only where the user names a proxy for it, and does not retry a failed lookup for a while.
+_Avoid_: background probe
+
 ### Traffic
 
 **Traffic totals**:
