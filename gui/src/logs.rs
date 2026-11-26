@@ -202,7 +202,8 @@ impl LogFeed {
         s.entries.iter().filter(|e| keep(e)).cloned().collect()
     }
 
-    /// Aggregates retained requests in the last 30 minutes since the latest start.
+    /// Routes and their health since the latest start. Traffic is counted
+    /// from the logs themselves; see `crate::traffic`.
     pub fn stats(&self) -> Stats {
         let s = self.store.lock().unwrap();
         let start = s
@@ -211,9 +212,6 @@ impl LogFeed {
             .rposition(|e| e.event == "server_started")
             .map_or(0, |i| i + 1);
         let mut stats = Stats::default();
-        let now = Local::now();
-        let mut latency_total = 0u64;
-        let mut latency_count = 0u64;
         for e in s.entries.range(start..) {
             match e.event.as_str() {
                 "current_route" | "route_unavailable" => stats.routes.push(e.clone()),
@@ -229,37 +227,7 @@ impl LogFeed {
                 }
                 _ => {}
             }
-            if !e.is_request_end() {
-                continue;
-            }
-            let Some(t) = e.time else { continue };
-            let age = now - t;
-            if age < chrono::Duration::zero()
-                || age >= chrono::Duration::minutes(SPARK_MINUTES as i64)
-            {
-                continue;
-            }
-            stats.requests += 1;
-            if e.is_error() {
-                stats.errors += 1;
-            }
-            stats.bytes += e.bytes();
-            if let Some(ms) = e.duration_ms() {
-                latency_total += ms;
-                latency_count += 1;
-            }
-            if let Some(t) = e.time {
-                let age = (now - t).num_minutes();
-                if (0..SPARK_MINUTES as i64).contains(&age) {
-                    let slot = SPARK_MINUTES - 1 - age as usize;
-                    stats.per_minute[slot] += 1;
-                    if e.is_error() {
-                        stats.errors_per_minute[slot] += 1;
-                    }
-                }
-            }
         }
-        stats.avg_latency_ms = (latency_count > 0).then(|| latency_total / latency_count);
         stats
     }
 
@@ -400,16 +368,8 @@ fn file_identity(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-pub const SPARK_MINUTES: usize = 30;
-
 #[derive(Default)]
 pub struct Stats {
-    pub requests: u64,
-    pub errors: u64,
-    pub bytes: u64,
-    pub avg_latency_ms: Option<u64>,
-    pub per_minute: [u32; SPARK_MINUTES],
-    pub errors_per_minute: [u32; SPARK_MINUTES],
     pub routes: Vec<Entry>,
     /// The latest health of each route since the server started, by proxy
     /// endpoint, destination origin and transport, as the daemon tracks it.
@@ -575,7 +535,8 @@ mod tests {
             ),
         )
         .unwrap();
-        wait_for(|| feed.stats().requests == 1);
+        let ends = || feed.entries(|e| e.is_request_end());
+        wait_for(|| ends().len() == 1);
         // Partial line is not parsed until its newline arrives.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -586,18 +547,14 @@ mod tests {
         f.write_all(&next.as_bytes()[..10]).unwrap();
         f.flush().unwrap();
         std::thread::sleep(Duration::from_millis(800));
-        assert_eq!(feed.stats().requests, 1);
+        assert_eq!(ends().len(), 1);
         f.write_all(&next.as_bytes()[10..]).unwrap();
         f.flush().unwrap();
-        wait_for(|| feed.stats().requests == 2);
-        let stats = feed.stats();
-        assert_eq!(stats.errors, 1);
-        assert_eq!(stats.bytes, 200);
-        assert_eq!(stats.avg_latency_ms, Some(20));
-        assert_eq!(
-            feed.entries(|e| e.is_request_end())[0].service(),
-            Some(Service::Claude)
-        );
+        wait_for(|| ends().len() == 2);
+        assert_eq!(ends().iter().filter(|e| e.is_error()).count(), 1);
+        assert_eq!(ends().iter().map(Entry::bytes).sum::<u64>(), 200);
+        assert_eq!(ends()[1].duration_ms(), Some(20));
+        assert_eq!(ends()[0].service(), Some(Service::Claude));
 
         // Rotation: the logger renames to `.1` and starts a fresh file. A line
         // written just before is still read from the rotated file.
@@ -606,37 +563,8 @@ mod tests {
         f.flush().unwrap();
         std::fs::rename(&path, dir.path().join("proxy.log.1")).unwrap();
         std::fs::write(&path, line("request_failed", 502)).unwrap();
-        wait_for(|| feed.stats().requests == 4);
+        wait_for(|| ends().len() == 4);
         assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 3);
-    }
-
-    #[test]
-    fn stats_exclude_old_future_and_undated_requests() {
-        let feed = LogFeed {
-            store: Arc::new(Mutex::new(Store::default())),
-        };
-        let now = Local::now();
-        let mut lines = Vec::new();
-        for (time, status) in [
-            (Some(now - chrono::Duration::minutes(31)), "502"),
-            (Some(now - chrono::Duration::minutes(30)), "502"),
-            (Some(now + chrono::Duration::seconds(10)), "502"),
-            (None, "502"),
-            (Some(now - chrono::Duration::minutes(29)), "200"),
-            (Some(now - chrono::Duration::seconds(1)), "502"),
-        ] {
-            let value = serde_json::json!({"event":"request_finished", "timestamp":time.map(|t| t.to_rfc3339()),
-                "status":status, "received_bytes":"100", "duration_ms":"20"});
-            lines.extend_from_slice(format!("{value}\n").as_bytes());
-        }
-        feed.ingest(&mut lines);
-        let stats = feed.stats();
-        assert_eq!(stats.requests, 2);
-        assert_eq!(stats.errors, 1);
-        assert_eq!(stats.bytes, 200);
-        assert_eq!(stats.avg_latency_ms, Some(20));
-        assert_eq!(stats.per_minute.iter().sum::<u32>(), 2);
-        assert_eq!(stats.errors_per_minute.iter().sum::<u32>(), 1);
     }
 
     #[test]
@@ -653,10 +581,9 @@ mod tests {
         )
         .into_bytes();
         feed.ingest(&mut lines);
-        assert_eq!(feed.entries(|e| e.is_request_end()).len(), 1);
-        let stats = feed.stats();
-        assert_eq!(stats.requests, 1);
-        assert_eq!(stats.errors, 0);
+        let ends = feed.entries(|e| e.is_request_end());
+        assert_eq!(ends.len(), 1);
+        assert!(!ends[0].is_error());
         assert_eq!(feed.entries(|_| true)[0].status(), None);
     }
 

@@ -50,6 +50,8 @@ pub struct Tray {
     restart: MenuItem<Wry>,
     quit: MenuItem<Wry>,
     view: Mutex<Option<View>>,
+    /// The last 30 minutes' requests and errors, as Home counts All traffic.
+    traffic: Mutex<Option<String>>,
     /// Model calls sent upstream as of the last update.
     sent: AtomicU64,
     beacon: Mutex<Beacon>,
@@ -185,6 +187,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         restart,
         quit,
         view: Mutex::new(None),
+        traffic: Mutex::new(None),
         sent: AtomicU64::new(
             app.state::<AppState>()
                 .core
@@ -221,6 +224,40 @@ impl Tray {
 pub fn sync(app: &AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || sync_on_main_thread(&handle));
+}
+
+/// Counts the last 30 minutes of All traffic from the logs, as Home does,
+/// without holding the shared state while reading. Returns whether the line
+/// changed; `None` before the tray or the proxy is ready to count.
+pub fn refresh_traffic(app: &AppHandle) -> Option<bool> {
+    let tray = app.try_state::<Tray>()?;
+    let path = {
+        let state = app.try_state::<AppState>()?;
+        let core = state.core.lock().unwrap();
+        // Stopped, the line is not shown; nothing needs counting.
+        describe(&core.controller.phase())
+            .2
+            .is_none()
+            .then(|| core.logs.path())
+    };
+    let Some(path) = path else { return Some(false) };
+    let traffic = coport_gui::traffic::read(
+        &path,
+        30,
+        &Default::default(),
+        coport_gui::traffic::TrafficScope::All,
+        &Default::default(),
+    )
+    .ok()?;
+    let line = traffic_line(traffic.stats.requests, traffic.stats.errors);
+    let mut last = tray.traffic.lock().unwrap();
+    let changed = last.as_deref() != Some(line.as_str());
+    *last = Some(line);
+    Some(changed)
+}
+
+fn traffic_line(requests: u64, errors: u64) -> String {
+    format!("{requests} requests · {errors} errors")
 }
 
 /// Icon status, headline and, unless running, the line shown instead of stats.
@@ -270,10 +307,12 @@ fn sync_on_main_thread(app: &AppHandle) {
         let phase = core.controller.phase();
         let (status, headline, idle) = describe(&phase);
         let stats = match idle {
-            None => {
-                let stats = core.logs.stats();
-                format!("{} requests · {} errors", stats.requests, stats.errors)
-            }
+            None => tray
+                .traffic
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "Reading traffic…".into()),
             Some(idle) => idle.to_owned(),
         };
         let view = View {

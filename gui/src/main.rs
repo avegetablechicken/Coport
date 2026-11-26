@@ -293,10 +293,43 @@ fn tray_notifier(app: tauri::AppHandle) -> proxy::Notify {
             }
         })
         .expect("tray sync thread");
+    // The tray's traffic line is counted apart, at most once a second while
+    // the log grows and once a minute as its window slides.
+    let (traffic_tx, traffic_rx) = std::sync::mpsc::channel::<()>();
+    let counter = app.clone();
+    std::thread::Builder::new()
+        .name("tray-traffic".into())
+        .spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
+            let mut counted: Option<std::time::Instant> = None;
+            loop {
+                // Until the first count, retry each second for the tray to exist.
+                let wait = Duration::from_secs(if counted.is_some() { 60 } else { 1 });
+                if traffic_rx.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
+                    break;
+                }
+                if let Some(at) = counted {
+                    std::thread::sleep(Duration::from_secs(1).saturating_sub(at.elapsed()));
+                }
+                while traffic_rx.try_recv().is_ok() {}
+                match tray::refresh_traffic(&counter) {
+                    Some(changed) => {
+                        counted = Some(std::time::Instant::now());
+                        if changed {
+                            tray::sync(&counter);
+                        }
+                    }
+                    None => counted = None,
+                }
+            }
+        })
+        .expect("tray traffic thread");
     let tx = Mutex::new(tx);
+    let traffic_tx = Mutex::new(traffic_tx);
     Arc::new(move || {
         let _ = app.emit("state-changed", ());
         let _ = tx.lock().unwrap().send(());
+        let _ = traffic_tx.lock().unwrap().send(());
     })
 }
 
