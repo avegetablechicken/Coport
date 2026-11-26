@@ -654,7 +654,7 @@ function accountRow(c, scope, window, review = "", source = "local") {
     return `<div class="credential-traffic" data-tip-scope="${tooltipScopeKey(identityKey)}"><div class="traffic-identity brief">${identity}<span class="traffic-brief"><span>${calls} · <span class="bad">${rate} errors</span></span>${review}</span></div></div>`;
   }
   return `<div class="credential-traffic" data-tip-scope="${tooltipScopeKey(identityKey)}"><div class="traffic-identity">${identity}${review}</div>
-    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${scope === "model" && c.firstTokenSamples != null ? stat("First Token", fmtMs(c.firstTokenMs ?? null)) : ""}${stat("Avg. Time", fmtMs(c.avgMs))}${outputTpsStat(c, scope, identityKey)}</div>${modelTokenStats(c, scope)}</div>`;
+    ${chart(c, scope, true, window)}<div class="strip">${stat(scope === "model" ? "Calls" : "Requests", c.requests)}${stat("Error Rate", rate, c.errors ? "bad" : "")}${firstTokenStat(c, scope)}${stat("Avg. Time", fmtMs(c.avgMs))}${outputTpsStat(c, scope, identityKey)}</div>${modelTokenStats(c, scope)}</div>`;
 }
 
 /// The share ring, chart and totals of one traffic view, as Home, each device
@@ -667,6 +667,15 @@ function tooltipScopeKey(key) {
   const keys = tooltipScopeKey.keys ||= new Map();
   if (!keys.has(key)) keys.set(key, `tooltip-${keys.size}`);
   return keys.get(key);
+}
+function firstTokenStat(stats, scope) {
+  if (scope !== "model" || (stats.firstTokenSamples == null && stats.forwardedFirstTokenSamples == null && !Number.isFinite(stats.firstTokenMs))) return "";
+  const average = (total, samples) => samples > 0 && Number.isFinite(total) ? Math.floor(total / samples) : null;
+  // The backend selects a timing per successful call, including historic
+  // samples. Never replace that population with its forwarded-only subset.
+  const first = average(stats.firstTokenTotalMs, stats.firstTokenSamples) ?? (Number.isFinite(stats.firstTokenMs) ? stats.firstTokenMs : null);
+  const forwarded = average(stats.forwardedFirstTokenTotalMs, stats.forwardedFirstTokenSamples);
+  return stat("First Token", fmtMs(first ?? forwarded));
 }
 function outputTpsStat(stats, scope, key = "output-tps") {
   if (scope !== "model") return "";
@@ -695,7 +704,7 @@ function trafficSummary(view, scope, window = view, source = "") {
      <div class="strip">
        ${stat(scope === "model" ? "Calls" : "Requests", view.requests)}
        ${stat("Error Rate", rate, rateClass)}
-       ${scope === "model" && view.firstTokenSamples != null ? stat("First Token", fmtMs(view.firstTokenMs ?? null)) : ""}
+       ${firstTokenStat(view, scope)}
        ${stat("Avg. Time", fmtMs(view.avgMs))}
        ${outputTpsStat(view, scope, JSON.stringify(["summary", source]))}
      </div>${modelTokenStats(view, scope)}</div>`;
@@ -706,7 +715,7 @@ function trafficSummary(view, scope, window = view, source = "") {
 const RAW_TOTALS = ["requests", "errors", "bytes", "cacheRead", "cachePrompt", "latencyTotalMs", "latencySamples"];
 const REPORTED_TOKENS = ["inputTokens", "outputTokens", "cachedInputTokens", "uncachedInputTokens", "cacheWriteTokens"];
 /// Reported only by this version's logs and devices; older devices add nothing.
-const REPORTED_FIRST_TOKEN = ["firstTokenTotalMs", "firstTokenSamples"];
+const REPORTED_FIRST_TOKEN = ["firstTokenTotalMs", "firstTokenSamples", "forwardedFirstTokenTotalMs", "forwardedFirstTokenSamples", "cooldownTotalMs", "cooldownSamples"];
 const REPORTED_OUTPUT_TPS = ["outputTpsTokens", "outputTpsDurationMs"];
 function addTraffic(to, from, offset = 0, length = Infinity) {
   for (const key of RAW_TOTALS) to[key] = (to[key] || 0) + (from[key] || 0);
@@ -1992,7 +2001,7 @@ function detail(e) {
   const rows = Object.entries(e.fields)
     .map(([k, v]) => {
       let value = typeof v === "string" ? v : JSON.stringify(v);
-      if (k === "duration_ms" || k === "headers_ms") value = fmtMs(Number(value));
+      if (["duration_ms", "headers_ms", "first_token_ms", "forwarded_first_token_ms", "location_cooldown_actual_ms", "location_cooldown_wait_ms", "upstream_started_ms"].includes(k)) value = fmtMs(Number(value));
       if (k === "received_bytes") value = fmtBytes(Number(value));
       return `<dt>${esc(k)}</dt><dd>${esc(value)}</dd>`;
     })

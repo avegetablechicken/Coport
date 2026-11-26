@@ -401,16 +401,16 @@ test('Models shows the average first token time before Avg. Time where this devi
   const context = setup('model');
   Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: (v) => v == null ? '—' : `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '' });
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
-  const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 650, firstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
+  const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 300, firstTokenTotalMs: 600, firstTokenSamples: 2, forwardedFirstTokenTotalMs: 600, forwardedFirstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
   for (const html of [context.accountRow(local, 'model', local), context.trafficSummary(local, 'model')]) {
-    assert.match(html, /<Error Rate=[^>]*>\s*<First Token=650 ms>\s*<Avg\. Time=4000 ms>\s*<Output TPS<span[^>]*>!<\/span>=—>/);
+    assert.match(html, /<Error Rate=[^>]*>\s*<First Token=300 ms>\s*<Avg\. Time=4000 ms>\s*<Output TPS<span[^>]*>!<\/span>=—>/);
     assert.doesNotMatch(html, /Received/);
   }
   // No streamed output is unknown, not zero.
-  const none = { ...local, firstTokenMs: null, firstTokenSamples: 0 };
+  const none = { ...local, firstTokenMs: null, firstTokenSamples: 0, forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 0 };
   assert.match(context.accountRow(none, 'model', none), /<First Token=—>/);
   // Requests have no first token, and peers' summaries do not report it.
-  const remote = { ...local, firstTokenMs: undefined, firstTokenSamples: undefined };
+  const remote = { ...local, firstTokenMs: undefined, firstTokenSamples: undefined, forwardedFirstTokenTotalMs: undefined, forwardedFirstTokenSamples: undefined };
   for (const [view, scope] of [[local, 'all'], [remote, 'model']]) {
     assert.doesNotMatch(context.accountRow(view, scope, view), /First Token/);
     assert.doesNotMatch(context.trafficSummary({ ...view }, scope), /First Token/);
@@ -1039,4 +1039,62 @@ test('a recentered ring slides from where it was drawn to its new place', () => 
   // Each source keeps its own place.
   context.placeRing(ring(50), 'device', 5000, false);
   assert.equal(moves.length, 0);
+});
+
+test('First Token displays the corrected number without a tooltip', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
+  const stats = { firstTokenTotalMs: 3000, firstTokenSamples: 1,
+    forwardedFirstTokenTotalMs: 3000, forwardedFirstTokenSamples: 1,
+    cooldownTotalMs: 120000, cooldownSamples: 1 };
+  const part = s => ({ ...s, credentials: [{ service: 'Antigravity', credential: 'work', ...s }] });
+  const total = context.sumTrafficViews([part(stats), part({ firstTokenTotalMs: 900, firstTokenSamples: 1 }), part({})]);
+  for (const view of [total, total.credentials[0]]) {
+    assert.equal(context.firstTokenStat(view, 'model'), '<First Token=1950 ms>');
+  }
+  assert.equal(context.firstTokenStat(context.sumTrafficViews([part(stats)]), 'model'), '<First Token=3000 ms>');
+  // Historic samples retain their weight beside corrected new samples.
+  assert.equal(total.firstTokenTotalMs, 3900);
+  assert.equal(total.firstTokenSamples, 2);
+  assert.equal(context.firstTokenStat({ firstTokenSamples: 0 }, 'model'), '<First Token=—>');
+  assert.equal(context.firstTokenStat(total, 'all'), '');
+});
+
+test('First Token preserves existing measurements without forwarding samples on summaries and accounts', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
+  const old = { firstTokenTotalMs: 1300, firstTokenSamples: 2 };
+  const part = s => ({ ...s, credentials: [{ service: 'Codex', credential: 'work', ...s }] });
+  const total = context.sumTrafficViews([part(old), part({ forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 0 })]);
+  for (const view of [total, total.credentials[0], { firstTokenMs: 650 }]) {
+    assert.equal(context.firstTokenStat(view, 'model'), '<First Token=650 ms>');
+  }
+  // A measured zero is valid; an absent measurement is not zero.
+  assert.equal(context.firstTokenStat({ firstTokenMs: 0 }, 'model'), '<First Token=0 ms>');
+  assert.equal(context.firstTokenStat({ ...old, forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 1 }, 'model'), '<First Token=650 ms>');
+  assert.equal(context.firstTokenStat({ firstTokenTotalMs: 0, firstTokenSamples: 1, forwardedFirstTokenTotalMs: 0, forwardedFirstTokenSamples: 1 }, 'model'), '<First Token=0 ms>');
+});
+
+test('First Token keeps all 4358 successful samples when only 92 have forwarding timings', () => {
+  const context = setup('model');
+  loadSharedViews(context);
+  Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: v => v == null ? '—' : `${v} ms` });
+  const part = (service, firstTokenTotalMs, firstTokenSamples, forwardedFirstTokenTotalMs, forwardedFirstTokenSamples) => {
+    const stats = { firstTokenTotalMs, firstTokenSamples, forwardedFirstTokenTotalMs, forwardedFirstTokenSamples };
+    return { ...stats, credentials: [{ service, credential: 'work', ...stats }] };
+  };
+  // Aggregate-only reproduction of the frozen 24-hour audit; no identities.
+  const total = context.sumTrafficViews([
+    part('Codex', 7533138, 1023, 709946, 92),
+    part('Antigravity', 16230735, 2763, 0, 0),
+    part('Claude', 958942, 393),
+    part('Grok', 616150, 179),
+  ]);
+  assert.equal(total.firstTokenTotalMs, 25338965);
+  assert.equal(total.firstTokenSamples, 4358);
+  assert.equal(total.forwardedFirstTokenSamples, 92);
+  assert.equal(context.firstTokenStat(total, 'model'), '<First Token=5814 ms>');
+  assert.equal(context.firstTokenStat(total.credentials.find(c => c.service === 'Codex'), 'model'), '<First Token=7363 ms>');
 });

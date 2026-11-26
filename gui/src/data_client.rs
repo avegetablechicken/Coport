@@ -256,7 +256,7 @@ struct CredentialView {
     output_tps: Option<f64>,
     cache_hit_rate: Option<f64>,
 }
-/// Over the calls that streamed output, where any source reported them.
+/// Over successful calls that streamed output, where any source reported them.
 fn first_token_ms(stats: &Stats) -> Option<u64> {
     stats
         .first_token_samples
@@ -455,6 +455,16 @@ fn add_stats(to: &mut Stats, from: &Stats) {
         // Sources that did not report it, as older ones, add nothing.
         (&mut to.first_token_total_ms, from.first_token_total_ms),
         (&mut to.first_token_samples, from.first_token_samples),
+        (
+            &mut to.forwarded_first_token_total_ms,
+            from.forwarded_first_token_total_ms,
+        ),
+        (
+            &mut to.forwarded_first_token_samples,
+            from.forwarded_first_token_samples,
+        ),
+        (&mut to.cooldown_total_ms, from.cooldown_total_ms),
+        (&mut to.cooldown_samples, from.cooldown_samples),
         (&mut to.output_tps_tokens, from.output_tps_tokens),
         (&mut to.output_tps_duration_ms, from.output_tps_duration_ms),
     ] {
@@ -2472,6 +2482,10 @@ mod tests {
             summary.groups[0].stats.counts[0] = 2;
             summary.groups[0].stats.first_token_total_ms = first_token.map(|t| t.0);
             summary.groups[0].stats.first_token_samples = first_token.map(|t| t.1);
+            summary.groups[0].stats.forwarded_first_token_total_ms = first_token.map(|t| t.0 / 3);
+            summary.groups[0].stats.forwarded_first_token_samples = first_token.map(|t| t.1);
+            summary.groups[0].stats.cooldown_total_ms = first_token.map(|t| t.0 / 2);
+            summary.groups[0].stats.cooldown_samples = first_token.map(|t| t.1);
             summary
         };
         let current = device(KEY, "http://10.1.1.1", "https://a.example", Some((900, 2)));
@@ -2507,9 +2521,17 @@ mod tests {
         assert_eq!(merged["requests"], 6);
         assert_eq!(merged["firstTokenMs"], 450);
         assert_eq!(merged["firstTokenSamples"], 2);
+        for stats in [&merged, &merged["credentials"][0]] {
+            assert_eq!(stats["forwardedFirstTokenTotalMs"], 300);
+            assert_eq!(stats["forwardedFirstTokenSamples"], 2);
+            assert_eq!(stats["cooldownTotalMs"], 450);
+            assert_eq!(stats["cooldownSamples"], 2);
+        }
         assert_eq!(merged["credentials"][0]["firstTokenMs"], 450);
         let older = view(&[&older]);
         assert!(older.get("firstTokenSamples").is_none());
+        assert!(older.get("forwardedFirstTokenSamples").is_none());
+        assert!(older.get("cooldownSamples").is_none());
         assert!(older["firstTokenMs"].is_null());
         assert!(older["credentials"][0].get("firstTokenSamples").is_none());
         let quiet = view(&[&quiet]);

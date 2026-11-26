@@ -60,7 +60,7 @@ fn lifecycle_rank(entry: &Entry) -> u8 {
 }
 
 /// The fields traffic reads from log records; file summaries keep only these.
-const FIELDS: [&str; 20] = [
+const FIELDS: [&str; 22] = [
     "account_id",
     "credential_ref",
     "account_label",
@@ -81,6 +81,8 @@ const FIELDS: [&str; 20] = [
     "proxy_endpoint",
     "proxy",
     "first_token_ms",
+    "forwarded_first_token_ms",
+    "location_cooldown_actual_ms",
 ];
 
 /// A request or model call merged from its lifecycle records. The most
@@ -664,7 +666,7 @@ pub struct CredentialTraffic {
     cache_write_tokens: Option<u64>,
     cache_hit_rate: Option<f64>,
     avg_ms: Option<u64>,
-    /// Average time to a model call's first streamed output, over the calls
+    /// Average time to first streamed output, over successful model calls
     /// that streamed any.
     first_token_ms: Option<u64>,
     output_tps: Option<f64>,
@@ -687,6 +689,10 @@ pub struct CredentialTraffic {
     first_token_total: u64,
     #[serde(rename = "firstTokenSamples")]
     first_token_count: u64,
+    forwarded_first_token_total_ms: u64,
+    forwarded_first_token_samples: u64,
+    cooldown_total_ms: u64,
+    cooldown_samples: u64,
     cache_read: u64,
     cache_prompt: u64,
 }
@@ -763,6 +769,10 @@ fn read_at(
         summary.latency_count += group.latency_count;
         summary.first_token_total += group.first_token_total;
         summary.first_token_count += group.first_token_count;
+        summary.forwarded_first_token_total_ms += group.forwarded_first_token_total_ms;
+        summary.forwarded_first_token_samples += group.forwarded_first_token_samples;
+        summary.cooldown_total_ms += group.cooldown_total_ms;
+        summary.cooldown_samples += group.cooldown_samples;
         summary.output_tps_tokens = summary
             .output_tps_tokens
             .saturating_add(group.output_tps_tokens);
@@ -956,16 +966,35 @@ fn aggregate(
         group.latency_count += 1;
         group.avg_ms = Some(group.latency_total / group.latency_count);
     }
-    if let Some(ms) = token("first_token_ms") {
-        group.first_token_total = group.first_token_total.saturating_add(ms);
+    // Output before cancellation/failure is still logged, but only completed
+    // successful calls contribute to first-token and cooldown averages.
+    let successful_call = (e.event == "model_call_finished"
+        || (e.event == "request_finished" && is_historical_http_call(e)))
+        && !e.is_error()
+        && !e.status().is_some_and(|status| status >= 400);
+    let forwarded = token("forwarded_first_token_ms")
+        .filter(|ms| token("first_token_ms").is_some_and(|first| *ms <= first));
+    if let Some(ms) = token("first_token_ms").filter(|_| successful_call) {
+        // Select a timing for each call before adding it. Choosing a whole
+        // forwarded-only aggregate would silently discard historic samples.
+        group.first_token_total = group
+            .first_token_total
+            .saturating_add(forwarded.unwrap_or(ms));
         group.first_token_count += 1;
         group.first_token_ms = Some(group.first_token_total / group.first_token_count);
     }
+    if let Some(ms) = forwarded.filter(|_| successful_call) {
+        group.forwarded_first_token_total_ms =
+            group.forwarded_first_token_total_ms.saturating_add(ms);
+        group.forwarded_first_token_samples += 1;
+    }
+    if let Some(ms) = token("location_cooldown_actual_ms").filter(|_| successful_call) {
+        group.cooldown_total_ms = group.cooldown_total_ms.saturating_add(ms);
+        group.cooldown_samples += 1;
+    }
     // Use paired measurements, never divide all usage by timings from only
     // some calls. Active, failed and non-streaming calls have no output rate.
-    if (e.event == "model_call_finished"
-        || (e.event == "request_finished" && is_historical_http_call(e)))
-        && !e.is_error()
+    if successful_call
         && let (Some(output), Some(first), Some(duration)) = (
             output.filter(|n| *n > 1),
             token("first_token_ms"),
@@ -1387,6 +1416,13 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
                         .then_some(g.first_token_total),
                     first_token_samples: (scope == TrafficScope::Model)
                         .then_some(g.first_token_count),
+                    forwarded_first_token_total_ms: (scope == TrafficScope::Model)
+                        .then_some(g.forwarded_first_token_total_ms),
+                    forwarded_first_token_samples: (scope == TrafficScope::Model)
+                        .then_some(g.forwarded_first_token_samples),
+                    cooldown_total_ms: (scope == TrafficScope::Model)
+                        .then_some(g.cooldown_total_ms),
+                    cooldown_samples: (scope == TrafficScope::Model).then_some(g.cooldown_samples),
                     output_tps_tokens: (scope == TrafficScope::Model)
                         .then_some(g.output_tps_tokens),
                     output_tps_duration_ms: (scope == TrafficScope::Model)
@@ -1634,6 +1670,14 @@ mod tests {
                             .then_some(g.first_token_total),
                         first_token_samples: (scope == TrafficScope::Model)
                             .then_some(g.first_token_count),
+                        forwarded_first_token_total_ms: (scope == TrafficScope::Model)
+                            .then_some(g.forwarded_first_token_total_ms),
+                        forwarded_first_token_samples: (scope == TrafficScope::Model)
+                            .then_some(g.forwarded_first_token_samples),
+                        cooldown_total_ms: (scope == TrafficScope::Model)
+                            .then_some(g.cooldown_total_ms),
+                        cooldown_samples: (scope == TrafficScope::Model)
+                            .then_some(g.cooldown_samples),
                         output_tps_tokens: (scope == TrafficScope::Model)
                             .then_some(g.output_tps_tokens),
                         output_tps_duration_ms: (scope == TrafficScope::Model)
@@ -3044,6 +3088,114 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn first_token_timing_counts_only_successful_calls_across_refreshes() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("proxy.log");
+            let at = (Local::now() - chrono::Duration::minutes(2)).to_rfc3339();
+            let mut rows = vec![
+                serde_json::json!({"model_call_id":"waited", "event":"model_call_finished", "first_token_ms":"123000", "forwarded_first_token_ms":"3000", "location_cooldown_actual_ms":"120000"}),
+                serde_json::json!({"model_call_id":"cancelled", "event":"model_call_cancelled", "location_cooldown_actual_ms":"17000", "location_cooldown_wait_ms":"180000"}),
+                serde_json::json!({"model_call_id":"old", "event":"model_call_finished", "first_token_ms":"900", "location_cooldown_wait_ms":"600"}),
+                serde_json::json!({"model_call_id":"rejected", "event":"model_call_failed", "status":"400"}),
+                serde_json::json!({"model_call_id":"failed-after-output", "event":"model_call_failed", "first_token_ms":"1000", "forwarded_first_token_ms":"800", "location_cooldown_actual_ms":"50000"}),
+                serde_json::json!({"model_call_id":"cancelled-after-output", "event":"model_call_cancelled", "first_token_ms":"2000", "forwarded_first_token_ms":"1800", "location_cooldown_actual_ms":"20000"}),
+                serde_json::json!({"model_call_id":"incomplete", "event":"model_call_incomplete", "first_token_ms":"2000", "forwarded_first_token_ms":"1800", "location_cooldown_actual_ms":"20000"}),
+                serde_json::json!({"model_call_id":"unknown", "event":"model_call_unknown", "first_token_ms":"2000", "forwarded_first_token_ms":"1800", "location_cooldown_actual_ms":"20000"}),
+                serde_json::json!({"model_call_id":"active", "event":"model_call_updated", "first_token_ms":"2000", "forwarded_first_token_ms":"1800", "location_cooldown_actual_ms":"20000"}),
+                serde_json::json!({"model_call_id":"error-status", "event":"model_call_finished", "status":"500", "first_token_ms":"2000", "forwarded_first_token_ms":"1800", "location_cooldown_actual_ms":"20000"}),
+            ];
+            for row in &mut rows {
+                row["timestamp"] = at.clone().into();
+                row["service"] = "codex".into();
+                row["provider"] = "work".into();
+                row["method"] = "POST".into();
+                row["path"] = "/v1/responses".into();
+            }
+            let raw = rows
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(newline)
+                + newline;
+            std::fs::write(&path, &raw).unwrap();
+            // Rotated copies and repeated reads must not double count a call.
+            std::fs::write(path.with_file_name("proxy.log.1"), &raw).unwrap();
+            for _ in 0..2 {
+                let traffic = read(&path, 30, &configured(&["work"]), TrafficScope::Model).unwrap();
+                for stats in [&traffic.summary, &traffic.credentials[0]] {
+                    assert_eq!(stats.requests, 10);
+                    assert_eq!(stats.first_token_count, 2);
+                    assert_eq!(stats.first_token_total, 3900);
+                    assert_eq!(stats.first_token_ms, Some(1950));
+                    assert_eq!(stats.forwarded_first_token_samples, 1);
+                    assert_eq!(stats.forwarded_first_token_total_ms, 3000);
+                    assert_eq!(stats.cooldown_samples, 1);
+                    assert_eq!(stats.cooldown_total_ms, 120000);
+                }
+                // HTTP and SSH export the same success-only populations.
+                let config = coport::config::Config::parse(
+                    "listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n",
+                )
+                .unwrap();
+                let key = coport::external_access::DataKey::new(&"e".repeat(64)).unwrap();
+                let exported = export_window_limit(
+                    ReadSource::Path(&path),
+                    &config,
+                    &key,
+                    ExportOptions {
+                        end: traffic.end,
+                        minutes: 30,
+                        scope: TrafficScope::Model,
+                        limit: 24,
+                    },
+                    &ExportIdentities {
+                        labels: configured(&["work"]),
+                        identities: Default::default(),
+                        references: Vec::new(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(exported.len(), 1);
+                let stats = &exported[0].stats;
+                assert_eq!(stats.requests, 10);
+                assert_eq!(stats.first_token_samples, Some(2));
+                assert_eq!(stats.first_token_total_ms, Some(3900));
+                assert_eq!(stats.forwarded_first_token_samples, Some(1));
+                assert_eq!(stats.forwarded_first_token_total_ms, Some(3000));
+                assert_eq!(stats.cooldown_samples, Some(1));
+                assert_eq!(stats.cooldown_total_ms, Some(120000));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_first_token_timing_excludes_failed_and_cancelled_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let at = (Local::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let rows = [("ok", "request_finished", "200"),
+            ("http-error", "request_finished", "400"),
+            ("failed", "request_failed", "200"),
+            ("cancelled", "request_cancelled", "200")]
+            .into_iter().map(|(id, event, status)| serde_json::json!({
+                "timestamp":at, "request_id":id, "event":event, "status":status,
+                "method":"POST", "path":"/v1/responses", "service":"codex", "provider":"work",
+                "first_token_ms":"500", "forwarded_first_token_ms":"300", "location_cooldown_actual_ms":"100"
+            }).to_string()).collect::<Vec<_>>();
+        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+        let traffic = read(&path, 30, &configured(&["work"]), TrafficScope::Model).unwrap();
+        assert_eq!(traffic.summary.requests, 4);
+        assert_eq!(traffic.summary.errors, 2);
+        assert_eq!(traffic.summary.first_token_count, 1);
+        assert_eq!(traffic.summary.first_token_ms, Some(300));
+        assert_eq!(traffic.summary.forwarded_first_token_samples, 1);
+        assert_eq!(traffic.summary.forwarded_first_token_total_ms, 300);
+        assert_eq!(traffic.summary.cooldown_samples, 1);
+        assert_eq!(traffic.summary.cooldown_total_ms, 100);
     }
 
     #[test]

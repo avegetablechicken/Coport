@@ -45,13 +45,27 @@ pub struct Stats {
     pub cache_prompt: u64,
     pub latency_total_ms: u64,
     pub latency_samples: u64,
-    /// Time to first streamed output, summed over the model calls that
-    /// streamed any. Absent from Requests, from exporters older than it, and
+    /// Time to first streamed output, summed over successful model calls that
+    /// streamed any. Each call uses its forwarded timing when available,
+    /// otherwise its original request-start timing. Historic samples remain
+    /// in both the total and denominator. Absent from Requests, older exporters,
     /// for readers that do not name [`FIRST_TOKEN`]; see [`SERVICES_HEADER`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_total_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_samples: Option<u64>,
+    /// Independent measured timing populations, negotiated via FIRST_TOKEN_TIMING.
+    /// Forwarded timing starts at the first upstream send. Only successful
+    /// model calls contribute to either timing; cancelled waits stay in logs.
+    /// Missing historic measurements never count as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_first_token_total_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_first_token_samples: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_total_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_samples: Option<u64>,
     /// Paired totals: output tokens excluding the first token of each completed
     /// streaming call, and time from first output to request completion.
     /// Sent only to readers naming OUTPUT_TPS.
@@ -153,14 +167,16 @@ fn account_digest(value: &str) -> String {
 /// or Grok rejects a whole summary naming it. Readers therefore name the
 /// further services they parse, over HTTP in this header and over SSH in this
 /// environment variable, both ignored by older exporters. Groups of a service
-/// the reader did not name are left out. Statistics [`FIRST_TOKEN`] and
-/// [`OUTPUT_TPS`] are left out likewise for readers that do not name them.
+/// the reader did not name are left out. Statistics [`FIRST_TOKEN`],
+/// [`OUTPUT_TPS`] and [`FIRST_TOKEN_TIMING`] are left out likewise for readers
+/// that do not name them.
 pub const SERVICES_HEADER: &str = "x-coport-services";
 pub const SERVICES_ENV: &str = "COPORT_SUMMARY_SERVICES";
 /// The further services and optional statistics this version parses.
-pub const SERVICES: &str = "antigravity,grok,first-token,output-tps";
+pub const SERVICES: &str = "antigravity,grok,first-token,output-tps,first-token-timing";
 /// Names the first token statistic in a reader's list.
 pub const FIRST_TOKEN: &str = "first-token";
+pub const FIRST_TOKEN_TIMING: &str = "first-token-timing";
 pub const OUTPUT_TPS: &str = "output-tps";
 
 pub fn output_tps(tokens: Option<u64>, duration_ms: Option<u64>) -> Option<f64> {
@@ -175,6 +191,7 @@ pub struct ReaderServices {
     pub grok: bool,
     /// Parses `firstTokenTotalMs` and `firstTokenSamples`.
     pub first_token: bool,
+    pub first_token_timing: bool,
     pub output_tps: bool,
 }
 impl ReaderServices {
@@ -183,6 +200,7 @@ impl ReaderServices {
         antigravity: true,
         grok: true,
         first_token: true,
+        first_token_timing: true,
         output_tps: true,
     };
     /// The services a reader's comma-separated list names.
@@ -195,6 +213,7 @@ impl ReaderServices {
             antigravity: names("antigravity"),
             grok: names("grok"),
             first_token: names(FIRST_TOKEN),
+            first_token_timing: names(FIRST_TOKEN_TIMING),
             output_tps: names(OUTPUT_TPS),
         }
     }
@@ -229,6 +248,13 @@ fn for_reader(bytes: &[u8], services: ReaderServices) -> Result<Vec<u8>, String>
         .into_iter()
         .all(|service| services.reads(service) || !named(service))
         && (services.first_token || !first_token())
+        && (services.first_token_timing
+            || !bytes
+                .windows(b"\"forwardedFirstTokenSamples\"".len())
+                .any(|part| part == b"\"forwardedFirstTokenSamples\"")
+                && !bytes
+                    .windows(b"\"cooldownSamples\"".len())
+                    .any(|part| part == b"\"cooldownSamples\""))
         && (services.output_tps
             || !bytes
                 .windows(b"\"outputTpsTokens\"".len())
@@ -258,6 +284,14 @@ impl Summary {
                 for group in groups.iter_mut() {
                     group.stats.output_tps_tokens = None;
                     group.stats.output_tps_duration_ms = None;
+                }
+            }
+            if !services.first_token_timing {
+                for group in groups.iter_mut() {
+                    group.stats.forwarded_first_token_total_ms = None;
+                    group.stats.forwarded_first_token_samples = None;
+                    group.stats.cooldown_total_ms = None;
+                    group.stats.cooldown_samples = None;
                 }
             }
             if !services.first_token {
@@ -408,13 +442,22 @@ fn validate_groups(groups: &[Group], buckets: usize) -> Result<(), String> {
                 }
                 _ => true,
             }
-            || match (s.first_token_total_ms, s.first_token_samples) {
+            || [
+                (s.first_token_total_ms, s.first_token_samples),
+                (
+                    s.forwarded_first_token_total_ms,
+                    s.forwarded_first_token_samples,
+                ),
+                (s.cooldown_total_ms, s.cooldown_samples),
+            ]
+            .into_iter()
+            .any(|pair| match pair {
                 (None, None) => false,
                 (Some(total), Some(samples)) => {
                     samples > s.requests || (samples == 0 && total != 0)
                 }
                 _ => true,
-            }
+            })
             || s.error_counts.iter().zip(&s.counts).any(|(e, n)| e > n)
             || [
                 s.requests,
@@ -436,6 +479,10 @@ fn validate_groups(groups: &[Group], buckets: usize) -> Result<(), String> {
             .chain(s.cache_write_tokens.iter())
             .chain(s.first_token_total_ms.iter())
             .chain(s.first_token_samples.iter())
+            .chain(s.forwarded_first_token_total_ms.iter())
+            .chain(s.forwarded_first_token_samples.iter())
+            .chain(s.cooldown_total_ms.iter())
+            .chain(s.cooldown_samples.iter())
             .chain(s.output_tps_tokens.iter())
             .chain(s.output_tps_duration_ms.iter())
             .any(|n| *n > 9_007_199_254_740_991)
@@ -1111,6 +1158,7 @@ mod tests {
             json!({"timestamp":at, "event":"model_call_finished", "model_call_id":uuid::Uuid::new_v4().to_string(),
                 "request_id":uuid::Uuid::new_v4().to_string(), "service":service, "method":"POST", "path":path,
                 "account_id":"user@example.test", "status":"200", "first_token_ms":"420",
+                "forwarded_first_token_ms":"120", "location_cooldown_actual_ms":"250",
                 "output_tokens":"101", "duration_ms":"2420"})
             .to_string()
                 + "\n"
@@ -1212,6 +1260,7 @@ mod tests {
             ReaderServices::named(" Antigravity , GROK"),
             ReaderServices {
                 first_token: false,
+                first_token_timing: false,
                 output_tps: false,
                 ..ReaderServices::ALL
             }
@@ -1248,6 +1297,42 @@ mod tests {
         stats
     }
 
+    fn assert_first_token_timing(summary: &Summary, body: &[u8], named: bool) {
+        let mut measured = false;
+        for groups in std::iter::once(&summary.groups).chain(
+            summary
+                .windows
+                .iter()
+                .chain(summary.previous_windows.iter())
+                .map(|w| &w.groups),
+        ) {
+            for group in groups {
+                let s = &group.stats;
+                let values = (
+                    s.forwarded_first_token_total_ms,
+                    s.forwarded_first_token_samples,
+                    s.cooldown_total_ms,
+                    s.cooldown_samples,
+                );
+                if !named {
+                    assert_eq!(values, (None, None, None, None));
+                }
+                if values == (Some(120), Some(1), Some(250), Some(1)) {
+                    measured = true;
+                }
+            }
+        }
+        assert_eq!(measured, named);
+        for key in [
+            "forwardedFirstTokenTotalMs",
+            "forwardedFirstTokenSamples",
+            "cooldownTotalMs",
+            "cooldownSamples",
+        ] {
+            assert_eq!(body.windows(key.len()).any(|w| w == key.as_bytes()), named);
+        }
+    }
+
     /// Readers from before First Token reject a summary naming it, so only one
     /// that names it receives it, over HTTP and SSH alike.
     #[tokio::test]
@@ -1275,6 +1360,14 @@ mod tests {
             ("X-Coport-Services: first-token\r\n", true),
             ("X-Coport-Services: output-tps\r\n", false),
             ("X-Coport-Services: first-token,output-tps\r\n", true),
+            (
+                "X-Coport-Services: first-token,first-token-timing\r\n",
+                true,
+            ),
+            (
+                "X-Coport-Services: first-token-timing\r\nX-Coport-Window: 30:model\r\n",
+                false,
+            ),
             (
                 "X-Coport-Services: first-token,output-tps\r\nX-Coport-Window: 30:model\r\n",
                 true,
@@ -1304,12 +1397,13 @@ mod tests {
             let stats = first_token(&summary, body);
             assert!(!stats.is_empty(), "{extra:?}");
             let expected = if named {
-                (Some(420), Some(1))
+                (Some(120), Some(1))
             } else {
                 (None, None)
             };
             assert!(stats.iter().all(|s| *s == expected), "{extra:?} {stats:?}");
             assert_output_tps(&summary, body, extra.contains("output-tps"));
+            assert_first_token_timing(&summary, body, extra.contains("first-token-timing"));
         }
         #[cfg(unix)]
         {
@@ -1337,9 +1431,10 @@ mod tests {
                     frame.validate().unwrap();
                     let stats = first_token(&frame, line);
                     assert_output_tps(&frame, line, services.output_tps);
+                    assert_first_token_timing(&frame, line, services.first_token_timing);
                     assert!(!stats.is_empty(), "{reader:?}");
                     assert_eq!(
-                        stats.contains(&(Some(420), Some(1))),
+                        stats.contains(&(Some(120), Some(1))),
                         named,
                         "{reader:?} {stats:?}"
                     );
@@ -1635,6 +1730,22 @@ mod tests {
             .map_err(|e| e.to_string())
             .and_then(|summary| summary.validate().map(|_| summary))
         };
+        for (total, samples) in [
+            ("forwardedFirstTokenTotalMs", "forwardedFirstTokenSamples"),
+            ("cooldownTotalMs", "cooldownSamples"),
+        ] {
+            assert!(summary(json!({total:900,samples:2})).is_ok());
+            assert!(summary(json!({total:0,samples:0})).is_ok());
+            for invalid in [
+                json!({total:900}),
+                json!({samples:1}),
+                json!({total:900,samples:3}),
+                json!({total:900,samples:0}),
+                json!({total:9_007_199_254_740_992u64,samples:1}),
+            ] {
+                assert!(summary(invalid.clone()).is_err(), "{invalid}");
+            }
+        }
         // Exporters older than it omit it.
         let older = summary(json!({})).unwrap();
         assert_eq!(older.groups[0].stats.first_token_total_ms, None);

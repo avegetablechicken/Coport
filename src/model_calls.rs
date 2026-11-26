@@ -486,6 +486,15 @@ impl HttpObserver {
             parser.stop("decode_error");
         }
         log.fields.extend(parser.observation.fields.clone());
+        if !log.fields.contains_key("forwarded_first_token_ms") {
+            let ms = |key: &str| log.fields.get(key)?.as_str()?.parse::<u64>().ok();
+            if let Some(elapsed) = ms("first_token_ms")
+                .zip(ms("upstream_started_ms"))
+                .and_then(|(first, sent)| first.checked_sub(sent))
+            {
+                log.field("forwarded_first_token_ms", elapsed);
+            }
+        }
     }
 }
 
@@ -738,6 +747,7 @@ impl WsCalls {
             "received_bytes",
             "reason",
             "model_call_id",
+            "upstream_started_ms",
         ] {
             fields.remove(key);
         }
@@ -877,11 +887,12 @@ impl WsCalls {
         field(&mut call.fields, "wrote_downstream", true);
         event.apply(&mut call.fields);
         if event.kind.ends_with(".delta") && !call.fields.contains_key("first_token_ms") {
-            field(
-                &mut call.fields,
-                "first_token_ms",
-                call.started.elapsed().as_millis(),
-            );
+            let elapsed = call.started.elapsed().as_millis();
+            field(&mut call.fields, "first_token_ms", elapsed);
+            // The relay starts each turn immediately before forwarding its
+            // request frame. There is no local cooldown between these origins.
+            // Never reuse the connection's HTTP handshake timing for a turn.
+            field(&mut call.fields, "forwarded_first_token_ms", elapsed);
         }
         if event.kind == "error" {
             // A following response.failed is authoritative; do not count both.
@@ -1338,6 +1349,66 @@ mod tests {
     }
 
     #[test]
+    fn websocket_first_token_is_reported_for_every_turn_without_handshake_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let mut log = log_at(&path);
+        log.field("upstream_started_ms", 120_000);
+        let mut calls = WsCalls::new(&log, "");
+        for (id, end) in [("one", "response.completed"), ("two", "response.failed")] {
+            send(&mut calls, true, json!({"type":"response.create"}));
+            assert!(
+                !calls
+                    .calls
+                    .back()
+                    .unwrap()
+                    .fields
+                    .contains_key("first_token_ms")
+            );
+            assert!(
+                !calls
+                    .calls
+                    .back()
+                    .unwrap()
+                    .fields
+                    .contains_key("forwarded_first_token_ms")
+            );
+            send(
+                &mut calls,
+                false,
+                json!({"type":"response.output_text.delta", "response_id":id, "delta":"hi"}),
+            );
+            let fields = &calls.calls.back().unwrap().fields;
+            let first = fields["first_token_ms"].clone();
+            assert!(first.as_str().unwrap().parse::<u64>().is_ok());
+            assert_eq!(fields["forwarded_first_token_ms"], first);
+            assert!(!fields.contains_key("upstream_started_ms"));
+            send(
+                &mut calls,
+                false,
+                json!({"type":"response.output_text.delta", "response_id":id, "delta":"again"}),
+            );
+            assert_eq!(calls.calls.back().unwrap().fields["first_token_ms"], first);
+            send(&mut calls, false, json!({"type":end, "response":{"id":id}}));
+        }
+        send(&mut calls, true, json!({"type":"response.create"}));
+        calls.finish("cancelled", "client_closed");
+        log.logger.flush().unwrap();
+        let rows = records(&path);
+        for event in ["model_call_finished", "model_call_failed"] {
+            let row = rows.iter().find(|r| r["event"] == event).unwrap();
+            assert!(row.get("first_token_ms").is_some());
+            assert_eq!(row["forwarded_first_token_ms"], row["first_token_ms"]);
+        }
+        let cancelled = rows
+            .iter()
+            .find(|r| r["event"] == "model_call_cancelled")
+            .unwrap();
+        assert!(cancelled.get("first_token_ms").is_none());
+        assert!(cancelled.get("forwarded_first_token_ms").is_none());
+    }
+
+    #[test]
     fn http_body_ids_survive_finished_and_failed_lifecycle_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.log");
@@ -1741,6 +1812,47 @@ mod tests {
             _ => body.to_vec(),
         }
     }
+    #[test]
+    fn first_token_keeps_end_to_end_time_and_measures_from_actual_send() {
+        let dir = tempfile::tempdir().unwrap();
+        for newline in ["\n", "\r\n"] {
+            for sent in [None, Some(120_000), Some(999_999)] {
+                let mut log = log_at(&dir.path().join("proxy.log"));
+                log.started = Instant::now() - std::time::Duration::from_secs(123);
+                if let Some(sent) = sent {
+                    log.field("upstream_started_ms", sent);
+                }
+                let mut observer = HttpObserver::new(true, None, &mut log);
+                observer.feed(
+                    format!("data: {{\"type\":\"response.created\"}}{newline}{newline}").as_bytes(),
+                    &mut log,
+                );
+                assert!(!log.fields.contains_key("first_token_ms"));
+                observer.feed(format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}}{newline}{newline}").as_bytes(), &mut log);
+                let first: u64 = log.fields["first_token_ms"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(first >= 123_000);
+                if sent == Some(120_000) {
+                    assert_eq!(
+                        log.fields["forwarded_first_token_ms"],
+                        (first - 120_000).to_string()
+                    );
+                } else {
+                    assert!(!log.fields.contains_key("forwarded_first_token_ms"));
+                }
+                let before = log.fields.get("forwarded_first_token_ms").cloned();
+                observer.feed(
+                    format!("data: {{\"type\":\"response.failed\"}}{newline}{newline}").as_bytes(),
+                    &mut log,
+                );
+                assert_eq!(log.fields.get("forwarded_first_token_ms"), before.as_ref());
+            }
+        }
+    }
+
     #[test]
     fn http_observer_decodes_compressed_and_untyped_event_streams() {
         let dir = tempfile::tempdir().unwrap();

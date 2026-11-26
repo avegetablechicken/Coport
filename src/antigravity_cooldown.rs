@@ -53,15 +53,39 @@ struct Cooldown {
 #[derive(Default)]
 pub(super) struct LocationCooldowns(Mutex<HashMap<Scope, Cooldown>>);
 
+/// Also records elapsed waiting when the client cancels the pending request.
+struct WaitTiming<'a> {
+    log: &'a mut RequestLog,
+    started: Option<Tick>,
+}
+
+impl Drop for WaitTiming<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.log
+                .field("location_cooldown_actual_ms", started.elapsed().as_millis());
+        }
+    }
+}
+
 impl LocationCooldowns {
+    #[cfg(test)]
+    pub(super) fn shorten_for_test(&self, duration: Duration) {
+        for cooldown in self.0.lock().unwrap().values_mut() {
+            cooldown.until = Tick::now() + duration;
+        }
+    }
+
     pub(super) async fn wait(&self, scope: Option<&Scope>, log: &mut RequestLog) {
         let Some(scope) = scope else { return };
+        let mut timing = WaitTiming { log, started: None };
         loop {
             let until = self.0.lock().unwrap().get(scope).map(|c| c.until);
             let Some(until) = until.filter(|until| *until > Tick::now()) else {
                 return;
             };
-            log.field(
+            timing.started.get_or_insert_with(Tick::now);
+            timing.log.field(
                 "location_cooldown_wait_ms",
                 until.saturating_duration_since(Tick::now()).as_millis(),
             );
@@ -276,6 +300,43 @@ mod tests {
         assert!(retry.as_mut().now_or_never().is_none(), "{minutes} min");
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(retry.now_or_never().is_some(), "{minutes} min");
+        assert_eq!(
+            log.fields["location_cooldown_actual_ms"],
+            (minutes * 60_000).to_string()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_wait_records_elapsed_time_instead_of_planned_cooldown() {
+        let cooldowns = LocationCooldowns::default();
+        let scope = Scope::new("oauth", "fake");
+        let (_dir, mut log) = log();
+        cooldowns.reject(scope.clone(), &mut log);
+        let mut wait = Box::pin(cooldowns.wait(Some(&scope), &mut log));
+        assert!(wait.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(17)).await;
+        drop(wait);
+        assert_eq!(log.fields["location_cooldown_wait_ms"], "180000");
+        assert_eq!(log.fields["location_cooldown_actual_ms"], "17000");
+        assert!(!log.fields.contains_key("first_token_ms"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extended_wait_accumulates_and_no_wait_is_not_a_zero_sample() {
+        let cooldowns = LocationCooldowns::default();
+        let scope = Scope::new("oauth", "fake");
+        let (_dir, mut log) = log();
+        cooldowns.wait(Some(&scope), &mut log).await;
+        assert!(!log.fields.contains_key("location_cooldown_actual_ms"));
+        cooldowns.reject(scope.clone(), &mut log);
+        let mut wait = Box::pin(cooldowns.wait(Some(&scope), &mut log));
+        assert!(wait.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(180)).await;
+        cooldowns.shorten_for_test(Duration::from_secs(60));
+        assert!(wait.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(wait.now_or_never().is_some());
+        assert_eq!(log.fields["location_cooldown_actual_ms"], "240000");
     }
 
     fn accepted(cooldowns: &LocationCooldowns, scope: &Scope) {

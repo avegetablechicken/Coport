@@ -185,7 +185,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     let body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"The caller does not have permission","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"IAM_PERMISSION_DENIED","metadata":{"consumer":"projects/secret-project"}}]}}"#;
                     io.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
-                else if response_mode == "location_once" && attempt == 0 {
+                else if matches!(response_mode, "location_once" | "location_once_sse") && attempt == 0 {
                     let body = r#"{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
                     io.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }
@@ -228,7 +228,7 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                     let body = r#"{"access_token":"renewed-access","expires_in":3599,"scope":"openid","token_type":"Bearer","id_token":"h.eyJlbWFpbCI6InJlbW90ZUBleGFtcGxlLmludmFsaWQiLCJzdWIiOiIxIn0.s"}"#;
                     io.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
-                else if response_mode=="gemini_sse" {
+                else if matches!(response_mode, "gemini_sse" | "location_once_sse") {
                     // Cloud Code's stream: Gemini chunks wrapped in `response`, usage last.
                     let body = concat!(
                         "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"private-output\"}]}}],\"modelVersion\":\"gemini-test\",\"responseId\":\"gemini-response\"},\"traceId\":\"t\"}\r\n\r\n",
@@ -2810,6 +2810,60 @@ async fn refresh_failure_is_not_replayed_and_counts_once() {
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(!log.contains("upstream_retry"));
     assert!(!log.contains("refresh-secret"));
+}
+
+#[tokio::test]
+async fn forwarded_first_token_origin_excludes_profile_and_survives_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_response_head(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let running = running("").await;
+    let mut log = RequestLog {
+        logger: running.server.logger.clone(),
+        fields: Default::default(),
+        started: Instant::now(),
+        status: 200,
+        bytes: 0,
+        outcome: "test_finished",
+    };
+    let mut origin = None;
+    for (method, path) in [
+        (hyper::Method::GET, "/api/oauth/profile"),
+        (hyper::Method::POST, "/v1/responses"),
+        (hyper::Method::POST, "/v1/responses"),
+    ] {
+        let request =
+            reqwest::Request::new(method, Url::parse(&format!("{endpoint}{path}")).unwrap());
+        running
+            .server
+            .send_via(
+                &Choice::direct(),
+                request,
+                false,
+                Deadline::new(3.0),
+                &mut log,
+            )
+            .await
+            .unwrap();
+        if path.ends_with("profile") {
+            assert!(!log.fields.contains_key("upstream_started_ms"));
+        } else if let Some(origin) = &origin {
+            assert_eq!(&log.fields["upstream_started_ms"], origin);
+        } else {
+            origin = Some(log.fields["upstream_started_ms"].clone());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    upstream.await.unwrap();
 }
 
 #[tokio::test]
@@ -6468,6 +6522,77 @@ async fn antigravity_location_cooldown_disconnects_before_headers_and_only_delay
             && line["request_id"] == upstream["request_id"]
             && line.get("status").is_none()
     }));
+    crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
+}
+
+#[tokio::test]
+async fn antigravity_first_token_separates_local_cooldown_from_forwarding() {
+    let _login = crate::antigravity::TEST_LOGIN.lock().await;
+    let (running, _fixture) = antigravity_auto_setup(false, "location_once_sse").await;
+    let call = || {
+        http()
+            .post(format!(
+                "{}/antigravity/v1internal:streamGenerateContent",
+                running.url
+            ))
+            .bearer_auth("access-secret")
+            .body(r#"{"model":"test"}"#)
+            .send()
+    };
+    assert!(call().await.is_err());
+    // Exercise the real 400 -> next request -> wait -> SSE path without
+    // spending three minutes asleep. Long intervals use the paused-clock tests.
+    running
+        .server
+        .location_cooldowns
+        .shorten_for_test(Duration::from_millis(200));
+    assert!(
+        call()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .contains("private-output")
+    );
+    // A repeat after success must not inherit the prior request's wait.
+    assert!(
+        call()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .contains("private-output")
+    );
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    let rows: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let calls: Vec<_> = rows
+        .iter()
+        .filter(|r| r["event"] == "model_call_finished")
+        .collect();
+    assert_eq!(calls.len(), 2, "{raw}");
+    let ms =
+        |row: &serde_json::Value, key: &str| row[key].as_str().unwrap().parse::<u64>().unwrap();
+    let waited = calls[0];
+    let wait = ms(waited, "location_cooldown_actual_ms");
+    assert!(wait > 0, "{waited}");
+    let sent = ms(waited, "upstream_started_ms");
+    let first = ms(waited, "first_token_ms");
+    assert!(sent + 1 >= wait, "{waited}");
+    assert_eq!(ms(waited, "forwarded_first_token_ms"), first - sent);
+    assert!(calls[1].get("location_cooldown_actual_ms").is_none());
+    assert!(calls[1].get("forwarded_first_token_ms").is_some());
+    let failed = rows
+        .iter()
+        .find(|r| r["event"] == "model_call_failed")
+        .unwrap();
+    assert!(failed.get("first_token_ms").is_none());
+    assert!(failed.get("forwarded_first_token_ms").is_none());
     crate::antigravity::set_test_login(crate::antigravity::TEST_SAVED_TOKEN, "saved-refresh");
 }
 

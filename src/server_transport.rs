@@ -500,6 +500,16 @@ impl Server {
                 .ok_or(Error::config("Cannot replay streaming request."))?;
             *outgoing.timeout_mut() = Some(remaining);
             log.field("upstream_attempts", attempt);
+            // First actual send, after local cooldown and route preparation.
+            // Profile lookups share this log but must not start model timing.
+            // Keep this origin across transport retries and credential renewal.
+            if crate::model_calls::is_model_endpoint(
+                outgoing.method().as_str(),
+                outgoing.url().path(),
+            ) && !log.fields.contains_key("upstream_started_ms")
+            {
+                log.field("upstream_started_ms", log.started.elapsed().as_millis());
+            }
             match client.execute(outgoing).await {
                 Ok(response) => {
                     self.record_health(&key, response_health(response.status()), "request")
