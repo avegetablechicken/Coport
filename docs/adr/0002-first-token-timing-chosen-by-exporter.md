@@ -1,0 +1,3 @@
+# First Token's timing is chosen per call by the exporting device
+
+First Token times each successful model call from its first upstream send when that is known, and from the request's start otherwise, so historic calls without forwarded timing still count. The choice is made per call when a device counts its log, and peers send only the summed totals, so a reader cannot switch to a forwarded-only or request-start-only average on its own: it would mix two definitions in one total. Changing the timing needs a new pair of totals in the peer data format, negotiated with every reader like `first-token-timing` was.
