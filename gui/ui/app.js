@@ -162,41 +162,10 @@ const ui = {
   devicesLoaded: false,
   deviceRefresh: false,
   fetchedAt: 0,
-  refreshRequest: 0,
   page: "main",
   /// Opened from View All: keep the Log at the top until the user scrolls.
   pinLog: false,
-  filter: "requests",
-  /// The Log lists what upstreams returned instead of what clients received.
-  upstream: false,
-  search: "",
-  searchMode: "keyword",
-  activityRequest: 0,
-  rows: [],
-  // Activity list range: a preset re-resolved when chosen or the page opens,
-  // or "custom". Epoch milliseconds; `to` is an inclusive minute.
-  activityPreset: "hour",
-  activityFrom: null,
-  activityTo: null,
-  activityNext: null,
-  // Pages past the first have been loaded; a live update keeps them.
-  activityPaged: false,
-  activityLoadingMore: false,
-  activityError: "",
   recent: [],
-  trafficMinutes: 30,
-  trafficScope: "model",
-  localTrafficViews: Object.create(null),
-  homeTraffic: null,
-  homeTrafficMinutes: 30,
-  homeTrafficRequest: 0,
-  homeTrafficError: "",
-  homeTrafficFetchedAt: 0,
-  homeTrafficLoading: false,
-  traffic: null,
-  trafficError: "",
-  trafficLoading: false,
-  trafficRequest: 0,
   expanded: new Set(),
   builtPage: null,
   websocketOpen: false,
@@ -207,16 +176,29 @@ const ui = {
   tagColors: {},
 };
 
+const trafficViews = createTrafficViews({ invoke });
+const activityLog = createActivityPager({
+  invoke,
+  show(update, live) {
+    const apply = () => { update(); renderActivityList(); };
+    if (live) keepLogScroll(apply);
+    else apply();
+  },
+  failed: (error) => toast(String(error)),
+  now: currentMinute,
+});
+const deviceForm = createDeviceForm();
+const refreshes = createLatest();
+
 async function refresh() {
-  const request = ++ui.refreshRequest;
+  const request = refreshes.begin();
   const [snap, recent] = await Promise.all([
     invoke("get_state"),
     invoke("get_activity", { filter: "requests", search: "" }),
   ]);
   // A later request still in flight must not discard this completed snapshot.
   // In particular, Restart waits until its fresh configuration is displayed.
-  if (request < (ui.appliedRefreshRequest || 0)) return;
-  ui.appliedRefreshRequest = request;
+  if (!request.apply()) return;
   ui.snap = snap;
   if (ui.devicesLoaded) setDeviceForwarders(snap.forwarding ? [snap.forwarding] : []);
   ui.recent = recent.rows.slice(0, 5);
@@ -225,7 +207,7 @@ async function refresh() {
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
   // Switching forwarding on or off changes which source Home reads at once.
-  if (ui.page === "main" && (Date.now() - ui.homeTrafficFetchedAt >= 15000 || (ui.homeTraffic?.device ?? null) !== homeTrafficDevice())) loadHomeTraffic();
+  if (ui.page === "main" && (Date.now() - trafficViews.homeFetchedAt >= 15000 || (trafficViews.home?.device ?? null) !== homeTrafficDevice())) loadHomeTraffic();
   if (ui.page === "activity") scheduleActivityLog();
   render();
 }
@@ -240,73 +222,6 @@ let refreshTimer;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, 120);
-}
-
-/// Lists the chosen range newest first. `"more"` appends the next, older page; `"live"`
-/// re-reads the log for lines written since and keeps the older pages already loaded.
-/// Otherwise the backend reuses its last read of the range for filters, searches and pages.
-async function loadActivity(mode) {
-  if (ui.activityTo == null) resolveActivityRange();
-  const query = {
-    filter: activityFilter(), search: ui.search, searchMode: ui.searchMode,
-    range: { from: ui.activityFrom, to: ui.activityTo + 60 * 1000 },
-    after: mode === "more" ? ui.activityNext : null,
-    fresh: mode === "live",
-  };
-  // A live refresh must not invalidate a scan of the same query still running.
-  const key = JSON.stringify([query.filter, query.search, query.searchMode, query.range, query.after]);
-  if (mode === "live" && ui.activityLoadingKey === key && ui.activityLoadingRequest === ui.activityRequest) return;
-  const request = ++ui.activityRequest;
-  ui.activityLoadingKey = key;
-  ui.activityLoadingRequest = request;
-  const current = () => request === ui.activityRequest && query.filter === activityFilter() && query.search === ui.search
-    && query.searchMode === ui.searchMode && query.range.from === ui.activityFrom && query.range.to === ui.activityTo + 60 * 1000;
-  if (mode === "more") ui.activityLoadingMore = true;
-  let activity;
-  try {
-    activity = await invoke("get_activity", query);
-  } catch (error) {
-    // A failed live update keeps the list; the next one retries.
-    if (!current() || mode === "live") return;
-    // A failed older page keeps the pages already loaded, so it can be retried.
-    if (mode === "more") {
-      renderActivityList();
-      toast(String(error));
-      return;
-    }
-    ui.rows = [];
-    ui.activityNext = null;
-    ui.activityError = String(error);
-    renderActivityList();
-    return;
-  } finally {
-    if (ui.activityLoadingRequest === request) ui.activityLoadingKey = null;
-    if (mode === "more") ui.activityLoadingMore = false;
-  }
-  if (!current()) return;
-  ui.activityError = "";
-  if (mode === "more") {
-    ui.rows = ui.rows.concat(activity.rows);
-    ui.activityNext = activity.next;
-    ui.activityPaged = true;
-    renderActivityList();
-    return;
-  }
-  // Keep older pages only when the new page reaches the already loaded rows.
-  // Otherwise a burst larger than one page would leave an unpageable gap.
-  const last = activity.rows.at(-1);
-  const overlaps = last && ui.rows.some((e) => e.time === last.time && e.seq === last.seq);
-  const older = mode === "live" && ui.activityPaged && activity.next && overlaps
-    ? ui.rows.filter((e) => e.time >= ui.activityFrom && (e.time < last.time || (e.time === last.time && e.seq < last.seq)))
-    : [];
-  const update = () => {
-    ui.rows = activity.rows.concat(older);
-    if (!older.length) ui.activityNext = activity.next;
-    ui.activityPaged = older.length > 0;
-    renderActivityList();
-  };
-  if (mode === "live") keepLogScroll(update);
-  else update();
 }
 
 /// Offset of the Log block from where the first block of the page starts.
@@ -344,12 +259,9 @@ function keepLogScroll(update) {
 /// present (or a preset moved with the clock). Waits while a choice is open or
 /// an older page is loading.
 function refreshActivityLog() {
-  if (ui.page !== "activity" || document.hidden || openSelect || ui.activityLoadingMore) return;
+  if (ui.page !== "activity" || document.hidden || openSelect || activityLog.loadingMore) return;
   if (!$("range-editor")?.hidden) return;
-  const [from, to] = [ui.activityFrom, ui.activityTo];
-  resolveActivityRange();
-  if (from === ui.activityFrom && to === ui.activityTo && to < currentMinute()) return;
-  loadActivity("live");
+  activityLog.refresh();
 }
 
 // New log lines arrive in bursts; list them at most every few seconds.
@@ -717,8 +629,6 @@ function trafficSummary(view, scope, window = view, source = "") {
   return html;
 }
 
-/// A view read within this long is reused by every page that shows it.
-const TRAFFIC_REUSE_MS = 15000;
 /// A Devices frame completed with this device's traffic, read within the
 /// Devices cadence; a Devices visit reads it again only after that.
 function trafficFrameFresh(frame) {
@@ -726,101 +636,25 @@ function trafficFrameFresh(frame) {
 }
 const DEVICE_FRAME_MS = 30000;
 
-/// One read per view: a fresh view is reused and a read in flight is joined,
-/// so Home, Activity and Devices never read the same traffic twice.
-function sharedTrafficLoad(views, loads, key, read) {
-  const cached = ui[views]?.[key];
-  if (cached && Date.now() - cached.loadedAt < TRAFFIC_REUSE_MS) return Promise.resolve(cached);
-  const pending = (ui[loads] ||= Object.create(null));
-  if (pending[key]) return pending[key];
-  const generation = ui.trafficGeneration || 0;
-  const load = read().then((view) => {
-    // A reset while reading (reassigned traffic) discards the old result.
-    if (generation !== (ui.trafficGeneration || 0)) return sharedTrafficLoad(views, loads, key, read);
-    view.loadedAt = Date.now();
-    return ((ui[views] ||= Object.create(null))[key] = view);
-  }).finally(() => { if (pending[key] === load) delete pending[key]; });
-  pending[key] = load;
-  return load;
-}
-
-/// Drops every shared view, e.g. after traffic is reassigned; reads in flight are repeated.
-function resetTrafficViews() {
-  ui.trafficGeneration = (ui.trafficGeneration || 0) + 1;
-  ui.localTrafficViews = Object.create(null);
-  ui.localTrafficLoads = Object.create(null);
-  ui.forwardedTrafficViews = Object.create(null);
-  ui.forwardedTrafficLoads = Object.create(null);
-}
-
-/// This device's traffic is one flat view: its window, totals and metrics.
-function localTrafficView(traffic, scope) {
-  return { ...traffic, scope };
-}
-
-/// This device's traffic, as Home, Activity and This Device show it.
-function loadLocalTraffic(minutes, scope) {
-  return sharedTrafficLoad("localTrafficViews", "localTrafficLoads", `${minutes}:${scope}`,
-    async () => localTrafficView(await invoke("get_traffic", { minutes, scope }), scope));
-}
-
-/// The forwarded device's traffic, as Home and its Devices card show it. The
-/// daemon answers from its last forwarding summary; nothing is contacted.
-function loadForwardedTraffic(device, minutes, scope) {
-  return sharedTrafficLoad("forwardedTrafficViews", "forwardedTrafficLoads", `${device}:${minutes}:${scope}`, async () => {
-    const remote = await invoke("get_forwarding_traffic", { minutes, scope });
-    return {
-      ...remote.traffic, start: remote.windowStart, end: remote.windowEnd, bucketMinutes: remote.bucketMinutes, scope,
-      device: remote.deviceId, deviceName: remote.name, fetchedAt: remote.fetchedAt, remoteError: remote.error,
-    };
-  });
-}
-
-/// The last read of the traffic Home or Activity shows for the shared range, so
-/// either page opens with the other's ring instead of waiting for a read.
-function cachedTraffic(device) {
-  const key = `${ui.trafficMinutes}:${ui.trafficScope}`;
-  return (device ? ui.forwardedTrafficViews?.[`${device}:${key}`] : ui.localTrafficViews?.[key]) ?? null;
-}
-
 /// Home shows the forwarded device's traffic while SSH forwarding is on, else this machine's.
 function homeTrafficDevice() {
   return ui.snap?.forwarding?.deviceId ?? null;
 }
 
 async function loadHomeTraffic(force = false) {
-  if (ui.homeTrafficLoading && !force) return;
-  const request = ++ui.homeTrafficRequest;
-  ui.homeTrafficLoading = true;
-  // As on the Activity page, stats follow the category their data was read for.
-  const scope = ui.trafficScope;
-  const minutes = ui.homeTrafficMinutes;
-  const device = homeTrafficDevice();
-  try {
-    const view = await (device ? loadForwardedTraffic(device, minutes, scope) : loadLocalTraffic(minutes, scope));
-    if (request !== ui.homeTrafficRequest) return;
-    ui.homeTraffic = view;
-    ui.homeTrafficError = "";
-    ui.homeTrafficFetchedAt = Date.now();
-  } catch (error) {
-    if (request !== ui.homeTrafficRequest) return;
-    ui.homeTrafficError = String(error);
-  } finally {
-    if (request === ui.homeTrafficRequest) ui.homeTrafficLoading = false;
-  }
-  if (ui.page === "main") render();
+  if (await trafficViews.loadHome(homeTrafficDevice(), force) && ui.page === "main") render();
 }
 
 function trafficBlock() {
   // Traffic read for another source (this machine or a former destination) is not shown.
-  const st = ui.homeTraffic && (ui.homeTraffic.device ?? null) === homeTrafficDevice() ? ui.homeTraffic : null;
-  const range = trafficControls("home-traffic", ui.homeTrafficMinutes, "Home traffic time range");
-  const error = ui.homeTrafficError === "TRAFFIC_UPDATING" ? "" : ui.homeTrafficError || st?.remoteError || "";
+  const st = trafficViews.home && (trafficViews.home.device ?? null) === homeTrafficDevice() ? trafficViews.home : null;
+  const range = trafficControls("home-traffic", trafficViews.minutes, "Home traffic time range");
+  const error = trafficViews.homeError === "TRAFFIC_UPDATING" ? "" : trafficViews.homeError || st?.remoteError || "";
   if (!st) return block("Traffic", range, `<div class="placeholder">${esc(error || "Loading traffic…")}</div>`, "traffic");
   return block(
     "Traffic",
     range,
-    `<div class="traffic-content" aria-busy="${ui.homeTrafficLoading}">
+    `<div class="traffic-content" aria-busy="${trafficViews.homeLoading}">
      ${error ? `<span class="traffic-update-error" title="${esc(error)}">Update failed</span>` : ""}
      ${trafficSummary(st, st.scope, st, st.device ? `device/${st.device}` : "local")}
      ${st.device ? `<div class="placeholder">Includes other clients on ${esc(st.deviceName)}. Updated ${esc(new Date(st.fetchedAt).toLocaleTimeString())}${Date.now() - st.fetchedAt > 90000 || st.remoteError ? " · stale" : ""}.</div>` : ""}</div>`,
@@ -1394,45 +1228,20 @@ function trafficRangeSelect(id, selected, label) {
 }
 
 function trafficControls(prefix, minutes, label) {
-  return `<span class="traffic-controls" data-morph="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], ui.trafficScope,
+  return `<span class="traffic-controls" data-morph="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], trafficViews.scope,
     "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
 }
 
 /// Home, Activity and Devices show traffic for one range, so changing pages
 /// keeps it. Reads started for the previous range must not land afterwards.
 function setTrafficMinutes(minutes) {
-  ui.trafficMinutes = ui.homeTrafficMinutes = ui.deviceTrafficMinutes = minutes;
-  ++ui.trafficRequest; ++ui.homeTrafficRequest;
-  ui.trafficLoading = ui.homeTrafficLoading = false;
-  ui.trafficError = ui.homeTrafficError = "";
-  ui.homeTrafficFetchedAt = 0;
+  trafficViews.setMinutes(minutes);
+  ui.deviceTrafficMinutes = minutes;
 }
 
 async function loadTraffic() {
-  // Long ranges can take longer to read than the refresh interval; a read of
-  // the same range and category that is still current is not started twice.
-  const key = `${ui.trafficMinutes}:${ui.trafficScope}`;
-  if (ui.trafficLoading && ui.trafficLoadingKey === key && ui.trafficLoadingRequest === ui.trafficRequest) return;
-  const request = ++ui.trafficRequest;
-  ui.trafficLoading = true;
-  ui.trafficLoadingKey = key;
-  ui.trafficLoadingRequest = request;
   $("activity-traffic")?.setAttribute("aria-busy", "true");
-  // Charts follow the category their data was read for, so a switch keeps
-  // the previous charts consistent until the replacement arrives.
-  const scope = ui.trafficScope;
-  const minutes = ui.trafficMinutes;
-  try {
-    const traffic = await loadLocalTraffic(minutes, scope);
-    if (request !== ui.trafficRequest) return;
-    ui.traffic = traffic;
-    ui.trafficError = "";
-  } catch (error) {
-    if (request !== ui.trafficRequest) return;
-    ui.trafficError = String(error);
-  } finally {
-    if (request === ui.trafficRequest) ui.trafficLoading = false;
-  }
+  if (!(await trafficViews.loadActivity())) return;
   if (ui.page === "activity") renderActivityTraffic();
   else if (ui.page === "devices") render();
 }
@@ -1681,7 +1490,7 @@ const MATCH_REASONS = {
 
 /// Logged configurations counted here without an exact match. Each can be
 /// assigned to a current configuration or to Unidentified; the logs stay as they are.
-function trafficReview(c, targets = [], scope = ui.traffic?.scope) {
+function trafficReview(c, targets = [], scope = trafficViews.activity?.scope) {
   if (!c.sources?.length) return "";
   const review = c.sources.some((s) => s.reason);
   const unit = scope === "model" ? "call" : "request";
@@ -1709,13 +1518,13 @@ async function assignTraffic(choice) {
   try {
     await invoke("set_traffic_assignment", choice);
   } catch (error) {
-    ui.trafficError = String(error);
+    trafficViews.activityError = String(error);
     ui.mergedDataError = String(error);
     if (ui.page === "devices") render();
     else renderActivityTraffic();
     return;
   }
-  resetTrafficViews();
+  trafficViews.reset();
   ui.deviceTrafficViews = Object.create(null);
   await Promise.all([loadTraffic(), loadMergedData(true), refresh()]);
 }
@@ -1728,9 +1537,9 @@ function renderActivityTraffic() {
   // While the Log is at or above the top, Traffic changing height must not move it.
   const logBefore = logOffset();
   const keepLog = logBefore != null && logBefore <= 0.5 && $("content").scrollTop > 0;
-  const traffic = ui.traffic;
-  const scope = traffic?.scope ?? ui.trafficScope;
-  el.setAttribute("aria-busy", String(ui.trafficLoading));
+  const traffic = trafficViews.activity;
+  const scope = traffic?.scope ?? trafficViews.scope;
+  el.setAttribute("aria-busy", String(trafficViews.activityLoading));
   const date = (ms) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const rows = traffic?.credentials.map((c) => accountRow(c, scope, traffic, trafficReview(c, traffic.targets))).join("");
   const reviews = traffic?.credentials.reduce((n, c) => n + (c.sources ?? []).filter((s) => s.reason).length, 0) ?? 0;
@@ -1749,9 +1558,9 @@ function renderActivityTraffic() {
   el.innerHTML = `<div class="block-head"><span class="block-title">Traffic</span>
     <span class="info-tip" data-tip="${esc(notes)}" aria-label="${esc(notes)}">${ICON.info}</span>
     ${reviews ? `<button type="button" class="traffic-review-all" data-action="traffic-review" title="Requests from ${reviews} renamed, changed or unknown ${reviews === 1 ? "configuration need" : "configurations need"} review">${ICON.warning}Review</button>` : ""}
-    ${trafficControls("traffic", ui.trafficMinutes, "Traffic time range")}</div>
-    ${ui.trafficError && traffic ? `<span class="traffic-update-error" title="${esc(ui.trafficError)}">Update failed</span>` : ""}
-    ${!traffic ? `<div class="placeholder">${esc(ui.trafficError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope, "local") + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
+    ${trafficControls("traffic", trafficViews.minutes, "Traffic time range")}</div>
+    ${trafficViews.activityError && traffic ? `<span class="traffic-update-error" title="${esc(trafficViews.activityError)}">Update failed</span>` : ""}
+    ${!traffic ? `<div class="placeholder">${esc(trafficViews.activityError || "Loading traffic…")}</div>` : `${rows ? trafficShare(traffic.credentials, scope, "local") + rows : '<div class="placeholder">No requests in this time range.</div>'}<div class="traffic-axis"><span>${esc(date(traffic.start))}</span><span>${bucketLabel} per bar</span><span>${esc(date(traffic.end))}</span></div>`}`;
   if (ui.pinLog) scrollToLog();
   else if (keepLog) $("content").scrollTop += logOffset() - logBefore;
   queueFit();
@@ -1759,46 +1568,29 @@ function renderActivityTraffic() {
 
 const SEARCH_MODES = [["keyword", "Keyword"], ["path", "Path"], ["proxy", "Proxy"], ["status", "Status"], ["credential", "Credential"]];
 function searchPlaceholder() {
-  return { keyword: "Search log fields", path: "Path contains…", proxy: "Exact proxy name or direct", status: "HTTP status, e.g. 429", credential: "Account, API Key or settings" }[ui.searchMode];
+  return { keyword: "Search log fields", path: "Path contains…", proxy: "Exact proxy name or direct", status: "HTTP status, e.g. 429", credential: "Account, API Key or settings" }[activityLog.searchMode];
 }
 
 const RANGE_PRESETS = [["hour", "Last hour"], ["6h", "Last 6 hours"], ["today", "Today"], ["yesterday", "Yesterday"]];
 
-/// Sets the Activity range from its preset, relative to the current time.
-function resolveActivityRange() {
-  if (ui.activityPreset === "custom" && ui.activityTo != null) return;
-  const now = currentMinute();
-  const midnight = new Date(now);
-  midnight.setHours(0, 0, 0, 0);
-  const yesterday = new Date(midnight);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const hour = 60 * 60 * 1000;
-  [ui.activityFrom, ui.activityTo] = {
-    "6h": [now - 6 * hour, now],
-    today: [midnight.getTime(), now],
-    // `to` is an inclusive minute: the last minute before midnight.
-    yesterday: [yesterday.getTime(), midnight.getTime() - 60 * 1000],
-  }[ui.activityPreset] ?? [now - hour, now];
-}
-
 function rangeLabel() {
-  const preset = RANGE_PRESETS.find(([key]) => key === ui.activityPreset);
+  const preset = RANGE_PRESETS.find(([key]) => key === activityLog.preset);
   if (preset) return preset[1];
   const day = (ms) => new Date(ms).toDateString() === new Date().toDateString()
     ? "Today" : new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
   const time = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-  const from = `${day(ui.activityFrom)} ${time(ui.activityFrom)}`;
-  return day(ui.activityFrom) === day(ui.activityTo)
-    ? `${from} – ${time(ui.activityTo)}` : `${from} – ${day(ui.activityTo)} ${time(ui.activityTo)}`;
+  const from = `${day(activityLog.from)} ${time(activityLog.from)}`;
+  return day(activityLog.from) === day(activityLog.to)
+    ? `${from} – ${time(activityLog.to)}` : `${from} – ${day(activityLog.to)} ${time(activityLog.to)}`;
 }
 
 function renderActivityRange() {
   const el = $("activity-range");
   if (!el) return;
   const items = [
-    ...RANGE_PRESETS.map(([key, label]) => ({ label, action: "activity-preset", target: key, checked: ui.activityPreset === key })),
+    ...RANGE_PRESETS.map(([key, label]) => ({ label, action: "activity-preset", target: key, checked: activityLog.preset === key })),
     null,
-    { label: "Custom Range…", action: "range-edit", checked: ui.activityPreset === "custom" },
+    { label: "Custom Range…", action: "range-edit", checked: activityLog.preset === "custom" },
   ];
   el.innerHTML = `<button type="button" class="select range-select" data-menu="${esc(JSON.stringify(items))}"
     aria-haspopup="menu" aria-expanded="false" aria-label="Log time range">${esc(rangeLabel())}</button>`;
@@ -1809,8 +1601,8 @@ function showRangeEditor(open) {
   if (!editor) return;
   editor.hidden = !open;
   if (!open) return;
-  $("activity-from").value = localInput(ui.activityFrom);
-  $("activity-to").value = localInput(ui.activityTo);
+  $("activity-from").value = localInput(activityLog.from);
+  $("activity-to").value = localInput(activityLog.to);
   $("range-error").hidden = true;
   $("activity-from").focus();
 }
@@ -1823,12 +1615,12 @@ async function applyRangeEditor() {
     $("range-error").hidden = false;
     return;
   }
-  ui.activityPreset = "custom";
-  ui.activityFrom = from;
-  ui.activityTo = to;
+  activityLog.preset = "custom";
+  activityLog.from = from;
+  activityLog.to = to;
   showRangeEditor(false);
   renderActivityRange();
-  await loadActivity();
+  await activityLog.load();
 }
 
 /// Forwarded requests are logged on the destination, not here; say so rather
@@ -1853,7 +1645,7 @@ function activityShell() {
     <section class="block" id="activity-traffic" data-morph="traffic"></section>
     <section class="block log-block" data-morph="log">
       <div class="block-head"><span class="block-title">Log</span><span class="block-aside">
-        ${panelSelect("activity-side", ACTIVITY_SIDES, ui.upstream ? "upstream" : "client", "Responses listed", "", `title="${esc(ACTIVITY_SIDE_TIP)}"`)}<span id="activity-range"></span></span></div>
+        ${panelSelect("activity-side", ACTIVITY_SIDES, activityLog.upstream ? "upstream" : "client", "Responses listed", "", `title="${esc(ACTIVITY_SIDE_TIP)}"`)}<span id="activity-range"></span></span></div>
       <div class="range-editor" id="range-editor" role="dialog" aria-label="Custom log range" hidden>
         <label class="range-row"><span class="range-label">From</span>
           <input class="field" id="activity-from" type="datetime-local" aria-label="Start of the log range" /></label>
@@ -1867,19 +1659,14 @@ function activityShell() {
         </div>
       </div>
       <div class="activity-search">
-        ${panelSelect("search-mode", SEARCH_MODES, ui.searchMode, "Search condition")}
+        ${panelSelect("search-mode", SEARCH_MODES, activityLog.searchMode, "Search condition")}
         <label class="search">${ICON.search}
-          <input class="field" id="search" type="search" spellcheck="false" aria-label="Search logs" placeholder="${esc(searchPlaceholder())}" value="${esc(ui.search)}" /></label>
+          <input class="field" id="search" type="search" spellcheck="false" aria-label="Search logs" placeholder="${esc(searchPlaceholder())}" value="${esc(activityLog.search)}" /></label>
       </div>
       <div class="segmented" id="filters"></div>
       <div id="activity-list"></div>
     </section>
   </div>`;
-}
-
-/// The backend filter for the Log. All Events lists both sides already.
-function activityFilter() {
-  return ui.upstream && ui.filter !== "all" ? `upstream_${ui.filter}` : ui.filter;
 }
 
 const ACTIVITY_SIDES = [["client", "Client"], ["upstream", "Upstream"]];
@@ -1889,7 +1676,7 @@ function renderActivitySide() {
   const el = $("activity-side");
   if (!el) return;
   // All Events lists both sides, so there is nothing to switch.
-  el.hidden = ui.filter === "all";
+  el.hidden = activityLog.filter === "all";
 }
 
 function renderActivityList() {
@@ -1903,13 +1690,13 @@ function renderActivityList() {
     ["errors", "Errors"],
     ["all", "All Events"],
   ]
-    .map(([f, label]) => `<button aria-pressed="${ui.filter === f}" data-action="filter" data-filter="${f}">${label}</button>`)
+    .map(([f, label]) => `<button aria-pressed="${activityLog.filter === f}" data-action="filter" data-filter="${f}">${label}</button>`)
     .join("");
-  $("activity-list").innerHTML = ui.activityError
-    ? `<div class="placeholder">${esc(ui.activityError)}</div>`
-    : ui.rows.length
-      ? ui.rows.map((e) => requestRow(e, true) + (ui.expanded.has(e.seq) ? detail(e) : "")).join("")
-        + (ui.activityNext ? '<div class="list-more"><button type="button" class="btn" data-action="activity-more">Load More</button></div>' : "")
+  $("activity-list").innerHTML = activityLog.error
+    ? `<div class="placeholder">${esc(activityLog.error)}</div>`
+    : activityLog.rows.length
+      ? activityLog.rows.map((e) => requestRow(e, true) + (ui.expanded.has(e.seq) ? detail(e) : "")).join("")
+        + (activityLog.next ? '<div class="list-more"><button type="button" class="btn" data-action="activity-more">Load More</button></div>' : "")
       : '<div class="placeholder">No matching entries in this range.</div>';
   queueFit();
 }
@@ -1958,7 +1745,7 @@ function detail(e) {
 // ---------------------------------------------------------------- devices
 
 function selectDeviceTraffic() {
-  const cached = ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes}:${ui.trafficScope}`];
+  const cached = ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes}:${trafficViews.scope}`];
   if (!cached) return false;
   ui.mergedData = cached;
   return true;
@@ -1981,7 +1768,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
   }
   let completed = false, completeSelected = false;
   const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
-  const requestedKey = `${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`;
+  const requestedKey = `${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`;
   try {
     const onUpdate = new Channel();
     onUpdate.onmessage = data => {
@@ -2000,7 +1787,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
       if (ui.page === "devices" || ui.page === "settings") render();
     };
     const data = await invoke("get_merged_data", {
-      minutes: ui.deviceTrafficMinutes || 30, scope: ui.trafficScope || "model", onUpdate, refreshRemote,
+      minutes: ui.deviceTrafficMinutes || 30, scope: trafficViews.scope || "model", onUpdate, refreshRemote,
     });
     if (request !== ui.mergedDataRequest) return;
     if (Array.isArray(data)) {
@@ -2013,7 +1800,7 @@ async function loadMergedData(force = false, refreshRemote = false) {
     if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
     ui.mergedDataError = ""; ui.mergedDataUpdating = false;
     // A range chosen during a refresh gets its peers from it, and this device from a read now.
-    const key = `${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`;
+    const key = `${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`;
     completeSelected = refreshRemote && key !== requestedKey && !ui.deviceTrafficViews?.[key]?.local;
   } catch (e) {
     if (request === ui.mergedDataRequest) {
@@ -2126,11 +1913,11 @@ async function checkConfiguredSsh() {
 // This device's card and the forwarded device's come from the shared views, so
 // they show while a remote refresh is still collecting peers. Errors leave the placeholder.
 async function loadDeviceCards() {
-  const minutes = ui.deviceTrafficMinutes || 30, scope = ui.trafficScope || "model";
+  const minutes = ui.deviceTrafficMinutes || 30, scope = trafficViews.scope || "model";
   const forwarded = ui.snap?.forwarding?.deviceId;
   await Promise.all([
-    loadLocalTraffic(minutes, scope).catch(() => {}),
-    forwarded && loadForwardedTraffic(forwarded, minutes, scope).catch(() => {}),
+    trafficViews.local(minutes, scope).catch(() => {}),
+    forwarded && trafficViews.forwarded(forwarded, minutes, scope).catch(() => {}),
   ]);
   if (ui.page === "devices") render();
 }
@@ -2157,7 +1944,7 @@ async function loadDevices(refreshRemote = false) {
     const due = refreshRemote || Date.now() - (ui.deviceRemoteAttemptAt || 0) >= DEVICE_REFRESH_MS;
     const remote = due && !(ui.mergedDataLoading && ui.mergedDataRemote);
     // This device's traffic in the frame is reused as briefly as every page reuses it.
-    const missing = !trafficFrameFresh(ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${ui.trafficScope || "model"}`]);
+    const missing = !trafficFrameFresh(ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`]);
     ui.deviceStartupRefreshDone = true;
     await Promise.all([local, loadDeviceCards(), (remote || missing) && loadMergedData(remote, remote)]);
 
@@ -2259,7 +2046,7 @@ function forwardingRestoreSettings() {
 /// cards and Merged Traffic waits.
 function deviceCardViews() {
   const minutes = ui.deviceTrafficMinutes || 30;
-  const scope = ui.trafficScope || "model";
+  const scope = trafficViews.scope || "model";
   const data = ui.mergedData?.minutes === minutes && ui.mergedData.scope === scope ? ui.mergedData : null;
   // A frame completed for this range carries this device and the forwarded
   // device's live view beside the peers, and Merged Traffic is their sum.
@@ -2271,11 +2058,11 @@ function deviceCardViews() {
     // A device already counted via another entry gets no view, live or not.
     if (source?.exclusion === "duplicate") continue;
     const live = device.id !== forwarded ? null : complete ? data.forwarded.traffic
-      : ui.forwardedTrafficViews?.[`${device.id}:${minutes}:${scope}`];
+      : trafficViews.forwardedView(device.id, minutes, scope);
     if (live && (complete || live.device === device.id)) { cards.set(device.id, { view: live, window: live }); continue; }
     if (source?.traffic) cards.set(device.id, { view: source.traffic, window: source.traffic.end != null ? source.traffic : data });
   }
-  return { local: complete ? data.local : ui.localTrafficViews?.[`${minutes}:${scope}`], cards, merged: complete ? data.traffic : null, scope };
+  return { local: complete ? data.local : trafficViews.localView(minutes, scope), cards, merged: complete ? data.traffic : null, scope };
 }
 function devicesPage() {
   const local = ui.snap.phase;
@@ -2328,7 +2115,7 @@ function deviceConnectionStatus(device) {
   return { state: "warn", label: "Statistics not included" };
 }
 function deviceSettings() {
-  const d = ui.deviceDraft || { transport: "ssh" };
+  const d = deviceForm.draft || { transport: "ssh" };
   const rows = ui.devices.map(device => {
     const status = deviceConnectionStatus(device);
     const forwarding = deviceForwardingSettings(device);
@@ -2336,7 +2123,7 @@ function deviceSettings() {
     const tip = capabilities ? ` data-tip="${esc(capabilities)}" tabindex="0"` : "";
     return `<div class="device-settings-item" data-tip-scope="device-settings:${esc(device.id)}"><div class="row device-setting-row"><span class="device-setting-name row-label"${tip}><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${esc(device.name)}<span class="device-setting-transport">${device.data?.transport === "ssh" || !device.data ? "SSH" : "HTTP"}</span></span><span class="row-value device-setting-actions"><button class="text-link" data-action="device-edit" data-id="${esc(device.id)}">Edit</button><button class="icon-btn" data-action="device-remove" data-id="${esc(device.id)}" data-tip="Remove device" aria-label="Remove ${esc(device.name)}">${ICON.trash}</button></span></div>${forwarding}</div>`;
   }).join("");
-  const form = ui.deviceFormOpen ? `<div class="device-form">
+  const form = deviceForm.open ? `<div class="device-form">
     <label>Connection${panelSelect("device-transport", [["ssh", "SSH"], ["http", "HTTP / HTTPS"]], d.transport, "Connection", "field")}</label>
     <label>Name (optional)<input class="field" id="device-name" value="${esc(d.name || "")}" maxlength="128" data-tip="Defaults to the SSH config name or HTTP origin."></label>
     ${d.transport === "ssh" ? `
@@ -2353,12 +2140,7 @@ function deviceSettings() {
   return block("Devices", `<button class="icon-btn" data-action="device-new" data-tip="Add device" aria-label="Add device">${ICON.plus}</button>`, rows + form);
 }
 function captureDeviceDraft() {
-  if (!$("device-name")) return;
-  const d = ui.deviceDraft || {};
-  ui.deviceDraft = { ...d, name: $("device-name").value, transport: $("device-transport").value,
-    host: $("device-host")?.value ?? d.host ?? "", binary: $("device-binary")?.value ?? d.binary ?? "",
-    url: $("device-url")?.value ?? d.url ?? "", key: $("device-key-file")?.value ?? d.key ?? "",
-    env: $("device-key-env")?.value ?? d.env ?? "", ca: $("device-ca-file")?.value ?? d.ca ?? "" };
+  deviceForm.capture((id) => $(id)?.value);
 }
 document.addEventListener("input", event => { if (event.target.id?.startsWith("device-")) captureDeviceDraft(); });
 document.addEventListener("change", event => {
@@ -3025,14 +2807,14 @@ async function act(action, el) {
             try { await loadDeviceDefinitions(); } catch (error) { toast(String(error)); }
           }
           // Home's ring, already read, opens Activity unchanged.
-          ui.traffic = cachedTraffic(null) ?? ui.traffic;
+          trafficViews.activity = trafficViews.cached(null) ?? trafficViews.activity;
           loadTraffic();
           // Presets follow the clock; a custom range stays as chosen.
-          resolveActivityRange();
-          await loadActivity();
+          activityLog.resolveRange();
+          await activityLog.load();
         }
         if (ui.page === "main") {
-          ui.homeTraffic = cachedTraffic(homeTrafficDevice()) ?? ui.homeTraffic;
+          trafficViews.home = trafficViews.cached(homeTrafficDevice()) ?? trafficViews.home;
           loadHomeTraffic();
         }
         if (ui.page === "devices") {
@@ -3074,18 +2856,15 @@ async function act(action, el) {
       break;
     }
     case "device-new":
-      ui.deviceDraft = { id: null, transport: "ssh" };
-      ui.deviceFormOpen = true; render(); $("device-name")?.focus();
+      deviceForm.add(); render(); $("device-name")?.focus();
       break;
     case "device-cancel":
-      ui.deviceFormOpen = false; ui.deviceDraft = null; render();
+      deviceForm.close(); render();
       break;
     case "device-edit": {
       const d = ui.devices.find(device => device.id === el.dataset.id);
       if (d) {
-        ui.deviceDraft = { id: d.id, name: d.name, sshEnabled: !!d.ssh, dataEnabled: !!d.data, host: d.ssh?.host, binary: d.ssh?.binary,
-          url: d.data?.url, key: d.data?.tokenFile, env: d.data?.tokenEnv, ca: d.data?.caCertificate, transport: d.data?.transport || (d.ssh ? "ssh" : "http") };
-        ui.deviceFormOpen = true; render(); $("device-name")?.focus();
+        deviceForm.edit(d); render(); $("device-name")?.focus();
       }
       break;
     }
@@ -3094,12 +2873,8 @@ async function act(action, el) {
       await loadMergedData(true, true);
       break;
     case "device-save": {
-      captureDeviceDraft(); const d = ui.deviceDraft;
-      const ssh = d.transport === "ssh";
-      const device = { id: d.id || null, name: d.name.trim() || (ssh ? d.host.trim() : d.url.trim()),
-        ssh: ssh ? { host: d.host.trim(), binary: d.binary.trim() } : null,
-        data: { transport: d.transport, url: ssh ? "" : d.url.trim(), tokenFile: ssh ? null : d.key.trim() || null, tokenEnv: ssh ? null : d.env.trim() || null, caCertificate: ssh ? null : d.ca.trim() || null } };
-      try { await invoke("save_device", { device }); ui.deviceFormOpen = false; ui.deviceDraft = null; const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || (!ui.mergedData && !(ui.mergedDataLoading && ui.mergedDataRemote))) loadMergedData(true); }
+      captureDeviceDraft(); const device = deviceForm.device();
+      try { await invoke("save_device", { device }); deviceForm.close(); const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || (!ui.mergedData && !(ui.mergedDataLoading && ui.mergedDataRemote))) loadMergedData(true); }
       catch (e) { toast(String(e)); }
       break;
     }
@@ -3169,8 +2944,8 @@ async function act(action, el) {
       break;
     }
     case "filter":
-      ui.filter = el.dataset.filter;
-      await loadActivity();
+      activityLog.filter = el.dataset.filter;
+      await activityLog.load();
       break;
     case "traffic-assign":
       await assignTraffic(JSON.parse(el.dataset.target));
@@ -3193,13 +2968,13 @@ async function act(action, el) {
       break;
     case "activity-more":
       el.disabled = true;
-      await loadActivity("more");
+      await activityLog.load("more");
       break;
     case "activity-preset":
-      ui.activityPreset = el.dataset.target;
-      resolveActivityRange();
+      activityLog.preset = el.dataset.target;
+      activityLog.resolveRange();
       renderActivityRange();
-      await loadActivity();
+      await activityLog.load();
       break;
     case "range-edit":
       showRangeEditor(true);
@@ -3286,22 +3061,20 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("change", async (event) => {
   if (event.target.id === "activity-side") {
-    ui.upstream = event.target.value === "upstream";
-    await loadActivity();
+    activityLog.upstream = event.target.value === "upstream";
+    await activityLog.load();
     return;
   }
   if (event.target.id === "search-mode") {
-    ui.searchMode = event.target.value;
+    activityLog.searchMode = event.target.value;
     clearTimeout(searchTimer);
     $("search").placeholder = searchPlaceholder();
-    await loadActivity();
+    await activityLog.load();
     return;
   }
   if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {
     if (event.target.id === "devices-traffic-scope") {
-      ui.trafficScope = event.target.value;
-      ++ui.trafficRequest; ++ui.homeTrafficRequest;
-      ui.homeTrafficFetchedAt = 0; ui.homeTrafficLoading = false;
+      trafficViews.setScope(event.target.value);
     } else { setTrafficMinutes(Number(event.target.value)); }
     const cards = loadDeviceCards();
     const shown = selectDeviceTraffic();
@@ -3314,15 +3087,11 @@ document.addEventListener("change", async (event) => {
     return;
   }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {
-    ui.trafficScope = event.target.value;
     // Both views share the category. In-flight results from the old category
-    // must not repopulate either cache after a switch.
-    ++ui.trafficRequest;
-    ++ui.homeTrafficRequest;
-    // Keep the previous charts mounted until the replacement data is ready.
-    ui.trafficError = ui.homeTrafficError = "";
-    ui.homeTrafficFetchedAt = 0;
-    ui.homeTrafficLoading = false;
+    // must not repopulate either cache after a switch; the previous charts
+    // stay mounted until the replacement data is ready.
+    trafficViews.setScope(event.target.value);
+    trafficViews.clearErrors();
     if (ui.page === "main") {
       const loading = loadHomeTraffic(true);
       render();
@@ -3357,9 +3126,9 @@ document.addEventListener("change", async (event) => {
 let searchTimer;
 document.addEventListener("input", (event) => {
   if (event.target.id !== "search") return;
-  ui.search = event.target.value;
+  activityLog.search = event.target.value;
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => loadActivity(), 120);
+  searchTimer = setTimeout(() => activityLog.load(), 120);
 });
 
 /// Whether keys on `el` edit text, where ←/→ move the caret.

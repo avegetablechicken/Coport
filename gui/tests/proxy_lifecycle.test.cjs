@@ -4,6 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+const { createLatest } = require('../ui/latest.js');
 
 test('pending proxy operations remain visible and disable duplicate power requests', () => {
   const ui = { snap: { phase: { state: 'running', busy: true, port: 8787 }, config: { exists: true } } };
@@ -99,10 +100,10 @@ test('Restart publishes new proxies before announcing success, including concurr
   const messages = [];
   const rendered = [];
   const snap = name => ({ config: { details: { proxies: [{ name }] } } });
-  const ui = { page: 'settings', refreshRequest: 0, snap: snap('old'), proxies: { old: { name: 'old' } }, homeTrafficFetchedAt: Date.now() };
+  const ui = { page: 'settings', snap: snap('old'), proxies: { old: { name: 'old' } } };
   const context = {
-    ui, tagColors: () => ({}),
-    cachedTraffic: () => null, homeTrafficDevice: () => null, loadHomeTraffic() {},
+    ui, tagColors: () => ({}), refreshes: createLatest(), trafficViews: { homeFetchedAt: Date.now(), home: null, cached: () => null },
+    homeTrafficDevice: () => null, loadHomeTraffic() {},
     changePage: update => update(), $: () => ({ scrollTop: 0 }),
     invoke: async command => {
       if (command === 'get_state') return new Promise(resolve => pending.push(resolve));

@@ -5,6 +5,7 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+const { createTrafficViews } = require("../ui/traffic_views.js");
 const handlers = source.slice(source.indexOf('listen("state-changed", scheduleRefresh);'));
 const timeout = 60 * 1000;
 
@@ -117,31 +118,31 @@ test("reopening Settings rereads the login item that System Settings may have ch
 
 // Page changes: the shown page stays while the next one reads its first data,
 // then one motion (changePage) shows it.
-function navigation(page = "main") {
-  const views = { "30:model": { scope: "model", credentials: [] } };
-  const ui = { page, snap: { settings: {} }, trafficMinutes: 30, homeTrafficMinutes: 30, trafficScope: "model", localTrafficViews: views };
+async function navigation(page = "main") {
+  const traffic = createTrafficViews({ invoke: async (_, { minutes, scope }) => ({ minutes, credentials: [] }) });
+  await traffic.local(30, "model");
+  const ui = { page, snap: { settings: {} } };
   const rendered = [];
   const changes = [];
   const loads = [];
   const context = {
-    ui, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
-    changePage: (update) => { changes.push({ page: ui.page, traffic: ui.traffic, homeTraffic: ui.homeTraffic, mergedData: ui.mergedData }); update(); },
-    loadTraffic() {}, resolveActivityRange() {}, loadHomeTraffic() {}, loadDevices() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
-    loadActivity: () => new Promise((resolve) => loads.push(resolve)),
+    ui, trafficViews: traffic, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
+    changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: ui.mergedData }); update(); },
+    loadTraffic() {}, loadHomeTraffic() {}, loadDevices() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
+    activityLog: { resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) },
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
     // Nothing in the panel has focus to keep across renders.
     document: { activeElement: null },
   };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function render()"), source.indexOf("\nfunction renderTop()")), context);
-  vm.runInContext(source.slice(source.indexOf("function cachedTraffic("), source.indexOf("/// Home shows the forwarded device")), context);
   vm.runInContext(source.slice(source.indexOf("async function act("), source.indexOf("// Any scroll or input")), context);
   const go = (target) => context.act("page", { dataset: { page: target } });
-  return { ui, views, rendered, changes, loads, render: context.render, go, context };
+  return { ui, traffic, rendered, changes, loads, render: context.render, go, context };
 }
 
 test("the shown page stays while the next one loads, then changes once", async () => {
-  const p = navigation();
+  const p = await navigation();
   const going = p.go("activity");
   await Promise.resolve();
   p.render();
@@ -155,7 +156,7 @@ test("the shown page stays while the next one loads, then changes once", async (
 });
 
 test("a later page change supersedes one still loading", async () => {
-  const p = navigation();
+  const p = await navigation();
   const activity = p.go("activity");
   await Promise.resolve();
   await p.go("main");
@@ -166,43 +167,46 @@ test("a later page change supersedes one still loading", async () => {
 });
 
 test("Home and Activity open with the ring the other already read", async () => {
-  const p = navigation();
+  const p = await navigation();
   const going = p.go("activity");
   p.loads[0]();
   await going;
-  assert.equal(p.changes[0].traffic, p.views["30:model"]);
-  const other = { scope: "model", credentials: [] };
-  p.views["360:model"] = other;
-  p.ui.trafficMinutes = p.ui.homeTrafficMinutes = 360;
+  assert.equal(p.changes[0].traffic, p.traffic.localView(30, "model"));
+  const other = await p.traffic.local(360, "model");
+  p.traffic.minutes = 360;
   await p.go("main");
   assert.equal(p.changes[1].homeTraffic, other);
 });
 
 test("Devices opens with the merged traffic of the range Home shows", async () => {
-  const p = navigation();
-  const context = { ui: p.ui };
+  const p = await navigation();
+  const context = { ui: p.ui, trafficViews: p.traffic };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function selectDeviceTraffic("), source.indexOf("async function loadMergedData(")), context);
   const day = { minutes: 1440, scope: "model", sources: [] };
   p.ui.mergedData = { minutes: 30, scope: "model", sources: [] };
   p.ui.deviceTrafficViews = { "30:model": p.ui.mergedData, "1440:model": day };
-  p.ui.trafficMinutes = p.ui.homeTrafficMinutes = p.ui.deviceTrafficMinutes = 1440;
+  p.traffic.minutes = p.ui.deviceTrafficMinutes = 1440;
   p.context.selectDeviceTraffic = context.selectDeviceTraffic;
   await p.go("devices");
   assert.equal(p.changes[0].mergedData, day);
 });
 
-test("a range chosen on any traffic page applies to Home, Activity and Devices", () => {
-  const ui = { trafficMinutes: 30, homeTrafficMinutes: 30, deviceTrafficMinutes: 30, trafficRequest: 4, homeTrafficRequest: 7,
-    trafficLoading: true, homeTrafficLoading: true, trafficError: "old", homeTrafficError: "old", homeTrafficFetchedAt: 5 };
-  const context = { ui };
+test("a range chosen on any traffic page applies to Home, Activity and Devices", async () => {
+  const pending = [];
+  const traffic = createTrafficViews({ invoke: () => new Promise((resolve) => pending.push(resolve)) });
+  const ui = { deviceTrafficMinutes: 30 };
+  const context = { ui, trafficViews: traffic };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function setTrafficMinutes("), source.indexOf("\nasync function loadTraffic(")), context);
+  const reads = [traffic.loadActivity(), traffic.loadHome(null)];
+  Object.assign(traffic, { activityError: "old", homeError: "old", homeFetchedAt: 5 });
   context.setTrafficMinutes(360);
-  assert.deepEqual([ui.trafficMinutes, ui.homeTrafficMinutes, ui.deviceTrafficMinutes], [360, 360, 360]);
+  assert.deepEqual([traffic.minutes, ui.deviceTrafficMinutes], [360, 360]);
+  assert.deepEqual([traffic.activityLoading, traffic.homeLoading, traffic.activityError, traffic.homeError, traffic.homeFetchedAt], [false, false, "", "", 0]);
   // Reads still running for the previous range are superseded.
-  assert.deepEqual([ui.trafficRequest, ui.homeTrafficRequest], [5, 8]);
-  assert.deepEqual([ui.trafficLoading, ui.homeTrafficLoading, ui.trafficError, ui.homeTrafficError, ui.homeTrafficFetchedAt], [false, false, "", "", 0]);
+  for (const resolve of pending) resolve({ credentials: [] });
+  assert.deepEqual(await Promise.all(reads), [false, false]);
   // Every range control on the three pages calls it.
   const handlers = source.slice(source.indexOf('document.addEventListener("change"'));
   for (const id of ["devices-traffic-range", "home-traffic-range", "traffic-range"]) assert.match(handlers, new RegExp(`"${id}"[^]*?setTrafficMinutes\\(`));

@@ -3,20 +3,38 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.js'), 'utf8');
+const { createTrafficViews } = require('../ui/traffic_views.js');
+const { createDeviceForm } = require('../ui/device_form.js');
+/// Leaves `views` in the harness's shared traffic cache as reads just made
+/// them; one without `loadedAt` is as old as a view that must be read again.
+async function seedTraffic(h, { local = {}, forwarded = {} }) {
+  for (const [kind, views] of [['local', local], ['forwarded', forwarded]]) {
+    for (const [key, view] of Object.entries(views)) {
+      const parts = key.split(':');
+      const [minutes, scope] = parts.slice(-2);
+      h.seeding = async () => kind === 'local' ? view : { traffic: view, windowStart: view.start, windowEnd: view.end, bucketMinutes: view.bucketMinutes, deviceId: view.device };
+      h.clock = () => view.loadedAt ?? 0;
+      await (kind === 'forwarded' ? h.trafficViews.forwarded(parts[0], Number(minutes), scope) : h.trafficViews.local(Number(minutes), scope));
+    }
+  }
+  h.seeding = null;
+  h.clock = () => Date.now();
+}
 const start = source.indexOf('function deviceConnectionKey(');
 const code = source.slice(start, source.indexOf('// ---------------------------------------------------------------- settings', start));
 function harness(invoke) {
   const ui = { page: 'devices', devices: [], snap: { phase: { state: 'running', port: 8787 }, settings: {} } };
   const fields = {}, listeners = {};
-  const context = { ui, invoke, Promise, ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', loadMergedData() {}, toast() {}, changePage: update => update(),
+  const context = { ui, invoke, Promise, deviceForm: createDeviceForm(), seeding: null, clock: () => Date.now(), ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', loadMergedData() {}, toast() {}, changePage: update => update(),
     message: (_, text) => text, esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
     $: id => fields[id], document: { addEventListener: (event, callback) => { listeners[event] = callback; } } };
+  context.trafficViews = createTrafficViews({ invoke: (command, args) => (context.seeding || context.invoke)(command, args), now: () => context.clock() });
   context.render = () => {
     for (const key of Object.keys(fields)) delete fields[key];
-    if (!ui.deviceFormOpen) return;
+    if (!context.deviceForm.open) return;
     const html = context.deviceSettings();
     for (const match of html.matchAll(/<input[^>]*id="([^"]+)"[^>]*value="([^"]*)"/g)) fields[match[1]] = { value: match[2], id: match[1], focus() {} };
-    fields['device-transport'] = { value: ui.deviceDraft.transport, id: 'device-transport' };
+    fields['device-transport'] = { value: context.deviceForm.draft.transport, id: 'device-transport' };
   };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function panelSelect("), source.indexOf("let openSelect = null;")), context);
@@ -125,14 +143,14 @@ test('Settings includes one Devices block without a separate forwarding block', 
   assert.match(rendered, /aria-checked="false" data-action="mask-account-names"/);
 });
 
-test('each device renders full Traffic metrics and an offline peer leaves other devices visible', () => {
+test('each device renders full Traffic metrics and an offline peer leaves other devices visible', async () => {
   const h = harness(async () => []);
   Object.assign(h, { chart: () => '<svg class="chart"></svg>', stat: (name, value) => `${name}:${value};`, fmtMs: v => `${v} ms`, fmtBytes: v => `${v} B`, modelTokenStats: t => `Input Tokens:${t.inputTokens};Hit Rate:${t.cacheHitRate};`, trafficShare: () => '<div class="traffic-share">Account usage</div>', serviceMark: () => '', message: (kind, value) => value, ICON: { chevron: '' } });
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
   const traffic = { requests: 5, errors: 1, errorRate: 0.2, avgMs: 200, bytes: 1234, outputTps: 50, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
   h.ui.devices = [{ id: 'online', name: 'Online', ssh: { host: 'online' }, data: { transport: 'ssh' } }, { id: 'offline', name: 'Offline', ssh: { host: 'offline' }, data: { transport: 'ssh' } }];
-  h.ui.localTrafficViews = { '30:model': { ...traffic, start: 0, end: 1800000, bucketMinutes: 1 } };
+  await seedTraffic(h, { local: { '30:model': { ...traffic, start: 0, end: 1800000, bucketMinutes: 1 } } });
   h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 1800000, bucketMinutes: 1, sources: [{ name: 'Online', traffic }, { name: 'Offline', error: 'Unavailable' }] };
   const html = h.devicesPage();
   assert.equal((html.match(/Calls:5/g) || []).length, 2);
@@ -145,12 +163,12 @@ test('each device renders full Traffic metrics and an offline peer leaves other 
 
 test('traffic range changes reject late responses from the previous selection', async () => {
   const pending = [];
-  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: (command, args) => new Promise(resolve => pending.push({ command, args, resolve })), render() {} };
+  const context = { Channel: class {}, trafficViews: { scope: 'model' }, ui: { page: 'devices', deviceTrafficMinutes: 30, mergedDataRequest: 0 }, invoke: (command, args) => new Promise(resolve => pending.push({ command, args, resolve })), render() {} };
   vm.createContext(context);
   const start = source.indexOf('async function loadMergedData(');
   vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
   const first = context.loadMergedData();
-  context.ui.deviceTrafficMinutes = 1440; context.ui.trafficScope = 'all';
+  context.ui.deviceTrafficMinutes = 1440; context.trafficViews.scope = 'all';
   const next = context.loadMergedData(true);
   assert.equal(pending[0].command, 'get_merged_data');
   assert.equal(pending[1].command, 'get_merged_data');
@@ -173,7 +191,7 @@ test('Devices button is visible only with configured peers and the redundant Dev
 });
 
 test('automatic alignment retains previous traffic while refreshing without an error message', async () => {
-  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0, mergedData: { selected: 'last-good' } }, invoke: async () => { throw 'TRAFFIC_UPDATING'; }, render() {} };
+  const context = { Channel: class {}, trafficViews: { scope: 'model' }, ui: { page: 'devices', deviceTrafficMinutes: 30, mergedDataRequest: 0, mergedData: { selected: 'last-good' } }, invoke: async () => { throw 'TRAFFIC_UPDATING'; }, render() {} };
   vm.createContext(context);
   const start = source.indexOf('async function loadMergedData(');
   vm.runInContext(source.slice(start, source.indexOf('function deviceTrafficContent(', start)), context);
@@ -221,7 +239,7 @@ test('Devices title contains only a settings icon and no redundant update/config
 test('Models and All switch immediately from one snapshot without new IPC requests', async () => {
   let calls = 0;
   const views = [{ minutes: 30, scope: 'model', traffic: { requests: 3 } }, { minutes: 30, scope: 'all', traffic: { requests: 5 } }, { minutes: 360, scope: 'all', traffic: { requests: 8 } }];
-  const context = { Channel: class {}, ui: { page: 'devices', deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 }, invoke: async () => { calls++; return views; }, render() {} };
+  const context = { Channel: class {}, trafficViews: { scope: 'model' }, ui: { page: 'devices', deviceTrafficMinutes: 30, mergedDataRequest: 0 }, invoke: async () => { calls++; return views; }, render() {} };
   vm.createContext(context);
   const a = source.indexOf('function relabelDeviceViews(');
   vm.runInContext(source.slice(a,source.indexOf('async function loadDeviceDefinitions',a)),context);
@@ -230,11 +248,11 @@ test('Models and All switch immediately from one snapshot without new IPC reques
   await context.loadMergedData();
   assert.equal(context.ui.mergedData.traffic.requests, 3);
   for (let i=0;i<10;i++) {
-    context.ui.trafficScope = i%2 ? 'model' : 'all';
+    context.trafficViews.scope = i%2 ? 'model' : 'all';
     assert.equal(context.selectDeviceTraffic(),true);
     assert.equal(context.ui.mergedData.traffic.requests,i%2 ? 3 : 5);
   }
-  context.ui.deviceTrafficMinutes = 360; context.ui.trafficScope = 'all';
+  context.ui.deviceTrafficMinutes = 360; context.trafficViews.scope = 'all';
   assert.equal(context.selectDeviceTraffic(),true);
   assert.equal(context.ui.mergedData.traffic.requests,8);
   assert.equal(calls,1);
@@ -317,22 +335,22 @@ test('statistics query events display local aliases, transport and failure/recov
 });
 
 
-test('This Device renders the shared local view before remote statistics arrive', () => {
+test('This Device renders the shared local view before remote statistics arrive', async () => {
   const h = harness(async () => { throw new Error('Cached rendering must not query'); });
-  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model';
+  h.ui.deviceTrafficMinutes = 30; h.trafficViews.scope = 'model';
   const view = { requests: 17, credentials: [{ credential: 'Known', requests: 17 }] };
-  h.ui.localTrafficViews = { '30:model': view };
+  await seedTraffic(h, { local: { '30:model': view } });
   const shown = [];
   h.deviceTrafficContent = (traffic, scope, key) => { shown.push(traffic); return `${key}:${scope}:${traffic.requests}:${traffic.credentials.length}`; };
   let html = h.devicesPage();
   assert.match(html, /local:model:17:1/);
   // Home, Activity and This Device show the very same object.
-  assert.equal(shown[0], view);
+  assert.equal(shown[0], h.trafficViews.localView(30, 'model'));
   assert.doesNotMatch(html, /Loading traffic/);
-  h.ui.trafficScope = 'all';
+  h.trafficViews.scope = 'all';
   assert.doesNotMatch(h.devicesPage(), /local:model:17:1/);
   // Merged statistics never replace this device's live view.
-  h.ui.trafficScope = 'model';
+  h.trafficViews.scope = 'model';
   h.ui.mergedData = { minutes: 30, scope: 'model', sources: [] };
   assert.match(h.devicesPage(), /local:model:17:1/);
 });
@@ -349,7 +367,7 @@ test('switching range during a remote refresh waits for it instead of reading th
   vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('), source.indexOf('function deviceTrafficContent(')), h);
   h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
-  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model'; h.ui.mergedDataRequest = 0;
+  h.ui.deviceTrafficMinutes = 30; h.trafficViews.scope = 'model'; h.ui.mergedDataRequest = 0;
   const view = minutes => ({ minutes, scope: 'model', local: { requests: minutes }, traffic: { requests: minutes }, sources: [{ name: 'MS', included: true, traffic: { requests: minutes } }] });
   const refresh = h.loadMergedData(true, true);
   pending[0].args.onUpdate.onmessage([view(30)]);
@@ -387,7 +405,7 @@ function devicesHarness(invoke) {
   h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
   h.ui.devicesLoaded = true;
-  h.ui.deviceTrafficMinutes = 30; h.ui.trafficScope = 'model'; h.ui.mergedDataRequest = 0;
+  h.ui.deviceTrafficMinutes = 30; h.trafficViews.scope = 'model'; h.ui.mergedDataRequest = 0;
   return h;
 }
 
@@ -792,7 +810,7 @@ test('forwarding settings keep mechanisms in documentation instead of repeated h
 test('selected device traffic renders before completion and ignores superseded channel updates', async () => {
   const pending = [];
   let renders = 0;
-  const context = { Channel: class {}, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 1440, trafficScope: 'all', mergedDataRequest: 0 },
+  const context = { Channel: class {}, trafficViews: { scope: 'all' }, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 1440, mergedDataRequest: 0 },
     invoke: (command, args) => new Promise((resolve, reject) => pending.push({ command, args, resolve, reject })),
     render() { renders++; } };
   vm.createContext(context);
@@ -826,7 +844,7 @@ test('selected device traffic renders before completion and ignores superseded c
 
 test('a background failure retains the selected traffic already rendered', async () => {
   let update, reject;
-  const context = { Channel: class {}, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 30, trafficScope: 'model', mergedDataRequest: 0 },
+  const context = { Channel: class {}, trafficViews: { scope: 'model' }, ui: { page: 'devices', devices: [], deviceTrafficMinutes: 30, mergedDataRequest: 0 },
     invoke: (_, args) => { update = args.onUpdate; return new Promise((_, fail) => { reject = fail; }); },
     render() {} };
   vm.createContext(context);
@@ -847,7 +865,7 @@ test('a background failure retains the selected traffic already rendered', async
 test('a periodic refresh keeps shown peers until they answer instead of flashing them away', async () => {
   const pending = [];
   const h = devicesHarness((command, args) => command === 'get_merged_data' ? new Promise((resolve, reject) => pending.push({ args, resolve, reject })) : Promise.resolve([]));
-  h.ui.localTrafficViews = { '30:model': { requests: 1, start: 0, end: 60_000, bucketMinutes: 1, counts: [1], errorCounts: [0], tokenCounts: [0], credentials: [] } };
+  await seedTraffic(h, { local: { '30:model': { requests: 1, start: 0, end: 60_000, bucketMinutes: 1, counts: [1], errorCounts: [0], tokenCounts: [0], credentials: [] } } });
   const counted = requests => ({ requests, start: 0, end: 60_000, bucketMinutes: 1, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
   // Each frame of the range comes completed with this device and Merged Traffic.
   const view = (requests, error) => ({ minutes: 30, scope: 'model', start: 0, end: 60_000, bucketMinutes: 1,
@@ -889,7 +907,7 @@ test('a periodic refresh keeps shown peers until they answer instead of flashing
 test('open Devices refreshes remote statistics every 30 seconds; Settings never does', async () => {
   const calls=[];
   const h=harness(async(command,args)=>{calls.push([command,args]);return command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : [];});
-  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
+  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.trafficViews.scope = 'model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
   const remote=()=>calls.filter(([command,args])=>command==='get_merged_data' && args.refreshRemote===true).length;
   // Repeated visits and timer ticks within 30 seconds read the cache.
@@ -918,7 +936,7 @@ test('open Devices refreshes remote statistics every 30 seconds; Settings never 
 test('a slow remote refresh is neither repeated nor superseded by the next tick', async () => {
   const pending=[];
   const h=harness((command,args)=>command==='get_merged_data' ? new Promise(resolve=>pending.push({args,resolve})) : Promise.resolve(command==='get_devices' ? [{id:'ms',name:'MS',ssh:{host:'MS'}}] : []));
-  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
+  h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.trafficViews.scope = 'model';h.selectDeviceTraffic=()=>false;h.Channel=class {};
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('),source.indexOf('function deviceTrafficContent(')),h);
   const first=h.loadDevices();
   for(let i=0;i<5 && !pending.length;i++) await Promise.resolve();
@@ -969,7 +987,7 @@ test('Devices Refresh performs only one explicitly authorized statistics read', 
   h.Channel = class {};
   h.ui.mergedDataRequest = 0;
   h.ui.deviceTrafficMinutes = 30;
-  h.ui.trafficScope = 'model';
+  h.trafficViews.scope = 'model';
   h.selectDeviceTraffic = () => false;
   vm.runInContext(source.slice(source.indexOf('async function loadMergedData('), source.indexOf('function deviceTrafficContent(')), h);
   h.ui.deviceStartupRefreshDone = true;
@@ -1065,7 +1083,7 @@ test('recovery during an in-flight statistics request waits for the Devices cade
     assert.equal(command,'get_merged_data');
     return new Promise(resolve=>pending.push({args,resolve}));
   });
-  h.Channel=class {};h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.ui.trafficScope='model';
+  h.Channel=class {};h.ui.mergedDataRequest=0;h.ui.deviceTrafficMinutes=30;h.trafficViews.scope = 'model';
   h.ui.page='devices';h.ui.devices=[{id:'ms',name:'MS',ssh:{host:'MS'}}];
   h.ui.deviceStartupRefreshDone=true;h.ui.deviceCapabilities={ms:{host:'MS',checkedAt:100,error:'offline'}};
   vm.runInContext(source.slice(source.indexOf('function selectDeviceTraffic('),source.indexOf('function deviceTrafficContent(')),h);
@@ -1131,7 +1149,7 @@ test('forwarding evidence never changes an HTTP statistics connection or starts 
   assert.equal(h.deviceConnectionStatus(http).state,'failed');
 });
 
-test('Merged Traffic and every card show the views of one completed frame', () => {
+test('Merged Traffic and every card show the views of one completed frame', async () => {
   const shown = [];
   const h = devicesHarness(async () => []);
   h.deviceTrafficContent = (traffic, scope, key) => { shown.push([key, traffic]); return `${key}:${traffic.requests};`; };
@@ -1139,9 +1157,9 @@ test('Merged Traffic and every card show the views of one completed frame', () =
   const view = (requests) => ({ requests, errors: 0, bytes: requests, start: 0, end: 60000, bucketMinutes: 1, counts: [requests], errorCounts: [0], tokenCounts: [0], credentials: [] });
   h.ui.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }, { id: 'fw', name: 'Forwarded', ssh: { host: 'fw' } }, { id: 'dup', name: 'Duplicate', ssh: { host: 'dup' } }];
   // Shared views read for Home differ from the frame's; the frame wins once completed.
-  h.ui.localTrafficViews = { '30:model': view(100) };
+  await seedTraffic(h, { local: { '30:model': view(100) } });
   h.ui.snap.forwarding = { deviceId: 'fw' };
-  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(400), device: 'fw' } };
+  await seedTraffic(h, { forwarded: { 'fw:30:model': { ...view(400), device: 'fw' } } });
   const frame = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, sources: [
     { name: 'MS', included: true, traffic: view(2) },
     { name: 'Forwarded', included: true, traffic: view(3) },
@@ -1162,7 +1180,7 @@ test('Merged Traffic and every card show the views of one completed frame', () =
   assert.doesNotMatch(merged, /Loading traffic…/);
 });
 
-test('a forwarded device already counted via another entry gets no card', () => {
+test('a forwarded device already counted via another entry gets no card', async () => {
   const h = devicesHarness(async () => []);
   h.deviceTrafficContent = (traffic, scope, key) => `${key}:${traffic.requests};`;
   h.message = (_, text) => text;
@@ -1170,8 +1188,7 @@ test('a forwarded device already counted via another entry gets no card', () => 
   // Both entries point at one machine; the HTTP entry is listed first and counted.
   h.ui.devices = [{ id: 'http', name: 'Machine HTTP', data: { transport: 'http', url: 'https://example.invalid' } }, { id: 'fw', name: 'Machine SSH', ssh: { host: 'fw' } }];
   h.ui.snap.forwarding = { deviceId: 'fw' };
-  h.ui.forwardedTrafficViews = { 'fw:30:model': { ...view(4), device: 'fw' } };
-  h.ui.localTrafficViews = { '30:model': view(1) };
+  await seedTraffic(h, { forwarded: { 'fw:30:model': { ...view(4), device: 'fw' } }, local: { '30:model': view(1) } });
   // The backend leaves the duplicate's live view out of the frame and the sum.
   h.ui.mergedData = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, local: view(1), traffic: view(5), sources: [
     { name: 'Machine HTTP', included: true, traffic: view(4) },
@@ -1193,7 +1210,7 @@ test('between refreshes the Devices timer reads no statistics for peers', async 
   const frame = () => ({ '30:model': { minutes: 30, scope: 'model', local: { requests: 1, credentials: [] }, loadedAt: Date.now(), sources: [] } });
   h.ui.deviceTrafficViews = frame();
   h.ui.deviceRemoteAttemptAt = Date.now();
-  h.ui.localTrafficViews = { '30:model': { requests: 1, credentials: [], loadedAt: Date.now() } };
+  await seedTraffic(h, { local: { '30:model': { requests: 1, credentials: [], loadedAt: Date.now() } } });
   for (let i = 0; i < 3; i++) await h.loadDevices();
   // Peers' views stay as they are, and this device's fresh view is reused.
   assert.ok(!calls.includes('get_merged_data'));

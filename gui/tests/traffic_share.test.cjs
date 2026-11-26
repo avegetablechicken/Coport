@@ -4,8 +4,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+const { createTrafficViews } = require('../ui/traffic_views.js');
 function setup(scope = 'model') {
-  const context = { ui: { trafficScope: scope }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
+  const context = { ui: {}, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('function tooltipScopeKey('), source.indexOf('function trafficSummary(')), context);
   vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
@@ -67,7 +68,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
   const context = setup('all');
   const el = { innerHTML: '', setAttribute() {} };
   Object.assign(context, {
-    ui: { trafficScope: 'all', traffic: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
+    ui: {}, trafficViews: { scope: 'all', activity: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
       credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
     openSelect: null, closeSelect() {}, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
     trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
@@ -278,63 +279,55 @@ test('every sector arc bends the short or long way its ends call for', () => {
 });
 test('traffic data keeps the category it was read for', async () => {
   const pending = [];
-  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, page: 'main' };
-  const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
-  vm.createContext(context);
-  loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
-  const load = context.loadTraffic();
+  const views = createTrafficViews({ invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) });
+  views.scope = 'all';
+  const load = views.loadActivity();
   // The selector already shows the new category while the old data renders.
-  ui.trafficScope = 'model';
+  views.scope = 'model';
   pending[0].resolve({ credentials: [] });
-  await load;
+  assert.equal(await load, true);
   assert.equal(pending[0].query.scope, 'all');
-  assert.equal(ui.traffic.scope, 'all');
+  assert.equal(views.activity.scope, 'all');
 });
 test('a traffic read still running is not started again', async () => {
   const pending = [];
-  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 43200, page: 'activity' };
-  const context = { ui, $: () => null, renderActivityTraffic() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
-  vm.createContext(context);
-  loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
-  const first = context.loadTraffic();
-  context.loadTraffic();
+  let now = 1e6;
+  const views = createTrafficViews({ invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })), now: () => now });
+  views.scope = 'all';
+  views.minutes = 43200;
+  const first = views.loadActivity();
+  assert.equal(await views.loadActivity(), false);
   assert.equal(pending.length, 1);
   // Another range starts at once.
-  ui.trafficMinutes = 30;
-  const second = context.loadTraffic();
+  views.minutes = 30;
+  const second = views.loadActivity();
   assert.equal(pending.length, 2);
   // Switching back joins the read still running instead of repeating it.
-  ui.trafficMinutes = 43200;
-  ++ui.trafficRequest;
-  const third = context.loadTraffic();
+  views.setMinutes(43200);
+  const third = views.loadActivity();
   assert.equal(pending.length, 2);
   for (const { resolve } of pending) resolve({ credentials: [] });
-  await Promise.all([first, second, third]);
+  assert.deepEqual(await Promise.all([first, second, third]), [false, false, true]);
   // A view read moments ago is reused; an older one is read again.
-  await context.loadTraffic();
+  await views.loadActivity();
   assert.equal(pending.length, 2);
-  ui.localTrafficViews['43200:all'].loadedAt -= 15000;
-  context.loadTraffic();
+  now += 15000;
+  views.loadActivity();
   assert.equal(pending.length, 3);
 });
 test('home traffic keeps the category it was read for', async () => {
   const pending = [];
-  const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'activity' };
-  const context = { ui, render() {}, invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) };
-  vm.createContext(context);
-  loadSharedViews(context);
-  loadHome(context);
-  const load = context.loadHomeTraffic();
-  ui.trafficScope = 'model';
+  const views = createTrafficViews({ invoke: (_, query) => new Promise((resolve) => pending.push({ query, resolve })) });
+  views.scope = 'all';
+  const load = views.loadHome(null);
+  views.scope = 'model';
   pending[0].resolve({ start: 1000, end: 181000, bucketMinutes: 1, requests: 3, credentials: [credential('a', 3)] });
-  await load;
+  assert.equal(await load, true);
   assert.equal(pending[0].query.scope, 'all');
-  assert.equal(ui.homeTraffic.scope, 'all');
-  assert.equal(ui.homeTraffic.requests, 3);
-  assert.deepEqual(plain(ui.homeTraffic.credentials.map((c) => [c.credential, c.requests])), [['a', 3]]);
-  for (const stats of [ui.homeTraffic, ui.localTrafficViews['30:all']]) {
+  assert.equal(views.home.scope, 'all');
+  assert.equal(views.home.requests, 3);
+  assert.deepEqual(plain(views.home.credentials.map((c) => [c.credential, c.requests])), [['a', 3]]);
+  for (const stats of [views.home, views.localView(30, 'all')]) {
     assert.equal(stats.start, 1000);
     assert.equal(stats.end, 181000);
     assert.equal(stats.bucketMinutes, 1);
@@ -625,19 +618,13 @@ test('assigning traffic refreshes device views and removes stale cached mappings
   const calls = [];
   Object.assign(context, { invoke: async () => calls.push('assign'),
     loadTraffic: async () => calls.push('activity'), loadMergedData: async force => calls.push(force),
-    refresh: async () => calls.push('refresh') });
+    refresh: async () => calls.push('refresh'), trafficViews: { reset: () => calls.push('reset') } });
   loadSharedViews(context);
-  context.ui.localTrafficViews = { old: {} };
-  context.ui.localTrafficLoads = { old: Promise.resolve() };
-  context.ui.forwardedTrafficViews = { old: {} };
   context.ui.deviceTrafficViews = { old: {} };
   await context.assignTraffic({});
-  assert.deepEqual(calls, ['assign', 'activity', true, 'refresh']);
-  for (const views of ['localTrafficViews', 'localTrafficLoads', 'forwardedTrafficViews', 'deviceTrafficViews']) {
-    assert.equal(Object.keys(context.ui[views]).length, 0, views);
-  }
+  assert.deepEqual(calls, ['assign', 'reset', 'activity', true, 'refresh']);
+  assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 0);
 });
-
 test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
   const context = setup();
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
@@ -651,7 +638,7 @@ test('every bucket in an idle chart retains its one-pixel baseline in both scope
 });
 test('home traffic draws the share ring above its chart', () => {
   const context = setup('all');
-  context.ui.homeTraffic = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
+  context.trafficViews.home = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
   vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
@@ -659,14 +646,14 @@ test('home traffic draws the share ring above its chart', () => {
   assert.match(html, /class="traffic-share"[\s\S]*class="chart"/);
   assert.match(html, /\[Codex\][\s\S]*\[Claude\]/);
   // Before credentials arrive, the block still renders without a ring.
-  context.ui.homeTraffic = { ...context.ui.homeTraffic };
-  delete context.ui.homeTraffic.credentials;
+  context.trafficViews.home = { ...context.trafficViews.home };
+  delete context.trafficViews.home.credentials;
   assert.doesNotMatch(context.trafficBlock(), /traffic-share/);
 });
 test('Home Traffic hides part of an account email while configuration names stay readable', () => {
   const context = setup('all');
   const stats = (requests) => ({ requests, errors: 0, bytes: 0, counts: [requests], errorCounts: [0], tokenCounts: [0] });
-  context.ui.homeTraffic = { ...stats(4), avgMs: 10, start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [
+  context.trafficViews.home = { ...stats(4), avgMs: 10, start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [
     { service: 'Codex', credential: 'suzhi2333@gmail.com', ...stats(3) },
     { service: 'Codex', credential: 'work', ...stats(1) },
   ] };
@@ -680,26 +667,24 @@ test('Home Traffic hides part of an account email while configuration names stay
 });
 test('forwarding Home reads the destination from the daemon cache, never local history', async () => {
   const calls = [];
-  const ui = { trafficScope: 'all', homeTrafficRequest: 0, homeTrafficMinutes: 360, page: 'main', snap: { forwarding: { deviceId: 'ms', name: 'MS' } } };
   const remote = {
     deviceId: 'ms', name: 'MS', fetchedAt: Date.now(), error: null, scope: 'all', windowStart: 0, windowEnd: 21600000, bucketMinutes: 10,
     traffic: { requests: 5, errors: 1, avgMs: 20, bytes: 9, counts: [5], errorCounts: [1], tokenCounts: [0], credentials: [credential('remote-account', 5)] },
   };
-  const context = { ui, render() {}, invoke: async (command, args) => { calls.push([command, args]); return remote; } };
-  vm.createContext(context);
-  loadSharedViews(context);
-  loadHome(context);
-  await context.loadHomeTraffic();
+  const views = createTrafficViews({ invoke: async (command, args) => { calls.push([command, args]); return remote; } });
+  views.scope = 'all';
+  views.minutes = 360;
+  await views.loadHome('ms');
   assert.deepEqual(plain(calls), [['get_forwarding_traffic', { minutes: 360, scope: 'all' }]]);
   // A remote view must not enter this machine's cache used by Devices.
-  assert.equal(ui.localTrafficViews, undefined);
-  assert.equal(ui.homeTraffic.device, 'ms');
-  assert.deepEqual([ui.homeTraffic.start, ui.homeTraffic.end, ui.homeTraffic.bucketMinutes], [0, 21600000, 10]);
+  assert.equal(views.localView(360, 'all'), undefined);
+  assert.equal(views.home.device, 'ms');
+  assert.deepEqual([views.home.start, views.home.end, views.home.bucketMinutes], [0, 21600000, 10]);
   // The Devices card of the forwarded device reuses Home's view instead of asking again.
-  assert.equal(await context.loadForwardedTraffic('ms', 360, 'all'), ui.homeTraffic);
+  assert.equal(await views.forwarded('ms', 360, 'all'), views.home);
   assert.equal(calls.length, 1);
   // This device's own view is still read locally.
-  await context.loadLocalTraffic(360, 'all');
+  await views.local(360, 'all');
   assert.equal(calls[1][0], 'get_traffic');
 });
 test('forwarding Home Traffic labels the destination and hides another source', () => {
@@ -711,23 +696,24 @@ test('forwarding Home Traffic labels the destination and hides another source', 
   const { ui } = context;
   ui.page = 'main';
   ui.snap = { forwarding: { deviceId: 'ms' } };
-  ui.homeTrafficError = '';
+  const views = context.trafficViews;
+  views.homeError = '';
   // Local history read before forwarding started is not shown as the destination's.
-  ui.homeTraffic = { requests: 7, errors: 0, counts: [7], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('local', 7)], device: null };
+  views.home = { requests: 7, errors: 0, counts: [7], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('local', 7)], device: null };
   assert.match(context.trafficBlock(), /Loading traffic…/);
-  ui.homeTraffic = { requests: 5, errors: 0, counts: [5], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('remote-account', 5)], device: 'ms', deviceName: 'MS', fetchedAt: Date.now(), remoteError: null };
+  views.home = { requests: 5, errors: 0, counts: [5], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('remote-account', 5)], device: 'ms', deviceName: 'MS', fetchedAt: Date.now(), remoteError: null };
   let html = context.trafficBlock();
   assert.match(html, /class="traffic-share"[\s\S]*remote-account/);
   assert.match(html, /Includes other clients on MS/);
   assert.doesNotMatch(html, /stale|Update failed/);
   // A failed later read keeps the last window, marked stale.
-  ui.homeTraffic.remoteError = 'statistics offline';
+  views.home.remoteError = 'statistics offline';
   html = context.trafficBlock();
   assert.match(html, /stale/);
   assert.match(html, /Update failed/);
   // Before the daemon's first summary, the block waits instead of reporting failure.
-  ui.homeTraffic = null;
-  ui.homeTrafficError = 'TRAFFIC_UPDATING';
+  views.home = null;
+  views.homeError = 'TRAFFIC_UPDATING';
   assert.match(context.trafficBlock(), /Loading traffic…/);
 });
 test('First Token shows where a device reports it, formatting the backend average', () => {
@@ -818,41 +804,34 @@ test('an unchanged view reuses its markup', () => {
 });
 test('Home, Activity and This Device share one read of the same traffic', async () => {
   const pending = [];
-  const ui = { trafficScope: 'all', trafficRequest: 0, trafficMinutes: 30, homeTrafficRequest: 0, homeTrafficMinutes: 30, page: 'main' };
-  const context = { ui, $: () => null, render() {}, renderActivityTraffic() {}, invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) };
-  vm.createContext(context);
-  loadSharedViews(context);
-  loadHome(context);
-  vm.runInContext(source.slice(source.indexOf('async function loadTraffic('), source.indexOf('\nfunction modelTokenStats(')), context);
-  const reads = [context.loadHomeTraffic(), context.loadTraffic(), context.loadLocalTraffic(30, 'all')];
+  const views = createTrafficViews({ invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) });
+  views.scope = 'all';
+  const reads = [views.loadHome(null), views.loadActivity(), views.local(30, 'all')];
   assert.equal(pending.length, 1);
   pending[0].resolve({ start: 0, end: 1800000, bucketMinutes: 1, requests: 4, credentials: [], targets: [] });
   const [, , card] = await Promise.all(reads);
-  assert.equal(ui.homeTraffic, card);
-  assert.equal(ui.traffic, card);
+  assert.equal(views.home, card);
+  assert.equal(views.activity, card);
   assert.equal(card.requests, 4);
   // A different range is its own read.
-  ui.homeTrafficMinutes = 360;
-  context.loadHomeTraffic();
+  views.minutes = 360;
+  views.loadHome(null);
   assert.equal(pending.length, 2);
   assert.equal(pending[1].query.minutes, 360);
 });
 test('a reset while reading discards the old result and reads again', async () => {
   const pending = [];
-  const ui = {};
-  const context = { ui, invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) };
-  vm.createContext(context);
-  loadSharedViews(context);
-  const read = context.loadLocalTraffic(30, 'all');
+  const views = createTrafficViews({ invoke: (command, query) => new Promise((resolve) => pending.push({ command, query, resolve })) });
+  const read = views.local(30, 'all');
   // Traffic is reassigned while the read runs.
-  context.resetTrafficViews();
+  views.reset();
   pending[0].resolve({ requests: 1, credentials: [] });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(pending.length, 2, 'the stale result is read again');
-  assert.equal(ui.localTrafficViews['30:all'], undefined);
+  assert.equal(views.localView(30, 'all'), undefined);
   pending[1].resolve({ requests: 2, credentials: [] });
   assert.equal((await read).requests, 2);
-  assert.equal(ui.localTrafficViews['30:all'].requests, 2);
+  assert.equal(views.localView(30, 'all').requests, 2);
 });
 test('Account names start after the longest service name, Antigravity', () => {
   const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
