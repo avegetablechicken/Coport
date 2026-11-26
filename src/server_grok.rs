@@ -126,6 +126,7 @@ impl Server {
         Ok(headers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_grok(
         &self,
         incoming: Request<Incoming>,

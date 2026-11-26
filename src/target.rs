@@ -250,105 +250,114 @@ mod tests {
         Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\n  routing:\n    api_key:\n      'https://codex.invalid/v1': none\n      'https://both.invalid/v1': none\n      'https://shared.invalid/v1': none\nclaude:\n  config_dirs: []\n  routing:\n    api_key:\n      'https://gateway.invalid/v1': none\n      'https://both.invalid/v1': none\nantigravity:\n  routing:\n    api_key:\n      relay.invalid/antigravity: none\n      gateway.invalid/v1beta: none\n      shared.invalid/v1: none\ngrok:\n  homes: []\n  routing:\n    api_key:\n      grok.invalid/v1: none\n      shared.invalid/v1: none\n").unwrap()
     }
 
-    /// Every request a client sends: its App with and without the
-    /// configuration (`None` when only the configuration's URL routes decide
-    /// it), its kind and the target without its scope.
+    /// A request's method and target, its App with and without the
+    /// configuration, its kind and its target without the scope.
+    type Case = (
+        &'static str,
+        &'static str,
+        Service,
+        Service,
+        Kind,
+        &'static str,
+    );
+
+    /// Every request a client sends, classified.
     #[test]
     fn every_request_target_is_classified_once() {
         let config = config();
         #[rustfmt::skip]
-        let cases: &[(&str, &str, Service, Option<Service>, Kind, &str)] = &[
+        let cases: &[Case] = &[
             // Codex: its own paths, its Token refresh, explicit upstreams.
-            ("POST", "/v1/responses", Codex, Some(Codex), ModelCall, "/v1/responses"),
-            ("GET", "/v1/responses", Codex, Some(Codex), ModelWebSocket, "/v1/responses"),
-            ("GET", "/v1/responses/response-id", Codex, Some(Codex), Other, "/v1/responses/response-id"),
-            ("POST", "/backend-api/codex/responses/compact", Codex, Some(Codex), ModelCall, "/backend-api/codex/responses/compact"),
-            ("POST", "/backend-api/codex/analytics-events/events", Codex, Some(Codex), Other, "/backend-api/codex/analytics-events/events"),
-            ("GET", "/backend-api/wham/usage", Codex, Some(Codex), Other, "/backend-api/wham/usage"),
-            ("POST", "/mcp/openaiDeveloperDocs", Codex, Some(Codex), Other, "/mcp/openaiDeveloperDocs"),
-            ("POST", "/v1/chat/completions", Codex, Some(Codex), ModelCall, "/v1/chat/completions"),
-            ("POST", "/v1/completions", Codex, Some(Codex), ModelCall, "/v1/completions"),
-            ("POST", "/v1/not-responses", Codex, Some(Codex), Other, "/v1/not-responses"),
-            ("GET", "/v1/models", Codex, Some(Codex), Other, "/v1/models"),
-            ("POST", "/oauth/token", Codex, Some(Codex), TokenRefresh, "/oauth/token"),
-            ("POST", "/https://auth.openai.com/oauth/token", Codex, Some(Codex), TokenRefresh, "/https://auth.openai.com/oauth/token"),
-            ("POST", "/oauth/token?x=1", Codex, Some(Codex), Other, "/oauth/token?x=1"),
-            ("POST", "/https://evil.com/oauth/token", Codex, Some(Codex), Other, "/https://evil.com/oauth/token"),
-            ("POST", "/https://auth.openai.com/oauth/authorize", Codex, Some(Codex), Other, "/https://auth.openai.com/oauth/authorize"),
-            ("POST", "/codex/https://auth.openai.com/oauth/token", Codex, Some(Codex), TokenRefresh, "/https://auth.openai.com/oauth/token"),
-            ("GET", "/codex/https://chatgpt.com/backend-api/wham/usage", Codex, Some(Codex), Other, "/https://chatgpt.com/backend-api/wham/usage"),
-            ("GET", "/codex/https://example.invalid/v1/responses?model=x", Codex, Some(Codex), ModelWebSocket, "/https://example.invalid/v1/responses?model=x"),
-            ("POST", "/codex/https://gateway.invalid/v1/messages", Codex, Some(Codex), ModelCall, "/https://gateway.invalid/v1/messages"),
-            ("POST", "/codex/https://platform.claude.com/v1/oauth/token", Codex, Some(Codex), Other, "/https://platform.claude.com/v1/oauth/token"),
-            ("POST", "/https://sharecoder.invalid/responses", Codex, Some(Codex), ModelCall, "/https://sharecoder.invalid/responses"),
+            ("POST", "/v1/responses", Codex, Codex, ModelCall, "/v1/responses"),
+            ("GET", "/v1/responses", Codex, Codex, ModelWebSocket, "/v1/responses"),
+            ("GET", "/v1/responses/response-id", Codex, Codex, Other, "/v1/responses/response-id"),
+            ("POST", "/backend-api/codex/responses/compact", Codex, Codex, ModelCall, "/backend-api/codex/responses/compact"),
+            ("POST", "/backend-api/codex/analytics-events/events", Codex, Codex, Other, "/backend-api/codex/analytics-events/events"),
+            ("GET", "/backend-api/wham/usage", Codex, Codex, Other, "/backend-api/wham/usage"),
+            ("POST", "/mcp/openaiDeveloperDocs", Codex, Codex, Other, "/mcp/openaiDeveloperDocs"),
+            ("POST", "/v1/chat/completions", Codex, Codex, ModelCall, "/v1/chat/completions"),
+            ("POST", "/v1/completions", Codex, Codex, ModelCall, "/v1/completions"),
+            ("POST", "/v1/not-responses", Codex, Codex, Other, "/v1/not-responses"),
+            ("GET", "/v1/models", Codex, Codex, Other, "/v1/models"),
+            ("POST", "/oauth/token", Codex, Codex, TokenRefresh, "/oauth/token"),
+            ("POST", "/https://auth.openai.com/oauth/token", Codex, Codex, TokenRefresh, "/https://auth.openai.com/oauth/token"),
+            ("POST", "/oauth/token?x=1", Codex, Codex, Other, "/oauth/token?x=1"),
+            ("POST", "/https://evil.com/oauth/token", Codex, Codex, Other, "/https://evil.com/oauth/token"),
+            ("POST", "/https://auth.openai.com/oauth/authorize", Codex, Codex, Other, "/https://auth.openai.com/oauth/authorize"),
+            ("POST", "/codex/https://auth.openai.com/oauth/token", Codex, Codex, TokenRefresh, "/https://auth.openai.com/oauth/token"),
+            ("GET", "/codex/https://chatgpt.com/backend-api/wham/usage", Codex, Codex, Other, "/https://chatgpt.com/backend-api/wham/usage"),
+            ("GET", "/codex/https://example.invalid/v1/responses?model=x", Codex, Codex, ModelWebSocket, "/https://example.invalid/v1/responses?model=x"),
+            ("POST", "/codex/https://gateway.invalid/v1/messages", Codex, Codex, ModelCall, "/https://gateway.invalid/v1/messages"),
+            ("POST", "/codex/https://platform.claude.com/v1/oauth/token", Codex, Codex, Other, "/https://platform.claude.com/v1/oauth/token"),
+            ("POST", "/https://sharecoder.invalid/responses", Codex, Codex, ModelCall, "/https://sharecoder.invalid/responses"),
             // Only explicit upstreams take Codex's scope.
-            ("POST", "/codex/v1/responses", Codex, Some(Codex), ModelCall, "/codex/v1/responses"),
-            ("POST", "/https://codex.invalid/v1/messages", Codex, Some(Claude), ModelCall, "/https://codex.invalid/v1/messages"),
+            ("POST", "/codex/v1/responses", Codex, Codex, ModelCall, "/codex/v1/responses"),
+            ("POST", "/https://codex.invalid/v1/messages", Codex, Claude, ModelCall, "/https://codex.invalid/v1/messages"),
             // A prefix that only begins with an App's name is not its scope.
-            ("POST", "/grokking/v1/responses", Codex, Some(Codex), ModelCall, "/grokking/v1/responses"),
-            ("POST", "/anthropic-evil/v1/oauth/token", Codex, Some(Codex), Other, "/anthropic-evil/v1/oauth/token"),
-            ("CONNECT", "api.anthropic.com:443", Codex, Some(Codex), Other, "api.anthropic.com:443"),
+            ("POST", "/grokking/v1/responses", Codex, Codex, ModelCall, "/grokking/v1/responses"),
+            ("POST", "/anthropic-evil/v1/oauth/token", Codex, Codex, Other, "/anthropic-evil/v1/oauth/token"),
+            ("CONNECT", "api.anthropic.com:443", Codex, Codex, Other, "api.anthropic.com:443"),
             // Claude: its scope, its unscoped Messages and OAuth paths, its Token refresh.
-            ("POST", "/v1/messages", Claude, Some(Claude), ModelCall, "/v1/messages"),
-            ("POST", "/https://other.invalid/v1/messages", Claude, Some(Claude), ModelCall, "/https://other.invalid/v1/messages"),
-            ("GET", "/api/oauth/usage", Claude, Some(Claude), Other, "/api/oauth/usage"),
-            ("POST", "/anthropic/v1/messages", Claude, Some(Claude), ModelCall, "/v1/messages"),
-            ("POST", "/anthropic/v1/messages/count_tokens", Claude, Some(Claude), Other, "/v1/messages/count_tokens"),
-            ("GET", "/anthropic/api/oauth/usage", Claude, Some(Claude), Other, "/api/oauth/usage"),
-            ("POST", "/claude/https://example.invalid/api/v1/messages", Claude, Some(Claude), ModelCall, "/https://example.invalid/api/v1/messages"),
-            ("GET", "/claude/v1/models", Claude, Some(Claude), Other, "/v1/models"),
-            ("GET", "/anthropic/https://api.anthropic.com/v1/models", Claude, Some(Claude), Other, "/https://api.anthropic.com/v1/models"),
-            ("POST", "/v1/oauth/token", Claude, Some(Claude), TokenRefresh, "/v1/oauth/token"),
-            ("POST", "/https://platform.claude.com/v1/oauth/token", Claude, Some(Claude), TokenRefresh, "/https://platform.claude.com/v1/oauth/token"),
-            ("POST", "/anthropic/v1/oauth/token", Claude, Some(Claude), TokenRefresh, "/v1/oauth/token"),
-            ("POST", "/anthropic/https://platform.claude.com/v1/oauth/token", Claude, Some(Claude), TokenRefresh, "/https://platform.claude.com/v1/oauth/token"),
-            ("POST", "/anthropic/v1/oauth/token?redirect=evil", Claude, Some(Claude), Other, "/v1/oauth/token?redirect=evil"),
-            ("POST", "/https://platform.claude.com.evil.invalid/v1/oauth/token", Codex, Some(Codex), Other, "/https://platform.claude.com.evil.invalid/v1/oauth/token"),
-            ("POST", "/https://platform.claude.com:444/v1/oauth/token", Codex, Some(Codex), Other, "/https://platform.claude.com:444/v1/oauth/token"),
+            ("POST", "/v1/messages", Claude, Claude, ModelCall, "/v1/messages"),
+            ("POST", "/https://other.invalid/v1/messages", Claude, Claude, ModelCall, "/https://other.invalid/v1/messages"),
+            ("GET", "/api/oauth/usage", Claude, Claude, Other, "/api/oauth/usage"),
+            ("POST", "/anthropic/v1/messages", Claude, Claude, ModelCall, "/v1/messages"),
+            ("POST", "/anthropic/v1/messages/count_tokens", Claude, Claude, Other, "/v1/messages/count_tokens"),
+            ("GET", "/anthropic/api/oauth/usage", Claude, Claude, Other, "/api/oauth/usage"),
+            ("POST", "/claude/https://example.invalid/api/v1/messages", Claude, Claude, ModelCall, "/https://example.invalid/api/v1/messages"),
+            ("GET", "/claude/v1/models", Claude, Claude, Other, "/v1/models"),
+            ("GET", "/anthropic/https://api.anthropic.com/v1/models", Claude, Claude, Other, "/https://api.anthropic.com/v1/models"),
+            ("POST", "/v1/oauth/token", Claude, Claude, TokenRefresh, "/v1/oauth/token"),
+            ("POST", "/https://platform.claude.com/v1/oauth/token", Claude, Claude, TokenRefresh, "/https://platform.claude.com/v1/oauth/token"),
+            ("POST", "/anthropic/v1/oauth/token", Claude, Claude, TokenRefresh, "/v1/oauth/token"),
+            ("POST", "/anthropic/https://platform.claude.com/v1/oauth/token", Claude, Claude, TokenRefresh, "/https://platform.claude.com/v1/oauth/token"),
+            ("POST", "/anthropic/v1/oauth/token?redirect=evil", Claude, Claude, Other, "/v1/oauth/token?redirect=evil"),
+            ("POST", "/https://platform.claude.com.evil.invalid/v1/oauth/token", Codex, Codex, Other, "/https://platform.claude.com.evil.invalid/v1/oauth/token"),
+            ("POST", "/https://platform.claude.com:444/v1/oauth/token", Codex, Codex, Other, "/https://platform.claude.com:444/v1/oauth/token"),
             // Codex's Token refresh in Claude's scope is not one.
-            ("POST", "/anthropic/oauth/token", Claude, Some(Claude), Other, "/oauth/token"),
+            ("POST", "/anthropic/oauth/token", Claude, Claude, Other, "/oauth/token"),
             // Antigravity: its scope, with the upstream `//` agy collapses restored.
-            ("POST", "/antigravity/v1internal:streamGenerateContent?alt=sse", Antigravity, Some(Antigravity), ModelCall, "/v1internal:streamGenerateContent?alt=sse"),
-            ("GET", "/antigravity/v1internal:streamGenerateContent", Antigravity, Some(Antigravity), Other, "/v1internal:streamGenerateContent"),
-            ("POST", "/antigravity/v1internal:generateContent", Antigravity, Some(Antigravity), ModelCall, "/v1internal:generateContent"),
-            ("POST", "/antigravity/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent", Antigravity, Some(Antigravity), ModelCall, "/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"),
-            ("POST", "/antigravity/https:/relay.example.com/antigravity/v1internal:generateContent", Antigravity, Some(Antigravity), ModelCall, "/https://relay.example.com/antigravity/v1internal:generateContent"),
-            ("POST", "/antigravity/v1internal:loadCodeAssist", Antigravity, Some(Antigravity), Other, "/v1internal:loadCodeAssist"),
-            ("POST", "/antigravity/v1internal:countTokens", Antigravity, Some(Antigravity), Other, "/v1internal:countTokens"),
-            ("POST", "/antigravity/v1internal:generateContentX", Antigravity, Some(Antigravity), Other, "/v1internal:generateContentX"),
-            ("POST", "/antigravity/https://oauth2.googleapis.com/token", Antigravity, Some(Antigravity), TokenRefresh, "/https://oauth2.googleapis.com/token"),
-            ("POST", "/antigravity/https://oauth2.googleapis.com/revoke", Antigravity, Some(Antigravity), Other, "/https://oauth2.googleapis.com/revoke"),
-            ("POST", "/antigravityx/v1internal:x", Codex, Some(Codex), Other, "/antigravityx/v1internal:x"),
+            ("POST", "/antigravity/v1internal:streamGenerateContent?alt=sse", Antigravity, Antigravity, ModelCall, "/v1internal:streamGenerateContent?alt=sse"),
+            ("GET", "/antigravity/v1internal:streamGenerateContent", Antigravity, Antigravity, Other, "/v1internal:streamGenerateContent"),
+            ("POST", "/antigravity/v1internal:generateContent", Antigravity, Antigravity, ModelCall, "/v1internal:generateContent"),
+            ("POST", "/antigravity/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent", Antigravity, Antigravity, ModelCall, "/https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"),
+            ("POST", "/antigravity/https:/relay.example.com/antigravity/v1internal:generateContent", Antigravity, Antigravity, ModelCall, "/https://relay.example.com/antigravity/v1internal:generateContent"),
+            ("POST", "/antigravity/v1internal:loadCodeAssist", Antigravity, Antigravity, Other, "/v1internal:loadCodeAssist"),
+            ("POST", "/antigravity/v1internal:countTokens", Antigravity, Antigravity, Other, "/v1internal:countTokens"),
+            ("POST", "/antigravity/v1internal:generateContentX", Antigravity, Antigravity, Other, "/v1internal:generateContentX"),
+            ("POST", "/antigravity/https://oauth2.googleapis.com/token", Antigravity, Antigravity, TokenRefresh, "/https://oauth2.googleapis.com/token"),
+            ("POST", "/antigravity/https://oauth2.googleapis.com/revoke", Antigravity, Antigravity, Other, "/https://oauth2.googleapis.com/revoke"),
+            ("POST", "/antigravityx/v1internal:x", Codex, Codex, Other, "/antigravityx/v1internal:x"),
             // Gemini's API is Antigravity's only through its URL routes.
-            ("POST", "/v1beta/models/gemini-3-pro:generateContent", Codex, Some(Codex), ModelCall, "/v1beta/models/gemini-3-pro:generateContent"),
-            ("POST", "/https://relay.invalid/antigravity/v1beta/models/g:generateContent", Antigravity, Some(Codex), ModelCall, "/https://relay.invalid/antigravity/v1beta/models/g:generateContent"),
-            ("POST", "/https://gateway.invalid/v1beta/models/g:generateContent", Antigravity, Some(Codex), ModelCall, "/https://gateway.invalid/v1beta/models/g:generateContent"),
+            ("POST", "/v1beta/models/gemini-3-pro:generateContent", Codex, Codex, ModelCall, "/v1beta/models/gemini-3-pro:generateContent"),
+            ("POST", "/https://relay.invalid/antigravity/v1beta/models/g:generateContent", Antigravity, Codex, ModelCall, "/https://relay.invalid/antigravity/v1beta/models/g:generateContent"),
+            ("POST", "/https://gateway.invalid/v1beta/models/g:generateContent", Antigravity, Codex, ModelCall, "/https://gateway.invalid/v1beta/models/g:generateContent"),
             // Claude's scope never considers another App's URL routes.
-            ("POST", "/anthropic/https://relay.invalid/antigravity/v1beta/models/g:generateContent", Claude, Some(Claude), ModelCall, "/https://relay.invalid/antigravity/v1beta/models/g:generateContent"),
+            ("POST", "/anthropic/https://relay.invalid/antigravity/v1beta/models/g:generateContent", Claude, Claude, ModelCall, "/https://relay.invalid/antigravity/v1beta/models/g:generateContent"),
             // Grok: its scope, and its URL routes.
-            ("POST", "/grok/v1/responses", Grok, Some(Grok), ModelCall, "/v1/responses"),
-            ("POST", "/grok/v1/chat/completions", Grok, Some(Grok), ModelCall, "/v1/chat/completions"),
-            ("POST", "/grok/chat/completions", Grok, Some(Grok), ModelCall, "/chat/completions"),
-            ("POST", "/grok/https://cli-chat-proxy.grok.com/v1/responses", Grok, Some(Grok), ModelCall, "/https://cli-chat-proxy.grok.com/v1/responses"),
-            ("GET", "/grok/https://cli-chat-proxy.grok.com/v1/models", Grok, Some(Grok), Other, "/https://cli-chat-proxy.grok.com/v1/models"),
-            ("GET", "/grok/v1/settings", Grok, Some(Grok), Other, "/v1/settings"),
-            ("GET", "/grok/v1/billing?format=credits", Grok, Some(Grok), Other, "/v1/billing?format=credits"),
-            ("POST", "/grok/oauth2/token", Grok, Some(Grok), Other, "/oauth2/token"),
-            ("POST", "/https://grok.invalid/v1/chat/completions", Grok, Some(Codex), ModelCall, "/https://grok.invalid/v1/chat/completions"),
+            ("POST", "/grok/v1/responses", Grok, Grok, ModelCall, "/v1/responses"),
+            ("POST", "/grok/v1/chat/completions", Grok, Grok, ModelCall, "/v1/chat/completions"),
+            ("POST", "/grok/chat/completions", Grok, Grok, ModelCall, "/chat/completions"),
+            ("POST", "/grok/https://cli-chat-proxy.grok.com/v1/responses", Grok, Grok, ModelCall, "/https://cli-chat-proxy.grok.com/v1/responses"),
+            ("GET", "/grok/https://cli-chat-proxy.grok.com/v1/models", Grok, Grok, Other, "/https://cli-chat-proxy.grok.com/v1/models"),
+            ("GET", "/grok/v1/settings", Grok, Grok, Other, "/v1/settings"),
+            ("GET", "/grok/v1/billing?format=credits", Grok, Grok, Other, "/v1/billing?format=credits"),
+            ("POST", "/grok/oauth2/token", Grok, Grok, Other, "/oauth2/token"),
+            ("POST", "/https://grok.invalid/v1/chat/completions", Grok, Codex, ModelCall, "/https://grok.invalid/v1/chat/completions"),
             // Only the configuration decides unscoped URL routes; records logged
             // without it fall back to the proxy's default for those.
-            ("GET", "/https://gateway.invalid/v1/models", Claude, Some(Codex), Other, "/https://gateway.invalid/v1/models"),
+            ("GET", "/https://gateway.invalid/v1/models", Claude, Codex, Other, "/https://gateway.invalid/v1/models"),
             // Every scope takes a URL several Apps route.
-            ("GET", "/codex/https://both.invalid/v1/models", Codex, Some(Codex), Other, "/https://both.invalid/v1/models"),
-            ("GET", "/anthropic/https://both.invalid/v1/models", Claude, Some(Claude), Other, "/https://both.invalid/v1/models"),
-            ("POST", "/codex/https://shared.invalid/v1/messages", Codex, Some(Codex), ModelCall, "/https://shared.invalid/v1/messages"),
-            ("POST", "/antigravity/https://shared.invalid/v1/messages", Antigravity, Some(Antigravity), ModelCall, "/https://shared.invalid/v1/messages"),
-            ("POST", "/grok/https://shared.invalid/v1/messages", Grok, Some(Grok), ModelCall, "/https://shared.invalid/v1/messages"),
+            ("GET", "/codex/https://both.invalid/v1/models", Codex, Codex, Other, "/https://both.invalid/v1/models"),
+            ("GET", "/anthropic/https://both.invalid/v1/models", Claude, Claude, Other, "/https://both.invalid/v1/models"),
+            ("POST", "/codex/https://shared.invalid/v1/messages", Codex, Codex, ModelCall, "/https://shared.invalid/v1/messages"),
+            ("POST", "/antigravity/https://shared.invalid/v1/messages", Antigravity, Antigravity, ModelCall, "/https://shared.invalid/v1/messages"),
+            ("POST", "/grok/https://shared.invalid/v1/messages", Grok, Grok, ModelCall, "/https://shared.invalid/v1/messages"),
         ];
         for &(method, raw, app, logged, kind, rest) in cases {
             let target = Target::new(method, raw);
             assert_eq!(config.app(&target).unwrap(), app, "{method} {raw}");
-            assert_eq!(logged_service(raw), logged.unwrap(), "{method} {raw}");
+            assert_eq!(logged_service(raw), logged, "{method} {raw}");
             assert_eq!(target.kind(), kind, "{method} {raw}");
             assert_eq!(target.rest(), rest, "{method} {raw}");
             assert_eq!(
