@@ -31,7 +31,7 @@ The upstream a request is sent to, the proxy it goes through and the credential 
 _Avoid_: destination, path
 
 **Saved login**:
-An **App**'s OAuth login stored on this computer where the **App** keeps it. When a **Model call** carrying its access token is rejected as expired, Coport renews it with a **Token refresh** and sends the call again.
+An **App**'s OAuth login stored on this computer where the **App** keeps it. When a **Model call** carrying a Codex, Claude or Antigravity Saved login's access token is rejected as expired, Coport renews it with a **Token refresh** and sends the call again. Grok's own client renews Grok's; Coport relays that **Token refresh** and learns its account.
 _Avoid_: credential file, stored token
 
 **Account lookup**:
