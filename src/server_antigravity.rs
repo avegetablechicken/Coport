@@ -141,7 +141,7 @@ impl Server {
 
     /// Keeps the account a lookup named for the saved login. A failure to
     /// save it is logged; the request goes on.
-    pub(super) fn learn_antigravity_login(
+    pub(crate) fn learn_antigravity_login(
         &self,
         refresh_token: &str,
         identity: &AntigravityIdentity,

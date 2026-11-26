@@ -170,10 +170,8 @@ const KEYRING_SERVICE: &str = "Codex Auth";
 pub(crate) async fn saved_auth(home: &Path) -> Result<Value> {
     Ok(saved_auth_store(home).await?.1)
 }
-pub(crate) async fn saved_auth_store(
-    home: &Path,
-) -> Result<(crate::oauth_credentials::Store, Value)> {
-    use crate::oauth_credentials::Store;
+pub(crate) async fn saved_auth_store(home: &Path) -> Result<(crate::saved_login::Store, Value)> {
+    use crate::saved_login::Store;
     let settings = auth_settings(home)?;
     let file = || {
         let store = Store::File(home.join("auth.json"));

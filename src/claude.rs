@@ -125,8 +125,8 @@ async fn saved_credentials(directory: &std::path::Path) -> Result<serde_json::Va
 }
 pub(crate) async fn saved_credentials_store(
     directory: &std::path::Path,
-) -> Result<(crate::oauth_credentials::Store, serde_json::Value)> {
-    use crate::oauth_credentials::Store;
+) -> Result<(crate::saved_login::Store, serde_json::Value)> {
+    use crate::saved_login::Store;
     let file = || {
         let store = Store::File(directory.join(".credentials.json"));
         Ok((store.clone(), store.read_file()?))

@@ -497,9 +497,7 @@ pub(crate) fn refresh_form(refresh_token: &str, client: &OAuthClient) -> String 
 /// The saved login's document and the item it is kept in, to renew it in
 /// place. `recent` accepts a read at most 30 seconds old, as requests are
 /// matched with.
-pub(crate) async fn saved_document(
-    recent: bool,
-) -> Result<(crate::oauth_credentials::Store, Value)> {
+pub(crate) async fn saved_document(recent: bool) -> Result<(crate::saved_login::Store, Value)> {
     let raw = if recent {
         crate::keychain::read_go_keyring_recent(SERVICE, ACCOUNT, RECENT).await?
     } else {
@@ -513,7 +511,7 @@ pub(crate) async fn saved_document(
         .ok_or(Error::config(
             "Invalid Antigravity login in the OS credential store.",
         ))?;
-    let store = crate::oauth_credentials::Store::GoKeyring(SERVICE.into(), ACCOUNT.into());
+    let store = crate::saved_login::Store::GoKeyring(SERVICE.into(), ACCOUNT.into());
     Ok((store, document))
 }
 /// Bounds how long a login Antigravity replaced may still match.

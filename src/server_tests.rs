@@ -4516,14 +4516,10 @@ async fn auto_refresh_rotates_saved_tokens_once_for_concurrent_and_repeated_mode
         } else {
             Service::Codex
         };
-        assert_eq!(
-            crate::oauth_credentials::access(&saved, service),
-            Some("new-access")
-        );
-        assert_eq!(
-            crate::oauth_credentials::refresh(&saved, service),
-            Some("new-refresh")
-        );
+        crate::saved_login::with_login!(service, L => {
+            assert_eq!(crate::saved_login::access::<L>(&saved), Some("new-access"));
+            assert_eq!(crate::saved_login::refresh::<L>(&saved), Some("new-refresh"));
+        });
         assert_eq!(saved["other"], "preserved");
         // A configured API gateway must receive the caller's original token,
         // even if it also happens to be an old OAuth alias in this process.
@@ -4721,14 +4717,10 @@ async fn auto_refresh_merges_its_rotation_into_unrelated_edits_made_meanwhile() 
         } else {
             Service::Codex
         };
-        assert_eq!(
-            crate::oauth_credentials::access(&saved, service),
-            Some("new-access")
-        );
-        assert_eq!(
-            crate::oauth_credentials::refresh(&saved, service),
-            Some("new-refresh")
-        );
+        crate::saved_login::with_login!(service, L => {
+            assert_eq!(crate::saved_login::access::<L>(&saved), Some("new-access"));
+            assert_eq!(crate::saved_login::refresh::<L>(&saved), Some("new-refresh"));
+        });
         assert_eq!(saved["mcpOAuth"]["server"]["accessToken"], "mcp-access");
         assert_eq!(saved[section]["clientId"], "kept-client");
         assert_eq!(saved["other"], "preserved");
@@ -4788,7 +4780,7 @@ async fn auto_refresh_takes_over_from_a_claude_code_that_died_holding_its_lock()
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().await.unwrap(), "model-result");
     assert_eq!(
-        crate::oauth_credentials::access(&read_json(&file), Service::Claude),
+        crate::saved_login::access::<crate::saved_login::Claude>(&read_json(&file)),
         Some("new-access")
     );
     let refreshes = take_requests(&mut fixture)
@@ -4842,7 +4834,7 @@ async fn auto_refresh_gives_up_while_another_renewal_holds_the_lock() {
     }
     assert_eq!(auto_model(&running, true).await.status(), 200);
     assert_eq!(
-        crate::oauth_credentials::access(&read_json(&file), Service::Claude),
+        crate::saved_login::access::<crate::saved_login::Claude>(&read_json(&file)),
         Some("new-access")
     );
     assert!(locks.iter().all(|lock| !lock.exists()));

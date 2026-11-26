@@ -190,6 +190,16 @@ impl Server {
         self.codex_refresh_routes = Arc::new(routes);
         self
     }
+    /// Claude's refresh tokens and the accounts learned for them.
+    pub(crate) fn claude_refresh_routes(&self) -> &crate::refresh_routes::RefreshRoutes {
+        &self.refresh_routes
+    }
+    /// Antigravity's refresh tokens and the accounts learned for them.
+    pub(crate) fn antigravity_refresh_routes(
+        &self,
+    ) -> &crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity> {
+        &self.antigravity_refresh_routes
+    }
     /// Decrypt CONNECT tunnels to credential-routed API hosts.
     pub fn with_credential_proxy(
         mut self,
