@@ -26,6 +26,14 @@ _Avoid_: OAuth refresh, renewal request
 A request Coport sends upstream while serving a client's request that is not that request itself, such as an account lookup or a **Token refresh** made before retrying a **Model call**.
 _Avoid_: side request, probe
 
+**Route**:
+The upstream a request is sent to, the proxy it goes through and the credential it carries, chosen by its **App** from the credential or the target the client sent.
+_Avoid_: destination, path
+
+**Saved login**:
+An **App**'s OAuth login stored on this computer where the **App** keeps it. When a **Model call** carrying its access token is rejected as expired, Coport renews it with a **Token refresh** and sends the call again.
+_Avoid_: credential file, stored token
+
 ### Traffic
 
 **Traffic totals**:
