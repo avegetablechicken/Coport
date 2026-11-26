@@ -3,7 +3,7 @@
 //! their key or upstream URL. Account lookups, their caches, route states and
 //! statistics labels follow Claude's.
 use super::antigravity_cooldown::Scope;
-use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord};
+use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::{
     antigravity::{Antigravity, AntigravityIdentity, AntigravityRoute, ApiCredential, ApiRoute},
@@ -38,11 +38,7 @@ impl Server {
         incoming: Request<Incoming>,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        if incoming.method() != "POST" {
-            return Err(Error::new(405, "Token refresh supports POST only."));
-        }
-        let (parts, body) = incoming.into_parts();
-        let bytes = read_body(body).await?;
+        let (parts, bytes) = Server::token_refresh_body(incoming).await?;
         // The endpoint serves every Google client; only Antigravity's is
         // routed, so another's credential never leaves through its proxy.
         if !crate::antigravity::form_field(&bytes, "client_id")
@@ -72,35 +68,13 @@ impl Server {
                 Err(error) => return Err(error),
             }
         }
-        log.field("credential_match", credential_match(route.configured));
-        if let Some(identity) = &route.identity {
-            log.field("account_id", &identity.email);
+        RouteRecord {
+            account_id: route.identity.as_ref().map(|i| i.email.clone()),
+            account_label: self.antigravity_label(route.saved, route.identity.as_ref()),
+            configured: route.configured,
+            ..Default::default()
         }
-        if let Some(label) = self.antigravity_label(route.saved, route.identity.as_ref()) {
-            log.field("account_label", label);
-        }
-        let url = Url::parse(crate::antigravity::TOKEN_REFRESH_UPSTREAM).unwrap();
-        let mut request = reqwest::Request::new(parts.method, url);
-        *request.headers_mut() = filtered_headers(&parts.headers);
-        // The proxy reads the response to learn its account and does not
-        // decompress it.
-        request
-            .headers_mut()
-            .insert("accept-encoding", "identity".parse().unwrap());
-        *request.body_mut() = Some(bytes.into());
-        let response = self
-            .send_via(
-                &route.proxy,
-                request,
-                false,
-                Deadline::new(self.config.request_timeout_seconds),
-                Upstream::Relay,
-                log,
-            )
-            .await?;
-        if !response.status().is_success() {
-            return Ok(response);
-        }
+        .stamp(log);
         // The new access token is this login's too, though the client may
         // keep it without saving it where the saved login is read.
         let renewed = self.antigravity_renewed.clone();
@@ -108,13 +82,16 @@ impl Server {
         let observe: ResponseObserver = Box::new(move |body| {
             renewed.learn_response(body, &sent, identity);
         });
-        Ok(self.learn_refresh_route(
-            response,
-            routes.clone(),
-            route.identity,
-            Some(token),
-            Some(observe),
-        ))
+        let token_route = TokenRoute {
+            url: Url::parse(crate::antigravity::TOKEN_REFRESH_UPSTREAM).unwrap(),
+            proxy: route.proxy,
+            routes: routes.clone(),
+            previous: route.identity,
+            sent: Some(token),
+            observe: Some(observe),
+        };
+        self.relay_token_refresh(parts, bytes, token_route, log)
+            .await
     }
 
     /// The route a credential takes, as records name it: the saved login's

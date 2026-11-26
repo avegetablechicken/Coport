@@ -1,4 +1,4 @@
-use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord};
+use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::{
     grok::{ApiRoute, Endpoint, GrokAccount, GrokRoute, GrokTarget},
@@ -45,7 +45,6 @@ impl Server {
         // What the request carries: a renewal's refresh token, a usage
         // read's access token, or nothing a sign-in can be routed by.
         let mut token = None;
-        let mut sign_in = false;
         match endpoint {
             Endpoint::Token => {
                 // Deserialize once; serde rejects duplicate credential or grant fields.
@@ -75,9 +74,8 @@ impl Server {
                         }
                         token = Some(refresh);
                     }
-                    (DEVICE_GRANT, None, Some(code)) if crate::identity::valid_token(&code) => {
-                        sign_in = true;
-                    }
+                    // A device sign-in, routed by none.
+                    (DEVICE_GRANT, None, Some(code)) if crate::identity::valid_token(&code) => {}
                     _ => {
                         return Err(Error::new(
                             403,
@@ -137,6 +135,20 @@ impl Server {
             log.field("account_id", account.user_id());
         }
         log.field("upstream_base_url", url.origin().ascii_serialization());
+        if endpoint == Endpoint::Token {
+            // Learned whatever the policy, which only decides whether learned
+            // tokens are used, so turning it off later finds these renewals.
+            // A device sign-in's tokens name their account the same way.
+            let route = TokenRoute {
+                url,
+                proxy: choice.clone(),
+                routes: self.grok_routes.clone(),
+                previous: identity,
+                sent: token.filter(|_| refresh),
+                observe: None,
+            };
+            return self.relay_token_refresh(parts, bytes, route, log).await;
+        }
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
@@ -153,22 +165,7 @@ impl Server {
         if endpoint == Endpoint::Discovery {
             return discovery_response(response, listener.as_deref()).await;
         }
-        Ok(
-            // Learned whatever the policy, which only decides whether learned
-            // tokens are used, so turning it off later finds these renewals.
-            // A device sign-in's tokens name their account the same way.
-            if (refresh || sign_in) && response.status().is_success() {
-                self.learn_refresh_route(
-                    response,
-                    self.grok_routes.clone(),
-                    identity,
-                    token.filter(|_| refresh),
-                    None,
-                )
-            } else {
-                response
-            },
-        )
+        Ok(response)
     }
 }
 

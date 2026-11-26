@@ -1,6 +1,6 @@
 //! Claude's requests: routed by the Claude login or API key they carry, or a
 //! configured URL route for an explicit upstream.
-use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord};
+use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::claude::ClaudeRoute;
 
@@ -35,7 +35,53 @@ impl Adapter for Claude {
         (): (),
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        server.forward_token_refresh(incoming, log, true).await
+        let (parts, bytes) = Server::token_refresh_body(incoming).await?;
+        let token = refresh_token(&bytes)
+            .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
+        let mut learned = server.refresh_routes.identity(&token);
+        let existing = learned.clone();
+        let recovered = &mut learned;
+        let logger = &mut *log;
+        let (proxy, account_id, configured) = server
+            .config
+            .claude
+            .resolve_refresh_with_profile(&token, existing.as_ref(), |access, probe| async move {
+                let named = server
+                    .lookup_claude_identity(&access, &probe, logger)
+                    .await?;
+                *recovered = Some(named.clone());
+                Ok(named)
+            })
+            .await?;
+        // A learned or saved refresh token names its account; a probe has none.
+        RouteRecord {
+            account_label: learned
+                .as_ref()
+                .filter(|identity| Some(&identity.account_id) == account_id.as_ref())
+                .and_then(|identity| {
+                    crate::identity::routing_account_label(
+                        &server.config.claude.routing,
+                        &identity.account_id,
+                        &identity.usernames,
+                        "",
+                    )
+                }),
+            account_id,
+            configured,
+            ..Default::default()
+        }
+        .stamp(log);
+        // The refresh token it replaces names the account even where the
+        // routing does not map it.
+        let route = TokenRoute {
+            url: Url::parse(crate::claude::TOKEN_REFRESH_UPSTREAM).unwrap(),
+            proxy,
+            routes: server.refresh_routes.clone(),
+            previous: learned,
+            sent: None,
+            observe: None,
+        };
+        server.relay_token_refresh(parts, bytes, route, log).await
     }
 
     fn renews(_: &Server) -> bool {

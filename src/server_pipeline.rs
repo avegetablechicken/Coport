@@ -94,7 +94,7 @@ pub(super) struct RouteRecord {
 }
 
 impl RouteRecord {
-    fn stamp(self, log: &mut RequestLog) {
+    pub(super) fn stamp(self, log: &mut RequestLog) {
         for (name, value) in [
             ("provider", self.provider),
             ("upstream_base_url", self.upstream_base_url),
@@ -358,6 +358,71 @@ impl Server {
             )
             .await?;
         Ok(self.location_cooldowns.observe(relay.cooldown, response))
+    }
+}
+
+/// Where a Token refresh renews its login, and what its response teaches.
+pub(super) struct TokenRoute<A: crate::refresh_routes::Account> {
+    pub(super) url: Url,
+    pub(super) proxy: Choice,
+    /// The account learned from the token's response is kept here.
+    pub(super) routes: Arc<crate::refresh_routes::RefreshRoutes<A>>,
+    /// The account the refresh token was known to name.
+    pub(super) previous: Option<A>,
+    /// The refresh token sent, when the response may omit its successor.
+    pub(super) sent: Option<String>,
+    pub(super) observe: Option<ResponseObserver>,
+}
+
+impl Server {
+    /// A Token refresh's parts and body: only POSTed ones are relayed.
+    pub(super) async fn token_refresh_body(
+        incoming: Request<Incoming>,
+    ) -> Result<(hyper::http::request::Parts, Bytes)> {
+        if incoming.method() != "POST" {
+            return Err(Error::new(405, "Token refresh supports POST only."));
+        }
+        let (parts, body) = incoming.into_parts();
+        Ok((parts, read_body(body).await?))
+    }
+
+    /// Relays a Token refresh unchanged to its App's token endpoint and, on
+    /// success, learns which account its new refresh token belongs to.
+    pub(super) async fn relay_token_refresh<A: crate::refresh_routes::Account>(
+        &self,
+        parts: hyper::http::request::Parts,
+        bytes: Bytes,
+        route: TokenRoute<A>,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        let mut request = reqwest::Request::new(parts.method, route.url);
+        *request.headers_mut() = filtered_headers(&parts.headers);
+        // The proxy reads the response to learn its account and does not
+        // decompress it.
+        request
+            .headers_mut()
+            .insert("accept-encoding", "identity".parse().unwrap());
+        *request.body_mut() = Some(bytes.into());
+        let response = self
+            .send_via(
+                &route.proxy,
+                request,
+                false,
+                Deadline::new(self.config.request_timeout_seconds),
+                Upstream::Relay,
+                log,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+        Ok(self.learn_refresh_route(
+            response,
+            route.routes,
+            route.previous,
+            route.sent,
+            route.observe,
+        ))
     }
 }
 

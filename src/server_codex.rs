@@ -1,6 +1,6 @@
 //! Codex's requests: routed by the ChatGPT login they carry or a configured
 //! URL route; OpenAI's docs MCP by a login when one is sent.
-use super::pipeline::{Adapter, Codex, Credential, Plan, Relay, RouteRecord};
+use super::pipeline::{Adapter, Codex, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 
 /// A Codex Route: its credential's, or none for the docs MCP's fallback.
@@ -49,7 +49,40 @@ impl Adapter for Codex {
         (): (),
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
-        server.forward_token_refresh(incoming, log, false).await
+        let (parts, bytes) = Server::token_refresh_body(incoming).await?;
+        let token = refresh_token(&bytes)
+            .ok_or(Error::new(400, "Token refresh requires a refresh_token."))?;
+        let learned = server.codex_refresh_routes.identity(&token);
+        let (proxy, identity, configured) = server
+            .config
+            .resolve_refresh(&token, learned.as_ref())
+            .await?;
+        // A learned or saved refresh token names its account; a probe has none.
+        RouteRecord {
+            account_id: identity.as_ref().map(|i| i.account_id.clone()),
+            account_label: identity.as_ref().and_then(|i| {
+                crate::identity::routing_account_label(
+                    &server.config.codex.routing,
+                    &i.account_id,
+                    &i.usernames,
+                    "",
+                )
+            }),
+            configured,
+            ..Default::default()
+        }
+        .stamp(log);
+        // The refresh token it replaces names the account even where the
+        // routing does not map it.
+        let route = TokenRoute {
+            url: Url::parse(TOKEN_REFRESH_UPSTREAM).unwrap(),
+            proxy,
+            routes: server.codex_refresh_routes.clone(),
+            previous: identity,
+            sent: None,
+            observe: None,
+        };
+        server.relay_token_refresh(parts, bytes, route, log).await
     }
 
     fn renews(_: &Server) -> bool {
