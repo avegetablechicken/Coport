@@ -1,0 +1,367 @@
+//! The one forwarding pipeline every App's request goes through, and the
+//! seam its adapters fill. The pipeline owns the order: plan the Route,
+//! renew under the rotation lock, look accounts up after releasing it, record
+//! the Route, build the upstream request, observe and send it, and retry once
+//! with a renewed Saved login. Each App's adapter only answers what its Route
+//! is.
+use super::*;
+use crate::claude::ClaudeIdentity;
+use antigravity_cooldown::Scope;
+use auto_refresh::{Renewal, Snapshot};
+
+/// What one App contributes to forwarding its requests.
+pub(super) trait Adapter {
+    /// The App's own relays the pipeline does not shape, such as its Token
+    /// refresh.
+    type Own;
+    /// An account Route chosen from the request and local state alone.
+    type Pending;
+    /// A Route as final as its record, before its upstream request is built.
+    type Route;
+
+    /// What the App makes of the request before the account its credential
+    /// names. May reject it, or rewrite its headers.
+    async fn plan(
+        server: &Server,
+        incoming: &mut Request<Incoming>,
+        target: &Target,
+    ) -> Result<Plan<Self::Own, Self::Route>>;
+
+    /// Relays a request `plan` gave to the App itself.
+    async fn own(
+        server: &Server,
+        incoming: Request<Incoming>,
+        own: Self::Own,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response>;
+
+    /// Whether a Model call routed by account may renew a Saved login.
+    fn renews(server: &Server) -> bool;
+
+    /// The account Route, with no remote request: the rotation lock may be
+    /// held.
+    async fn account(
+        server: &Server,
+        incoming: &Request<Incoming>,
+        target: &Target,
+    ) -> Result<Self::Pending>;
+
+    /// The access token of the Saved login the Route may renew.
+    fn saved_login(pending: &Self::Pending) -> Option<&str>;
+
+    /// Finishes an account Route with any account lookup it needs, after the
+    /// rotation lock is released.
+    async fn complete(
+        server: &Server,
+        pending: Self::Pending,
+        log: &mut RequestLog,
+    ) -> Result<Self::Route>;
+
+    /// The fields every record of the request carries for its Route.
+    fn record(server: &Server, route: &Self::Route) -> RouteRecord;
+
+    /// The upstream request's destination and credential. Endpoint checks
+    /// made here reject a request whose record already names its Route.
+    fn build(
+        server: &Server,
+        route: Self::Route,
+        incoming: &Request<Incoming>,
+        target: &Target,
+        log: &mut RequestLog,
+    ) -> Result<Relay>;
+}
+
+pub(super) enum Plan<O, R> {
+    /// A request the App relays itself.
+    Own(O),
+    /// A Route that needs no account: an API key or URL route. It renews no
+    /// Saved login.
+    Route(R),
+    /// A Route by the account the request's credential names.
+    Account,
+}
+
+/// The Route fields of a request's records. Unset fields are not logged.
+#[derive(Default)]
+pub(super) struct RouteRecord {
+    pub(super) provider: Option<String>,
+    pub(super) upstream_base_url: Option<String>,
+    pub(super) credential_ref: Option<String>,
+    pub(super) account_id: Option<String>,
+    pub(super) account_label: Option<String>,
+    /// The credential is one the configuration holds or maps.
+    pub(super) configured: bool,
+}
+
+impl RouteRecord {
+    fn stamp(self, log: &mut RequestLog) {
+        for (name, value) in [
+            ("provider", self.provider),
+            ("upstream_base_url", self.upstream_base_url),
+            ("credential_ref", self.credential_ref),
+            ("account_id", self.account_id),
+            ("account_label", self.account_label),
+        ] {
+            if let Some(value) = value {
+                log.field(name, value);
+            }
+        }
+        log.field("credential_match", credential_match(self.configured));
+    }
+}
+
+/// The upstream request a Route sends.
+pub(super) struct Relay {
+    pub(super) url: Url,
+    pub(super) proxy: Choice,
+    /// Sent with the platform's TLS, as to a custom upstream.
+    pub(super) native_tls: bool,
+    pub(super) credential: Credential,
+    /// The login an Antigravity location cooldown pauses.
+    pub(super) cooldown: Option<Scope>,
+    /// Whether a Saved login snapshot taken for the Route still applies.
+    pub(super) renews: bool,
+    pub(super) claude_identity: Option<ClaudeIdentity>,
+}
+
+/// How the Route's credential replaces the client's.
+pub(super) enum Credential {
+    /// The client's own, as a Gemini API key it sent.
+    AsSent,
+    Bearer(String),
+    /// Codex's: its token, and the ChatGPT account it names.
+    Codex {
+        token: String,
+        account_id: Option<String>,
+    },
+    Claude(crate::claude::ClaudeRoute),
+    /// OpenAI's docs MCP: no credential, and only these client headers.
+    Docs,
+}
+
+impl Credential {
+    fn apply(self, headers: &mut HeaderMap) -> Result<()> {
+        let bearer = |token: &str| {
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| Error::new(401, "Invalid credential."))
+        };
+        match self {
+            Self::AsSent => {}
+            Self::Bearer(token) => {
+                headers.insert("authorization", bearer(&token)?);
+            }
+            Self::Codex { token, account_id } => {
+                headers.insert("authorization", bearer(&token)?);
+                if let Some(id) = account_id {
+                    headers.insert(
+                        "chatgpt-account-id",
+                        id.parse()
+                            .map_err(|_| Error::new(401, "Invalid account ID."))?,
+                    );
+                }
+            }
+            Self::Claude(route) => route.headers(headers)?,
+            Self::Docs => {
+                let allowed = [
+                    "accept",
+                    "accept-encoding",
+                    "content-type",
+                    "mcp-session-id",
+                    "mcp-protocol-version",
+                    "last-event-id",
+                ];
+                let names: Vec<_> = headers
+                    .keys()
+                    .filter(|n| !allowed.contains(&n.as_str()))
+                    .cloned()
+                    .collect();
+                for n in names {
+                    headers.remove(n);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Server {
+    pub(super) async fn forward(
+        &self,
+        incoming: Request<Incoming>,
+        target: &Target,
+        app: Service,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        if incoming.headers().keys().any(|name| {
+            !repeatable_request_header(name.as_str())
+                && incoming.headers().get_all(name).iter().count() > 1
+        }) {
+            return Err(Error::new(400, "Duplicate request header."));
+        }
+        if incoming
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some_and(|n| n > 32 * 1024 * 1024)
+        {
+            return Err(Error::new(413, "Request body exceeds 32 MiB."));
+        }
+        let websocket = crate::tunnel::websocket(&incoming)?;
+        if incoming.headers().contains_key("expect") {
+            return Err(Error::new(417, "Expect is unsupported."));
+        }
+        if incoming.method() == "CONNECT" {
+            return Err(Error::new(400, "Invalid CONNECT request."));
+        }
+        match app {
+            Service::Antigravity if websocket => {
+                return Err(Error::new(400, "Antigravity does not use WebSockets."));
+            }
+            Service::Grok if websocket => {
+                return Err(Error::new(400, "Grok does not use WebSockets."));
+            }
+            _ => {}
+        }
+        match app {
+            Service::Codex => {
+                self.pipeline::<Codex>(incoming, target, app, websocket, log)
+                    .await
+            }
+            Service::Claude => {
+                self.pipeline::<Claude>(incoming, target, app, websocket, log)
+                    .await
+            }
+            Service::Antigravity => {
+                self.pipeline::<Antigravity>(incoming, target, app, websocket, log)
+                    .await
+            }
+            Service::Grok => {
+                self.pipeline::<Grok>(incoming, target, app, websocket, log)
+                    .await
+            }
+        }
+    }
+
+    async fn pipeline<A: Adapter>(
+        &self,
+        mut incoming: Request<Incoming>,
+        target: &Target,
+        app: Service,
+        websocket: bool,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        let (route, snapshot) = match A::plan(self, &mut incoming, target).await? {
+            Plan::Own(own) => return A::own(self, incoming, own, log).await,
+            Plan::Route(route) => (route, None),
+            Plan::Account => {
+                // Only a Model call renews its Saved login; it routes under the
+                // rotation lock so the token it is routed by stays current.
+                let renews =
+                    self.config.auto_refresh_access_token && target.model_call() && A::renews(self);
+                let rotation_guard = if renews {
+                    Some(self.auto_refresh.rotation.read().await)
+                } else {
+                    None
+                };
+                if renews {
+                    if let Some(token) = incoming
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                    {
+                        if let Some(current) = self.refreshed_alias(app, token).await {
+                            incoming.headers_mut().insert(
+                                "authorization",
+                                format!("Bearer {current}").parse().unwrap(),
+                            );
+                        }
+                    }
+                }
+                let pending = A::account(self, &incoming, target).await?;
+                let snapshot = match A::saved_login(&pending).filter(|_| renews) {
+                    Some(token) => self.refresh_snapshot(app, token).await,
+                    None => None,
+                };
+                // An account lookup is a remote request: a renewal waiting to
+                // rotate a login never waits behind one.
+                drop(rotation_guard);
+                (A::complete(self, pending, log).await?, snapshot)
+            }
+        };
+        A::record(self, &route).stamp(log);
+        let relay = A::build(self, route, &incoming, target, log)?;
+        self.send(incoming, target, relay, websocket, snapshot, log)
+            .await
+    }
+
+    async fn send(
+        &self,
+        incoming: Request<Incoming>,
+        target: &Target,
+        relay: Relay,
+        websocket: bool,
+        snapshot: Option<Snapshot>,
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        let (parts, body) = incoming.into_parts();
+        let bytes = read_body(body).await?;
+        // Drain the input before waiting so Hyper can observe a disconnected
+        // client and cancel its pending call throughout the cooldown.
+        self.location_cooldowns
+            .wait(relay.cooldown.as_ref(), log)
+            .await;
+        if target.kind() == Kind::ModelCall {
+            crate::model_calls::observe_request(&bytes, log);
+        }
+        let mut headers = filtered_headers(&parts.headers);
+        relay.credential.apply(&mut headers)?;
+        if websocket {
+            headers.insert("connection", "Upgrade".parse().unwrap());
+            headers.insert("upgrade", "websocket".parse().unwrap());
+            for name in ["sec-websocket-key", "sec-websocket-version"] {
+                headers.insert(name, parts.headers[name].clone());
+            }
+        }
+        // The client's Accept-Encoding is forwarded, so responses arrive as the
+        // client negotiated and are relayed byte for byte; Model calls are
+        // observed by decoding them as they stream through.
+        let mut request = reqwest::Request::new(parts.method, relay.url);
+        *request.headers_mut() = headers;
+        *request.body_mut() = Some(bytes.into());
+        let deadline = Deadline::new(self.config.request_timeout_seconds);
+        let renewal = Renewal::new(
+            snapshot.filter(|_| relay.renews),
+            &request,
+            relay.claude_identity,
+        );
+        let response = self
+            .send_via(
+                &relay.proxy,
+                request,
+                relay.native_tls,
+                deadline,
+                Upstream::relay(target),
+                log,
+            )
+            .await?;
+        let response = self
+            .retry_after_renewal(
+                response,
+                renewal,
+                &relay.proxy,
+                relay.native_tls,
+                deadline,
+                log,
+            )
+            .await?;
+        Ok(self.location_cooldowns.observe(relay.cooldown, response))
+    }
+}
+
+pub(super) struct Codex;
+pub(super) struct Claude;
+pub(super) struct Antigravity;
+pub(super) struct Grok;

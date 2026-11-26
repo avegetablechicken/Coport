@@ -3,9 +3,10 @@
 //! their key or upstream URL. Account lookups, their caches, route states and
 //! statistics labels follow Claude's.
 use super::antigravity_cooldown::Scope;
+use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord};
 use super::*;
 use crate::{
-    antigravity::{Antigravity, AntigravityIdentity, ApiCredential, ApiRoute},
+    antigravity::{Antigravity, AntigravityIdentity, AntigravityRoute, ApiCredential, ApiRoute},
     refresh_routes::RefreshRoutes,
 };
 use std::collections::BTreeMap;
@@ -27,239 +28,6 @@ impl Server {
     ) -> Self {
         self.antigravity_refresh_routes = Arc::new(routes);
         self
-    }
-
-    pub(super) async fn forward_antigravity(
-        &self,
-        mut incoming: Request<Incoming>,
-        target: &Target,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        let settings = &self.config.antigravity;
-        let api_target = target.rest();
-        if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
-            return self
-                .forward_antigravity_api(incoming, target, route, log)
-                .await;
-        }
-        // A key in `x-goog-api-key` or `key` is a Gemini API key, routed as
-        // Claude's `x-api-key`; a Bearer token stays a Google login.
-        if settings.serves_api_keys() {
-            if let Some((key, credential)) =
-                crate::antigravity::api_credential(incoming.headers(), api_target)?
-                    .filter(|(_, credential)| *credential != ApiCredential::Bearer)
-            {
-                let route = settings
-                    .resolve_api_key(key, credential, api_target)
-                    .await?;
-                return self
-                    .forward_antigravity_api(incoming, target, route, log)
-                    .await;
-            }
-        }
-        if !settings.enabled() {
-            return Err(Error::new(404, "Antigravity routing is not configured."));
-        }
-        // An unprefixed target is Antigravity's only through an API key route.
-        if !target.scoped() {
-            return Err(Error::config("Unroutable Antigravity request target."));
-        }
-        let rest = target.rest();
-        if crate::antigravity::token_host(rest) {
-            if target.kind() != Kind::TokenRefresh {
-                return Err(Error::new(
-                    404,
-                    "Only Antigravity's token refresh is served on oauth2.googleapis.com.",
-                ));
-            }
-            return self.forward_antigravity_refresh(incoming, log).await;
-        }
-        // agy's scope check names its token in the query: route by it as by
-        // a Bearer header, which must name the same token if both are sent.
-        if let Some(token) = crate::antigravity::query_token(rest)? {
-            let bearer = incoming
-                .headers()
-                .get("authorization")
-                .map(|v| v.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")));
-            match bearer {
-                None => {
-                    let value = format!("Bearer {token}")
-                        .parse()
-                        .map_err(|_| Error::new(401, "Invalid credential."))?;
-                    incoming.headers_mut().insert("authorization", value);
-                }
-                Some(Some(bearer)) if bearer == token => {}
-                Some(_) => {
-                    return Err(Error::new(
-                        400,
-                        "Supply one access token: the Bearer header and access_token differ.",
-                    ));
-                }
-            }
-        }
-        // As for Codex and Claude: only the saved login's model calls renew it.
-        let auto_refresh =
-            self.config.auto_refresh_access_token && settings.saved_login && target.model_call();
-        let rotation_guard = if auto_refresh {
-            Some(self.auto_refresh.rotation.read().await)
-        } else {
-            None
-        };
-        if auto_refresh {
-            if let Some(token) = incoming
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-            {
-                if let Some(current) = self.refreshed_alias(Service::Antigravity, token).await {
-                    incoming.headers_mut().insert(
-                        "authorization",
-                        format!("Bearer {current}").parse().unwrap(),
-                    );
-                }
-            }
-        }
-        let mut route = settings
-            .resolve(
-                incoming.headers(),
-                &self.antigravity_refresh_routes,
-                &self.antigravity_renewed,
-            )
-            .await?;
-        // Validate the target before any account lookup.
-        let url = settings.url(rest)?;
-        // Taken before the lookup, which changes the route's proxy alone: the
-        // shared rotation lock is not held across a remote request.
-        let refresh_snapshot = if auto_refresh && route.matched_login {
-            self.refresh_snapshot(Service::Antigravity, &route.token)
-                .await
-        } else {
-            None
-        };
-        drop(rotation_guard);
-        if route.needs_profile {
-            let identity = self
-                .antigravity_identity(&route.token, &route.proxy, log)
-                .await?;
-            if let Some(refresh) = route.refresh_token.as_deref() {
-                self.learn_antigravity_login(refresh, &identity);
-            }
-            settings.apply_profile(&mut route, identity)?;
-        }
-        log.field("provider", &route.label);
-        log.field(
-            "upstream_base_url",
-            url.origin().ascii_serialization().as_str(),
-        );
-        if let Some(identity) = &route.identity {
-            log.field("account_id", &identity.email);
-        }
-        if let Some(label) = self.antigravity_label(route.matched_login, route.identity.as_ref()) {
-            log.field("account_label", label);
-        }
-        log.field("credential_match", credential_match(route.configured));
-        let scope = Scope::model(incoming.method(), &url, || {
-            let login = route
-                .identity
-                .as_ref()
-                .map(|id| id.email.to_ascii_lowercase());
-            let credential = login
-                .as_deref()
-                .or(route.refresh_token.as_deref())
-                .unwrap_or(&route.token);
-            Scope::new("oauth", credential)
-        });
-        let (parts, body) = incoming.into_parts();
-        let bytes = read_body(body).await?;
-        // Drain the input before waiting so Hyper can observe a disconnected
-        // client and cancel its pending call throughout the cooldown.
-        self.location_cooldowns.wait(scope.as_ref(), log).await;
-        if target.kind() == Kind::ModelCall {
-            crate::model_calls::observe_request(&bytes, log);
-        }
-        let mut headers = filtered_headers(&parts.headers);
-        headers.insert(
-            "authorization",
-            format!("Bearer {}", route.token)
-                .parse()
-                .map_err(|_| Error::new(401, "Invalid credential."))?,
-        );
-        let mut request = reqwest::Request::new(parts.method, url);
-        *request.headers_mut() = headers;
-        *request.body_mut() = Some(bytes.into());
-        let deadline = Deadline::new(self.config.request_timeout_seconds);
-        let renewal = auto_refresh::Renewal::new(refresh_snapshot, &request, None);
-        let response = self
-            .send_via(
-                &route.proxy,
-                request,
-                false,
-                deadline,
-                Upstream::relay(target),
-                log,
-            )
-            .await?;
-        let response = self
-            .retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
-            .await?;
-        Ok(self.location_cooldowns.observe(scope, response))
-    }
-
-    /// A Gemini API request, as Codex's and Claude's API key requests: no
-    /// account lookup, and its key is relayed where it came, for the upstream
-    /// to validate.
-    async fn forward_antigravity_api(
-        &self,
-        incoming: Request<Incoming>,
-        target: &Target,
-        route: ApiRoute,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        let url = route.url(target.rest())?;
-        log.field("provider", &route.selector);
-        log.field("upstream_base_url", &route.upstream);
-        if let Some(reference) =
-            crate::identity::shared_api_reference("Antigravity", &route.upstream, &route.key)
-        {
-            log.field("credential_ref", reference);
-        }
-        log.field("credential_match", credential_match(route.configured));
-        let scope = Scope::model(incoming.method(), &url, || {
-            Scope::new(&route.upstream, &route.key)
-        });
-        let (parts, body) = incoming.into_parts();
-        let bytes = read_body(body).await?;
-        // Drain the input before waiting so Hyper can observe a disconnected
-        // client and cancel its pending call throughout the cooldown.
-        self.location_cooldowns.wait(scope.as_ref(), log).await;
-        if target.kind() == Kind::ModelCall {
-            crate::model_calls::observe_request(&bytes, log);
-        }
-        let mut headers = filtered_headers(&parts.headers);
-        if route.credential == ApiCredential::Bearer {
-            headers.insert(
-                "authorization",
-                format!("Bearer {}", route.key)
-                    .parse()
-                    .map_err(|_| Error::new(401, "Invalid credential."))?,
-            );
-        }
-        let mut request = reqwest::Request::new(parts.method, url);
-        *request.headers_mut() = headers;
-        *request.body_mut() = Some(bytes.into());
-        let deadline = Deadline::new(self.config.request_timeout_seconds);
-        let response = self
-            .send_via(
-                &route.proxy,
-                request,
-                route.custom_upstream,
-                deadline,
-                Upstream::relay(target),
-                log,
-            )
-            .await?;
-        Ok(self.location_cooldowns.observe(scope, response))
     }
 
     /// Antigravity's token refresh, as Codex's and Claude's: routed by its
@@ -629,5 +397,213 @@ impl Server {
                 failed_probes.insert(token, Instant::now());
             }
         }
+    }
+}
+
+/// An Antigravity Route and the Cloud Code or Gemini API URL it sends to.
+pub(super) enum Route {
+    /// A Gemini API key or URL route.
+    Api(ApiRoute, Url),
+    /// The Google login the request carries.
+    Account(AntigravityRoute, Url),
+}
+
+impl Adapter for super::pipeline::Antigravity {
+    type Own = ();
+    type Pending = (AntigravityRoute, Url);
+    type Route = Route;
+
+    async fn plan(
+        server: &Server,
+        incoming: &mut Request<Incoming>,
+        target: &Target,
+    ) -> Result<Plan<(), Route>> {
+        let settings = &server.config.antigravity;
+        let api_target = target.rest();
+        if let Some(route) = settings.api_route(incoming.headers(), api_target)? {
+            let url = route.url(api_target)?;
+            return Ok(Plan::Route(Route::Api(route, url)));
+        }
+        // A key in `x-goog-api-key` or `key` is a Gemini API key, routed as
+        // Claude's `x-api-key`; a Bearer token stays a Google login.
+        if settings.serves_api_keys() {
+            if let Some((key, credential)) =
+                crate::antigravity::api_credential(incoming.headers(), api_target)?
+                    .filter(|(_, credential)| *credential != ApiCredential::Bearer)
+            {
+                let route = settings
+                    .resolve_api_key(key, credential, api_target)
+                    .await?;
+                let url = route.url(api_target)?;
+                return Ok(Plan::Route(Route::Api(route, url)));
+            }
+        }
+        if !settings.enabled() {
+            return Err(Error::new(404, "Antigravity routing is not configured."));
+        }
+        // An unprefixed target is Antigravity's only through an API key route.
+        if !target.scoped() {
+            return Err(Error::config("Unroutable Antigravity request target."));
+        }
+        let rest = target.rest();
+        if crate::antigravity::token_host(rest) {
+            if target.kind() != Kind::TokenRefresh {
+                return Err(Error::new(
+                    404,
+                    "Only Antigravity's token refresh is served on oauth2.googleapis.com.",
+                ));
+            }
+            return Ok(Plan::Own(()));
+        }
+        // agy's scope check names its token in the query: route by it as by
+        // a Bearer header, which must name the same token if both are sent.
+        if let Some(token) = crate::antigravity::query_token(rest)? {
+            let bearer = incoming
+                .headers()
+                .get("authorization")
+                .map(|v| v.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")));
+            match bearer {
+                None => {
+                    let value = format!("Bearer {token}")
+                        .parse()
+                        .map_err(|_| Error::new(401, "Invalid credential."))?;
+                    incoming.headers_mut().insert("authorization", value);
+                }
+                Some(Some(bearer)) if bearer == token => {}
+                Some(_) => {
+                    return Err(Error::new(
+                        400,
+                        "Supply one access token: the Bearer header and access_token differ.",
+                    ));
+                }
+            }
+        }
+        Ok(Plan::Account)
+    }
+
+    async fn own(
+        server: &Server,
+        incoming: Request<Incoming>,
+        (): (),
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        server.forward_antigravity_refresh(incoming, log).await
+    }
+
+    /// As for Codex and Claude: only the saved login's Model calls renew it.
+    fn renews(server: &Server) -> bool {
+        server.config.antigravity.saved_login
+    }
+
+    async fn account(
+        server: &Server,
+        incoming: &Request<Incoming>,
+        target: &Target,
+    ) -> Result<(AntigravityRoute, Url)> {
+        let settings = &server.config.antigravity;
+        let route = settings
+            .resolve(
+                incoming.headers(),
+                &server.antigravity_refresh_routes,
+                &server.antigravity_renewed,
+            )
+            .await?;
+        // Validate the target before any account lookup.
+        let url = settings.url(target.rest())?;
+        Ok((route, url))
+    }
+
+    fn saved_login((route, _): &(AntigravityRoute, Url)) -> Option<&str> {
+        route.matched_login.then_some(route.token.as_str())
+    }
+
+    async fn complete(
+        server: &Server,
+        (mut route, url): (AntigravityRoute, Url),
+        log: &mut RequestLog,
+    ) -> Result<Route> {
+        if route.needs_profile {
+            let identity = server
+                .antigravity_identity(&route.token, &route.proxy, log)
+                .await?;
+            if let Some(refresh) = route.refresh_token.as_deref() {
+                server.learn_antigravity_login(refresh, &identity);
+            }
+            server
+                .config
+                .antigravity
+                .apply_profile(&mut route, identity)?;
+        }
+        Ok(Route::Account(route, url))
+    }
+
+    fn record(server: &Server, route: &Route) -> RouteRecord {
+        match route {
+            Route::Api(route, _) => RouteRecord {
+                provider: Some(route.selector.clone()),
+                upstream_base_url: Some(route.upstream.clone()),
+                credential_ref: crate::identity::shared_api_reference(
+                    "Antigravity",
+                    &route.upstream,
+                    &route.key,
+                ),
+                configured: route.configured,
+                ..Default::default()
+            },
+            Route::Account(route, url) => RouteRecord {
+                provider: Some(route.label.clone()),
+                upstream_base_url: Some(url.origin().ascii_serialization()),
+                account_id: route.identity.as_ref().map(|i| i.email.clone()),
+                account_label: server
+                    .antigravity_label(route.matched_login, route.identity.as_ref()),
+                configured: route.configured,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn build(
+        _: &Server,
+        route: Route,
+        incoming: &Request<Incoming>,
+        _: &Target,
+        _: &mut RequestLog,
+    ) -> Result<Relay> {
+        Ok(match route {
+            Route::Api(route, url) => Relay {
+                cooldown: Scope::model(incoming.method(), &url, || {
+                    Scope::new(&route.upstream, &route.key)
+                }),
+                url,
+                proxy: route.proxy,
+                native_tls: route.custom_upstream,
+                credential: if route.credential == ApiCredential::Bearer {
+                    Credential::Bearer(route.key)
+                } else {
+                    Credential::AsSent
+                },
+                renews: false,
+                claude_identity: None,
+            },
+            Route::Account(route, url) => Relay {
+                cooldown: Scope::model(incoming.method(), &url, || {
+                    let login = route
+                        .identity
+                        .as_ref()
+                        .map(|id| id.email.to_ascii_lowercase());
+                    let credential = login
+                        .as_deref()
+                        .or(route.refresh_token.as_deref())
+                        .unwrap_or(&route.token);
+                    Scope::new("oauth", credential)
+                }),
+                url,
+                proxy: route.proxy,
+                native_tls: false,
+                credential: Credential::Bearer(route.token),
+                renews: true,
+                claude_identity: None,
+            },
+        })
     }
 }

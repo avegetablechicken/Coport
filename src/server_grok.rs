@@ -1,3 +1,4 @@
+use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord};
 use super::*;
 use crate::{
     grok::{ApiRoute, Endpoint, GrokAccount, GrokRoute, GrokTarget},
@@ -5,158 +6,6 @@ use crate::{
 };
 
 impl Server {
-    pub(super) async fn forward_grok(
-        &self,
-        incoming: Request<Incoming>,
-        target: &Target,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        let settings = &self.config.grok;
-        // Proxy tunnels and scoped base URLs share the credential router.
-        let rest = target.rest();
-        let raw = target.raw();
-        if !settings.configured() {
-            return Err(Error::new(404, "Grok routing is not configured."));
-        }
-        if let Some((url, endpoint)) = settings.endpoint(raw) {
-            return self
-                .forward_grok_subscription(incoming, url, endpoint, log)
-                .await;
-        }
-        let path = rest.split('?').next().unwrap_or(rest);
-        if path.ends_with("/oauth2/token")
-            || rest.starts_with("/https://auth.x.ai/")
-            || incoming.method() == "GET" && path.ends_with("/chat/completions")
-            || raw
-                .split_once('?')
-                .is_some_and(|(path, _)| settings.endpoint(path).is_some())
-        {
-            return Err(Error::new(404, "Unknown Grok endpoint."));
-        }
-        match settings
-            .resolve(incoming.headers(), rest, &self.grok_routes)
-            .await?
-        {
-            GrokTarget::Account(route) => {
-                self.forward_grok_account(incoming, route, target, log)
-                    .await
-            }
-            GrokTarget::Api(route) => self.forward_grok_api(incoming, route, target, log).await,
-        }
-    }
-
-    async fn forward_grok_account(
-        &self,
-        incoming: Request<Incoming>,
-        route: GrokRoute,
-        target: &Target,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        // As Codex's account requests: the account and its route, no provider.
-        log.field(
-            "upstream_base_url",
-            route.url.origin().ascii_serialization().as_str(),
-        );
-        if let Some(account) = route.identity.as_ref().and_then(|i| i.account()) {
-            log.field("account_id", account);
-        }
-        if let Some(label) = &route.account_label {
-            log.field("account_label", label);
-        }
-        log.field("credential_match", credential_match(route.configured));
-        let headers = self.grok_headers(&incoming, &route.token)?;
-        self.send_grok(
-            incoming,
-            headers,
-            route.url,
-            &route.proxy,
-            false,
-            target,
-            log,
-        )
-        .await
-    }
-
-    /// An xAI API or gateway request, as Codex's and Claude's API key
-    /// requests: its key is relayed as sent, for the upstream to validate.
-    async fn forward_grok_api(
-        &self,
-        incoming: Request<Incoming>,
-        route: ApiRoute,
-        target: &Target,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        log.field("provider", &route.selector);
-        log.field("upstream_base_url", &route.upstream);
-        let key = incoming
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or_default()
-            .to_owned();
-        if let Some(reference) =
-            crate::identity::shared_api_reference("Grok", &route.upstream, &key)
-        {
-            log.field("credential_ref", reference);
-        }
-        log.field("credential_match", credential_match(route.configured));
-        let headers = self.grok_headers(&incoming, &key)?;
-        self.send_grok(
-            incoming,
-            headers,
-            route.url,
-            &route.proxy,
-            route.custom_upstream,
-            target,
-            log,
-        )
-        .await
-    }
-
-    /// The forwarded headers with the one credential the route was chosen by.
-    fn grok_headers(&self, incoming: &Request<Incoming>, token: &str) -> Result<HeaderMap> {
-        let mut headers = filtered_headers(incoming.headers());
-        headers.insert(
-            "authorization",
-            format!("Bearer {token}")
-                .parse()
-                .map_err(|_| Error::new(401, "Invalid credential."))?,
-        );
-        Ok(headers)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn send_grok(
-        &self,
-        incoming: Request<Incoming>,
-        headers: HeaderMap,
-        url: Url,
-        proxy: &Choice,
-        custom_upstream: bool,
-        target: &Target,
-        log: &mut RequestLog,
-    ) -> Result<reqwest::Response> {
-        let (parts, body) = incoming.into_parts();
-        let bytes = read_body(body).await?;
-        if target.kind() == Kind::ModelCall {
-            crate::model_calls::observe_request(&bytes, log);
-        }
-        let mut request = reqwest::Request::new(parts.method, url);
-        *request.headers_mut() = headers;
-        *request.body_mut() = Some(bytes.into());
-        let deadline = Deadline::new(self.config.request_timeout_seconds);
-        self.send_via(
-            proxy,
-            request,
-            custom_upstream,
-            deadline,
-            Upstream::relay(target),
-            log,
-        )
-        .await
-    }
-
     pub fn with_grok_routes(mut self, routes: RefreshRoutes<GrokAccount>) -> Self {
         self.grok_routes = Arc::new(routes);
         self
@@ -395,4 +244,145 @@ async fn discovery_response(
     Ok(reqwest::Response::from(
         built.body(reqwest::Body::from(body)).unwrap(),
     ))
+}
+
+/// A Grok Route: every one is chosen from the request's credential, with no
+/// account lookup or Saved login renewal.
+pub(super) enum Route {
+    /// As Codex's account requests: the account and its route, no provider.
+    Account(GrokRoute),
+    /// An xAI API or gateway request, as Codex's and Claude's API key
+    /// requests: its key is relayed as sent, for the upstream to validate.
+    Api(ApiRoute, String),
+}
+
+impl Adapter for super::pipeline::Grok {
+    type Own = (Url, Endpoint);
+    type Pending = std::convert::Infallible;
+    type Route = Route;
+
+    async fn plan(
+        server: &Server,
+        incoming: &mut Request<Incoming>,
+        target: &Target,
+    ) -> Result<Plan<(Url, Endpoint), Route>> {
+        let settings = &server.config.grok;
+        // Proxy tunnels and scoped base URLs share the credential router.
+        let rest = target.rest();
+        let raw = target.raw();
+        if !settings.configured() {
+            return Err(Error::new(404, "Grok routing is not configured."));
+        }
+        if let Some(own) = settings.endpoint(raw) {
+            return Ok(Plan::Own(own));
+        }
+        let path = rest.split('?').next().unwrap_or(rest);
+        if path.ends_with("/oauth2/token")
+            || rest.starts_with("/https://auth.x.ai/")
+            || incoming.method() == "GET" && path.ends_with("/chat/completions")
+            || raw
+                .split_once('?')
+                .is_some_and(|(path, _)| settings.endpoint(path).is_some())
+        {
+            return Err(Error::new(404, "Unknown Grok endpoint."));
+        }
+        Ok(Plan::Route(
+            match settings
+                .resolve(incoming.headers(), rest, &server.grok_routes)
+                .await?
+            {
+                GrokTarget::Account(route) => Route::Account(route),
+                GrokTarget::Api(route) => {
+                    let key = incoming
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or_default()
+                        .to_owned();
+                    Route::Api(route, key)
+                }
+            },
+        ))
+    }
+
+    async fn own(
+        server: &Server,
+        incoming: Request<Incoming>,
+        (url, endpoint): (Url, Endpoint),
+        log: &mut RequestLog,
+    ) -> Result<reqwest::Response> {
+        server
+            .forward_grok_subscription(incoming, url, endpoint, log)
+            .await
+    }
+
+    fn renews(_: &Server) -> bool {
+        false
+    }
+
+    async fn account(
+        _: &Server,
+        _: &Request<Incoming>,
+        _: &Target,
+    ) -> Result<std::convert::Infallible> {
+        unreachable!("every Grok Route is planned")
+    }
+
+    fn saved_login(pending: &std::convert::Infallible) -> Option<&str> {
+        match *pending {}
+    }
+
+    async fn complete(
+        _: &Server,
+        pending: std::convert::Infallible,
+        _: &mut RequestLog,
+    ) -> Result<Route> {
+        match pending {}
+    }
+
+    fn record(_: &Server, route: &Route) -> RouteRecord {
+        match route {
+            Route::Account(route) => RouteRecord {
+                upstream_base_url: Some(route.url.origin().ascii_serialization()),
+                account_id: route
+                    .identity
+                    .as_ref()
+                    .and_then(|i| i.account())
+                    .map(|a| a.to_string()),
+                account_label: route.account_label.clone(),
+                configured: route.configured,
+                ..Default::default()
+            },
+            Route::Api(route, key) => RouteRecord {
+                provider: Some(route.selector.clone()),
+                upstream_base_url: Some(route.upstream.clone()),
+                credential_ref: crate::identity::shared_api_reference("Grok", &route.upstream, key),
+                configured: route.configured,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn build(
+        _: &Server,
+        route: Route,
+        _: &Request<Incoming>,
+        _: &Target,
+        _: &mut RequestLog,
+    ) -> Result<Relay> {
+        let (url, proxy, native_tls, token) = match route {
+            Route::Account(route) => (route.url, route.proxy, false, route.token),
+            Route::Api(route, key) => (route.url, route.proxy, route.custom_upstream, key),
+        };
+        Ok(Relay {
+            url,
+            proxy,
+            native_tls,
+            credential: Credential::Bearer(token),
+            cooldown: None,
+            renews: false,
+            claude_identity: None,
+        })
+    }
 }

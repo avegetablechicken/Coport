@@ -126,6 +126,10 @@ async fn fixture(mode: &'static str, response_mode: &'static str) -> Fixture {
                 else if let Some(status) = response_mode.strip_prefix("status_") {
                     io.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 4\r\nRetry-After: 120\r\nConnection: close\r\n\r\noops").as_bytes()).await.unwrap();
                 }
+                else if profile && response_mode == "profile_hang" {
+                    // A profile lookup left in flight until the client gives up.
+                    let _ = io.read_u8().await;
+                }
                 else if profile {
                     let (status, body) = match response_mode {
                         "profile_unauthorized" => (401, "{}"),
@@ -5601,6 +5605,55 @@ async fn antigravity_request(running: &Running, token: &str) {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+}
+
+// As Antigravity's: a Claude model call does not hold the rotation lock
+// while its profile is looked up.
+#[tokio::test]
+async fn a_claude_profile_lookup_holds_no_rotation_lock() {
+    let mut lookup = fixture("http", "profile_hang").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let running = running(&format!(
+        "auto_refresh_access_token: true\nproxies:\n  lookup: {endpoint}\nclaude:\n  account_auth_file_only: false\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n"
+    ))
+    .await;
+    trust(&running, &lookup, &endpoint);
+    let call = tokio::spawn(
+        http()
+            .post(format!("{}/anthropic/v1/messages", running.url))
+            .bearer_auth("unnamed-access")
+            .body("private-payload")
+            .send(),
+    );
+    // The lookup is in flight, and is never answered.
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("CONNECT upstream.invalid:443")
+    );
+    assert!(
+        lookup
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .starts_with("GET /api/oauth/profile ")
+    );
+    let renewal = tokio::time::timeout(
+        Duration::from_secs(2),
+        running.server.auto_refresh.rotation.write(),
+    )
+    .await;
+    assert!(
+        renewal.is_ok(),
+        "the rotation lock is held across the lookup"
+    );
+    assert!(!call.is_finished(), "the lookup is still in flight");
+    drop(renewal);
+    call.abort();
 }
 
 // The token rotation lock is shared by every service: a model call must not
