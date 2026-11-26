@@ -104,6 +104,8 @@ mod claude_forward;
 mod codex_forward;
 #[path = "server_grok.rs"]
 mod grok_forward;
+#[path = "server_identity_directory.rs"]
+mod identity_directory;
 #[path = "server_pipeline.rs"]
 mod pipeline;
 #[path = "server_transport.rs"]
@@ -114,21 +116,21 @@ use transport::*;
 #[path = "auto_refresh.rs"]
 mod auto_refresh;
 
-/// Claude OAuth identities by access token, with last use for bounded LRU
-/// eviction. An identity does not depend on routing, so one process can share
-/// the cache across servers rebuilt for configuration changes.
-pub type ClaudeProfiles = Arc<Mutex<HashMap<String, (Instant, crate::claude::ClaudeIdentity)>>>;
-/// Background identity discovery does not retry a failed probe sooner than
-/// this; successes are kept in `ClaudeProfiles` instead.
-const FAILED_PROBE_RETRY: Duration = Duration::from_secs(600);
+#[cfg(test)]
+use identity_directory::FAILED_PROBE_RETRY;
+pub use identity_directory::Profiles;
+use identity_directory::{Directory, State};
+/// Claude accounts by OAuth access token, which servers rebuilt in one
+/// process share.
+pub type ClaudeProfiles = Profiles<crate::claude::ClaudeIdentity>;
 
 pub struct Server {
     pub config: Config,
     pub logger: Arc<Logger>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
-    claude_profiles: ClaudeProfiles,
-    antigravity_profiles: AntigravityProfiles,
+    claude_identities: Directory<crate::claude::ClaudeIdentity>,
+    antigravity_identities: Directory<crate::antigravity::AntigravityIdentity>,
     location_cooldowns: antigravity_cooldown::LocationCooldowns,
     antigravity_refresh_routes:
         Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
@@ -137,12 +139,6 @@ pub struct Server {
     grok_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::grok::GrokAccount>>,
     codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
-    // When background discovery last failed for a token, until a success. Only
-    // `ClaudeProfiles` holds identities. The key is the credential, so switching
-    // a saved login forces a new check.
-    failed_probes: tokio::sync::Mutex<HashMap<String, Instant>>,
-    // Serializes discovery, so concurrent runs share one probe per token.
-    discovery: tokio::sync::Mutex<()>,
     credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
     credential_proxy: Option<crate::credential_proxy::CredentialProxy>,
@@ -156,8 +152,8 @@ impl Server {
             logger,
             clients: Mutex::new(HashMap::new()),
             probes: Mutex::new(HashMap::new()),
-            claude_profiles: Default::default(),
-            antigravity_profiles: Default::default(),
+            claude_identities: Default::default(),
+            antigravity_identities: Default::default(),
             location_cooldowns: Default::default(),
             antigravity_refresh_routes: Default::default(),
             antigravity_renewed: Default::default(),
@@ -165,8 +161,6 @@ impl Server {
             refresh_routes: Default::default(),
             codex_refresh_routes: Default::default(),
             auto_refresh: Default::default(),
-            failed_probes: tokio::sync::Mutex::new(HashMap::new()),
-            discovery: tokio::sync::Mutex::new(()),
             credential_checks: Default::default(),
             tls: None,
             credential_proxy: None,
@@ -180,7 +174,7 @@ impl Server {
     }
     /// Reuse identities already looked up by another server in this process.
     pub fn with_claude_profiles(mut self, profiles: ClaudeProfiles) -> Self {
-        self.claude_profiles = profiles;
+        self.claude_identities.share(profiles);
         self
     }
     /// Keep the Claude refresh routes learned from token responses.
@@ -225,7 +219,6 @@ impl Server {
         if !states[1].values().any(|state| *state == "unknown") {
             return states;
         }
-        let failed_probes = self.failed_probes.lock().await;
         let mut confirmed = Vec::new();
         let (mut failed, mut pending) = (false, false);
         for (source, account) in self.config.claude.account_sources() {
@@ -249,12 +242,8 @@ impl Server {
             {
                 continue;
             }
-            let cached =
-                self.claude_profiles.lock().ok().and_then(|profiles| {
-                    profiles.get(&token).map(|(_, identity)| identity.clone())
-                });
-            match cached {
-                Some(identity) => confirmed.extend(crate::identity::routing_account_label(
+            match self.claude_identities.state(&token).await {
+                State::Known(identity) => confirmed.extend(crate::identity::routing_account_label(
                     &self.config.claude.routing,
                     &identity.account_id,
                     &identity.usernames,
@@ -263,8 +252,8 @@ impl Server {
                 // Until its identity is known, an unmatched token could belong
                 // to any route that no other evidence settles. The retry delay
                 // does not expire a failure: it stays the latest result.
-                None if failed_probes.contains_key(&token) => failed = true,
-                None => pending = true,
+                State::Failed => failed = true,
+                State::Unknown => pending = true,
             }
         }
         for state in states[1].values_mut() {
@@ -294,18 +283,16 @@ impl Server {
     ) -> std::collections::BTreeMap<(String, String), String> {
         let mut labels = self.config.local_traffic_credential_labels().await;
         self.cached_antigravity_labels(&mut labels);
-        if let Ok(profiles) = self.claude_profiles.lock() {
-            for (_, identity) in profiles.values() {
-                if let Some(label) = crate::identity::routing_account_label(
-                    &self.config.claude.routing,
-                    &identity.account_id,
-                    &identity.usernames,
-                    "",
-                ) {
-                    labels
-                        .entry(("Claude".into(), identity.account_id.clone()))
-                        .or_insert(label);
-                }
+        for identity in self.claude_identities.accounts() {
+            if let Some(label) = crate::identity::routing_account_label(
+                &self.config.claude.routing,
+                &identity.account_id,
+                &identity.usernames,
+                "",
+            ) {
+                labels
+                    .entry(("Claude".into(), identity.account_id))
+                    .or_insert(label);
             }
         }
         labels
@@ -314,9 +301,8 @@ impl Server {
         &self,
     ) -> std::collections::BTreeMap<(String, String), String> {
         let mut labels = self.config.local_traffic_credential_labels().await;
-        // Background identity discovery requires explicit consent to probing.
+        // Account discovery requires explicit consent to probing.
         // A payload fallback route is not authorization for a profile request.
-        let _discovery = self.discovery.lock().await;
         self.cached_antigravity_labels(&mut labels);
         self.discover_antigravity_label(&mut labels).await;
         let Some(proxy) = self.config.claude.routing.account_probe.as_ref() else {
@@ -331,175 +317,23 @@ impl Server {
             let Ok(token) = account.claude_token().await else {
                 continue;
             };
-            // Readers of these failures never wait for the probe below.
-            if self
-                .failed_probes
-                .lock()
-                .await
-                .get(&token)
-                .is_some_and(|at| at.elapsed() < FAILED_PROBE_RETRY)
-            {
-                continue;
-            }
             // Statistics reuse the request router's bounded identity cache.
-            // Its timestamps are for LRU eviction, not background revalidation.
-            let cached =
-                self.claude_profiles.lock().ok().and_then(|profiles| {
-                    profiles.get(&token).map(|(_, identity)| identity.clone())
-                });
-            if let Some(identity) = cached {
-                if let Some(label) = crate::identity::routing_account_label(
-                    &self.config.claude.routing,
-                    &identity.account_id,
-                    &identity.usernames,
-                    &source,
-                ) {
-                    labels.insert(("Claude".into(), identity.account_id), label);
-                }
+            let Some(identity) = self
+                .discover_account::<pipeline::Claude>(&token, proxy)
+                .await
+            else {
                 continue;
-            }
-            let mut log = RequestLog {
-                logger: self.logger.clone(),
-                fields: json!({"service":"claude"}).as_object().unwrap().clone(),
-                started: Instant::now(),
-                status: 0,
-                bytes: 0,
-                outcome: "account_probe_failed",
             };
-            let result = tokio::time::timeout(
-                Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
-                self.lookup_claude_identity(&token, proxy, &mut log),
-            )
-            .await
-            .unwrap_or_else(|_| Err(Error::config("Claude account probe timed out.")));
-            match result {
-                Ok(identity) => {
-                    log.outcome = "account_probe_finished";
-                    let label = crate::identity::routing_account_label(
-                        &self.config.claude.routing,
-                        &identity.account_id,
-                        &identity.usernames,
-                        &source,
-                    );
-                    // The lookup stored the identity in `ClaudeProfiles`.
-                    self.failed_probes.lock().await.remove(&token);
-                    if let Some(label) = label {
-                        labels.insert(("Claude".into(), identity.account_id), label);
-                    }
-                }
-                Err(error) => {
-                    log.field("reason", error.message);
-                    let mut failed_probes = self.failed_probes.lock().await;
-                    if failed_probes.len() >= 128 {
-                        failed_probes.clear();
-                    }
-                    failed_probes.insert(token, Instant::now());
-                }
+            if let Some(label) = crate::identity::routing_account_label(
+                &self.config.claude.routing,
+                &identity.account_id,
+                &identity.usernames,
+                &source,
+            ) {
+                labels.insert(("Claude".into(), identity.account_id), label);
             }
         }
         labels
-    }
-    async fn lookup_claude_identity(
-        &self,
-        token: &str,
-        proxy: &Choice,
-        log: &mut RequestLog,
-    ) -> Result<crate::claude::ClaudeIdentity> {
-        let cached = self
-            .claude_profiles
-            .lock()
-            .map_err(|_| Error::config("Claude profile cache unavailable."))?
-            .get_mut(token)
-            .map(|(last_used, identity)| {
-                *last_used = Instant::now();
-                identity.clone()
-            });
-        let identity = if let Some(identity) = cached {
-            identity
-        } else {
-            // Before the token's identity is known, account_probe (defaulting to
-            // account_fallback) provides the configured lookup transport.
-            // Never use a direct
-            // or cross-account proxy inferred from an unverified identity.
-            let url = self.config.claude.url("/api/oauth/profile")?;
-            log.field("service", "claude");
-            let request = self
-                .client("none")?
-                .get(url)
-                .bearer_auth(token)
-                .header("accept", "application/json")
-                // The proxy reads this profile itself and does not decompress it.
-                .header("accept-encoding", "identity")
-                .header("anthropic-beta", "oauth-2025-04-20")
-                .build()
-                .map_err(|_| Error::config("Invalid Claude profile request."))?;
-            let mut response = self
-                .send_via(
-                    proxy,
-                    request,
-                    false,
-                    Deadline::new(self.config.request_timeout_seconds.min(10.0)),
-                    Upstream::Auxiliary,
-                    log,
-                )
-                .await?;
-            if let Some(proxy) = log.fields.get("proxy").cloned() {
-                log.fields.insert("profile_proxy".into(), proxy);
-            }
-            if let Some(endpoint) = log.fields.get("proxy_endpoint").cloned() {
-                log.fields.insert("profile_proxy_endpoint".into(), endpoint);
-            }
-            let status = response.status();
-            record_upstream_response(log, status.as_u16(), Upstream::Auxiliary);
-            if !status.is_success() {
-                return Err(Error::new(
-                    if status.is_client_error() {
-                        status.as_u16()
-                    } else {
-                        502
-                    },
-                    "Claude profile lookup failed.",
-                ));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| Error::config("Claude profile read failed."))?
-            {
-                if bytes.len() + chunk.len() > 65536 {
-                    return Err(Error::config("Claude profile exceeds 64 KiB."));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            let value = serde_json::from_slice(&bytes)
-                .map_err(|_| Error::config("Invalid Claude profile JSON."))?;
-            let identity = crate::claude::ClaudeIdentity::profile(&value)?;
-            self.cache_claude_profile(token.to_owned(), identity.clone())?;
-            identity
-        };
-        Ok(identity)
-    }
-    fn cache_claude_profile(
-        &self,
-        token: String,
-        identity: crate::claude::ClaudeIdentity,
-    ) -> Result<()> {
-        let mut cache = self
-            .claude_profiles
-            .lock()
-            .map_err(|_| Error::config("Claude profile cache unavailable."))?;
-        if cache.len() >= 128 && !cache.contains_key(&token) {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (last_used, _))| *last_used)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
-            }
-        }
-        cache.insert(token, (Instant::now(), identity));
-        Ok(())
     }
     pub async fn startup_log(&self) {
         if let Some(proxy) = &self.credential_proxy {

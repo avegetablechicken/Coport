@@ -1,9 +1,37 @@
 //! Claude's requests: routed by the Claude login or API key they carry, or a
 //! configured URL route for an explicit upstream.
+use super::identity_directory::{Directory, Lookup, Texts};
 use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
-use crate::claude::ClaudeRoute;
+use crate::claude::{ClaudeIdentity, ClaudeRoute};
 use hyper::http::request::Parts;
+
+/// Claude's Account lookup: its OAuth profile.
+impl Lookup for Claude {
+    type Identity = ClaudeIdentity;
+    const SERVICE: &'static str = "claude";
+    const HEADERS: &'static [(&'static str, &'static str)] =
+        &[("anthropic-beta", "oauth-2025-04-20")];
+    const TEXTS: Texts = Texts {
+        request: "Invalid Claude profile request.",
+        failed: "Claude profile lookup failed.",
+        read: "Claude profile read failed.",
+        too_large: "Claude profile exceeds 64 KiB.",
+        json: "Invalid Claude profile JSON.",
+        timeout: "Claude account probe timed out.",
+    };
+    fn directory(server: &Server) -> &Directory<ClaudeIdentity> {
+        &server.claude_identities
+    }
+    // Before the token's identity is known, account_probe (defaulting to
+    // account_fallback) provides the lookup's proxy.
+    fn url(server: &Server) -> Result<Url> {
+        server.config.claude.url("/api/oauth/profile")
+    }
+    fn identity(answer: &serde_json::Value) -> Result<ClaudeIdentity> {
+        ClaudeIdentity::profile(answer)
+    }
+}
 
 impl Adapter for Claude {
     type Own = ();
@@ -48,7 +76,7 @@ impl Adapter for Claude {
             .claude
             .resolve_refresh_with_profile(&token, existing.as_ref(), |access, probe| async move {
                 let named = server
-                    .lookup_claude_identity(&access, &probe, logger)
+                    .lookup_account::<Claude>(&access, &probe, logger)
                     .await?;
                 *recovered = Some(named.clone());
                 Ok(named)
@@ -110,7 +138,7 @@ impl Adapter for Claude {
     ) -> Result<ClaudeRoute> {
         if route.needs_profile {
             let identity = server
-                .lookup_claude_identity(&route.token, &route.proxy, log)
+                .lookup_account::<Claude>(&route.token, &route.proxy, log)
                 .await?;
             server.config.claude.apply_profile(&mut route, identity)?;
         }

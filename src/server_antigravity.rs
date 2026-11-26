@@ -3,6 +3,7 @@
 //! their key or upstream URL. Account lookups, their caches, route states and
 //! statistics labels follow Claude's.
 use super::antigravity_cooldown::Scope;
+use super::identity_directory::{Directory, Lookup, State, Texts};
 use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
 use crate::{
@@ -12,14 +13,37 @@ use crate::{
 use hyper::http::request::Parts;
 use std::collections::BTreeMap;
 
-/// Google identities by access token, with last use for bounded LRU eviction.
-/// As `ClaudeProfiles`, one process can share it across rebuilt servers.
-pub type AntigravityProfiles = Arc<Mutex<HashMap<String, (Instant, AntigravityIdentity)>>>;
-const MAX_PROFILES: usize = 128;
+/// Google accounts by access token, which servers rebuilt in one process
+/// share.
+pub type AntigravityProfiles = Profiles<AntigravityIdentity>;
+
+/// Antigravity's Account lookup: the Google account's userinfo.
+impl Lookup for super::pipeline::Antigravity {
+    type Identity = AntigravityIdentity;
+    const SERVICE: &'static str = "antigravity";
+    const HEADERS: &'static [(&'static str, &'static str)] = &[];
+    const TEXTS: Texts = Texts {
+        request: "Invalid Antigravity account lookup.",
+        failed: "Antigravity account lookup failed.",
+        read: "Antigravity account lookup read failed.",
+        too_large: "Antigravity account lookup exceeds 64 KiB.",
+        json: "Invalid Antigravity account lookup JSON.",
+        timeout: "Antigravity account probe timed out.",
+    };
+    fn directory(server: &Server) -> &Directory<AntigravityIdentity> {
+        &server.antigravity_identities
+    }
+    fn url(_: &Server) -> Result<Url> {
+        Ok(Url::parse(crate::antigravity::USERINFO_URL).unwrap())
+    }
+    fn identity(answer: &serde_json::Value) -> Result<AntigravityIdentity> {
+        AntigravityIdentity::userinfo(answer)
+    }
+}
 
 impl Server {
     pub fn with_antigravity_profiles(mut self, profiles: AntigravityProfiles) -> Self {
-        self.antigravity_profiles = profiles;
+        self.antigravity_identities.share(profiles);
         self
     }
     /// Accounts learned for saved logins, kept across restarts.
@@ -58,7 +82,10 @@ impl Server {
         let routes = &self.antigravity_refresh_routes;
         let mut route = settings.resolve_refresh(&token, routes).await?;
         if let Some(access) = route.probe_token.clone() {
-            match self.antigravity_identity(&access, &route.proxy, log).await {
+            match self
+                .lookup_account::<super::pipeline::Antigravity>(&access, &route.proxy, log)
+                .await
+            {
                 Ok(identity) => {
                     self.learn_antigravity_login(&token, &identity);
                     settings.apply_refresh_profile(&mut route, identity)?;
@@ -135,98 +162,6 @@ impl Server {
         }
     }
 
-    /// The Google account of a token, looked up through `proxy`: never
-    /// directly, nor through a proxy an unverified account picks.
-    async fn antigravity_identity(
-        &self,
-        token: &str,
-        proxy: &Choice,
-        log: &mut RequestLog,
-    ) -> Result<AntigravityIdentity> {
-        if let Some(identity) = self.cached_antigravity_identity(token, true) {
-            return Ok(identity);
-        }
-        log.field("service", "antigravity");
-        let request = self
-            .client("none")?
-            .get(crate::antigravity::USERINFO_URL)
-            .bearer_auth(token)
-            .header("accept", "application/json")
-            // The proxy reads this response itself and does not decompress it.
-            .header("accept-encoding", "identity")
-            .build()
-            .map_err(|_| Error::config("Invalid Antigravity account lookup."))?;
-        let mut response = self
-            .send_via(
-                proxy,
-                request,
-                false,
-                Deadline::new(self.config.request_timeout_seconds.min(10.0)),
-                Upstream::Auxiliary,
-                log,
-            )
-            .await?;
-        for (from, to) in [
-            ("proxy", "profile_proxy"),
-            ("proxy_endpoint", "profile_proxy_endpoint"),
-        ] {
-            if let Some(value) = log.fields.get(from).cloned() {
-                log.fields.insert(to.into(), value);
-            }
-        }
-        let status = response.status();
-        record_upstream_response(log, status.as_u16(), Upstream::Auxiliary);
-        if !status.is_success() {
-            return Err(Error::new(
-                if status.is_client_error() {
-                    status.as_u16()
-                } else {
-                    502
-                },
-                "Antigravity account lookup failed.",
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| Error::config("Antigravity account lookup read failed."))?
-        {
-            if bytes.len() + chunk.len() > 65536 {
-                return Err(Error::config("Antigravity account lookup exceeds 64 KiB."));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value = serde_json::from_slice(&bytes)
-            .map_err(|_| Error::config("Invalid Antigravity account lookup JSON."))?;
-        let identity = AntigravityIdentity::userinfo(&value)?;
-        let mut cache = self
-            .antigravity_profiles
-            .lock()
-            .map_err(|_| Error::config("Antigravity profile cache unavailable."))?;
-        if cache.len() >= MAX_PROFILES && !cache.contains_key(token) {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (last_used, _))| *last_used)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
-            }
-        }
-        cache.insert(token.to_owned(), (Instant::now(), identity.clone()));
-        Ok(identity)
-    }
-
-    /// An identity already looked up for `token`; `touch` marks it used.
-    fn cached_antigravity_identity(&self, token: &str, touch: bool) -> Option<AntigravityIdentity> {
-        let mut cache = self.antigravity_profiles.lock().ok()?;
-        let (last_used, identity) = cache.get_mut(token)?;
-        if touch {
-            *last_used = Instant::now();
-        }
-        Some(identity.clone())
-    }
-
     /// The saved login and its known account: recorded, learned or looked up.
     async fn antigravity_saved_login(
         &self,
@@ -235,7 +170,10 @@ impl Server {
             return Ok(None);
         };
         let identity = Antigravity::login_identity(&login, &self.antigravity_refresh_routes)
-            .or_else(|| self.cached_antigravity_identity(&login.access_token, false));
+            .or_else(|| {
+                self.antigravity_identities
+                    .known(&login.access_token, false)
+            });
         Ok(Some((login, identity)))
     }
 
@@ -260,11 +198,10 @@ impl Server {
             return states;
         };
         if identity.is_none() && settings.routing.account_probe.is_some() {
-            let failed = self
-                .failed_probes
-                .lock()
-                .await
-                .contains_key(&login.access_token);
+            let failed = matches!(
+                self.antigravity_identities.state(&login.access_token).await,
+                State::Failed
+            );
             for state in states.values_mut() {
                 *state = if failed { "probe_failed" } else { "unknown" };
             }
@@ -290,23 +227,21 @@ impl Server {
                     .or_insert(label);
             }
         }
-        if let Ok(profiles) = self.antigravity_profiles.lock() {
-            for (_, identity) in profiles.values() {
-                if let Some(label) = settings.mapped_key(identity).or_else(|| {
-                    crate::identity::routing_account_label(&settings.routing, "", &[], "")
-                }) {
-                    labels
-                        .entry(("Antigravity".into(), identity.email.clone()))
-                        .or_insert(label);
-                }
+        for identity in self.antigravity_identities.accounts() {
+            if let Some(label) = settings
+                .mapped_key(&identity)
+                .or_else(|| crate::identity::routing_account_label(&settings.routing, "", &[], ""))
+            {
+                labels
+                    .entry(("Antigravity".into(), identity.email))
+                    .or_insert(label);
             }
         }
     }
 
-    /// Background discovery for the saved login, as for Claude's: only with
-    /// an explicit `account_probe`, not retried sooner than
-    /// `FAILED_PROBE_RETRY` after a failure. A found account is learned for
-    /// the login's refresh token.
+    /// Account discovery for the saved login, as for Claude's: only with an
+    /// explicit `account_probe`. A found account is learned for the login's
+    /// refresh token.
     pub(super) async fn discover_antigravity_label(
         &self,
         labels: &mut BTreeMap<(String, String), String>,
@@ -328,52 +263,17 @@ impl Server {
             }
             return;
         }
-        let token = login.access_token.clone();
-        if self
-            .failed_probes
-            .lock()
+        let Some(identity) = self
+            .discover_account::<super::pipeline::Antigravity>(&login.access_token, proxy)
             .await
-            .get(&token)
-            .is_some_and(|at| at.elapsed() < FAILED_PROBE_RETRY)
-        {
+        else {
             return;
-        }
-        let mut log = RequestLog {
-            logger: self.logger.clone(),
-            fields: json!({"service":"antigravity"})
-                .as_object()
-                .unwrap()
-                .clone(),
-            started: Instant::now(),
-            status: 0,
-            bytes: 0,
-            outcome: "account_probe_failed",
         };
-        let result = tokio::time::timeout(
-            Duration::from_secs_f64(self.config.request_timeout_seconds.min(10.0)),
-            self.antigravity_identity(&token, proxy, &mut log),
-        )
-        .await
-        .unwrap_or_else(|_| Err(Error::config("Antigravity account probe timed out.")));
-        match result {
-            Ok(identity) => {
-                log.outcome = "account_probe_finished";
-                self.failed_probes.lock().await.remove(&token);
-                if let Some(refresh) = login.refresh_token.as_deref() {
-                    self.learn_antigravity_login(refresh, &identity);
-                }
-                if let Some(label) = label(&identity) {
-                    labels.insert(("Antigravity".into(), identity.email), label);
-                }
-            }
-            Err(error) => {
-                log.field("reason", error.message);
-                let mut failed_probes = self.failed_probes.lock().await;
-                if failed_probes.len() >= 128 {
-                    failed_probes.clear();
-                }
-                failed_probes.insert(token, Instant::now());
-            }
+        if let Some(refresh) = login.refresh_token.as_deref() {
+            self.learn_antigravity_login(refresh, &identity);
+        }
+        if let Some(label) = label(&identity) {
+            labels.insert(("Antigravity".into(), identity.email), label);
         }
     }
 }
@@ -498,7 +398,7 @@ impl Adapter for super::pipeline::Antigravity {
     ) -> Result<Route> {
         if route.needs_profile {
             let identity = server
-                .antigravity_identity(&route.token, &route.proxy, log)
+                .lookup_account::<super::pipeline::Antigravity>(&route.token, &route.proxy, log)
                 .await?;
             if let Some(refresh) = route.refresh_token.as_deref() {
                 server.learn_antigravity_login(refresh, &identity);

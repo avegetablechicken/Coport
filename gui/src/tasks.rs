@@ -256,15 +256,12 @@ mod tests {
         ))
         .unwrap();
         let profiles = ClaudeProfiles::default();
-        profiles.lock().unwrap().insert(
-            "saved-secret".into(),
-            (
-                std::time::Instant::now(),
-                coport::claude::ClaudeIdentity {
-                    account_id: "remote-account".into(),
-                    usernames: vec!["remote@example.invalid".into()],
-                },
-            ),
+        profiles.insert(
+            "saved-secret",
+            coport::claude::ClaudeIdentity {
+                account_id: "remote-account".into(),
+                usernames: vec!["remote@example.invalid".into()],
+            },
         );
         let identity = ("Claude".to_owned(), "remote-account".to_owned());
         // Each configuration reload builds new tasks around the same cache.
@@ -367,15 +364,12 @@ mod tests {
             let states = tasks.account_states().await.unwrap();
             assert_eq!(states[1]["remote@example.invalid"], "unknown");
         }
-        profiles.lock().unwrap().insert(
-            "saved-secret".into(),
-            (
-                std::time::Instant::now(),
-                coport::claude::ClaudeIdentity {
-                    account_id: "remote-account".into(),
-                    usernames: vec!["remote@example.invalid".into()],
-                },
-            ),
+        profiles.insert(
+            "saved-secret",
+            coport::claude::ClaudeIdentity {
+                account_id: "remote-account".into(),
+                usernames: vec!["remote@example.invalid".into()],
+            },
         );
         for _ in 0..3 {
             let states = tasks.account_states().await.unwrap();

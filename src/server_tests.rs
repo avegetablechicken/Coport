@@ -748,7 +748,7 @@ async fn claude_third_party_explicit_url_streams_directly_without_oauth_lookup_o
         fixture.release.notify_one();
         assert_eq!(response.text().await.unwrap(), "data: last\n\n");
         assert!(fixture.requests.try_recv().is_err());
-        assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+        assert!((running.server.claude_identities.len() == 0));
     }
     let mut fixture = fixture("direct", "redirect").await;
     let running =
@@ -952,7 +952,7 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
         assert!(lookup.requests.try_recv().is_err());
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), saved);
         // Only failures are recorded; identities live in the profile cache.
-        let before = running.server.failed_probes.lock().await.clone();
+        let before = running.server.claude_identities.failures().await;
         assert_eq!(before.len(), usize::from(!succeeds));
         assert_eq!(
             running.server.cached_traffic_credential_labels().await,
@@ -960,8 +960,60 @@ async fn traffic_labels_probe_missing_claude_metadata_and_cache_failures_safely(
         );
         assert_eq!(running.server.traffic_credential_labels().await, first);
         assert!(lookup.requests.try_recv().is_err());
-        assert_eq!(*running.server.failed_probes.lock().await, before);
+        assert_eq!(running.server.claude_identities.failures().await, before);
     }
+}
+
+#[tokio::test]
+async fn a_requests_account_lookup_settles_a_failed_discovery() {
+    let mut lookup = fixture("http", "profile_retry_identity").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &lookup, &endpoint);
+    let identity = (
+        "Claude".to_owned(),
+        "12345678-1234-4234-8234-123456789abc".to_owned(),
+    );
+    let looked_up = async |lookup: &mut Fixture| {
+        for sent in ["CONNECT ", "GET /api/oauth/profile "] {
+            assert!(lookup.requests.recv().await.unwrap().starts_with(sent));
+        }
+    };
+    // Account discovery fails first.
+    assert!(
+        !running
+            .server
+            .traffic_credential_labels()
+            .await
+            .contains_key(&identity)
+    );
+    looked_up(&mut lookup).await;
+    // Then a request carrying the same token looks its account up.
+    http()
+        .post(format!("{}/anthropic/v1/messages", running.url))
+        .bearer_auth("saved-secret")
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    looked_up(&mut lookup).await;
+    // Within the retry delay, discovery answers with that account.
+    assert_eq!(
+        running
+            .server
+            .traffic_credential_labels()
+            .await
+            .get(&identity)
+            .map(String::as_str),
+        Some("remote@example.invalid")
+    );
+    assert!(lookup.requests.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -1013,9 +1065,11 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
     );
     // The next periodic check, a minute later, still holds the failure.
     *running.server.credential_checks.lock().await = None;
-    for at in running.server.failed_probes.lock().await.values_mut() {
-        *at = Instant::now() - Duration::from_secs(61);
-    }
+    running
+        .server
+        .claude_identities
+        .backdate(Duration::from_secs(61))
+        .await;
     running.server.credential_reports().await;
     assert!(
         lookup.requests.try_recv().is_err(),
@@ -1023,9 +1077,11 @@ async fn periodic_credentials_enrich_missing_identity_retry_failures_and_cache_s
     );
     // Expire both periodic and failed-probe caches, without waiting.
     *running.server.credential_checks.lock().await = None;
-    for at in running.server.failed_probes.lock().await.values_mut() {
-        *at = Instant::now() - FAILED_PROBE_RETRY - Duration::from_secs(1);
-    }
+    running
+        .server
+        .claude_identities
+        .backdate(FAILED_PROBE_RETRY + Duration::from_secs(1))
+        .await;
     running.server.credential_reports().await;
     assert!(
         lookup
@@ -1125,7 +1181,7 @@ async fn rebuilt_servers_reuse_shared_claude_identities() {
     );
     // A configuration reload starts a server without account checks.
     let rebuilt = Server::new(running.server.config.clone(), running.server.logger.clone())
-        .with_claude_profiles(running.server.claude_profiles.clone());
+        .with_claude_profiles(running.server.claude_identities.profiles());
     for _ in 0..3 {
         assert_eq!(
             rebuilt
@@ -1185,7 +1241,7 @@ async fn traffic_labels_do_not_probe_without_an_explicit_lookup_route() {
     let running = running(&format!("claude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account: {{'remote@example.invalid': none}}\n",serde_json::to_string(dir.path()).unwrap())).await;
     let labels = running.server.traffic_credential_labels().await;
     assert!(!labels.contains_key(&("Claude".into(), "remote-account".into())));
-    assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+    assert!((running.server.claude_identities.len() == 0));
 }
 
 #[tokio::test]
@@ -1240,12 +1296,11 @@ async fn account_status_reads_discovered_identities_without_probing() {
         );
         // A token's identity does not change, and a failure stays the latest
         // result after its retry delay: neither expires with time.
-        for (at, _) in running.server.claude_profiles.lock().unwrap().values_mut() {
-            *at = Instant::now() - Duration::from_secs(24 * 3600);
-        }
-        for at in running.server.failed_probes.lock().await.values_mut() {
-            *at = Instant::now() - FAILED_PROBE_RETRY - Duration::from_secs(1);
-        }
+        running
+            .server
+            .claude_identities
+            .backdate(Duration::from_secs(24 * 3600))
+            .await;
         for _ in 0..3 {
             assert_eq!(running.server.account_route_states().await, states);
         }
@@ -1298,7 +1353,7 @@ async fn account_status_leaves_unreadable_environment_sources_unknown() {
             "unknown"
         );
     }
-    assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+    assert!((running.server.claude_identities.len() == 0));
 }
 
 #[tokio::test]
@@ -1351,7 +1406,7 @@ async fn claude_saved_token_without_metadata_probes_then_routes_and_caches() {
             assert!(request.starts_with("POST /v1/messages "));
             assert!(request.ends_with("private-payload"));
         }
-        assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 1);
+        assert_eq!(running.server.claude_identities.len(), 1);
         if file_only {
             let response = http()
                 .post(format!("{}/anthropic/v1/messages", running.url))
@@ -1424,18 +1479,12 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
                 .ends_with("private-payload")
         );
     }
-    assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 2);
+    assert_eq!(running.server.claude_identities.len(), 2);
     running
         .server
-        .claude_profiles
-        .lock()
-        .unwrap()
-        .get_mut("first-secret")
-        .unwrap()
-        .0 = Instant::now()
-        // Windows counts `Instant` from boot, so it may not reach back 30 days.
-        .checked_sub(Duration::from_secs(30 * 24 * 60 * 60))
-        .unwrap_or_else(Instant::now);
+        .claude_identities
+        .backdate(Duration::from_secs(30 * 24 * 60 * 60))
+        .await;
     let response = http()
         .post(format!("{}/anthropic/api/oauth/usage", running.url))
         .bearer_auth("first-secret")
@@ -1465,43 +1514,6 @@ async fn claude_other_accounts_lookup_then_route_by_email_and_cache_per_token() 
             .all(|row| row["credential_match"] == "configured"),
         "{routed:?}"
     );
-}
-
-#[tokio::test]
-async fn claude_profile_cache_evicts_only_least_recently_used_identity() {
-    let running = running("claude:\n  routing: {}\n").await;
-    let identity = crate::claude::ClaudeIdentity::profile(&json!({
-        "account": {"uuid": "id", "email": "person@example.invalid"}
-    }))
-    .unwrap();
-    let start = Instant::now();
-    for index in 0..128 {
-        running
-            .server
-            .cache_claude_profile(format!("token-{index}"), identity.clone())
-            .unwrap();
-    }
-    {
-        // Older than every other entry, without reaching back past boot on Windows.
-        let mut cache = running.server.claude_profiles.lock().unwrap();
-        cache.get_mut("token-42").unwrap().0 =
-            start.checked_sub(Duration::from_secs(1)).unwrap_or(start);
-    }
-    // Replacing an existing token at capacity must not evict another account.
-    running
-        .server
-        .cache_claude_profile("token-0".into(), identity.clone())
-        .unwrap();
-    assert_eq!(running.server.claude_profiles.lock().unwrap().len(), 128);
-    running
-        .server
-        .cache_claude_profile("new-token".into(), identity)
-        .unwrap();
-    let cache = running.server.claude_profiles.lock().unwrap();
-    assert_eq!(cache.len(), 128);
-    assert!(!cache.contains_key("token-42"));
-    assert!(cache.contains_key("new-token"));
-    assert!(cache.contains_key("token-0"));
 }
 
 #[tokio::test]
@@ -1535,7 +1547,7 @@ async fn claude_profile_failures_never_forward_payload_or_cache_identity() {
         assert!(request.starts_with("GET /api/oauth/profile "));
         assert!(!request.contains("private-payload"));
         assert!(lookup.requests.try_recv().is_err());
-        assert!(running.server.claude_profiles.lock().unwrap().is_empty());
+        assert!((running.server.claude_identities.len() == 0));
         running.server.logger.flush().unwrap();
         let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
         let lines = raw
@@ -3363,9 +3375,6 @@ async fn repeated_list_headers_are_forwarded_but_sensitive_duplicates_are_reject
 
 #[tokio::test]
 async fn statistics_preserve_aged_claude_identity() {
-    let Some(stale) = Instant::now().checked_sub(Duration::from_secs(301)) else {
-        return; // Some platforms count Instant from a recent system boot.
-    };
     let mut lookup = fixture("http", "profile_unauthorized").await;
     let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
     let dir = tempfile::tempdir().unwrap();
@@ -3380,18 +3389,12 @@ async fn statistics_preserve_aged_claude_identity() {
         &json!({"account":{"uuid":"remote-account", "email":"remote@example.invalid"}}),
     )
     .unwrap();
-    running
-        .server
-        .cache_claude_profile("saved-secret".into(), identity)
+    let identities = &running.server.claude_identities;
+    identities
+        .remember("saved-secret", async { Ok(identity) })
+        .await
         .unwrap();
-    running
-        .server
-        .claude_profiles
-        .lock()
-        .unwrap()
-        .get_mut("saved-secret")
-        .unwrap()
-        .0 = stale;
+    identities.backdate(Duration::from_secs(301)).await;
     let labels = running.server.traffic_credential_labels().await;
     assert_eq!(
         labels
@@ -3399,12 +3402,7 @@ async fn statistics_preserve_aged_claude_identity() {
             .map(String::as_str),
         Some("remote@example.invalid")
     );
-    let retained = running
-        .server
-        .claude_profiles
-        .lock()
-        .unwrap()
-        .contains_key("saved-secret");
+    let retained = identities.known("saved-secret", false).is_some();
     let sent_lookup = lookup.requests.try_recv().is_ok();
     assert!(
         retained && !sent_lookup,
@@ -5595,7 +5593,7 @@ async fn antigravity_other_accounts_are_named_through_the_probe_then_routed_and_
         assert!(request.starts_with("POST /v1internal:generateContent HTTP/1.1"));
         assert!(request.ends_with("private-payload"));
     }
-    assert_eq!(running.server.antigravity_profiles.lock().unwrap().len(), 1);
+    assert_eq!(running.server.antigravity_identities.len(), 1);
     let call = first_record(&running, "model_call_finished").await;
     assert_eq!(call["account_id"], "remote@example.invalid");
     assert_eq!(call["account_label"], "Remote@Example.invalid");
