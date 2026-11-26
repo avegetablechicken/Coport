@@ -217,7 +217,7 @@ pub struct SourceState {
     included: bool,
     exclusion: Option<SourceExclusion>,
     error: Option<String>,
-    traffic: Option<TrafficView>,
+    traffic: Option<crate::traffic_stats::View>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,106 +229,33 @@ pub struct Merged {
     pub scope: crate::traffic::TrafficScope,
     pub bucket_minutes: u64,
 }
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrafficView {
-    #[serde(flatten)]
-    stats: Stats,
-    avg_ms: Option<u64>,
-    first_token_ms: Option<u64>,
-    output_tps: Option<f64>,
-    cache_hit_rate: Option<f64>,
-    credentials: Vec<CredentialView>,
-    targets: Vec<crate::traffic_identity::Target>,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CredentialView {
-    #[serde(skip)]
-    anonymous: bool,
-    sources: Vec<crate::traffic::SourceTraffic>,
-    service: Service,
-    credential: String,
-    #[serde(flatten)]
-    stats: Stats,
-    avg_ms: Option<u64>,
-    first_token_ms: Option<u64>,
-    output_tps: Option<f64>,
-    cache_hit_rate: Option<f64>,
-}
-/// Over successful calls that streamed output, where any source reported them.
-fn first_token_ms(stats: &Stats) -> Option<u64> {
-    stats
-        .first_token_samples
-        .filter(|samples| *samples > 0)
-        .map(|samples| stats.first_token_total_ms.unwrap_or(0) / samples)
-}
-fn empty_stats(buckets: usize) -> Stats {
-    Stats {
-        counts: vec![0; buckets],
-        error_counts: vec![0; buckets],
-        token_counts: vec![0; buckets],
-        ..Default::default()
-    }
-}
-fn traffic_view(groups: &[MergedGroup], buckets: usize) -> TrafficView {
-    let mut total = empty_stats(buckets);
-    let mut credentials = BTreeMap::<(Service, String), (String, bool, Stats)>::new();
+/// One device's traffic from its merged groups. Accounts are told apart by
+/// their label, and every unlabelled upstream of a service is one Unidentified.
+fn traffic_view(
+    groups: &[MergedGroup],
+    window: crate::traffic_stats::Window,
+    scope: crate::traffic::TrafficScope,
+) -> crate::traffic_stats::View {
+    let mut accounts = BTreeMap::<(Service, String), crate::traffic_stats::Account>::new();
     for group in groups {
-        add_stats(&mut total, &group.stats);
         let identity = if group.anonymous_upstream {
             "unidentified".into()
         } else {
             format!("known/{}", group.upstream)
         };
-        let entry = credentials
+        let account = accounts
             .entry((group.service, identity))
             .or_insert_with(|| {
-                (
+                crate::traffic_stats::Account::new(
+                    group.service,
                     group.upstream.clone(),
-                    group.anonymous_upstream,
-                    empty_stats(buckets),
+                    Vec::new(),
+                    crate::traffic_stats::empty(window.buckets()),
                 )
             });
-        add_stats(&mut entry.2, &group.stats);
+        crate::traffic_stats::add(&mut account.stats, &group.stats);
     }
-    let mut credentials: Vec<_> = credentials
-        .into_iter()
-        .map(
-            |((service, _), (credential, anonymous, stats))| CredentialView {
-                anonymous,
-                sources: Vec::new(),
-                service,
-                credential,
-                avg_ms: (stats.latency_samples > 0)
-                    .then(|| stats.latency_total_ms / stats.latency_samples),
-                first_token_ms: first_token_ms(&stats),
-                output_tps: crate::data_api::output_tps(
-                    stats.output_tps_tokens,
-                    stats.output_tps_duration_ms,
-                ),
-                cache_hit_rate: (stats.cache_prompt > 0)
-                    .then(|| stats.cache_read as f64 / stats.cache_prompt as f64),
-                stats,
-            },
-        )
-        .collect();
-    // Same ordering as Activity Traffic: known accounts by received bytes,
-    // largest first; unidentified accounts follow all known accounts.
-    credentials.sort_by_key(|c| (c.anonymous, std::cmp::Reverse(c.stats.bytes)));
-    TrafficView {
-        avg_ms: (total.latency_samples > 0).then(|| total.latency_total_ms / total.latency_samples),
-        first_token_ms: first_token_ms(&total),
-        output_tps: crate::data_api::output_tps(
-            total.output_tps_tokens,
-            total.output_tps_duration_ms,
-        ),
-        cache_hit_rate: (total.cache_prompt > 0)
-            .then(|| total.cache_read as f64 / total.cache_prompt as f64),
-        stats: total,
-        credentials,
-        targets: Vec::new(),
-    }
+    crate::traffic_stats::View::reported_by_peer(scope, window, accounts.into_values().collect())
 }
 fn selected_groups(
     summary: &Summary,
@@ -442,53 +369,6 @@ fn labels(config: &Config, key: &DataKey) -> LabelMaps {
             .collect(),
     )
 }
-fn add_stats(to: &mut Stats, from: &Stats) {
-    to.requests = to.requests.saturating_add(from.requests);
-    to.errors = to.errors.saturating_add(from.errors);
-    to.bytes = to.bytes.saturating_add(from.bytes);
-    for (to, from) in [
-        (&mut to.input_tokens, from.input_tokens),
-        (&mut to.output_tokens, from.output_tokens),
-        (&mut to.cached_input_tokens, from.cached_input_tokens),
-        (&mut to.uncached_input_tokens, from.uncached_input_tokens),
-        (&mut to.cache_write_tokens, from.cache_write_tokens),
-        // Sources that did not report it, as older ones, add nothing.
-        (&mut to.first_token_total_ms, from.first_token_total_ms),
-        (&mut to.first_token_samples, from.first_token_samples),
-        (
-            &mut to.forwarded_first_token_total_ms,
-            from.forwarded_first_token_total_ms,
-        ),
-        (
-            &mut to.forwarded_first_token_samples,
-            from.forwarded_first_token_samples,
-        ),
-        (&mut to.cooldown_total_ms, from.cooldown_total_ms),
-        (&mut to.cooldown_samples, from.cooldown_samples),
-        (&mut to.output_tps_tokens, from.output_tps_tokens),
-        (&mut to.output_tps_duration_ms, from.output_tps_duration_ms),
-    ] {
-        if let Some(value) = from {
-            *to = Some(to.unwrap_or(0).saturating_add(value));
-        }
-    }
-    to.cache_read = to.cache_read.saturating_add(from.cache_read);
-    to.cache_prompt = to.cache_prompt.saturating_add(from.cache_prompt);
-    to.latency_total_ms = to.latency_total_ms.saturating_add(from.latency_total_ms);
-    to.latency_samples = to.latency_samples.saturating_add(from.latency_samples);
-    for (to, from) in [
-        (&mut to.counts, &from.counts),
-        (&mut to.error_counts, &from.error_counts),
-        (&mut to.token_counts, &from.token_counts),
-    ] {
-        if to.is_empty() {
-            to.resize(from.len(), 0);
-        }
-        for (to, from) in to.iter_mut().zip(from) {
-            *to = to.saturating_add(*from);
-        }
-    }
-}
 fn add_groups(
     merged: &mut BTreeMap<(Service, String, String), MergedGroup>,
     maps: &LabelMaps,
@@ -531,7 +411,7 @@ fn add_groups(
             anonymous_upstream: upstream.is_none(),
             stats: Stats::default(),
         });
-        add_stats(&mut group.stats, stats);
+        crate::traffic_stats::add(&mut group.stats, stats);
     }
 }
 /// The forwarded device's traffic, labelled as Devices labels that device.
@@ -547,7 +427,7 @@ pub struct ForwardedTraffic {
     window_start: i64,
     window_end: i64,
     bucket_minutes: u64,
-    traffic: TrafficView,
+    traffic: crate::traffic_stats::View,
 }
 pub async fn forwarded_traffic(
     remote: crate::remote_forward::RemoteWindow,
@@ -579,7 +459,12 @@ pub async fn forwarded_traffic(
         bucket_minutes: bucket,
         traffic: traffic_view(
             &groups.into_values().collect::<Vec<_>>(),
-            (window.minutes / bucket) as usize,
+            crate::traffic_stats::Window {
+                start: window.window_start,
+                end: window.window_end,
+                bucket_minutes: bucket,
+            },
+            window.scope,
         ),
     })
 }
@@ -1291,7 +1176,11 @@ fn merge_fetched(
     end: i64,
 ) -> Result<Merged, String> {
     let bucket = crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let buckets = (minutes / bucket) as usize;
+    let window = crate::traffic_stats::Window {
+        start: end - minutes as i64 * 60_000,
+        end,
+        bucket_minutes: bucket,
+    };
     let mut seen = BTreeSet::from([context.local_id.clone()]);
     let mut states = Vec::new();
     for (source, result) in fetched {
@@ -1315,7 +1204,8 @@ fn merge_fetched(
                     );
                     source_traffic = Some(traffic_view(
                         &source_groups.into_values().collect::<Vec<_>>(),
-                        buckets,
+                        window,
+                        scope,
                     ));
                     (true, None)
                 }
@@ -1345,6 +1235,24 @@ fn merge_fetched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A peer's Model traffic over `buckets` one-minute buckets.
+    fn traffic_view(groups: &[MergedGroup], buckets: usize) -> crate::traffic_stats::View {
+        super::traffic_view(
+            groups,
+            crate::traffic_stats::Window {
+                start: 0,
+                end: buckets as i64 * 60_000,
+                bucket_minutes: 1,
+            },
+            crate::traffic::TrafficScope::Model,
+        )
+    }
+    fn empty_stats(buckets: usize) -> Stats {
+        crate::traffic_stats::empty(buckets)
+    }
+    fn add_stats(to: &mut Stats, from: &Stats) {
+        crate::traffic_stats::add(to, from)
+    }
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     #[tokio::test]
     async fn selected_views_render_before_slow_peers_and_background_responses() {
@@ -2432,8 +2340,8 @@ mod tests {
         assert_eq!(view.credentials.len(), 1);
         assert_eq!(view.credentials[0].credential, "My known account");
         assert_eq!(view.stats.requests, 4);
-        assert_eq!(view.avg_ms, Some(250));
-        assert_eq!(view.cache_hit_rate, Some(0.3));
+        assert_eq!(view.metrics.avg_ms, Some(250));
+        assert_eq!(view.metrics.cache_hit_rate, Some(0.3));
         let mut unknown = BTreeMap::new();
         add_groups(
             &mut unknown,
@@ -2733,7 +2641,7 @@ mod tests {
                 .iter()
                 .find(|g| g.credential == label)
                 .unwrap();
-            assert!(!matched.anonymous);
+            assert_ne!(matched.credential, crate::traffic_identity::UNIDENTIFIED);
             assert_eq!(group["requests"], matched.stats.requests);
             assert_eq!(group["bytes"], matched.stats.bytes);
         }
@@ -2947,8 +2855,8 @@ mod tests {
         assert_eq!(local["requests"], 1);
         let remote = result.sources[0].traffic.as_ref().unwrap();
         assert_eq!(remote.stats.requests, 1);
-        assert_eq!(remote.avg_ms, Some(200));
-        assert_eq!(remote.cache_hit_rate, Some(0.3));
+        assert_eq!(remote.metrics.avg_ms, Some(200));
+        assert_eq!(remote.metrics.cache_hit_rate, Some(0.3));
         assert_eq!(remote.credentials[0].credential, "known@example.invalid");
         // The card names the account as the peer does, so Merged Traffic adds
         // both into one account.
@@ -3295,6 +3203,12 @@ mod tests {
         let forwarded = forwarded_traffic(remote, config, local_log, labels)
             .await
             .unwrap();
+        let mut devices = devices;
+        devices.window = forwarded.traffic.window;
+        assert_eq!(
+            forwarded.traffic.window.end - forwarded.traffic.window.start,
+            30 * 60_000
+        );
         assert_eq!(
             serde_json::to_value(&devices).unwrap(),
             serde_json::to_value(&forwarded.traffic).unwrap()
