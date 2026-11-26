@@ -454,6 +454,7 @@ impl Server {
                     request,
                     false,
                     Deadline::new(self.config.request_timeout_seconds.min(10.0)),
+                    Upstream::Auxiliary,
                     log,
                 )
                 .await?;
@@ -464,7 +465,7 @@ impl Server {
                 log.fields.insert("profile_proxy_endpoint".into(), endpoint);
             }
             let status = response.status();
-            record_upstream_response(log, status.as_u16());
+            record_upstream_response(log, status.as_u16(), Upstream::Auxiliary);
             if !status.is_success() {
                 return Err(Error::new(
                     if status.is_client_error() {
@@ -729,6 +730,7 @@ impl Server {
             Some(Err(error)) => return Ok(reject(&mut log, error)),
             None => unreachable!("valid requests other than CONNECT have an app"),
         };
+        let relayed = Upstream::relay(&target);
         let ws_key = incoming.headers().get("sec-websocket-key").cloned();
         let upgrade = incoming
             .headers()
@@ -752,7 +754,7 @@ impl Server {
                     else {
                         // The upstream answered. Closing the client connection
                         // does not drop that response from the log.
-                        record_upstream_response(&mut log, status);
+                        record_upstream_response(&mut log, status, relayed);
                         log.status = 0;
                         log.fields.remove("status");
                         log.outcome = "request_failed";
@@ -764,7 +766,7 @@ impl Server {
                 }
                 if upstream.status() == 101 {
                     let Some((upgrade, key)) = upgrade.zip(ws_key) else {
-                        record_upstream_response(&mut log, 101);
+                        record_upstream_response(&mut log, 101, relayed);
                         return Ok(reject(
                             &mut log,
                             Error::config("Unexpected upstream protocol upgrade."),
@@ -781,7 +783,7 @@ impl Server {
                             .get("sec-websocket-accept")
                             .is_none_or(|v| v.as_bytes() != accept.as_bytes())
                     {
-                        record_upstream_response(&mut log, 101);
+                        record_upstream_response(&mut log, 101, relayed);
                         return Ok(reject(
                             &mut log,
                             Error::config("Invalid upstream WebSocket handshake."),
@@ -802,7 +804,7 @@ impl Server {
                                         .unwrap_or(""),
                                 );
                             }
-                            record_upstream_response(&mut log, 101);
+                            record_upstream_response(&mut log, 101, relayed);
                             let _ = relay.send(relay_websocket_or_tunnel(
                                 upgrade,
                                 Box::new(upstream),
@@ -816,7 +818,7 @@ impl Server {
                             return Ok(response);
                         }
                         Err(_) => {
-                            record_upstream_response(&mut log, 101);
+                            record_upstream_response(&mut log, 101, relayed);
                             return Ok(reject(
                                 &mut log,
                                 Error::config("WebSocket upgrade failed."),
@@ -825,7 +827,7 @@ impl Server {
                     }
                 }
                 let status = upstream.status();
-                record_upstream_response(&mut log, status.as_u16());
+                record_upstream_response(&mut log, status.as_u16(), relayed);
                 let headers = filtered_headers(upstream.headers());
                 let mut observer = (target.kind() == Kind::ModelCall).then(|| {
                     crate::model_calls::record_response_encoding(&mut log, &headers);
@@ -926,6 +928,7 @@ impl Server {
         let claude = service == Service::Claude;
         let model_call = target.model_call();
         let http_model_call = target.kind() == Kind::ModelCall;
+        let relayed = Upstream::relay(target);
         if target.kind() == Kind::TokenRefresh {
             return self.forward_token_refresh(incoming, log, claude).await;
         }
@@ -1224,7 +1227,7 @@ impl Server {
             claude_route.as_ref().and_then(|r| r.identity.clone()),
         );
         let response = self
-            .send_via(&choice, request, native_tls, deadline, log)
+            .send_via(&choice, request, native_tls, deadline, relayed, log)
             .await?;
         self.retry_after_renewal(response, renewal, &choice, native_tls, deadline, log)
             .await
@@ -1443,6 +1446,7 @@ impl Server {
                 request,
                 false,
                 Deadline::new(self.config.request_timeout_seconds),
+                Upstream::Relay,
                 log,
             )
             .await?;
@@ -1717,25 +1721,13 @@ fn client_tls_failure(error: &std::io::Error) -> &'static str {
 }
 
 /// An upstream HTTP response, relayed or not. The client outcome is recorded
-/// separately when this request ends. A lookup or token refresh made on a
-/// model call's log is not that model call.
-fn record_upstream_response(log: &mut RequestLog, status: u16) {
+/// separately when this request ends. An Auxiliary request's response, made
+/// on a Model call's log, is not that Model call's.
+fn record_upstream_response(log: &mut RequestLog, status: u16, upstream: Upstream) {
     log.status = status;
     log.field("status", status);
     log.field("headers_ms", log.started.elapsed().as_millis());
-    let method = log
-        .fields
-        .get("upstream_method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let path = log
-        .fields
-        .get("upstream_path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let auxiliary = log.fields.contains_key("model_call_id")
-        && !crate::model_calls::is_model_endpoint(method, path);
-    let hidden = auxiliary
+    let hidden = (upstream == Upstream::Auxiliary)
         .then(|| log.fields.remove("model_call_id"))
         .flatten();
     log.event("upstream_response");

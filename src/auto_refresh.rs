@@ -84,10 +84,18 @@ impl Server {
                 headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
                 // OAuth routes always use Authorization, never an API key.
                 headers.remove("x-api-key");
-                record_upstream_response(log, response.status().as_u16());
+                // Only Model calls renew their login.
+                record_upstream_response(log, response.status().as_u16(), Upstream::ModelCall);
                 drop(response);
-                self.send_via(choice, renewal.retry, native_tls, deadline, log)
-                    .await
+                self.send_via(
+                    choice,
+                    renewal.retry,
+                    native_tls,
+                    deadline,
+                    Upstream::ModelCall,
+                    log,
+                )
+                .await
             }
             Err(error) => {
                 log.field("oauth_refresh", "failed");
@@ -247,9 +255,20 @@ impl Server {
         let path = request.url().path().to_owned();
         let mut refresh_log = RequestLog { logger: self.logger.clone(), fields: json!({"request_id":uuid::Uuid::new_v4().to_string(), "service":snapshot.service.name(), "method":"POST", "path":path, "reason":"automatic_oauth_refresh"}).as_object().unwrap().clone(), started:Instant::now(), status:0, bytes:0, outcome:"oauth_refresh_finished" };
         let response = self
-            .send_via(choice, request, false, deadline, &mut refresh_log)
+            .send_via(
+                choice,
+                request,
+                false,
+                deadline,
+                Upstream::Auxiliary,
+                &mut refresh_log,
+            )
             .await?;
-        record_upstream_response(&mut refresh_log, response.status().as_u16());
+        record_upstream_response(
+            &mut refresh_log,
+            response.status().as_u16(),
+            Upstream::Auxiliary,
+        );
         if !response.status().is_success() {
             // Rejected generations stay blocked until the saved login changes.
             if matches!(response.status().as_u16(), 400 | 401 | 403) {

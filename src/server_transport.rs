@@ -1,6 +1,28 @@
 //! Shared route health, deadlines and outbound request execution.
 use super::*;
 
+/// What an upstream send is to the client's request it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Upstream {
+    /// The client's Model call itself: its first send starts the call's timing.
+    ModelCall,
+    /// The client's request itself, not a Model call.
+    Relay,
+    /// An Auxiliary request, such as an account lookup.
+    Auxiliary,
+}
+
+impl Upstream {
+    /// The send of the client's own request.
+    pub(super) fn relay(target: &Target) -> Self {
+        if target.model_call() {
+            Self::ModelCall
+        } else {
+            Self::Relay
+        }
+    }
+}
+
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(super) struct ProbeKey {
@@ -468,6 +490,7 @@ impl Server {
         request: reqwest::Request,
         native_tls: bool,
         deadline: Deadline,
+        upstream: Upstream,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         log.field("upstream_method", request.method());
@@ -501,13 +524,9 @@ impl Server {
             *outgoing.timeout_mut() = Some(remaining);
             log.field("upstream_attempts", attempt);
             // First actual send, after local cooldown and route preparation.
-            // Profile lookups share this log but must not start model timing.
+            // Auxiliary requests share this log but must not start model timing.
             // Keep this origin across transport retries and credential renewal.
-            if crate::model_calls::is_model_endpoint(
-                outgoing.method().as_str(),
-                outgoing.url().path(),
-            ) && !log.fields.contains_key("upstream_started_ms")
-            {
+            if upstream == Upstream::ModelCall && !log.fields.contains_key("upstream_started_ms") {
                 log.field("upstream_started_ms", log.started.elapsed().as_millis());
             }
             match client.execute(outgoing).await {
@@ -685,6 +704,7 @@ mod tests {
                 reqwest::Request::new(hyper::Method::GET, url.clone()),
                 false,
                 Deadline::new(3.0),
+                Upstream::Relay,
                 &mut request_log,
             ),
         )

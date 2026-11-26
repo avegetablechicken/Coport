@@ -2850,6 +2850,11 @@ async fn forwarded_first_token_origin_excludes_profile_and_survives_retry() {
                 request,
                 false,
                 Deadline::new(3.0),
+                if path.ends_with("profile") {
+                    Upstream::Auxiliary
+                } else {
+                    Upstream::ModelCall
+                },
                 &mut log,
             )
             .await
@@ -2895,6 +2900,7 @@ async fn cold_selection_consumes_the_request_budget_and_logs_eligibility_separat
             request,
             false,
             Deadline::new(0.05),
+            Upstream::Relay,
             &mut log,
         )
         .await;

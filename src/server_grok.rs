@@ -14,12 +14,11 @@ impl Server {
         let settings = &self.config.grok;
         // Proxy tunnels and scoped base URLs share the credential router.
         let rest = target.rest();
-        let model_call = target.kind() == Kind::ModelCall;
-        let target = target.raw();
+        let raw = target.raw();
         if !settings.configured() {
             return Err(Error::new(404, "Grok routing is not configured."));
         }
-        if let Some((url, endpoint)) = settings.endpoint(target) {
+        if let Some((url, endpoint)) = settings.endpoint(raw) {
             return self
                 .forward_grok_subscription(incoming, url, endpoint, log)
                 .await;
@@ -28,7 +27,7 @@ impl Server {
         if path.ends_with("/oauth2/token")
             || rest.starts_with("/https://auth.x.ai/")
             || incoming.method() == "GET" && path.ends_with("/chat/completions")
-            || target
+            || raw
                 .split_once('?')
                 .is_some_and(|(path, _)| settings.endpoint(path).is_some())
         {
@@ -39,13 +38,10 @@ impl Server {
             .await?
         {
             GrokTarget::Account(route) => {
-                self.forward_grok_account(incoming, route, model_call, log)
+                self.forward_grok_account(incoming, route, target, log)
                     .await
             }
-            GrokTarget::Api(route) => {
-                self.forward_grok_api(incoming, route, model_call, log)
-                    .await
-            }
+            GrokTarget::Api(route) => self.forward_grok_api(incoming, route, target, log).await,
         }
     }
 
@@ -53,7 +49,7 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         route: GrokRoute,
-        model_call: bool,
+        target: &Target,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         // As Codex's account requests: the account and its route, no provider.
@@ -75,7 +71,7 @@ impl Server {
             route.url,
             &route.proxy,
             false,
-            model_call,
+            target,
             log,
         )
         .await
@@ -87,7 +83,7 @@ impl Server {
         &self,
         incoming: Request<Incoming>,
         route: ApiRoute,
-        model_call: bool,
+        target: &Target,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         log.field("provider", &route.selector);
@@ -112,7 +108,7 @@ impl Server {
             route.url,
             &route.proxy,
             route.custom_upstream,
-            model_call,
+            target,
             log,
         )
         .await
@@ -137,20 +133,27 @@ impl Server {
         url: Url,
         proxy: &Choice,
         custom_upstream: bool,
-        model_call: bool,
+        target: &Target,
         log: &mut RequestLog,
     ) -> Result<reqwest::Response> {
         let (parts, body) = incoming.into_parts();
         let bytes = read_body(body).await?;
-        if model_call {
+        if target.kind() == Kind::ModelCall {
             crate::model_calls::observe_request(&bytes, log);
         }
         let mut request = reqwest::Request::new(parts.method, url);
         *request.headers_mut() = headers;
         *request.body_mut() = Some(bytes.into());
         let deadline = Deadline::new(self.config.request_timeout_seconds);
-        self.send_via(proxy, request, custom_upstream, deadline, log)
-            .await
+        self.send_via(
+            proxy,
+            request,
+            custom_upstream,
+            deadline,
+            Upstream::relay(target),
+            log,
+        )
+        .await
     }
 
     pub fn with_grok_routes(mut self, routes: RefreshRoutes<GrokAccount>) -> Self {
@@ -293,6 +296,7 @@ impl Server {
                 request,
                 false,
                 Deadline::new(self.config.request_timeout_seconds),
+                Upstream::Relay,
                 log,
             )
             .await?;

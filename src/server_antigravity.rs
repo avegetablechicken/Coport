@@ -191,7 +191,14 @@ impl Server {
         let deadline = Deadline::new(self.config.request_timeout_seconds);
         let renewal = auto_refresh::Renewal::new(refresh_snapshot, &request, None);
         let response = self
-            .send_via(&route.proxy, request, false, deadline, log)
+            .send_via(
+                &route.proxy,
+                request,
+                false,
+                deadline,
+                Upstream::relay(target),
+                log,
+            )
             .await?;
         let response = self
             .retry_after_renewal(response, renewal, &route.proxy, false, deadline, log)
@@ -243,7 +250,14 @@ impl Server {
         *request.body_mut() = Some(bytes.into());
         let deadline = Deadline::new(self.config.request_timeout_seconds);
         let response = self
-            .send_via(&route.proxy, request, route.custom_upstream, deadline, log)
+            .send_via(
+                &route.proxy,
+                request,
+                route.custom_upstream,
+                deadline,
+                Upstream::relay(target),
+                log,
+            )
             .await?;
         Ok(self.location_cooldowns.observe(scope, response))
     }
@@ -312,6 +326,7 @@ impl Server {
                 request,
                 false,
                 Deadline::new(self.config.request_timeout_seconds),
+                Upstream::Relay,
                 log,
             )
             .await?;
@@ -401,6 +416,7 @@ impl Server {
                 request,
                 false,
                 Deadline::new(self.config.request_timeout_seconds.min(10.0)),
+                Upstream::Auxiliary,
                 log,
             )
             .await?;
@@ -413,7 +429,7 @@ impl Server {
             }
         }
         let status = response.status();
-        record_upstream_response(log, status.as_u16());
+        record_upstream_response(log, status.as_u16(), Upstream::Auxiliary);
         if !status.is_success() {
             return Err(Error::new(
                 if status.is_client_error() {
