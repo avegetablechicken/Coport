@@ -167,7 +167,7 @@ impl Strings {
 
 /// What one log file contributes to traffic in one scope, before the time
 /// window and the current configuration apply.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FileTraffic {
     scan_end: i64,
     latest_event: Option<i64>,
@@ -181,6 +181,13 @@ struct FileTraffic {
 }
 
 impl FileTraffic {
+    /// Whether every event read so far lies before both this summary's end
+    /// and `end`: then lines added later extend it to `end` exactly as a new
+    /// scan to `end` would read the whole file.
+    fn extendable_to(&self, end: i64) -> bool {
+        self.latest_event
+            .is_none_or(|last| last < self.scan_end && last < end)
+    }
     fn scan_many(file: File, selections: &[(TrafficScope, i64)]) -> Result<Vec<Self>, String> {
         let mut traffic: Vec<_> = selections
             .iter()
@@ -280,6 +287,27 @@ struct FileStamp {
 /// are dropped, so a long range read once does not stay in memory.
 type Summaries = HashMap<(FileStamp, bool), (Instant, Arc<FileTraffic>)>;
 static SUMMARIES: Mutex<Option<Summaries>> = Mutex::new(None);
+/// The live file's summary per scope up to its last complete line. A later
+/// read parses only the lines added since; a rotated, truncated or replaced
+/// file, or a summary that cut an event off at its end, is read again whole.
+struct LiveTraffic {
+    stamp: FileStamp,
+    offset: u64,
+    /// The bytes just before `offset`, so a file rewritten in place is noticed.
+    before: Vec<u8>,
+    used: Instant,
+    traffic: Arc<FileTraffic>,
+}
+type LiveSummaries = HashMap<(std::path::PathBuf, bool), LiveTraffic>;
+static LIVE: Mutex<Option<LiveSummaries>> = Mutex::new(None);
+impl FileStamp {
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        return self.node == other.node;
+        #[cfg(not(unix))]
+        return self.path == other.path;
+    }
+}
 /// One lock per rotated file being summarized: a concurrent reader waits for
 /// the scan in progress and reuses its cached result instead of parsing again.
 static SCANNING: Mutex<Option<HashMap<FileStamp, Arc<Mutex<()>>>>> = Mutex::new(None);
@@ -546,7 +574,16 @@ fn summarize_file(
         len: meta.len(),
         modified: meta.modified().ok(),
     };
-    // The live file changes and is never cached, so it needs no scan lock.
+    if live {
+        let results = summarize_live(file_path, &file, &stamp, selections)?;
+        return Ok(Some(ScannedFile {
+            #[cfg(unix)]
+            stamp,
+            archived_modified,
+            results,
+        }));
+    }
+    // The live file is summarized on its own, so it needs no scan lock.
     let scan_lock = (!live).then(|| {
         SCANNING
             .lock()
@@ -1388,28 +1425,178 @@ fn ordered_files(
     Ok(files)
 }
 
+/// Summarizes the live file for every selection, continuing the cached
+/// summary of its scope where that reads the same as a whole new scan.
+fn summarize_live(
+    file_path: &Path,
+    file: &File,
+    stamp: &FileStamp,
+    selections: &[(TrafficScope, i64)],
+) -> Result<Vec<Arc<FileTraffic>>, String> {
+    // Concurrent readers wait here and continue from the summary just made.
+    let mut cache = LIVE.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    cache.retain(|_, live| live.used.elapsed() < SUMMARY_TTL);
+    let key = |scope: TrafficScope| (file_path.to_owned(), scope == TrafficScope::Model);
+    let unchanged = |live: &LiveTraffic| {
+        live.stamp.same_file(stamp)
+            && stamp.len >= live.offset
+            && bytes_before(file, live.offset).is_ok_and(|bytes| bytes == live.before)
+    };
+    let mut states: Vec<(u64, FileTraffic)> = selections
+        .iter()
+        .map(|(scope, end)| match cache.get(&key(*scope)) {
+            Some(live) if live.traffic.extendable_to(*end) && unchanged(live) => {
+                let mut traffic = (*live.traffic).clone();
+                traffic.scan_end = *end;
+                (live.offset, traffic)
+            }
+            _ => (
+                0,
+                FileTraffic {
+                    scan_end: *end,
+                    ..FileTraffic::default()
+                },
+            ),
+        })
+        .collect();
+    let mut results: Vec<Option<Arc<FileTraffic>>> = selections.iter().map(|_| None).collect();
+    let starts: BTreeSet<u64> = states.iter().map(|(offset, _)| *offset).collect();
+    for start in starts {
+        let indices: Vec<usize> = (0..states.len())
+            .filter(|i| states[*i].0 == start)
+            .collect();
+        let mut sighted: Vec<HashSet<_>> = indices
+            .iter()
+            .map(|i| states[*i].1.evidence.iter().cloned().collect())
+            .collect();
+        let mut strings = Strings::default();
+        let mut tail = Vec::new();
+        let end = read_appended(
+            file,
+            start,
+            |entry| {
+                for (k, i) in indices.iter().enumerate() {
+                    states[*i]
+                        .1
+                        .observe(&entry, selections[*i].0, &mut sighted[k], &mut strings);
+                }
+            },
+            |entry| tail.push(entry),
+        )?;
+        let before = bytes_before(file, end)?;
+        for (k, i) in indices.iter().enumerate() {
+            let scope = selections[*i].0;
+            let committed = Arc::new(std::mem::take(&mut states[*i].1));
+            // Only a summary that cut nothing off can be continued later.
+            if committed.extendable_to(i64::MAX) {
+                cache.insert(
+                    key(scope),
+                    LiveTraffic {
+                        stamp: stamp.clone(),
+                        offset: end,
+                        before: before.clone(),
+                        used: Instant::now(),
+                        traffic: committed.clone(),
+                    },
+                );
+            }
+            // A last line still being written counts in this read only.
+            results[*i] = Some(if tail.is_empty() {
+                committed
+            } else {
+                let mut traffic = (*committed).clone();
+                for entry in &tail {
+                    traffic.observe(entry, scope, &mut sighted[k], &mut strings);
+                }
+                Arc::new(traffic)
+            });
+        }
+    }
+    Ok(results.into_iter().map(Option::unwrap).collect())
+}
+
+/// Up to 256 bytes of `file` just before `offset`.
+fn bytes_before(file: &File, offset: u64) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let error = |_| "Cannot read traffic history".to_owned();
+    let start = offset.saturating_sub(256);
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(start)).map_err(error)?;
+    let mut bytes = Vec::new();
+    handle
+        .take(offset - start)
+        .read_to_end(&mut bytes)
+        .map_err(error)?;
+    Ok(bytes)
+}
+
+/// Reads `file` from byte `offset`: each complete line goes to `committed`
+/// and a last line without its newline yet to `tail`. Returns the offset
+/// after the last complete line.
+fn read_appended(
+    file: &File,
+    offset: u64,
+    mut committed: impl FnMut(Entry),
+    mut tail: impl FnMut(Entry),
+) -> Result<u64, String> {
+    use std::io::{Seek, SeekFrom};
+    let error = |_| "Cannot read traffic history".to_owned();
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(offset)).map_err(error)?;
+    let mut reader = BufReader::new(handle);
+    let mut line = Vec::new();
+    let mut offset = offset;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(error)?;
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            offset += read as u64;
+            line.pop();
+            if let Some(entry) = parse_line(&line) {
+                committed(entry);
+            }
+        } else {
+            if let Some(entry) = parse_line(&line) {
+                tail(entry);
+            }
+            break;
+        }
+    }
+    Ok(offset)
+}
+
+fn parse_line(line: &[u8]) -> Option<Entry> {
+    let Ok(Value::Object(mut fields)) = serde_json::from_slice(line) else {
+        return None;
+    };
+    let Some(Value::String(event)) = fields.remove("event") else {
+        return None;
+    };
+    let time = fields
+        .remove("timestamp")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        })
+        .map(|t| t.with_timezone(&Local));
+    Some(Entry {
+        seq: crate::logs::line_key(line),
+        event,
+        time,
+        fields,
+    })
+}
+
 fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String> {
     for line in BufReader::new(file).split(b'\n') {
         let line = line.map_err(|_| "Cannot read traffic history".to_owned())?;
-        let Ok(Value::Object(mut fields)) = serde_json::from_slice(&line) else {
-            continue;
-        };
-        let Some(Value::String(event)) = fields.remove("event") else {
-            continue;
-        };
-        let time = fields
-            .remove("timestamp")
-            .and_then(|v| {
-                v.as_str()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            })
-            .map(|t| t.with_timezone(&Local));
-        visit(Entry {
-            seq: crate::logs::line_key(&line),
-            event,
-            time,
-            fields,
-        });
+        if let Some(entry) = parse_line(&line) {
+            visit(entry);
+        }
     }
     Ok(())
 }
@@ -1417,6 +1604,147 @@ fn for_each_line(file: File, mut visit: impl FnMut(Entry)) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_reads_continue_where_the_last_left_off_exactly_as_a_new_scan() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let minute = 60_000;
+        let base = chrono::Utc::now().timestamp_millis() / minute * minute - 20 * minute;
+        let line = |m: i64, event: &str, id: &str, extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "timestamp": chrono::DateTime::from_timestamp_millis(base + m * minute).unwrap().to_rfc3339(),
+                "event": event, "service": "codex", "request_id": id,
+                "method": "POST", "path": "/v1/responses", "account_id": "acct", "account_label": "work",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            value.to_string()
+        };
+        let append = |text: &str| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let read = |dir: &Path, scope, end| {
+            serde_json::to_value(
+                read_at(
+                    ReadSource::Path(&dir.join("proxy.log")),
+                    30,
+                    &BTreeMap::new(),
+                    scope,
+                    &Default::default(),
+                    end,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        // A whole new scan reads a copy of every file at another path.
+        let fresh = |scope, end| {
+            let copy = tempfile::tempdir().unwrap();
+            for file in std::fs::read_dir(dir.path()).unwrap() {
+                let file = file.unwrap();
+                std::fs::copy(file.path(), copy.path().join(file.file_name())).unwrap();
+            }
+            read(copy.path(), scope, end)
+        };
+        let check = |end: i64, step: &str| {
+            for scope in [TrafficScope::All, TrafficScope::Model] {
+                let cached = read(dir.path(), scope, end);
+                assert_eq!(cached, fresh(scope, end), "{step}, {scope:?}");
+            }
+        };
+        let end = base + 25 * minute;
+        let finished =
+            serde_json::json!({"status": "200", "duration_ms": "500", "received_bytes": "10"});
+        let call = serde_json::json!({"model_call_id": "c1"});
+        append(&format!(
+            "{}\n{}\n{}\n",
+            line(1, "request_received", "r1", serde_json::json!({})),
+            line(2, "request_finished", "r1", finished.clone()),
+            line(3, "model_call_started", "r2", call.clone()),
+        ));
+        check(end, "first read");
+        // A call finishing later merges with its start read before.
+        let mut done = call.clone();
+        done.as_object_mut().unwrap().extend(
+            serde_json::json!({"status": "200", "duration_ms": "1000", "first_token_ms": "100", "output_tokens": "50"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        append(&format!(
+            "{}\n{}",
+            line(4, "model_call_finished", "r2", done),
+            line(5, "request_received", "r3", serde_json::json!({})),
+        ));
+        check(end, "a last line without its newline");
+        append(&format!(
+            "\n{}\n",
+            line(6, "request_finished", "r3", finished.clone())
+        ));
+        check(end, "the line completed");
+        check(end + minute, "a later end");
+        // An event after the end is cut off; the next read starts over.
+        append(&format!(
+            "{}\n",
+            line(26, "request_received", "late", serde_json::json!({}))
+        ));
+        check(end, "an event after the end");
+        check(end + 2 * minute, "after a cut");
+        // Rotation leaves a new live file; truncation a shorter one.
+        std::fs::rename(&path, dir.path().join("proxy.log.1")).unwrap();
+        append(&format!(
+            "{}\n",
+            line(7, "request_received", "r4", serde_json::json!({}))
+        ));
+        check(end + 2 * minute, "after rotation");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                line(8, "request_received", "r5", serde_json::json!({}))
+            ),
+        )
+        .unwrap();
+        check(end + 2 * minute, "after truncation");
+        append(&format!(
+            "{}\n",
+            line(9, "request_finished", "r5", finished)
+        ));
+        check(end + 2 * minute, "after truncation and growth");
+        // The summary continues from its offset: rewriting lines well before
+        // it, which the logger never does, goes unnoticed; see `before`.
+        for i in 0..4 {
+            append(&format!(
+                "{}\n",
+                line(
+                    10 + i,
+                    "request_received",
+                    &format!("pad{i}"),
+                    serde_json::json!({})
+                )
+            ));
+        }
+        check(end + 2 * minute, "before a rewrite");
+        // Blank r5's two lines, keeping every byte offset.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let r5: usize = text.lines().take(2).map(|line| line.len() + 1).sum();
+        std::fs::write(&path, format!("{}\n{}", " ".repeat(r5 - 1), &text[r5..])).unwrap();
+        let cached = read(dir.path(), TrafficScope::All, end + 2 * minute);
+        let rescanned = fresh(TrafficScope::All, end + 2 * minute);
+        assert_eq!(
+            cached["requests"].as_u64().unwrap(),
+            rescanned["requests"].as_u64().unwrap() + 1
+        );
+    }
     // Keep the pre-batching implementation as an independent semantic oracle.
     fn independent_export_reference(
         source: ReadSource<'_>,
