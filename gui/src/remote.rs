@@ -218,6 +218,11 @@ pub(crate) fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Resu
     // crash is replaced by the next start. The staging directory is private,
     // so the copy is never reachable with the source's permissions.
     let helper = dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
+    // A Daemon that stopped may still be copying, and a copy that fails
+    // removes the helper: one copy at a time, so neither removes the other's
+    // staging directory or helper. The lock ends with its process.
+    let lock = crate::daemon::lock_file(&dir.join("summary-helper.lock"))?;
+    lock.lock()?;
     // A daemon stopped while copying leaves its staging directory behind.
     for entry in std::fs::read_dir(dir)?.flatten() {
         if entry
@@ -1000,6 +1005,18 @@ mod tests {
         let helper = state.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&source, b"new executable").unwrap();
         assert_eq!(std::fs::read(&helper).unwrap(), b"old executable");
+        // A stopped daemon still copying finishes before the next one copies.
+        let copying = crate::daemon::lock_file(&state.join("summary-helper.lock")).unwrap();
+        copying.lock().unwrap();
+        let next = std::thread::spawn({
+            let (state, source) = (state.clone(), source.clone());
+            move || preserve_summary_executable(&state, &source)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(std::fs::read(&helper).unwrap(), b"old executable");
+        copying.unlock().unwrap();
+        next.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), b"new executable");
         // A copy interrupted by a stopped daemon is cleared by the next one.
         let interrupted = state.join(".summary-helperXYZ");
         std::fs::create_dir(&interrupted).unwrap();
