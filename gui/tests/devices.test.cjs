@@ -147,11 +147,11 @@ test('configuration lives in Settings and Settings loading makes no remote reque
 });
 
 test('Settings includes one Devices block without a separate forwarding block', () => {
-  const code = source.slice(source.indexOf('function settings()'), source.indexOf('/// The fixed configuration'));
-  const rendered = vm.runInNewContext(code + '\nsettings()', {
+  // The page whole, its blocks other than General stubbed after it loads.
+  const rendered = Object.assign(scripts.load(scripts.sandbox(), 'settings_page.js'), {
     ui: { snap: { settings: { maskAccountNames: false } } }, ICON: {}, panelSelect: () => '',
     block: (title, aside, body) => (title === 'General' ? body : `[${title}]`), configSettings: () => '[Network]', filesBlock: () => '[Files]', deviceSettings: () => '[Devices]',
-  });
+  }).settings();
   assert.ok(rendered.includes('[Files]\n    [Devices]'));
   assert.doesNotMatch(rendered, /Request forwarding/);
   assert.ok(rendered.trim().endsWith('[Devices]')); assert.equal((rendered.match(/\[Devices\]/g) || []).length, 1);

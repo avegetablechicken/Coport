@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const { createLatest } = require('../ui/latest.js');
+const scripts = require('./panel_harness.cjs');
 
 test('pending proxy operations remain visible and disable duplicate power requests', () => {
   const ui = { snap: { phase: { state: 'running', busy: true, port: 8787 }, config: { exists: true } } };
@@ -87,7 +88,8 @@ test('Settings shows applied values until restart, rather than pending file valu
   } } };
   const context = { ui, esc: String, block: (_, __, body) => body, ICON: { chevron: '' }, otherLogins: () => '' };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function configSettings()'), source.indexOf('const OTHER_LOGIN_PROVIDERS')), context);
+  scripts.load(context, 'settings_page.js');
+  context.otherLogins = () => '';
   const html = context.configSettings();
   assert.match(html, /id="config-listen_port"[^>]*value="8787"/);
   assert.match(html, /id="config-request_timeout_seconds"[^>]*value="30"/);
