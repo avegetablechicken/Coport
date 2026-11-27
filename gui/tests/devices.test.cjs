@@ -33,8 +33,6 @@ async function seedTraffic(h, { local = {}, forwarded = {} }) {
   h.seeding = null;
   h.clock = () => Date.now();
 }
-const start = source.indexOf('function deviceCapabilities(device) {');
-const code = source.slice(start, source.indexOf('// ---------------------------------------------------------------- settings', start));
 function harness(invoke) {
   const ui = { page: 'devices', snap: { phase: { state: 'running', port: 8787 }, settings: {} } };
   const fields = {}, listeners = {};
@@ -61,7 +59,11 @@ function harness(invoke) {
   vm.runInContext(source.slice(source.indexOf('async function assignTraffic('), source.indexOf('\nfunction renderActivityTraffic(')), context);
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
-  vm.runInContext(code, context);
+  scripts.load(context, 'devices_page.js');
+  // The real ones, for the tests of them; the rest of the page sees stubs.
+  context.real = { mergedDataBlock: context.mergedDataBlock, deviceTrafficContent: context.deviceTrafficContent };
+  context.mergedDataBlock = () => '';
+  context.installDevicesPage();
   vm.runInContext(source.slice(source.indexOf('async function refreshLaunchAtLogin('), source.indexOf('let refreshTimer;')), context);
   context.fields = fields; context.listeners = listeners;
   vm.runInContext(source.slice(source.indexOf('async function act('), source.indexOf('// Any scroll or input')), context);
@@ -160,8 +162,8 @@ test('Settings includes one Devices block without a separate forwarding block', 
 test('each device renders full Traffic metrics and an offline peer leaves other devices visible', async () => {
   const h = harness(async () => []);
   Object.assign(h, { chart: () => '<svg class="chart"></svg>', stat: (name, value) => `${name}:${value};`, fmtMs: v => `${v} ms`, fmtBytes: v => `${v} B`, modelTokenStats: t => `Input Tokens:${t.inputTokens};Hit Rate:${t.cacheHitRate};`, trafficShare: () => '<div class="traffic-share">Account usage</div>', serviceMark: () => '', message: (kind, value) => value, ICON: { chevron: '' } });
-  const start = source.indexOf('function deviceTrafficContent(');
-  vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
+  h.deviceTrafficContent = h.real.deviceTrafficContent;
+  h.installDevicesPage();
   const traffic = { requests: 5, errors: 1, errorRate: 0.2, avgMs: 200, bytes: 1234, outputTps: 50, inputTokens: 100, cacheHitRate: 0.3, credentials: [] };
   h.deviceList.devices = [{ id: 'online', name: 'Online', ssh: { host: 'online' }, data: { transport: 'ssh' } }, { id: 'offline', name: 'Offline', ssh: { host: 'offline' }, data: { transport: 'ssh' } }];
   await seedTraffic(h, { local: { '30:model': { ...traffic, start: 0, end: 1800000, bucketMinutes: 1 } } });
@@ -198,7 +200,8 @@ test('Devices button is visible only with configured peers and the redundant Dev
   context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
   context.ui.snap.settings.deviceCount = 1; context.renderTop(); assert.match(html, /data-page="devices"/);
   context.deviceList.loaded = true; context.deviceList.devices = []; context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
-  const devices = source.slice(source.indexOf('function devicesPage()'), source.indexOf('function deviceSettings()'));
+  const page = fs.readFileSync(require('node:path').join(__dirname, '../ui/devices_page.js'), 'utf8');
+  const devices = page.slice(page.indexOf('function devicesPage()'), page.indexOf('function deviceSettings()'));
   assert.doesNotMatch(devices, /block\("Devices"/);
 });
 
@@ -216,8 +219,8 @@ test('upstream account disclosures retain per-device expansion and place rings b
   const h = harness(async () => []);
   const events = {};
   Object.assign(h, { trafficReview: () => '', chart: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
-  const start = source.indexOf('function deviceTrafficContent(');
-  vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
+  h.deviceTrafficContent = h.real.deviceTrafficContent;
+  h.installDevicesPage();
   const traffic = { requests: 2, errors: 0, credentials: [
     { credential: 'suzhi2333@gmail.com', service: 'Claude', requests: 1, errors: 0 },
     { credential: 'work', service: 'Claude', requests: 1, errors: 0 },
@@ -407,7 +410,7 @@ function devicesHarness(invoke) {
   const h = harness(invoke);
   h.Channel = class {};
   h.deviceList.loadMerged = h.loadMerged;
-  vm.runInContext(source.slice(source.indexOf('function mergedDataBlock('), source.indexOf('function deviceCapabilities(device) {')), h);
+  h.mergedDataBlock = h.real.mergedDataBlock;
   h.trafficControls = () => '';
   h.deviceTrafficContent = (traffic, scope, key) => `${key}:${scope}:${traffic.requests}`;
   h.deviceList.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];

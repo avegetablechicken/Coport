@@ -431,8 +431,9 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   const mixed = { ...failed, errors: 15, errorRate: 15 / 16, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
   assert.ok(full(context.accountRow(mixed, 'model', mixed)));
   // Activity and Devices account rows both go through it.
-  for (const [from, to] of [['function renderActivityTraffic(', '\nconst SEARCH_MODES'], ['function deviceTrafficContent(', '\ndocument.addEventListener("toggle"']]) {
-    const body = source.slice(source.indexOf(from), source.indexOf(to));
+  const devicesPage = fs.readFileSync(path.join(__dirname, '../ui/devices_page.js'), 'utf8');
+  for (const [text, from, to] of [[source, 'function renderActivityTraffic(', '\nconst SEARCH_MODES'], [devicesPage, 'function deviceTrafficContent(', '\nfunction mergedDataBlock(']]) {
+    const body = text.slice(text.indexOf(from), text.indexOf(to));
     assert.match(body, /accountRow\(c, scope, /);
     assert.doesNotMatch(body, /chart\(c,|Avg\. Time|traffic-identity/);
   }
@@ -604,7 +605,7 @@ test('device traffic exposes renamed local sources with assignment choices', () 
   });
   loadSharedViews(context);
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('function deviceTrafficContent('), source.indexOf('document.addEventListener("toggle"')), context);
+  scripts.load(context, 'devices_page.js');
   const traffic = { requests: 2, errors: 0, credentials: [{ service: 'Claude', credential: 'myServer', requests: 2,
     sources: [{ name: 'api', base: 'https://example.invalid', reason: 'renamed', requests: 2 }] }],
     targets: [{ service: 'Claude', name: 'myServer', label: 'myServer', base: 'https://example.invalid' }] };
