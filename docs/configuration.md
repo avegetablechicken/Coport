@@ -556,6 +556,10 @@ timeouts. Codex provider metadata and account credential files refresh per reque
 Environment-backed credentials use process variables first. On macOS/Linux, an
 absent variable is read from the user's login/interactive zsh, bash or sh, with a
 3-second timeout and no logged values. Windows uses process variables only.
+Shell lookup results, including missing variables, are cached for 30 seconds;
+changes in shell startup files are picked up after that cache expires without
+restarting. Exporting a variable in a different terminal does not change an
+already-running daemon's inherited process environment.
 Shell startup must not require terminal interaction. Saved Codex account matches
 do not launch a shell to resolve unrelated API Key providers.
 
@@ -565,7 +569,12 @@ target/release/coport --config config.yaml
 ```
 
 `--check` validates configuration and enabled credential sources, not network
-reachability. Stop with Ctrl-C, SIGTERM or, on Windows, Ctrl-Break.
+reachability. `--check-config` validates startup configuration without requiring
+App credentials. Startup and Restart use this configuration-only validation:
+missing saved logins or API keys do not prevent the daemon from running. They
+are reported by credential diagnostics and when a request needs them. An enabled
+external data API still requires its own access key and TLS configuration.
+Stop with Ctrl-C, SIGTERM or, on Windows, Ctrl-Break.
 
 ## Command-line configuration overrides
 

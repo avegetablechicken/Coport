@@ -61,7 +61,7 @@ The background process that runs the proxy for the desktop app on this computer.
 _Avoid_: backend, service, helper
 
 **Restart**:
-Replacing the running **Daemon** with a new one. The new configuration and credentials are checked before the old one stops. Unless forced, the Restart waits for the old one's requests in flight. If the new one does not become healthy, the previous program runs again. One Restart runs at a time; another started meanwhile joins it.
+Replacing the running **Daemon** with a new one. The new startup configuration is checked before the old one stops; missing **App** credentials do not block startup or Restart, since they are resolved while serving requests. Unless forced, the Restart waits for the old one's requests in flight. If the new one does not become healthy, the previous program runs again. One Restart runs at a time; another started meanwhile joins it.
 _Avoid_: reload, relaunch
 
 ### Devices

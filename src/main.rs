@@ -22,6 +22,9 @@ struct Args {
     log_file: Option<String>,
     #[arg(long)]
     check: bool,
+    /// Validate startup configuration without requiring App credentials.
+    #[arg(long, conflicts_with = "check")]
+    check_config: bool,
     #[arg(long, hide = true)]
     print_listen_port: bool,
     /// Replace the proxy-port CA with one covering every credential-routed
@@ -70,12 +73,16 @@ async fn run(args: Args) -> Result<()> {
         println!("{}", config.listen_port);
         return Ok(());
     }
-    if args.check {
+    if args.check || args.check_config {
         config.check_external_data()?;
-        config.check_credentials().await?;
-        println!(
-            "Configuration, credential and route are valid. Proxy reachability was not tested."
-        );
+        if args.check {
+            config.check_credentials().await?;
+            println!(
+                "Configuration, credential and route are valid. Proxy reachability was not tested."
+            );
+        } else {
+            println!("Startup configuration is valid. App credentials were not checked.");
+        }
         return Ok(());
     }
     let tls_dir = coport::local_tls::dir_for(&std::path::absolute(&path).unwrap_or(path.clone()));
@@ -185,6 +192,25 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn startup_check_allows_missing_credentials_but_rejects_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let args = || {
+            Args::try_parse_from([
+                "coport",
+                "--config",
+                config.to_str().unwrap(),
+                "--check-config",
+            ])
+            .unwrap()
+        };
+        std::fs::write(&config, "listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\ngrok:\n  homes: []\n  routing:\n    api_key:\n      COPORT_TEST_ABSENT_STARTUP_KEY: none\n").unwrap();
+        run(args()).await.unwrap();
+        std::fs::write(&config, "listen_port: [").unwrap();
+        assert!(run(args()).await.is_err());
+    }
+
     #[test]
     fn service_options_belong_to_service_command() {
         let args = Args::try_parse_from([

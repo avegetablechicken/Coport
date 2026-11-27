@@ -205,7 +205,7 @@ impl<P: Platform> Lifecycle<P> {
             )));
         }
         let config = fs::read(launch.config)?;
-        check(launch.config, running.is_some())?;
+        check(launch.config)?;
         let Some((client, before)) = running else {
             let (client, status) = self.spawn(launch)?;
             return Ok(Restarted {
@@ -428,34 +428,12 @@ impl<P: Platform> Lifecycle<P> {
     }
 }
 
-/// The configuration at `path` can run; with `credentials`, its saved
-/// logins and keys are usable too, as a running Daemon's are.
-fn check(path: &Path, credentials: bool) -> io::Result<()> {
-    let config = coport::config::Config::read(path)
-        .and_then(|config| config.check_external_data().map(|()| config))
-        .map_err(|error| io::Error::other(error.message.to_string()))?;
-    if !credentials {
-        return Ok(());
-    }
-    // The caller may be on a runtime thread already; check on a thread of
-    // its own.
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(config.check_credentials())
-                    .map_err(|error| {
-                        io::Error::other(format!(
-                            "{}; the running proxy daemon was not stopped.",
-                            error.message
-                        ))
-                    })
-            })
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("The credential check failed.")))
-    })
+/// Validate startup configuration. App credentials are resolved while serving
+/// requests and missing logins or keys must not prevent a start or Restart.
+fn check(path: &Path) -> io::Result<()> {
+    coport::config::Config::read(path)
+        .and_then(|config| config.check_external_data())
+        .map_err(|error| io::Error::other(error.message.to_string()))
 }
 
 /// Whether the proxy port accepts connections. Not `/health`: a Daemon
@@ -626,6 +604,21 @@ mod tests {
             assert!(daemon.stopped());
             assert!(started.elapsed() < Duration::from_secs(5));
         }
+    }
+
+    #[test]
+    fn missing_credentials_do_not_block_restart() {
+        let _guard = daemon::spawn_guard();
+        let daemon = Daemon::serving(Some(0));
+        let config = daemon.dir.path().join("config.yaml");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("grok:\n  homes: []\n  routing:\n    api_key:\n      COPORT_TEST_ABSENT_RESTART_KEY: none\n");
+        std::fs::write(&config, contents).unwrap();
+        let (result, heard) = daemon.restart(Fake::default(), Wait::Force);
+        // The fake daemon rejects Stop; reaching it proves preflight passed.
+        assert!(message(result).contains("Cannot stop proxy daemon"));
+        assert_eq!(heard, [Progress::Stopping]);
+        assert!(daemon.stopped());
     }
 
     #[test]
