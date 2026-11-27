@@ -1008,9 +1008,14 @@ test('cached statistics retain success without hiding a later failure', () => {
 
 test('Devices Refresh performs only one explicitly authorized statistics read', async () => {
   const calls = [];
+  // Asserted here, not in invoke: the panel catches what invoke throws.
+  const networking = () => {
+    for (const [command] of calls) {
+      assert.ok(['get_devices', 'get_device_forwarders', 'get_device_capabilities', 'get_merged_data', 'get_traffic'].includes(command), `Unexpected networking command: ${command}`);
+    }
+  };
   const h = harness(async (command, args) => {
     calls.push([command, args]);
-    assert.ok(['get_devices', 'get_device_forwarders', 'get_device_capabilities', 'get_merged_data'].includes(command), `Unexpected networking command: ${command}`);
     return [];
   });
   h.Channel = class {};
@@ -1021,13 +1026,16 @@ test('Devices Refresh performs only one explicitly authorized statistics read', 
   h.deviceList.loadMerged = h.loadMerged;
   h.deviceList.startupRefreshDone = true;
   await h.action('merged-refresh');
+  networking();
   const reads = calls.filter(([command]) => command === 'get_merged_data');
   assert.equal(reads.length, 1, 'Refresh must not wait for a redundant local full-history merge');
   assert.equal(reads[0][1].refreshRemote, true);
   assert.equal(h.deviceList.error, '');
   calls.length = 0;
   for (let i = 0; i < 3; i++) await h.deviceList.load();
-  assert.ok(calls.filter(([command]) => command === 'get_merged_data').every(([,args]) => args.refreshRemote === false));
+  networking();
+  const later = calls.filter(([command]) => command === 'get_merged_data');
+  assert.ok(later.length > 0 && later.every(([,args]) => args.refreshRemote === false));
 });
 
 
