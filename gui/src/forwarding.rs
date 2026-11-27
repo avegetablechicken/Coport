@@ -77,11 +77,13 @@ impl Forwarding {
             .collect())
     }
 
-    /// The daemon's checks of the SSH Devices among `devices`; none without
-    /// a daemon.
-    pub async fn checks(&self, devices: &[Device]) -> Result<Vec<Checked>, String> {
+    /// The daemon's checks of the SSH Devices in `store`'s list; none
+    /// without a daemon. The daemon is told the list as it is now: one read
+    /// before a save or removal would bring back what it changed.
+    pub async fn checks(&self, store: &impl DeviceStore) -> Result<Vec<Checked>, String> {
+        let _operation = self.operations.lock().await;
         match self.daemon().await? {
-            Some((client, status)) => checks(&client, &status, devices, false)
+            Some((client, status)) => checks(&client, &status, &store.devices(), false)
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(Vec::new()),
@@ -366,7 +368,7 @@ mod tests {
         };
         let forwarding = Forwarding::new(dir.path().to_owned());
         forwarding.remove(&store, "peer").await.unwrap();
-        forwarding.checks(&store.devices()).await.unwrap();
+        forwarding.checks(&store).await.unwrap();
         assert_eq!(
             requests(&events),
             [

@@ -585,8 +585,7 @@ pub async fn set_forwarding_restore(state: State<'_, AppState>, enabled: bool) -
 pub async fn get_device_capabilities(
     state: State<'_, AppState>,
 ) -> Result<Vec<coport_gui::device_capabilities::Status>> {
-    let devices = state.core.lock().unwrap().settings.managed_devices.clone();
-    state.forwarding.checks(&devices).await
+    state.forwarding.checks(&*state).await
 }
 #[tauri::command]
 pub async fn set_device_forwarding(
