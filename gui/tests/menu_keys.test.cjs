@@ -42,7 +42,7 @@ function panel({ navigating = true } = {}) {
     IS_MAC: true,
     ui: { page: "main", menuBarNavigation: navigating },
     deviceList: { loaded: false },
-    hideRouteTooltip() {},
+    routeTooltip: { hide() {}, refresh() {} },
     menus: {
       open: null, current() { return this.open; }, close() {}, items: () => [],
       showSelect: (trigger, last) => opened.push([trigger.name, last]),

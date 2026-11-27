@@ -558,7 +558,8 @@ test('hovering across bars updates the tooltip and leaving hides it', () => {
     window: { addEventListener() {} },
   };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('let routeTooltipTimer;'), source.indexOf('\nfunction routingBlock(')), context);
+  scripts.load(context, 'route_tooltip.js');
+  context.createRouteTooltip({ document: context.document, window: context.window }).install();
   const bar = text => {
     const owner = {
       dataset: { tip: text }, isConnected: true,

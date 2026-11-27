@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
+const scripts = require('./panel_harness.cjs');
 
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 
@@ -79,9 +80,11 @@ function panel(page = 'main', script = source) {
     MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },
   };
   vm.createContext(context);
-  vm.runInContext(between('let routeTooltipTimer;', 'function routingBlock('), context);
+  scripts.load(context, 'route_tooltip.js');
+  context.routeTooltip = context.createRouteTooltip({ document: doc, window: context.window });
+  context.routeTooltip.install();
   vm.runInContext(between('function renderPage() {', '// ---------------------------------------------------------------- main'), context);
-  vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(refreshRouteTooltip)'), context);
+  vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(() => routeTooltip.refresh())'), context);
   assert.equal(typeof observer, 'function', 'content observer is registered');
   content.innerHTML = '';
   const redraw = () => { context.renderPage(); while (microtasks.length) microtasks.shift()(); observer(); };
