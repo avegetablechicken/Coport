@@ -56,7 +56,7 @@ function harness(invoke) {
   context.menus = { current: () => null, holdRender: () => false, close() {} };
   // Shared traffic views, markup and merging, as every page uses them.
   scripts.load(context, 'traffic_render.js');
-  vm.runInContext(source.slice(source.indexOf('async function assignTraffic('), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  scripts.load(context, 'activity_page.js');
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   scripts.load(context, 'devices_page.js');
@@ -328,7 +328,7 @@ test('statistics query events display local aliases, transport and failure/recov
   const deviceList = { devices: [{ id: 'device-id', name: 'MS' }] };
   const context = { ui, deviceList, esc: value => String(value).replace(/</g, '&lt;'), fmtTime: () => '12:00', fmtBytes: String, fmtMs: value => `${value} ms`, statusClass: () => '' };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function requestRow('), source.indexOf('function detail(')), context);
+  scripts.load(context, 'activity_page.js');
   const entry = { event: 'device_statistics_succeeded', time: 1, durationMs: 42, fields: { device_id: 'device-id', transport: 'ssh', query_count: 3 } };
   let html = context.requestRow(entry, true);
   assert.match(html, /Statistics query · MS/); assert.match(html, /SSH/);
@@ -621,11 +621,9 @@ test('home highlights remote mode and collapses inactive local configuration', (
 });
 
 test('Activity says forwarded requests are logged on the destination', () => {
-  const start = source.indexOf('function renderActivityForwarding(');
-  const end = source.indexOf('function activityShell(', start);
   const el = { hidden: true, innerHTML: '', dataset: {} };
   const context = { ui: { snap: { forwarding: { name: 'MS', deviceId: 'ms' } } }, esc: v => v, $: id => id === 'activity-forwarding' ? el : null };
-  vm.createContext(context); vm.runInContext(source.slice(start, end), context);
+  vm.createContext(context); scripts.load(context, 'activity_page.js');
   context.renderActivityForwarding();
   assert.equal(el.hidden, false);
   // A page change turns this notice into the destination's Devices card.

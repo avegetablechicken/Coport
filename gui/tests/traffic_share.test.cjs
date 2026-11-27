@@ -10,7 +10,7 @@ function setup(scope = 'model') {
   const context = { ui: {}, deviceList: { loading: false }, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
   scripts.load(context, 'traffic_render.js');
-  vm.runInContext(source.slice(source.indexOf('async function assignTraffic('), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  scripts.load(context, 'activity_page.js');
   return context;
 }
 // Arrays built inside the VM context have another realm's prototype.
@@ -76,7 +76,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
     fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, panelMotion: { queueFit() {} }, scrollToLog() {},
   });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
+  scripts.load(context, 'activity_page.js');
   context.renderActivityTraffic();
   assert.match(el.innerHTML, /<strong>su\*\*\*3@gmail\.com<\/strong>/);
   assert.doesNotMatch(el.innerHTML, /suzhi2333@gmail\.com/);
@@ -432,7 +432,8 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   assert.ok(full(context.accountRow(mixed, 'model', mixed)));
   // Activity and Devices account rows both go through it.
   const devicesPage = fs.readFileSync(path.join(__dirname, '../ui/devices_page.js'), 'utf8');
-  for (const [text, from, to] of [[source, 'function renderActivityTraffic(', '\nconst SEARCH_MODES'], [devicesPage, 'function deviceTrafficContent(', '\nfunction mergedDataBlock(']]) {
+  const activityPage = fs.readFileSync(path.join(__dirname, '../ui/activity_page.js'), 'utf8');
+  for (const [text, from, to] of [[activityPage, 'function renderActivityTraffic(', '\nconst SEARCH_MODES'], [devicesPage, 'function deviceTrafficContent(', '\nfunction mergedDataBlock(']]) {
     const body = text.slice(text.indexOf(from), text.indexOf(to));
     assert.match(body, /accountRow\(c, scope, /);
     assert.doesNotMatch(body, /chart\(c,|Avg\. Time|traffic-identity/);
