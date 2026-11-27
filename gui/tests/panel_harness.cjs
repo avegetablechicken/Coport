@@ -21,6 +21,7 @@ function sandbox(globals = {}) {
 }
 
 const loaded = new WeakMap();
+const newlines = new WeakMap();
 
 /// Runs `names` in `context`, in the order index.html loads them. A script
 /// already loaded there is not run again, as the WebView runs each once.
@@ -29,7 +30,9 @@ function load(context, ...names) {
   for (const name of names) assert(order.includes(name), `${name} is not a panel script`);
   const done = loaded.get(context) ?? loaded.set(context, new Set()).get(context);
   for (const name of order.filter((n) => names.includes(n) && !done.has(n))) {
-    vm.runInContext(fs.readFileSync(path.join(UI, name), 'utf8'), context, { filename: name });
+    const text = fs.readFileSync(path.join(UI, name), 'utf8');
+    const newline = newlines.get(context);
+    vm.runInContext(newline ? text.replace(/\r?\n/g, newline) : text, context, { filename: name });
     done.add(name);
   }
   return context;
@@ -69,9 +72,11 @@ function element(id) {
 /// - `document`, `window` and `globals` replace the fakes they name.
 /// - `before(context)` runs after the modules load and before app.js, where
 ///   a test can stand in for a factory app.js calls.
+/// - `newline` loads the scripts with that line ending, as a checkout of
+///   another platform has them.
 /// Listeners, Tauri events, observers and timers are kept, not run: tests
 /// call them as the WebView would.
-function panel({ invoke = () => new Promise(() => {}), elements = {}, document, window, globals = {}, before } = {}) {
+function panel({ invoke = () => new Promise(() => {}), elements = {}, document, window, globals = {}, before, newline } = {}) {
   const listeners = {};
   const windowListeners = {};
   const events = {};
@@ -116,6 +121,7 @@ function panel({ invoke = () => new Promise(() => {}), elements = {}, document, 
     queueMicrotask: (fn) => Promise.resolve().then(fn),
     ...globals,
   });
+  if (newline) newlines.set(context, newline);
   load(context, ...scripts().filter((name) => name !== 'app.js'));
   before?.(context);
   load(context, 'app.js');

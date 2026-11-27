@@ -5,27 +5,25 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const scripts = require('./panel_harness.cjs');
 
-const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 
 // Run the real renderPage and content observer: refreshing replaces the
 // hovered/focused node, as innerHTML does in the panel's WebView.
-function panel(page = 'main', script = source) {
-  const between = (start, end) => {
-    const from = script.indexOf(start);
-    const to = script.indexOf(end, from);
-    assert.ok(from >= 0 && to > from, `source section: ${start} … ${end}`);
-    return script.slice(from, to);
-  };
-  const events = {}, windowEvents = {}, timers = new Map(), microtasks = [];
-  let timerId = 0, observer, owners = [], hit = 0;
+function panel(page = 'main', newline) {
+  // Every listener of a type runs, in the order the panel added them.
+  const handlers = {}, windowHandlers = {};
+  const dispatch = (to) => new Proxy({}, { get: (_, type) => (event) => { for (const fn of to[type] || []) fn(event); } });
+  const events = dispatch(handlers), windowEvents = dispatch(windowHandlers);
+  const timers = new Map(), microtasks = [];
+  let timerId = 0, owners = [], hit = 0;
   let rows = [{ key: 'account-a', tip: '50.0 tok/s' }];
   const body = { matches: () => false };
   const tip = { hidden: true, style: {}, contains: node => node === tip, getBoundingClientRect: () => ({ width: 180, height: 40 }) };
   const doc = {
-    activeElement: body,
-    documentElement: { clientWidth: 480, clientHeight: 640 },
-    addEventListener(type, fn) { events[type] = fn; },
+    body, activeElement: body, hidden: false,
+    documentElement: { clientWidth: 480, clientHeight: 640, classList: { add() {} } },
+    addEventListener(type, fn) { (handlers[type] ||= []).push(fn); },
     elementFromPoint: () => hit === -2 ? tip : owners[hit] ?? null,
+    getElementById: id => id === 'route-tooltip' ? tip : content,
   };
   const owner = row => {
     const attrs = row.kind === 'title' || row.title ? { title: row.title ?? row.tip } : {};
@@ -36,7 +34,7 @@ function panel(page = 'main', script = source) {
     isConnected: true, keyboard: false, children: [],
     matches(selector) { return selector === ':focus-visible' ? this.keyboard : selector === ':hover' ? owners[hit] === this : selector.includes('.chart-bar') && row.kind === 'bar'; },
     contains(target) { return target === this; },
-    closest() { return this; },
+    closest() { return null; },
     getBoundingClientRect: () => ({ left: 100, top: 120, bottom: 132, width: 12, height: 12 }),
     getAttribute: name => attrs[name] ?? null,
     hasAttribute: name => name in attrs,
@@ -53,6 +51,7 @@ function panel(page = 'main', script = source) {
   };
   const content = {
     firstElementChild: {},
+    addEventListener() {},
     querySelectorAll: selector => selector.includes('[data-tip]') ? owners : [],
     contains: node => owners.includes(node),
     set innerHTML(_) {
@@ -67,25 +66,24 @@ function panel(page = 'main', script = source) {
       this.firstElementChild = {};
     },
   };
-  const context = {
-    ui: { page, builtPage: page }, document: doc,
-    $: id => id === 'route-tooltip' ? tip : content,
-    window: { addEventListener(type, fn) { windowEvents[type] = fn; } },
-    setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
-    clearTimeout(id) { timers.delete(id); },
-    queueMicrotask(fn) { microtasks.push(fn); },
-    menus: { current: () => null, holdRender: () => false, close() {} }, main: () => '', devicesPage: () => '', settings: () => '',
-    renderActivityForwarding() {}, renderActivityList() {},
-    panelMotion: { watchPage() {} },
-    MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },
-  };
-  vm.createContext(context);
-  scripts.load(context, 'route_tooltip.js');
-  context.routeTooltip = context.createRouteTooltip({ document: doc, window: context.window });
-  context.routeTooltip.install();
-  vm.runInContext(between('function renderPage() {', 'installHomePage();'), context);
-  vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(() => routeTooltip.refresh())'), context);
-  assert.equal(typeof observer, 'function', 'content observer is registered');
+  const p = scripts.panel({
+    document: doc, newline,
+    window: { innerWidth: 480, innerHeight: 640, addEventListener(type, fn) { (windowHandlers[type] ||= []).push(fn); } },
+    globals: {
+      setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
+      clearTimeout(id) { timers.delete(id); },
+      queueMicrotask(fn) { microtasks.push(fn); },
+    },
+  });
+  const { context } = p;
+  // The panel's own ui, so a test can change the page it shows.
+  context.ui = Object.assign(p.get('ui'), { page, builtPage: page });
+  // The pages themselves draw nothing here; the rows below stand for them.
+  Object.assign(context, { main: () => '', devicesPage: () => '', settings: () => '', renderActivityForwarding() {}, renderActivityList() {} });
+  // The content observer: the one that also follows title and tip changes.
+  const watcher = p.observers.find(o => o.target === content && o.options?.characterData);
+  assert.ok(watcher, 'content observer is registered');
+  const observer = () => watcher.fn([]);
   content.innerHTML = '';
   const redraw = () => { context.renderPage(); while (microtasks.length) microtasks.shift()(); observer(); };
   const hover = () => events.pointerover({ target: owners[hit], clientX: 106, clientY: 126 });
@@ -100,7 +98,7 @@ function panel(page = 'main', script = source) {
 for (const [format, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
   for (const page of ['main', 'devices', 'activity']) {
     test(`${format} ${page}: the content observer updates a tooltip after repeated refreshes`, () => {
-      const p = panel(page, source.replace(/\r?\n/g, newline));
+      const p = panel(page, newline);
       p.hover(); p.flush();
       for (let i = 0; i < 3; i++) {
         p.rows([{ key: 'account-a', tip: `${60 + i}.0 tok/s` }]);
