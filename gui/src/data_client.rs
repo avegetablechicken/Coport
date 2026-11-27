@@ -3,13 +3,12 @@
 #[cfg(test)]
 use crate::data_api::canonical;
 use crate::data_api::{Group, Service, Stats, Summary};
+use coport::config::Config;
 #[cfg(test)]
 use coport::external_access::DataKey;
-use coport::{config::Config, external_access::DataConfig};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
     path::PathBuf,
     time::Duration,
 };
@@ -49,161 +48,84 @@ pub struct Source {
     #[serde(default, skip_serializing)]
     pub ssh_device: Option<String>,
 }
-impl Source {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.name.trim().is_empty()
-            || self.name.len() > 128
-            || self.name.chars().any(char::is_control)
-        {
-            return Err("Provide a data source name (up to 128 bytes).".into());
-        }
-        if self.transport == Transport::Ssh {
-            return self
-                .ssh_connection
-                .as_ref()
-                .ok_or_else(|| "Configure the SSH data connection.".to_owned())?
-                .validate();
-        }
-        if self.url.len() > 2048 {
-            return Err("Data source URL is too long.".into());
-        }
-        let url = reqwest::Url::parse(&self.url).map_err(|_| "Invalid data source URL")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !matches!(url.path(), "" | "/")
-        {
-            return Err("Use an HTTP(S) origin without credentials, path or query.".into());
-        }
-        self.credentials().validate(0).map_err(|e| e.to_string())?;
-        if self
-            .ca_certificate
-            .as_ref()
-            .is_some_and(|path| !coport::config::expand(path).is_absolute())
-        {
-            return Err("CA certificate path must be absolute.".into());
-        }
-        Ok(())
-    }
-    fn credentials(&self) -> DataConfig {
-        DataConfig {
-            port: 1,
-            token_env: self.token_env.clone(),
-            token_file: self.token_file.clone(),
-            trusted_lan: vec!["10.0.0.0/8".parse().unwrap()],
-            tls: None,
-        }
-    }
+mod http;
+
+/// A requested range and category of a Summary.
+pub(crate) type Selection = (u64, crate::traffic::TrafficScope);
+
+/// How Summaries are read from Devices: over each Source's own transport, or
+/// in tests from a script.
+#[derive(Clone, Default)]
+pub(crate) enum Summaries {
+    #[default]
+    Network,
+    /// Each read's replies, in the order a Device would send them.
+    #[cfg(test)]
+    Scripted(std::sync::Arc<Script>),
 }
-async fn fetch(source: &Source) -> Result<Summary, String> {
-    fetch_selected(source, None).await
-}
-async fn fetch_selected(
-    source: &Source,
-    selection: Option<(u64, crate::traffic::TrafficScope)>,
-) -> Result<Summary, String> {
-    source.validate()?;
-    if source.transport == Transport::Ssh {
-        let summary = crate::remote::summary(
-            source
-                .ssh_connection
-                .as_ref()
-                .ok_or("Missing SSH data connection")?,
-        )
+#[cfg(test)]
+pub(crate) type Script = dyn Fn(&Source, Option<Selection>) -> tokio::sync::mpsc::UnboundedReceiver<Result<Summary, String>>
+    + Send
+    + Sync;
+
+impl Summaries {
+    /// Read `source`'s Summary. Without `selection`, `on_summary` gets the
+    /// complete one; with it, the selected range, then the complete one
+    /// unless that already was.
+    async fn read(
+        &self,
+        source: &Source,
+        selection: Option<Selection>,
+        mut on_summary: impl FnMut(Summary) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Network => {
+                source.validate()?;
+                if source.transport == Transport::Ssh {
+                    let device = source
+                        .ssh_connection
+                        .as_ref()
+                        .ok_or("Missing SSH data connection")?;
+                    return match selection {
+                        Some((minutes, scope)) => {
+                            crate::remote::summary_progressive(device, minutes, scope, on_summary)
+                                .await
+                        }
+                        None => {
+                            let summary = crate::remote::summary(device).await?;
+                            summary.validate()?;
+                            on_summary(summary)
+                        }
+                    };
+                }
+                let first = http::read(source, selection).await?;
+                let partial = selection.is_some() && first.schema_version == 4;
+                on_summary(first)?;
+                if partial {
+                    on_summary(http::read(source, None).await?)?;
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Scripted(script) => {
+                let mut replies = script(source, selection);
+                while let Some(reply) = replies.recv().await {
+                    on_summary(reply?)?;
+                }
+                Ok(())
+            }
+        }
+    }
+    /// `source`'s complete Summary.
+    async fn complete(&self, source: &Source) -> Result<Summary, String> {
+        let mut last = None;
+        self.read(source, None, |summary| {
+            last = Some(summary);
+            Ok(())
+        })
         .await?;
-        summary.validate()?;
-        return Ok(summary);
+        last.ok_or_else(|| "The device sent no summary.".into())
     }
-    let token = source
-        .credentials()
-        .load_token()
-        .map_err(|_| "Cannot load this data source's private access key")?;
-    let mut url = reqwest::Url::parse(&source.url).map_err(|_| "Invalid source URL")?;
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8));
-    if url.scheme() == "http" {
-        let host = url.host_str().ok_or("Missing data source host")?.to_owned();
-        let port = url.port_or_known_default().ok_or("Missing source port")?;
-        let addresses = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|_| "Cannot resolve LAN data source")?
-            .take(17)
-            .collect::<Vec<_>>();
-        if addresses.is_empty()
-            || addresses.len() > 16
-            || addresses.iter().any(|addr| !lan(addr.ip()))
-        {
-            return Err("HTTP data sources must resolve exclusively to private LAN or loopback addresses; use HTTPS for public sources.".into());
-        }
-        // Pin the validated resolution so a later DNS answer cannot redirect the key.
-        builder = builder.resolve_to_addrs(&host, &addresses);
-    }
-    if let Some(path) = &source.ca_certificate {
-        let bytes = coport::external_access::read_limited(
-            &coport::config::expand(path),
-            false,
-            1024 * 1024,
-        )
-        .map_err(|_| "Cannot read data source CA certificate")?;
-        let cert =
-            reqwest::Certificate::from_pem(&bytes).map_err(|_| "Invalid source CA certificate")?;
-        builder = builder.add_root_certificate(cert);
-    }
-    url.set_path("/v1/summary");
-    let client = builder.build().map_err(|_| "Cannot create data client")?;
-    let mut request = client
-        .get(url)
-        .bearer_auth(token)
-        .header(crate::data_api::SERVICES_HEADER, crate::data_api::SERVICES);
-    if let Some((minutes, scope)) = selection {
-        let scope = if scope == crate::traffic::TrafficScope::Model {
-            "model"
-        } else {
-            "all"
-        };
-        request = request.header("x-coport-window", format!("{minutes}:{scope}"));
-    }
-    let mut response = request
-        .send()
-        .await
-        .map_err(|_| "Data connection failed; check connectivity and HTTPS certificate")?;
-    if response.status() != reqwest::StatusCode::OK {
-        return Err(
-            "Data endpoint rejected the request; check its credentials and configuration.".into(),
-        );
-    }
-    if response
-        .headers()
-        .get("content-type")
-        .and_then(|h| h.to_str().ok())
-        .is_none_or(|h| !h.starts_with("application/json"))
-    {
-        return Err("Unexpected data response type.".into());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "Cannot read data summary")?
-    {
-        if chunk.len() > (1024usize * 1024).saturating_sub(bytes.len()) {
-            return Err("Data response exceeds size limit.".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let summary: Summary =
-        serde_json::from_slice(&bytes).map_err(|_| "Invalid processed summary schema")?;
-    summary.validate()?;
-    Ok(summary)
-}
-fn lan(ip: IpAddr) -> bool {
-    ip.is_loopback() || matches!(ip,IpAddr::V4(ip) if ip.is_private())
 }
 
 #[derive(Serialize)]
@@ -369,13 +291,14 @@ fn common_end(
 async fn fetch_sources(
     sources: Vec<Source>,
     log: &std::path::Path,
+    summaries: &Summaries,
 ) -> Result<Vec<(Source, Result<Summary, String>)>, String> {
     let mut tasks = tokio::task::JoinSet::new();
     for source in sources {
-        let log = log.to_owned();
+        let (log, summaries) = (log.to_owned(), summaries.clone());
         tasks.spawn(async move {
             let started = std::time::Instant::now();
-            let result = fetch(&source).await;
+            let result = summaries.complete(&source).await;
             crate::device_events::record(log, &source, result.is_ok(), started.elapsed()).await;
             (source, result)
         });
@@ -532,23 +455,34 @@ pub async fn forwarded_traffic(
         ),
     })
 }
-pub async fn merge(
+/// One range and category of every Source's Summary, read from `summaries`.
+#[cfg(test)]
+async fn merge(
     sources: Vec<Source>,
     device: ThisDevice,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
+    summaries: &Summaries,
 ) -> Result<Merged, String> {
     crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
     if sources.len() > crate::devices::LIMIT {
         return Err("At most 32 data sources are supported.".into());
     }
     let context = std::sync::Arc::new(prepare_merge(device).await?);
-    let (fetched, end) = align_sources(&context, sources, &[(minutes, scope)]).await?;
+    let (fetched, end) = align_sources(&context, sources, &[(minutes, scope)], summaries).await?;
     merge_fetched(&context, &fetched, minutes, scope, end)
 }
 
-pub async fn merge_views(sources: Vec<Source>, device: ThisDevice) -> Result<Vec<Merged>, String> {
-    MergeCache::default().views(sources, device, true).await
+/// Every range and category of every Source's Summary, read from `summaries`.
+#[cfg(test)]
+async fn merge_views(
+    sources: Vec<Source>,
+    device: ThisDevice,
+    summaries: Summaries,
+) -> Result<Vec<Merged>, String> {
+    MergeCache::reading(summaries)
+        .views(sources, device, true)
+        .await
 }
 
 fn cache_source_key(source: &Source) -> Result<Vec<u8>, String> {
@@ -562,6 +496,7 @@ fn cache_source_key(source: &Source) -> Result<Vec<u8>, String> {
 }
 #[derive(Default)]
 pub struct MergeCache {
+    summaries: Summaries,
     key: Vec<u8>,
     fetched: Option<(std::sync::Arc<Fetched>, i64)>,
     errors: BTreeMap<Vec<u8>, String>,
@@ -573,6 +508,14 @@ struct CachedState {
     keys: Vec<(String, Vec<u8>)>,
 }
 impl MergeCache {
+    /// A cache whose refreshes read Summaries from `summaries`.
+    #[cfg(test)]
+    pub(crate) fn reading(summaries: Summaries) -> Self {
+        Self {
+            summaries,
+            ..Self::default()
+        }
+    }
     pub async fn refresh_progressive(
         &mut self,
         sources: Vec<Source>,
@@ -581,8 +524,14 @@ impl MergeCache {
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
         let key = self.begin_refresh(&sources)?;
-        let result =
-            merge_progressive_snapshot(sources, device, selection.into(), on_update).await?;
+        let result = merge_progressive_snapshot(
+            sources,
+            device,
+            selection.into(),
+            on_update,
+            &self.summaries,
+        )
+        .await?;
         self.commit_refresh(&key, result)
     }
 
@@ -595,8 +544,12 @@ impl MergeCache {
         refresh: Refresh,
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
-        let key = cache.lock().await.begin_refresh(&sources)?;
-        let result = merge_progressive_snapshot(sources, device, refresh, on_update).await?;
+        let (key, summaries) = {
+            let mut cache = cache.lock().await;
+            (cache.begin_refresh(&sources)?, cache.summaries.clone())
+        };
+        let result =
+            merge_progressive_snapshot(sources, device, refresh, on_update, &summaries).await?;
         cache.lock().await.commit_refresh(&key, result)
     }
 
@@ -659,8 +612,13 @@ impl MergeCache {
         let mut full = None;
         if refresh_remote {
             let context = std::sync::Arc::new(prepare_merge(device.clone()).await?);
-            let (fetched, end) =
-                align_sources(&context, sources.clone(), &all_selections()).await?;
+            let (fetched, end) = align_sources(
+                &context,
+                sources.clone(),
+                &all_selections(),
+                &self.summaries,
+            )
+            .await?;
             self.fetched = Some((std::sync::Arc::new(fetched), end));
             self.errors.clear();
             full = Some(context);
@@ -797,20 +755,6 @@ async fn render_views(
     views.iter_mut().for_each(decorate);
     Ok(views)
 }
-/// Publish the selected view as peers respond, then fill the other cached views.
-pub async fn merge_progressive(
-    sources: Vec<Source>,
-    device: ThisDevice,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
-    on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
-) -> Result<Vec<Merged>, String> {
-    Ok(
-        merge_progressive_snapshot(sources, device, (minutes, scope).into(), on_update)
-            .await?
-            .views,
-    )
-}
 /// A refresh of one range/category first. Devices whose summary was just read
 /// elsewhere (the forwarded device, by the daemon's monitor) are not read again.
 pub struct Refresh {
@@ -839,6 +783,7 @@ async fn merge_progressive_snapshot(
     device: ThisDevice,
     refresh: Refresh,
     on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
+    summaries: &Summaries,
 ) -> Result<ProgressiveResult, String> {
     let Refresh {
         minutes,
@@ -869,39 +814,15 @@ async fn merge_progressive_snapshot(
             continue;
         }
         let tx = tx.clone();
-        let log = device.log.clone();
+        let (log, summaries) = (device.log.clone(), summaries.clone());
         tasks.spawn(async move {
             let started = std::time::Instant::now();
-            let result = async {
-                source.validate()?;
-                if source.transport == Transport::Ssh {
-                    crate::remote::summary_progressive(
-                        source
-                            .ssh_connection
-                            .as_ref()
-                            .ok_or("Missing SSH data connection")?,
-                        minutes,
-                        scope,
-                        |summary| {
-                            tx.send((index, Ok(summary)))
-                                .map_err(|_| "Data reader closed".into())
-                        },
-                    )
-                    .await
-                } else {
-                    let first = fetch_selected(&source, Some((minutes, scope))).await?;
-                    let partial = first.schema_version == 4;
-                    tx.send((index, Ok(first)))
-                        .map_err(|_| "Data reader closed")?;
-                    if partial {
-                        let rest = fetch(&source).await?;
-                        tx.send((index, Ok(rest)))
-                            .map_err(|_| "Data reader closed")?;
-                    }
-                    Ok(())
-                }
-            }
-            .await;
+            let result = summaries
+                .read(&source, Some((minutes, scope)), |summary| {
+                    tx.send((index, Ok(summary)))
+                        .map_err(|_| "Data reader closed".into())
+                })
+                .await;
             crate::device_events::record(log, &source, result.is_ok(), started.elapsed()).await;
             if let Err(error) = result {
                 let _ = tx.send((index, Err(error)));
@@ -966,7 +887,7 @@ async fn merge_progressive_snapshot(
     let mut complete_context = prepare_merge(context.device.clone()).await?;
     complete_context.at = context.at;
     let context = std::sync::Arc::new(complete_context);
-    let (fetched, end) = align_fetched(&context, fetched, &selections, false).await?;
+    let (fetched, end) = align_fetched(&context, fetched, &selections, None).await?;
     let mut views = merge_selections(&context, &fetched, &selections, end)?;
     for view in &mut views {
         for source in &mut view.sources {
@@ -1035,15 +956,18 @@ async fn align_sources(
     context: &MergeContext,
     sources: Vec<Source>,
     selections: &[(u64, crate::traffic::TrafficScope)],
+    summaries: &Summaries,
 ) -> Result<(Fetched, i64), String> {
-    let fetched = fetch_sources(sources, &context.device.log).await?;
-    align_fetched(context, fetched, selections, true).await
+    let fetched = fetch_sources(sources, &context.device.log, summaries).await?;
+    align_fetched(context, fetched, selections, Some(summaries)).await
 }
+/// The boundary every Summary in `fetched` can be merged at. Devices that
+/// disagree are read again from `refetch` up to twice, or without it marked.
 async fn align_fetched(
     context: &MergeContext,
     mut fetched: Fetched,
     selections: &[(u64, crate::traffic::TrafficScope)],
-    allow_refetch: bool,
+    refetch: Option<&Summaries>,
 ) -> Result<(Fetched, i64), String> {
     for attempt in 0..3 {
         let mut seen = BTreeSet::from([context.device.node_id.clone()]);
@@ -1079,9 +1003,9 @@ async fn align_fetched(
         // Progressive refresh already has all frames from the authorized connection.
         // A boundary mismatch must not launch another SSH connection behind the UI;
         // keep the devices that agree and report the others instead.
-        if !allow_refetch {
+        let Some(summaries) = refetch else {
             return Ok(align_partially(context, fetched, selections));
-        }
+        };
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
             // Only boundary skew is retried; failed sources (e.g. SSH denial or
@@ -1089,7 +1013,7 @@ async fn align_fetched(
             let (ok, mut failed): (Fetched, Fetched) =
                 fetched.into_iter().partition(|(_, result)| result.is_ok());
             let sources = ok.into_iter().map(|(s, _)| s).collect();
-            failed.extend(fetch_sources(sources, &context.device.log).await?);
+            failed.extend(fetch_sources(sources, &context.device.log, summaries).await?);
             failed.sort_by(|a, b| a.0.name.cmp(&b.0.name));
             fetched = failed;
         }
@@ -1355,77 +1279,58 @@ mod tests {
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     #[tokio::test]
     async fn selected_views_render_before_slow_peers_and_background_responses() {
-        if data_key_in_subprocess(
-            "data_client::tests::selected_views_render_before_slow_peers_and_background_responses",
-        ) {
-            return;
-        }
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let release_slow = std::sync::Arc::new(tokio::sync::Notify::new());
         let release_background = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-        let mut servers = Vec::new();
-        let mut sources = Vec::new();
-        for peer in 0..2 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let bytes = crate::data_api::publish(
-                &config,
-                &log,
-                &DataKey::new(KEY).unwrap(),
-                &uuid::Uuid::new_v4().to_string(),
-                &[],
-            )
-            .unwrap();
-            let mut selected: Summary = serde_json::from_slice(&bytes).unwrap();
-            selected.schema_version = 4;
-            selected.groups.clear();
-            selected
-                .windows
-                .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
-            selected
-                .previous_windows
-                .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
-            selected.validate().unwrap();
-            let selected = serde_json::to_vec(&selected).unwrap();
-            sources.push(Source {
-                name: format!("peer-{peer}"),
-                device_id: None,
-                transport: Transport::Http,
-                ssh_connection: None,
-                url: format!("http://{}", listener.local_addr().unwrap()),
-                token_env: Some(DATA_KEY_ENV.into()),
-                token_file: None,
-                ca_certificate: None,
-                ssh_device: None,
-            });
-            let slow = release_slow.clone();
-            let background = release_background.clone();
-            servers.push(tokio::spawn(async move {
-                for phase in 0..2 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.unwrap()); }
-                    let header = String::from_utf8(header).unwrap().to_lowercase();
-                    assert!(header.contains("x-coport-services: antigravity,grok"));
-                    let body = if phase == 0 {
-                        assert!(header.contains("x-coport-window: 1440:all"));
-                        if peer == 1 { slow.notified().await; }
-                        &selected
-                    } else {
-                        assert!(!header.contains("x-coport-window"));
-                        background.acquire().await.unwrap().forget();
-                        &bytes
-                    };
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                    socket.write_all(body).await.unwrap();
+        // Each Device sends the requested range, then the rest once released;
+        // the second one is slow to send even the first.
+        let replies: Vec<(Summary, Summary)> = (0..2)
+            .map(|_| {
+                let bytes = crate::data_api::publish(
+                    &config,
+                    &log,
+                    &DataKey::new(KEY).unwrap(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &[],
+                )
+                .unwrap();
+                let complete: Summary = serde_json::from_slice(&bytes).unwrap();
+                let mut selected = complete.clone();
+                selected.schema_version = 4;
+                selected.groups.clear();
+                selected
+                    .windows
+                    .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+                selected
+                    .previous_windows
+                    .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+                selected.validate().unwrap();
+                (selected, complete)
+            })
+            .collect();
+        let (slow, background) = (release_slow.clone(), release_background.clone());
+        let summaries = Summaries::Scripted(std::sync::Arc::new(move |source, selection| {
+            assert_eq!(selection, Some((1440, crate::traffic::TrafficScope::All)));
+            let peer = usize::from(source.name == "peer-1");
+            let (selected, complete) = replies[peer].clone();
+            let (slow, background) = (slow.clone(), background.clone());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                if peer == 1 {
+                    slow.notified().await;
                 }
-            }));
-        }
+                let _ = tx.send(Ok(selected));
+                background.acquire().await.unwrap().forget();
+                let _ = tx.send(Ok(complete));
+            });
+            rx
+        }));
+        let sources = vec![device_source("peer-0"), device_source("peer-1")];
         let updates = std::sync::Mutex::new(Vec::new());
-        let mut cache = MergeCache::default();
+        let mut cache = MergeCache::reading(summaries);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             cache.refresh_progressive(
@@ -1475,10 +1380,7 @@ mod tests {
                 .all(|view| view.sources.iter().all(|s| s.included))
         );
         assert_eq!(updates.lock().unwrap()[..2], [0, 1]);
-        for server in servers {
-            server.await.unwrap();
-        }
-        // Listeners are gone: cached page reads must retain successful snapshots.
+        // Cached page reads retain successful snapshots without reading again.
         let cached = cache
             .views(sources, this_device(config, log, BTreeMap::new()), false)
             .await
@@ -1493,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_views_never_connect_and_keep_sources_matched_after_renaming() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (summaries, reads) = scripted(|_, _, _| vec![Err("Data connection failed".into())]);
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("data.key");
         crate::settings::write_private(&key, KEY.as_bytes()).unwrap();
@@ -1503,7 +1405,7 @@ mod tests {
             device_id: Some(id.into()),
             transport: Transport::Http,
             ssh_connection: None,
-            url: format!("http://{}", listener.local_addr().unwrap()),
+            url: "http://127.0.0.1:1".into(),
             token_env: None,
             token_file: Some(key.to_string_lossy().into()),
             ca_certificate: None,
@@ -1515,7 +1417,7 @@ mod tests {
         }
         let log = dir.path().join("traffic.log");
         std::fs::write(&log, "").unwrap();
-        let mut cache = MergeCache::default();
+        let mut cache = MergeCache::reading(summaries);
         for _ in 0..3 {
             let views = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -1550,60 +1452,30 @@ mod tests {
         assert_eq!(views[0].sources[1].name, "Second");
         assert_eq!(views[0].sources[1].error.as_deref(), Some("error A"));
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err(),
-            "Reading cached views opened a network connection"
+            reads.lock().unwrap().is_empty(),
+            "Reading cached views read a Device"
         );
     }
     #[tokio::test]
     async fn progressive_alignment_mismatch_never_opens_another_connection() {
-        if data_key_in_subprocess(
-            "data_client::tests::progressive_alignment_mismatch_never_opens_another_connection",
-        ) {
-            return;
-        }
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls = count.clone();
         let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") {
-                    head.push(socket.read_u8().await.unwrap());
-                }
-                let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let end = now - (index % 2) as i64 * 60_000;
-                let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
-                summary.window_end = end;
-                summary.window_start = end - 30 * 60_000;
-                let body = serde_json::to_vec(&summary).unwrap();
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                socket.write_all(&body).await.unwrap();
-            }
+        // The two Devices answer a minute apart.
+        let turn = AtomicUsize::new(0);
+        let (summaries, reads) = scripted(move |_, _, _| {
+            let end = now - (turn.fetch_add(1, SeqCst) % 2) as i64 * 60_000;
+            let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+            summary.window_end = end;
+            summary.window_start = end - 30 * 60_000;
+            vec![Ok(summary)]
         });
-        let sources: Vec<Source> = (0..2)
-            .map(|i| Source {
-                name: format!("peer-{i}"),
-                device_id: None,
-                transport: Transport::Http,
-                ssh_connection: None,
-                url: url.clone(),
-                token_env: Some(DATA_KEY_ENV.into()),
-                token_file: None,
-                ca_certificate: None,
-                ssh_device: None,
-            })
-            .collect();
-        let mut cache = MergeCache::default();
+        let sources = vec![device_source("peer-0"), device_source("peer-1")];
+        let total = || reads.lock().unwrap().values().sum::<usize>();
+        let mut cache = MergeCache::reading(summaries);
         let views = cache
             .refresh_progressive(
                 sources.clone(),
@@ -1614,7 +1486,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            count.load(std::sync::atomic::Ordering::SeqCst),
+            total(),
             2,
             "One explicit refresh must contact each peer only once when boundaries disagree"
         );
@@ -1645,8 +1517,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        server.abort();
+        assert_eq!(total(), 2);
     }
 
     #[tokio::test]
@@ -1913,12 +1784,6 @@ mod tests {
 
     #[tokio::test]
     async fn local_archives_are_parsed_while_peers_answer() {
-        if data_key_in_subprocess(
-            "data_client::tests::local_archives_are_parsed_while_peers_answer",
-        ) {
-            return;
-        }
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (_dir, log, archive) = archived_traffic_fixture();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let peer_dir = tempfile::tempdir().unwrap();
@@ -1932,56 +1797,32 @@ mod tests {
             &[],
         )
         .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let complete: Summary = serde_json::from_slice(&bytes).unwrap();
+        let mut selected = complete.clone();
+        selected.schema_version = 4;
+        selected.groups.clear();
+        selected
+            .windows
+            .retain(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model);
+        selected
+            .previous_windows
+            .retain(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model);
+        // The Device holds its answer until released.
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let server = {
-            let release = release.clone();
+        let held = release.clone();
+        let summaries = Summaries::Scripted(std::sync::Arc::new(move |_, _| {
+            let (selected, complete, held) = (selected.clone(), complete.clone(), held.clone());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
-                let mut first = true;
-                loop {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        header.push(socket.read_u8().await.unwrap());
-                    }
-                    if std::mem::take(&mut first) {
-                        release.notified().await;
-                    }
-                    let mut summary: Summary = serde_json::from_slice(&bytes).unwrap();
-                    if String::from_utf8(header)
-                        .unwrap()
-                        .to_lowercase()
-                        .contains("x-coport-window: 30:model")
-                    {
-                        summary.schema_version = 4;
-                        summary.groups.clear();
-                        summary.windows.retain(|w| {
-                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
-                        });
-                        summary.previous_windows.retain(|w| {
-                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
-                        });
-                    }
-                    let body = serde_json::to_vec(&summary).unwrap();
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
-                }
-            })
-        };
-        let source = Source {
-            name: "peer".into(),
-            device_id: None,
-            transport: Transport::Http,
-            ssh_connection: None,
-            url,
-            token_env: Some(DATA_KEY_ENV.into()),
-            token_file: None,
-            ca_certificate: None,
-            ssh_device: None,
-        };
+                held.notified().await;
+                let _ = tx.send(Ok(selected));
+                let _ = tx.send(Ok(complete));
+            });
+            rx
+        }));
+        let source = device_source("peer");
         let refresh = tokio::spawn(async move {
-            MergeCache::default()
+            MergeCache::reading(summaries)
                 .refresh_progressive(
                     vec![source],
                     this_device(config, log, BTreeMap::new()),
@@ -2011,23 +1852,15 @@ mod tests {
             1,
             "The complete views reuse it"
         );
-        server.abort();
     }
 
     #[tokio::test]
     async fn cached_views_stay_readable_while_a_refresh_waits_for_peers() {
-        if data_key_in_subprocess(
-            "data_client::tests::cached_views_stay_readable_while_a_refresh_waits_for_peers",
-        ) {
-            return;
-        }
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bytes = crate::data_api::publish(
             &config,
             &log,
@@ -2036,52 +1869,40 @@ mod tests {
             &[],
         )
         .unwrap();
-        let source = Source {
-            name: "peer".into(),
-            device_id: None,
-            transport: Transport::Http,
-            ssh_connection: None,
-            url: format!("http://{}", listener.local_addr().unwrap()),
-            token_env: Some(DATA_KEY_ENV.into()),
-            token_file: None,
-            ca_certificate: None,
-            ssh_device: None,
-        };
+        let complete: Summary = serde_json::from_slice(&bytes).unwrap();
+        let mut selected = complete.clone();
+        selected.schema_version = 4;
+        selected.groups.clear();
+        selected
+            .windows
+            .retain(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model);
+        selected
+            .previous_windows
+            .retain(|w| w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model);
+        let source = device_source("peer");
+        // The first read holds its answer until released.
         let accepted = std::sync::Arc::new(AtomicUsize::new(0));
         let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let server = {
+        let summaries = {
             let (accepted, waiting, release) = (accepted.clone(), waiting.clone(), release.clone());
-            tokio::spawn(async move {
-                loop {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        header.push(socket.read_u8().await.unwrap());
-                    }
-                    if accepted.fetch_add(1, SeqCst) == 0 {
+            Summaries::Scripted(std::sync::Arc::new(move |_, _| {
+                let first = accepted.fetch_add(1, SeqCst) == 0;
+                let (selected, complete) = (selected.clone(), complete.clone());
+                let (waiting, release) = (waiting.clone(), release.clone());
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    if first {
                         waiting.notify_one();
                         release.notified().await;
                     }
-                    let mut summary: Summary = serde_json::from_slice(&bytes).unwrap();
-                    let header = String::from_utf8(header).unwrap().to_lowercase();
-                    if header.contains("x-coport-window: 30:model") {
-                        summary.schema_version = 4;
-                        summary.groups.clear();
-                        summary.windows.retain(|w| {
-                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
-                        });
-                        summary.previous_windows.retain(|w| {
-                            w.minutes == 30 && w.scope == crate::traffic::TrafficScope::Model
-                        });
-                    }
-                    let body = serde_json::to_vec(&summary).unwrap();
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
-                }
-            })
+                    let _ = tx.send(Ok(selected));
+                    let _ = tx.send(Ok(complete));
+                });
+                rx
+            }))
         };
-        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(MergeCache::default()));
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(MergeCache::reading(summaries)));
         let refresh = {
             let (cache, config, log, source) =
                 (cache.clone(), config.clone(), log.clone(), source.clone());
@@ -2115,11 +1936,7 @@ mod tests {
         .expect("A passive read waited for an explicit refresh")
         .unwrap();
         assert!(cached.iter().all(|view| !view.sources[0].included));
-        assert_eq!(
-            accepted.load(SeqCst),
-            1,
-            "The passive read opened a connection"
-        );
+        assert_eq!(accepted.load(SeqCst), 1, "The passive read read the Device");
         release.notify_one();
         let refreshed = tokio::time::timeout(Duration::from_secs(10), refresh)
             .await
@@ -2138,87 +1955,171 @@ mod tests {
             .await
             .unwrap();
         assert!(cached.iter().all(|view| view.sources[0].included));
-        server.abort();
     }
 
     #[tokio::test]
     async fn alignment_retries_never_reconnect_failed_sources() {
-        if data_key_in_subprocess(
-            "data_client::tests::alignment_retries_never_reconnect_failed_sources",
-        ) {
-            return;
-        }
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-        let serve = |fail: bool| {
-            let count = std::sync::Arc::new(AtomicUsize::new(0));
-            let calls = count.clone();
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            let server = tokio::spawn(async move {
-                loop {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut head = Vec::new();
-                    while !head.ends_with(b"\r\n\r\n") {
-                        head.push(socket.read_u8().await.unwrap());
-                    }
-                    let index = calls.fetch_add(1, SeqCst);
-                    if fail {
-                        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-                        continue;
-                    }
-                    let end = now - (index % 2) as i64 * 60_000;
-                    let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
-                    summary.window_end = end;
-                    summary.window_start = end - 30 * 60_000;
-                    let body = serde_json::to_vec(&summary).unwrap();
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
-                }
-            });
-            (url, count, server)
-        };
-        let (skewed, skewed_count, skewed_server) = serve(false);
-        let (denied, denied_count, denied_server) = serve(true);
-        let source = |name: &str, url: &str| Source {
-            name: name.into(),
-            device_id: None,
-            transport: Transport::Http,
-            ssh_connection: None,
-            url: url.into(),
-            token_env: Some(DATA_KEY_ENV.into()),
-            token_file: None,
-            ca_certificate: None,
-            ssh_device: None,
-        };
+        // The skewed Devices take turns answering at two boundaries.
+        let skewed = AtomicUsize::new(0);
+        let (summaries, reads) = scripted(move |source, _, _| {
+            if source.name == "denied" {
+                return vec![Err("Data endpoint rejected the request.".into())];
+            }
+            let end = now - (skewed.fetch_add(1, SeqCst) % 2) as i64 * 60_000;
+            let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
+            summary.window_end = end;
+            summary.window_start = end - 30 * 60_000;
+            vec![Ok(summary)]
+        });
         let sources = vec![
-            source("peer-0", &skewed),
-            source("peer-1", &skewed),
-            source("denied", &denied),
+            device_source("peer-0"),
+            device_source("peer-1"),
+            device_source("denied"),
         ];
         let result = merge(
             sources,
             this_device(config, log, BTreeMap::new()),
             30,
             crate::traffic::TrafficScope::Model,
+            &summaries,
         )
         .await;
         assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
-        assert_eq!(skewed_count.load(SeqCst), 6, "Skewed peers are retried");
+        let reads = reads.lock().unwrap();
         assert_eq!(
-            denied_count.load(SeqCst),
-            1,
+            reads["peer-0"] + reads["peer-1"],
+            6,
+            "Skewed peers are retried"
+        );
+        assert_eq!(
+            reads["denied"], 1,
             "A failed source must not be reconnected by alignment retries"
         );
-        skewed_server.abort();
-        denied_server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_http_device_sends_the_selected_range_then_the_rest() {
+        if data_key_in_subprocess(
+            "data_client::tests::an_http_device_sends_the_selected_range_then_the_rest",
+        ) {
+            return;
+        }
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        std::fs::write(&log, "").unwrap();
+        let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
+        let bytes = crate::data_api::publish(
+            &config,
+            &log,
+            &DataKey::new(KEY).unwrap(),
+            &uuid::Uuid::new_v4().to_string(),
+            &[],
+        )
+        .unwrap();
+        let mut selected: Summary = serde_json::from_slice(&bytes).unwrap();
+        selected.schema_version = 4;
+        selected.groups.clear();
+        selected
+            .windows
+            .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+        selected
+            .previous_windows
+            .retain(|w| w.minutes == 1440 && w.scope == crate::traffic::TrafficScope::All);
+        let selected = serde_json::to_vec(&selected).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = Source {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token_env: Some(DATA_KEY_ENV.into()),
+            ..device_source("peer")
+        };
+        let server = tokio::spawn(async move {
+            for request in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(socket.read_u8().await.unwrap());
+                }
+                let header = String::from_utf8(header).unwrap().to_lowercase();
+                assert!(header.contains("x-coport-services: antigravity,grok"));
+                let body = if request == 0 {
+                    assert!(header.contains("x-coport-window: 1440:all"));
+                    &selected
+                } else {
+                    assert!(!header.contains("x-coport-window"));
+                    &bytes
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let mut versions = Vec::new();
+        Summaries::Network
+            .read(
+                &source,
+                Some((1440, crate::traffic::TrafficScope::All)),
+                |summary| {
+                    versions.push(summary.schema_version);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0], 4);
+        assert_ne!(versions[1], 4);
+    }
+
+    /// A Device named `name`. A scripted read never connects to it.
+    fn device_source(name: &str) -> Source {
+        Source {
+            name: name.into(),
+            device_id: None,
+            transport: Transport::Http,
+            ssh_connection: None,
+            url: "http://127.0.0.1:1".into(),
+            token_env: None,
+            token_file: None,
+            ca_certificate: None,
+            ssh_device: None,
+        }
+    }
+
+    /// Summaries answered at once by `reply`, given the Device, the range
+    /// asked for and how many reads of that Device came before. The reads of
+    /// each Device are counted in the returned map.
+    fn scripted(
+        reply: impl Fn(&Source, Option<Selection>, usize) -> Vec<Result<Summary, String>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> (
+        Summaries,
+        std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    ) {
+        let reads = std::sync::Arc::<std::sync::Mutex<BTreeMap<String, usize>>>::default();
+        let counted = reads.clone();
+        let summaries = Summaries::Scripted(std::sync::Arc::new(move |source, selection| {
+            let attempt = {
+                let mut reads = counted.lock().unwrap();
+                let count = reads.entry(source.name.clone()).or_default();
+                *count += 1;
+                *count - 1
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for reply in reply(source, selection, attempt) {
+                let _ = tx.send(reply);
+            }
+            rx
+        }));
+        (summaries, reads)
     }
 
     fn sample(key: &DataKey, proxy: &str, upstream: &str) -> Summary {
@@ -2249,72 +2150,70 @@ mod tests {
     }
     #[tokio::test]
     async fn all_views_share_alignment_retries_and_omit_unused_groups() {
-        if data_key_in_subprocess(
-            "data_client::tests::all_views_share_alignment_retries_and_omit_unused_groups",
-        ) {
-            return;
-        }
         alignment_fixture(true).await;
     }
     #[tokio::test]
     async fn failed_alignment_stops_after_three_rounds_for_all_views() {
-        if data_key_in_subprocess(
-            "data_client::tests::failed_alignment_stops_after_three_rounds_for_all_views",
-        ) {
-            return;
-        }
         alignment_fixture(false).await;
     }
     async fn alignment_fixture(recover: bool) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let now = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         let aligned = now - 60_000;
-        let mut tasks = Vec::new();
-        let mut counters = Vec::new();
-        let mut sources = Vec::new();
-        for peer in 0..2 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            counters.push(count.clone());
-            tasks.push(tokio::spawn(async move {
-                let node = uuid::Uuid::new_v4().to_string();
-                for attempt in 0..3 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") { header.push(socket.read_u8().await.unwrap()); }
-                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let end = if peer == 1 && (attempt < 2 || !recover) { now } else { aligned };
-                    let windows = crate::data_api::RANGES.into_iter().flat_map(|minutes|
-                        [crate::traffic::TrafficScope::All, crate::traffic::TrafficScope::Model].into_iter().map(move |scope|
-                            crate::data_api::Window { minutes, scope, window_start: end-minutes as i64*60_000,
-                                window_end: end, bucket_minutes: crate::data_api::bucket_minutes(minutes).unwrap(), groups: Vec::new() })).collect();
-                    let summary = Summary { schema_version: 2, node_id: node.clone(), window_start: end-30*60_000,
-                        window_end: end, bucket_minutes: 1, groups: Vec::new(), windows, previous_windows: Vec::new() };
-                    summary.validate().unwrap();
-                    let body = serde_json::to_vec(&summary).unwrap();
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
-                }
-            }));
-            sources.push(Source {
-                name: format!("peer-{peer}"),
-                device_id: None,
-                transport: Transport::Http,
-                ssh_connection: None,
-                url,
-                token_env: Some(DATA_KEY_ENV.into()),
-                token_file: None,
-                ca_certificate: None,
-                ssh_device: None,
-            });
-        }
+        let nodes = [
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ];
+        // The second Device answers a minute ahead until its third read, if ever.
+        let (summaries, reads) = scripted(move |source, _, attempt| {
+            let peer = usize::from(source.name == "peer-1");
+            let end = if peer == 1 && (attempt < 2 || !recover) {
+                now
+            } else {
+                aligned
+            };
+            let windows = crate::data_api::RANGES
+                .into_iter()
+                .flat_map(|minutes| {
+                    [
+                        crate::traffic::TrafficScope::All,
+                        crate::traffic::TrafficScope::Model,
+                    ]
+                    .into_iter()
+                    .map(move |scope| crate::data_api::Window {
+                        minutes,
+                        scope,
+                        window_start: end - minutes as i64 * 60_000,
+                        window_end: end,
+                        bucket_minutes: crate::data_api::bucket_minutes(minutes).unwrap(),
+                        groups: Vec::new(),
+                    })
+                })
+                .collect();
+            let summary = Summary {
+                schema_version: 2,
+                node_id: nodes[peer].clone(),
+                window_start: end - 30 * 60_000,
+                window_end: end,
+                bucket_minutes: 1,
+                groups: Vec::new(),
+                windows,
+                previous_windows: Vec::new(),
+            };
+            summary.validate().unwrap();
+            vec![Ok(summary)]
+        });
+        let sources = vec![device_source("peer-0"), device_source("peer-1")];
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let before = crate::traffic::live_scans(&log);
-        let result = merge_views(sources, this_device(config, log.clone(), BTreeMap::new())).await;
+        let result = merge_views(
+            sources,
+            this_device(config, log.clone(), BTreeMap::new()),
+            summaries,
+        )
+        .await;
         if recover {
             let views = result.unwrap();
             assert_eq!(views.len(), 12);
@@ -2334,12 +2233,9 @@ mod tests {
             assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
             assert_eq!(crate::traffic::live_scans(&log) - before, 1);
         }
-        for counter in counters {
-            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
+        let reads = reads.lock().unwrap();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.values().all(|count| *count == 3), "{reads:?}");
     }
 
     #[tokio::test]
@@ -2900,9 +2796,13 @@ mod tests {
         };
         let labels = config.local_traffic_credential_labels().await;
         let (config_for_views, labels_for_views) = (config.clone(), labels.clone());
-        let views = merge_views(vec![source], this_device(config, log.clone(), labels))
-            .await
-            .unwrap();
+        let views = merge_views(
+            vec![source],
+            this_device(config, log.clone(), labels),
+            Summaries::Network,
+        )
+        .await
+        .unwrap();
         let audit: Vec<serde_json::Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
@@ -3087,33 +2987,6 @@ mod tests {
         assert_eq!(group.stats.requests, 2);
         assert!(!group.anonymous_proxy && !group.anonymous_upstream);
     }
-    #[test]
-    fn url_configuration_cannot_embed_credentials_or_arbitrary_paths() {
-        let make = |url: &str| Source {
-            name: "test".into(),
-            transport: Transport::Http,
-            ssh_connection: None,
-            url: url.into(),
-            token_env: Some("TEST_KEY".into()),
-            token_file: None,
-            ca_certificate: None,
-            device_id: None,
-            ssh_device: None,
-        };
-        for url in [
-            "file:///etc/passwd",
-            "http://user:password@localhost",
-            "https://example.com/logs",
-            "https://example.com/?key=secret",
-        ] {
-            assert!(make(url).validate().is_err());
-        }
-        assert!(make("http://10.42.0.196:8788").validate().is_ok());
-        assert!(make("https://example.com:8788").validate().is_ok());
-        assert!(!lan("8.8.8.8".parse().unwrap()));
-        assert!(!lan("169.254.169.254".parse().unwrap()));
-    }
-
     #[tokio::test]
     async fn forwarded_traffic_labels_accounts_like_devices_without_connecting_upstream() {
         let dir = tempfile::tempdir().unwrap();
@@ -3318,27 +3191,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_summary_reused_from_forwarding_opens_no_connection() {
-        if data_key_in_subprocess(
-            "data_client::tests::a_summary_reused_from_forwarding_opens_no_connection",
-        ) {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("proxy.log");
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
-        // The forwarded device's address is a trap: reading it again is a failure.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Reading the forwarded device again fails, as an unreachable one would.
+        let (summaries, reads) = scripted(|_, _, _| vec![Err("Data connection failed".into())]);
         let source = Source {
-            name: "Forwarded".into(),
             device_id: Some("fw".into()),
-            transport: Transport::Http,
-            ssh_connection: None,
-            url: format!("http://{}", listener.local_addr().unwrap()),
-            token_env: Some(DATA_KEY_ENV.into()),
-            token_file: None,
-            ca_certificate: None,
-            ssh_device: None,
+            ..device_source("Forwarded")
         };
         let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
         let mut summary = sample(&DataKey::new(KEY).unwrap(), "proxy", "upstream");
@@ -3349,7 +3210,7 @@ mod tests {
             scope: crate::traffic::TrafficScope::Model,
             reused: BTreeMap::from([("fw".to_owned(), summary)]),
         };
-        let cache = tokio::sync::Mutex::new(MergeCache::default());
+        let cache = tokio::sync::Mutex::new(MergeCache::reading(summaries));
         let views = MergeCache::refresh_shared(
             &cache,
             vec![source.clone()],
@@ -3366,10 +3227,8 @@ mod tests {
         assert!(view.sources[0].included, "{:?}", view.sources[0].error);
         assert_eq!(view.sources[0].traffic.as_ref().unwrap().stats.requests, 1);
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err(),
-            "A reused summary must not open a connection"
+            reads.lock().unwrap().is_empty(),
+            "A reused summary must not be read again"
         );
         // Nothing was queried, so no device query is recorded.
         assert!(
@@ -3381,19 +3240,19 @@ mod tests {
         let mut stale = summary;
         stale.window_end -= 10 * 60_000;
         stale.window_start -= 10 * 60_000;
-        let (result, accepted) = tokio::join!(
-            MergeCache::refresh_shared(
-                &cache,
-                vec![source],
-                this_device(config, log, BTreeMap::new()),
-                refresh(stale),
-                |_| Ok(())
-            ),
-            tokio::time::timeout(Duration::from_secs(5), async {
-                drop(listener.accept().await.unwrap());
-            })
+        let result = MergeCache::refresh_shared(
+            &cache,
+            vec![source],
+            this_device(config, log, BTreeMap::new()),
+            refresh(stale),
+            |_| Ok(()),
+        )
+        .await;
+        assert_eq!(
+            reads.lock().unwrap()["Forwarded"],
+            1,
+            "A stale summary must be read again"
         );
-        assert!(accepted.is_ok(), "A stale summary must be read again");
         assert!(!result.unwrap()[0].sources[0].included);
     }
 }
