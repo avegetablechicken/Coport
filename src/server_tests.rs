@@ -1403,6 +1403,30 @@ async fn account_status_reads_discovered_identities_without_probing() {
 }
 
 #[tokio::test]
+async fn account_status_never_shows_a_discovered_route_a_fallback_takes() {
+    let mut lookup = fixture("http", "sse").await;
+    let endpoint = format!("http://127.0.0.1:{}", lookup.addr.port());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"saved-secret"}}"#,
+    )
+    .unwrap();
+    let running = running(&format!("proxies:\n  lookup: {endpoint}\nclaude:\n  config_dirs: [{}]\n  base_url: https://upstream.invalid\n  routing:\n    account:\n      remote@example.invalid: none\n    account_probe: lookup\n    account_fallback: none\n", serde_json::to_string(dir.path()).unwrap())).await;
+    trust(&running, &lookup, &endpoint);
+    *running.server.credential_checks.lock().await = None;
+    running.server.credential_reports().await;
+    while let Ok(Some(_)) =
+        tokio::time::timeout(Duration::from_millis(200), lookup.requests.recv()).await
+    {}
+    // The saved login's requests take account_fallback, whatever its account.
+    assert_eq!(
+        running.server.account_route_states().await[1]["remote@example.invalid"],
+        "inactive"
+    );
+}
+
+#[tokio::test]
 async fn account_status_leaves_unreadable_environment_sources_unknown() {
     let running = running("claude:\n  config_dirs: []\n  auth_env: COPORT_TEST_UNSET_ACCOUNT_STATE\n  routing:\n    account: {'user@example.invalid': none}\n    account_probe: none\n").await;
     for _ in 0..2 {

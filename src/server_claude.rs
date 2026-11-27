@@ -74,9 +74,13 @@ impl Server {
             }
             // Until its account is known, an unnamed login could belong to any
             // route no other evidence settles. A failure stays the latest
-            // result after its retry delay.
+            // result after its retry delay. With a fallback, its requests take
+            // the fallback whatever its account is.
             logins.extend(match self.claude_identities.state(&token).await {
-                State::Known(identity) => label(&identity).map(Login::Remote),
+                State::Known(identity) if routing.account_default().is_none() => {
+                    label(&identity).map(Login::Remote)
+                }
+                State::Known(_) => None,
                 State::Failed if discovers => Some(Login::ProbeFailed),
                 State::Unknown if discovers => Some(Login::Unidentified),
                 State::Failed | State::Unknown => None,
