@@ -211,7 +211,6 @@ function createRouteTooltip({ document, window }) {
             return;
           }
           if (type === "pointerout" && owner.matches(":focus-visible")) { routeTooltipMode = "focus"; return; }
-          if (type === "focusout" && owner.matches(":hover")) { routeTooltipMode = "pointer"; return; }
           hideRouteTooltip();
         });
       }

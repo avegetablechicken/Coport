@@ -18,11 +18,6 @@ function tag(name) {
   return `<span class="tag ${down ? "down" : `c${ui.tagColors[name] ?? 0}`}">${esc(name)}</span>`;
 }
 
-/// Proxy candidates in order, e.g. [jp_lab] → [jp].
-function chain(names) {
-  return `<span class="chain">${names.map(tag).join('<span class="arrow">→</span>')}</span>`;
-}
-
 let toastTimer;
 function toast(text) {
   const el = $("toast");

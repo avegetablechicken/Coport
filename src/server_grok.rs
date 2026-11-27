@@ -84,7 +84,6 @@ impl Server {
                         ));
                     }
                 }
-                headers.insert("accept-encoding", "identity".parse().unwrap());
             }
             Endpoint::DeviceCode => {
                 #[derive(serde::Deserialize)]

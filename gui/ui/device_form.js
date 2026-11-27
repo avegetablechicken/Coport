@@ -13,7 +13,7 @@ function createDeviceForm() {
       form.open = true;
     },
     edit(d) {
-      form.draft = { id: d.id, name: d.name, sshEnabled: !!d.ssh, dataEnabled: !!d.data, host: d.ssh?.host, binary: d.ssh?.binary,
+      form.draft = { id: d.id, name: d.name, host: d.ssh?.host, binary: d.ssh?.binary,
         url: d.data?.url, key: d.data?.tokenFile, env: d.data?.tokenEnv, ca: d.data?.caCertificate, transport: d.data?.transport || (d.ssh ? "ssh" : "http") };
       form.open = true;
     },
