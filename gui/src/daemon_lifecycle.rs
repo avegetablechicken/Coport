@@ -152,6 +152,7 @@ impl<P: Platform> Lifecycle<P> {
         }
         // A request a cancelled Restart left must not force this one.
         let _ = fs::remove_file(self.force_request());
+        let _held = daemon::Held(lock);
         self.restart_locked(launch, wait, progress)
     }
 
@@ -394,11 +395,7 @@ impl<P: Platform> Lifecycle<P> {
         if !path.exists() {
             return Ok(true);
         }
-        match daemon::lock_file(&path)?.try_lock() {
-            Ok(()) => Ok(true),
-            Err(fs::TryLockError::WouldBlock) => Ok(false),
-            Err(fs::TryLockError::Error(error)) => Err(error),
-        }
+        Ok(daemon::try_hold(&path)?.is_some())
     }
 
     fn restarts(&self) -> PathBuf {

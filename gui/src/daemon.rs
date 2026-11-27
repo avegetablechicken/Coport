@@ -374,7 +374,7 @@ impl Client {
     }
 
     fn registration_is_unlocked(&self) -> bool {
-        lock_file(&self.directory.join("daemon.lock")).is_ok_and(|lock| lock.try_lock().is_ok())
+        try_hold(&self.directory.join("daemon.lock")).is_ok_and(|held| held.is_some())
     }
 
     fn request(&self, action: Action, timeout: Duration) -> io::Result<Response> {
@@ -415,13 +415,11 @@ pub async fn task_backend(dir: PathBuf) -> io::Result<Option<(Client, Status)>> 
         if !dir.exists() {
             return Ok(None);
         }
-        let lock = lock_file(&dir.join("daemon.lock"))?;
-        match lock.try_lock() {
-            Ok(()) => Ok(None),
-            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::other(
+        match try_hold(&dir.join("daemon.lock"))? {
+            Some(_) => Ok(None),
+            None => Err(io::Error::other(
                 "Proxy daemon is running but its control channel is unavailable.",
             )),
-            Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
     })
     .await
@@ -471,6 +469,26 @@ pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+/// A file lock this process holds. Dropping it unlocks rather than only
+/// closes: a child that another thread forks holds a copy of the handle until
+/// it execs, and the lock with it.
+pub(crate) struct Held(pub(crate) File);
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// The lock at `path` if no one else holds it.
+pub(crate) fn try_hold(path: &Path) -> io::Result<Option<Held>> {
+    let lock = lock_file(path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(Held(lock))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 struct Registration {
@@ -891,6 +909,30 @@ pub(crate) mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// A forked child shares the lock's open file description until it execs;
+    /// `try_clone` shares it the same way. Closing alone leaves the lock with
+    /// that copy, which made a following Restart or migration see it held.
+    #[test]
+    fn a_held_lock_is_released_even_while_a_forked_copy_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let lock = lock_file(&path).unwrap();
+        lock.try_lock().unwrap();
+        let copy = lock.try_clone().unwrap();
+        drop(lock);
+        assert!(
+            try_hold(&path).unwrap().is_none(),
+            "closing alone keeps the lock"
+        );
+        drop(copy);
+
+        let held = try_hold(&path).unwrap().unwrap();
+        let copy = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(try_hold(&path).unwrap().is_some());
+        drop(copy);
     }
 
     /// A daemon is ready once it records its executable; the helper, a copy

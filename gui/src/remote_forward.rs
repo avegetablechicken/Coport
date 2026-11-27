@@ -340,10 +340,10 @@ impl Routing {
         clear_device: Option<&str>,
     ) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let lock = crate::daemon::lock_file(&dir.join("daemon.lock")).map_err(|e| e.to_string())?;
-        lock.try_lock().map_err(|_| {
-            "The daemon is starting or unavailable; retry when it responds.".to_owned()
-        })?;
+        let _held = crate::daemon::try_hold(&dir.join("daemon.lock"))
+            .ok()
+            .flatten()
+            .ok_or("The daemon is starting or unavailable; retry when it responds.")?;
         let routing = Self::with_store(dir).map_err(|e| e.to_string())?;
         let mut preferences = routing.preferences.lock().unwrap().clone();
         let mut changed = false;

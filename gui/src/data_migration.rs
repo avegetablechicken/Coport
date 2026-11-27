@@ -21,14 +21,17 @@ fn prepare_paths(source: &Path, legacy: &Path, target: &Path) -> io::Result<()> 
     // Hold the daemon's own lock throughout the copy. Discovery alone can fail
     // while the daemon is starting/stopping and cannot prove files are idle.
     // A daemon from the previous version holds its lock in the old directory.
-    let mut locks = vec![crate::daemon::lock_file(&target.join("daemon.lock"))?];
+    let mut locks = vec![target.join("daemon.lock")];
     if legacy.join("daemon.lock").try_exists()? {
-        locks.push(crate::daemon::lock_file(&legacy.join("daemon.lock"))?);
+        locks.push(legacy.join("daemon.lock"));
     }
+    let mut held = Vec::new();
     for lock in &locks {
-        lock.try_lock().map_err(|error| io::Error::other(format!(
+        let taken = crate::daemon::try_hold(lock)
+            .and_then(|taken| taken.ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock)));
+        held.push(taken.map_err(|error| io::Error::other(format!(
             "Stop the proxy in the previous Coport app, then reopen this version to migrate its data. No source files will be deleted. Cannot acquire the daemon lock: {error}"
-        )))?;
+        )))?);
     }
     migrate(source, legacy, target)
 }
@@ -219,7 +222,8 @@ mod tests {
         assert!(prepare_paths(&source, &dir.path().join("legacy"), &target).is_err());
         assert!(!target.join("config.yaml").exists());
         assert!(!target.join(MARKER).exists());
-        drop(lock);
+        // Unlocked as a stopping daemon's exit would, whatever children hold.
+        lock.unlock().unwrap();
         prepare_paths(&source, &dir.path().join("legacy"), &target).unwrap();
         assert_eq!(
             fs::read(target.join("config.yaml")).unwrap(),
@@ -244,7 +248,7 @@ mod tests {
         assert!(!target.join("config.yaml").exists());
         assert!(!target.join("gui.json").exists());
         assert!(!target.join(MARKER).exists());
-        drop(lock);
+        lock.unlock().unwrap();
         prepare_paths(&source, &legacy, &target).unwrap();
         assert_eq!(fs::read(target.join("gui.json")).unwrap(), b"preferences");
         assert_eq!(fs::read(legacy.join("gui.json")).unwrap(), b"preferences");
