@@ -554,8 +554,6 @@ function routingBlock() {
 
 // ---------------------------------------------------------------- activity
 
-const TRAFFIC_RANGES = [[30, "30 minutes"], [360, "6 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "7 days"], [43200, "30 days"]];
-
 const menus = createMenus({
   document,
   window,
@@ -570,15 +568,6 @@ document.addEventListener("pointerdown", (event) => {
   if (editor && !editor.hidden && !editor.contains(event.target) && !event.target.closest?.(".select-menu")) showRangeEditor(false);
 });
 
-function trafficRangeSelect(id, selected, label) {
-  return panelSelect(id, TRAFFIC_RANGES.map(([minutes, text]) => [minutes, `Last ${text}`]), selected, label, "traffic-range");
-}
-
-function trafficControls(prefix, minutes, label) {
-  return `<span class="traffic-controls" data-morph="traffic-controls">${panelSelect(`${prefix}-scope`, [["all", "All"], ["model", "Models"]], trafficViews.scope,
-    "Traffic request category", "traffic-scope", 'title="Model calls: each HTTP generation/compaction request and each generation within a WebSocket counts once, including active, failed and cancelled calls."')}${trafficRangeSelect(`${prefix}-range`, minutes, label)}</span>`;
-}
-
 /// Home, Activity and Devices show traffic for one range, so changing pages
 /// keeps it. Reads started for the previous range must not land afterwards.
 function setTrafficMinutes(minutes) {
@@ -591,40 +580,6 @@ async function loadTraffic() {
   if (!(await trafficViews.loadActivity())) return;
   if (ui.page === "activity") renderActivityTraffic();
   else if (ui.page === "devices") render();
-}
-
-const MATCH_REASONS = {
-  renamed: "Same base URL, different name",
-  baseChanged: "Same name, different base URL",
-  legacy: "Logged before base URLs were recorded",
-  ambiguous: "Several configurations use this base URL or name",
-  unmatched: "No configuration has this name or base URL",
-};
-
-/// Logged configurations counted here without an exact match. Each can be
-/// assigned to a current configuration or to Unidentified; the logs stay as they are.
-function trafficReview(c, targets = [], scope = trafficViews.activity?.scope) {
-  if (!c.sources?.length) return "";
-  const review = c.sources.some((s) => s.reason);
-  const unit = scope === "model" ? "call" : "request";
-  const items = c.sources.flatMap((s, i) => {
-    const choose = (target, automatic = false) => JSON.stringify({ service: c.service, name: s.name, base: s.base ?? null, target, automatic });
-    const where = [s.name || "No name", s.base?.replace(/^https?:\/\//, "") ?? "No base URL"].join(" · ");
-    return [
-      i ? null : undefined,
-      { heading: where, detail: `${s.reason ? MATCH_REASONS[s.reason] : "Assigned by you"} · ${s.requests} ${unit}${s.requests === 1 ? "" : "s"}` },
-      ...targets.filter((t) => t.service === c.service).map((t) => ({
-        label: t.label, action: "traffic-assign", target: choose({ name: t.name, base: t.base }), checked: c.credential === t.label,
-      })),
-      { label: "Unidentified", action: "traffic-assign", target: choose(null), checked: c.credential === "Unidentified" },
-      !s.reason && { label: "Match Automatically", action: "traffic-assign", target: choose(null, true) },
-    ];
-  }).filter((item) => item !== undefined && item !== false);
-  const label = review
-    ? "Some requests here were matched to a renamed, changed or unknown configuration. Choose where they belong."
-    : "Requests here were assigned by you.";
-  return `<button type="button" class="icon-btn more traffic-review${review ? " review" : ""}" data-menu="${esc(JSON.stringify(items))}"
-    aria-label="${esc(label)}" title="${esc(label)}" aria-haspopup="menu" aria-expanded="false">${review ? ICON.warning : ICON.more}</button>`;
 }
 
 async function assignTraffic(choice) {

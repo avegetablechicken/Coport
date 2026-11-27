@@ -58,7 +58,7 @@ function harness(invoke) {
   context.menus = { current: () => null, holdRender: () => false, close() {} };
   // Shared traffic views, markup and merging, as every page uses them.
   scripts.load(context, 'traffic_render.js');
-  vm.runInContext(source.slice(source.indexOf('const MATCH_REASONS'), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('async function assignTraffic('), source.indexOf('\nfunction renderActivityTraffic(')), context);
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   vm.runInContext(code, context);

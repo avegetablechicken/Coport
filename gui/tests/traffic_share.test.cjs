@@ -10,7 +10,7 @@ function setup(scope = 'model') {
   const context = { ui: {}, deviceList: { loading: false }, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
   scripts.load(context, 'traffic_render.js');
-  vm.runInContext(source.slice(source.indexOf('const MATCH_REASONS'), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  vm.runInContext(source.slice(source.indexOf('async function assignTraffic('), source.indexOf('\nfunction renderActivityTraffic(')), context);
   return context;
 }
 // Arrays built inside the VM context have another realm's prototype.
