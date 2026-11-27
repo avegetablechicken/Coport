@@ -59,10 +59,11 @@
     const call = (time, live = false, account = pick()) => {
       const error = !live && random() < 0.03;
       const input = Math.round(18_000 + random() * 90_000);
+      const ms = Math.round(2_400 + random() * 14_000);
       calls.push({
         seq: seq++, time, account, error,
         status: error ? 529 : 200,
-        ms: Math.round(2_400 + random() * 14_000),
+        ms, firstMs: Math.round(ms * (0.08 + random() * 0.2)),
         bytes: Math.round(8_000 + random() * 60_000),
         input, output: Math.round(400 + random() * 4_000), cached: Math.round(input * (0.55 + random() * 0.35)),
       });
@@ -91,26 +92,40 @@
   const ARRIVALS = SCENE === "tour" ? [600, 2600, 5400, 6300, 9800, 12400] : [600, 1900, 2700, 4300, 5200, 6800, 8100, 9000];
   const arrived = new Set();
 
+  // A device's or an account's totals and the metrics the daemon derives
+  // from them, as one traffic view carries them.
   const totals = (list) => {
-    const sum = (key) => list.reduce((n, c) => n + c[key], 0);
+    const sum = (key, of = list) => of.reduce((n, c) => n + c[key], 0);
     const input = sum("input");
     const cached = sum("cached");
+    const output = sum("output");
+    const streamed = list.filter((c) => !c.error);
+    const first = sum("firstMs", streamed);
+    const streaming = sum("ms", streamed) - first;
+    const tokens = sum("output", streamed) - streamed.length;
     return {
       requests: list.length,
       errors: list.filter((c) => c.error).length,
       bytes: sum("bytes"),
       inputTokens: input,
-      outputTokens: sum("output"),
+      outputTokens: output,
       cachedInputTokens: cached,
       uncachedInputTokens: null,
       cacheWriteTokens: null,
-      cacheHitRate: input ? cached / input : null,
-      avgMs: list.length ? Math.round(sum("ms") / list.length) : null,
-      latencyTotalMs: sum("ms"),
-      latencySamples: list.length,
       cacheRead: cached,
       cachePrompt: input,
-      sources: [],
+      latencyTotalMs: sum("ms"),
+      latencySamples: list.length,
+      firstTokenTotalMs: first,
+      firstTokenSamples: streamed.length,
+      outputTpsTokens: tokens,
+      outputTpsDurationMs: streaming,
+      avgMs: list.length ? Math.round(sum("ms") / list.length) : null,
+      firstTokenMs: streamed.length ? Math.round(first / streamed.length) : null,
+      outputTps: streaming > 0 ? tokens / (streaming / 1000) : null,
+      outputTpsFromStart: sum("ms") > 0 ? output / (sum("ms") / 1000) : null,
+      cacheHitRate: input ? cached / input : null,
+      errorRate: list.length ? list.filter((c) => c.error).length / list.length : null,
     };
   };
 
@@ -139,24 +154,22 @@
     const accounts = [...new Set(inRange.map((c) => c.account))];
     const credentials = accounts.map((account) => {
       const own = inRange.filter((c) => c.account === account);
-      return { service: account.service, credential: account.credential, ...totals(own), ...buckets(own) };
+      return { service: account.service, credential: account.credential, sources: [], ...totals(own), ...buckets(own) };
     }).sort((a, b) => (a.credential === "Unidentified") - (b.credential === "Unidentified") || b.bytes - a.bytes);
-    return { start, end, credentials, summary: { service: "", credential: "", ...totals(inRange), ...buckets(inRange) } };
+    return { scope: "model", start, end, bucketMinutes: 1, ...totals(inRange), ...buckets(inRange), credentials, targets: [] };
   }
 
-  function traffic() {
-    const { start, end, credentials, summary } = view(local.calls);
-    return { scope: "model", start, end, bucketMinutes: 1, credentials, targets: [], summary };
-  }
+  const traffic = () => view(local.calls);
 
+  // Every device's traffic in one frame, with Merged Traffic summed as the
+  // app sums it: this device once and each other device once.
   function mergedData() {
     const { start, end } = window30();
     return [{
       windowStart: start, windowEnd: end, minutes: 30, scope: "model", bucketMinutes: 1,
-      sources: DEVICES.map((d) => {
-        const { credentials, summary } = view(d.traffic.calls);
-        return { name: d.name, included: true, exclusion: null, error: null, traffic: { ...summary, credentials, targets: [] } };
-      }),
+      sources: DEVICES.map((d) => ({ name: d.name, included: true, exclusion: null, error: null, traffic: view(d.traffic.calls) })),
+      local: traffic(),
+      traffic: view(DEVICES.reduce((calls, d) => calls.concat(d.traffic.calls), local.calls.slice())),
     }];
   }
 
@@ -324,15 +337,15 @@
         }
       });
       if (SCENE === "tour") await tour(elapsed);
-      resetTrafficViews();
+      trafficViews.reset();
       if (ui.page === "activity") {
-        await Promise.all([loadTraffic(), loadActivity("live")]);
+        await Promise.all([loadTraffic(), activityLog.load("live")]);
         const content = document.getElementById("content");
         content.scrollTop = elapsed >= LOG_AT ? content.scrollTop + (logOffset() ?? 0) : 0;
       } else if (ui.page === "devices") {
         await refresh();
         // Peers' statistics come from the last refresh's cache, as on a revisit.
-        await Promise.all([loadMergedData(true), loadDeviceCards()]);
+        await Promise.all([deviceList.loadMerged(true), deviceList.loadCards()]);
       } else {
         await refresh();
         await loadHomeTraffic(true);
