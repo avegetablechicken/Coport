@@ -81,8 +81,10 @@ pub struct Lifecycle<P = Native> {
     platform: P,
 }
 
-/// How long a started Daemon has to register and accept connections.
-const READY: Duration = Duration::from_secs(5);
+/// How long a started Daemon has to register and accept connections. Under
+/// heavy load, the fsyncs of startup alone took over 5 s; a slow Daemon is
+/// not a broken one, and one that exits is noticed at once.
+const READY: Duration = Duration::from_secs(15);
 /// Idle checks in a row, a check interval apart, before a Restart proceeds.
 const QUIET_CHECKS: u32 = 4;
 const CHECK_INTERVAL: Duration = Duration::from_millis(250);
