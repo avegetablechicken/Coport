@@ -501,7 +501,12 @@ impl Server {
         let endpoint = self.config.endpoint(&selected);
         log.field("proxy", &selected);
         log.field("proxy_endpoint", redacted_endpoint(endpoint));
-        log.event("route_selected");
+        // An Auxiliary request shares a Model call's log but is not that call.
+        if upstream == Upstream::Auxiliary {
+            log.auxiliary_event("route_selected");
+        } else {
+            log.event("route_selected");
+        }
         let key = ProbeKey::http(endpoint, request.url(), native_tls);
         let retryable = request.method() == hyper::Method::GET
             && !request.headers().contains_key("upgrade")
@@ -549,7 +554,11 @@ impl Server {
             {
                 break;
             }
-            let mut fields = log.record();
+            let mut fields = if upstream == Upstream::Auxiliary {
+                log.fields.clone()
+            } else {
+                log.record()
+            };
             fields.insert("transport_error".into(), json!(failure.reason));
             fields.insert(
                 "retry_delay_ms".into(),

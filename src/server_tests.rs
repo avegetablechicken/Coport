@@ -3065,6 +3065,7 @@ async fn forwarded_first_token_origin_excludes_profile_and_survives_retry() {
     });
     let running = running("").await;
     let mut log = RequestLog::for_test(running.server.logger.clone(), 200);
+    log.model_call("model-call");
     let mut origin = None;
     for (method, path) in [
         (hyper::Method::GET, "/api/oauth/profile"),
@@ -3099,6 +3100,17 @@ async fn forwarded_first_token_origin_excludes_profile_and_survives_retry() {
         }
     }
     upstream.await.unwrap();
+    // The account lookup's route is not the Model call's.
+    running.server.logger.flush().unwrap();
+    let raw = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    for line in raw.lines() {
+        let line: serde_json::Value = serde_json::from_str(line).unwrap();
+        if line["upstream_path"] == "/api/oauth/profile" {
+            assert!(line.get("model_call_id").is_none(), "{line}");
+            assert_ne!(line["event"], "model_call_updated", "{line}");
+        }
+    }
+    assert!(raw.contains("\"event\":\"route_selected\""), "{raw}");
 }
 
 #[tokio::test]
