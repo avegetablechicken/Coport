@@ -2,8 +2,6 @@
 // control must survive that, so Tab goes on from where it was instead of
 // starting over from wherever the browser puts it.
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 const { test } = require("node:test");
 const scripts = require("./panel_harness.cjs");
 

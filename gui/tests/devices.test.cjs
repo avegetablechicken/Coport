@@ -1,8 +1,6 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const vm = require('node:vm');
 const { test } = require('node:test');
-const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.js'), 'utf8');
 const { createTrafficViews } = require('../ui/traffic_views.js');
 const { createDeviceForm } = require('../ui/device_form.js');
 const { createDeviceList } = require('../ui/device_list.js');
@@ -34,12 +32,43 @@ async function seedTraffic(h, { local = {}, forwarded = {} }) {
   h.clock = () => Date.now();
 }
 function harness(invoke) {
-  const ui = { page: 'devices', snap: { phase: { state: 'running', port: 8787 }, settings: {} } };
-  const fields = {}, listeners = {};
-  const context = { ui, invoke, Promise, deviceForm: createDeviceForm(), seeding: null, clock: () => Date.now(), ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', toast() {}, panelMotion: { changePage: update => update(), queueFit() {} },
+  const fields = {}, handlers = {}, stand = {};
+  // Every listener of a type runs, in the order the panel added them.
+  const listeners = new Proxy({}, { get: (_, type) => (event) => Promise.all((handlers[type] || []).map((fn) => fn(event))) });
+  let context, startupCheck;
+  const p = scripts.panel({
+    invoke: (command, args) => context.invoke(command, args),
+    document: {
+      body: scripts.element('body'), hidden: false, documentElement: { classList: { add() {} } },
+      addEventListener: (type, fn) => { (handlers[type] ||= []).push(fn); },
+      // A device field is what the form last drew; the panel's own parts stand in.
+      getElementById: (id) => (id.startsWith('device-') ? fields[id] : (stand[id] ??= scripts.element(id))),
+      createElement: (tag) => scripts.element(tag),
+    },
+    before(sandbox) {
+      context = sandbox;
+      sandbox.createTrafficViews = () => (sandbox.trafficViews = createTrafficViews({
+        invoke: (command, args) => (sandbox.seeding || sandbox.invoke)(command, args), now: () => sandbox.clock(),
+      }));
+      // The panel's startup SSH check is left out; a test starts the one it reads.
+      sandbox.createDeviceList = () => {
+        const list = deviceListOf(sandbox);
+        startupCheck = list.checkSsh;
+        list.checkSsh = () => {};
+        return list;
+      };
+      sandbox.createMenus = () => ({ current: () => null, holdRender: () => false, close() {}, install() {}, showSelect() {}, showMenu() {}, items: () => [] });
+      sandbox.createPageMotion = () => ({ install() {}, watchPage() {}, moving: () => false, changePage: (update) => update(), queueFit() {} });
+    },
+  });
+  context.ui = Object.assign(p.get('ui'), { page: 'devices', snap: { phase: { state: 'running', port: 8787 }, settings: {} } });
+  context.deviceForm = p.get('deviceForm');
+  context.deviceList = p.get('deviceList');
+  context.deviceList.checkSsh = startupCheck;
+  Object.assign(context, {
+    invoke, seeding: null, clock: () => Date.now(), toast() {},
     message: (_, text) => text, esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
-    $: id => fields[id], document: { addEventListener: (event, callback) => { listeners[event] = callback; } } };
-  context.trafficViews = createTrafficViews({ invoke: (command, args) => (context.seeding || context.invoke)(command, args), now: () => context.clock() });
+  });
   context.render = () => {
     for (const key of Object.keys(fields)) delete fields[key];
     if (!context.deviceForm.open) return;
@@ -47,26 +76,14 @@ function harness(invoke) {
     for (const match of html.matchAll(/<input[^>]*id="([^"]+)"[^>]*value="([^"]*)"/g)) fields[match[1]] = { value: match[2], id: match[1], focus() {} };
     fields['device-transport'] = { value: context.deviceForm.draft.transport, id: 'device-transport' };
   };
-  context.deviceList = deviceListOf(context);
   // Peers' statistics are read only where a test reads them, through this.
   context.loadMerged = context.deviceList.loadMerged;
   context.deviceList.loadMerged = () => {};
-  vm.createContext(context);
-  scripts.load(context, 'menus.js');
-  context.menus = { current: () => null, holdRender: () => false, close() {} };
-  // Shared traffic views, markup and merging, as every page uses them.
-  scripts.load(context, 'traffic_render.js');
-  scripts.load(context, 'activity_page.js');
-  // One range for Home, Activity and Devices.
-  vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
-  scripts.load(context, 'devices_page.js');
   // The real ones, for the tests of them; the rest of the page sees stubs.
   context.real = { mergedDataBlock: context.mergedDataBlock, deviceTrafficContent: context.deviceTrafficContent };
   context.mergedDataBlock = () => '';
-  context.installDevicesPage();
-  vm.runInContext(source.slice(source.indexOf('async function refreshLaunchAtLogin('), source.indexOf('let refreshTimer;')), context);
   context.fields = fields; context.listeners = listeners;
-  vm.runInContext(source.slice(source.indexOf('async function act('), source.indexOf('// Any scroll or input')), context);
+  context.ICON = p.get('ICON');
   context.action = async (name, el = context.el || { dataset: {} }) => {
     context.el = el;
     await context.act(name, el);
@@ -136,7 +153,9 @@ test('refresh loads definitions and statistics without invoking remote lifecycle
   assert.match(html, /&lt;remote>/); assert.doesNotMatch(html, /Read-only statistics/);
   assert.doesNotMatch(html, /device-control|Remote Port|PID|Uptime/);
   assert.doesNotMatch(html, /data-action="power"/);
-  assert.doesNotMatch(source, /control_device|device-management|device-ssh-enabled|device-data-enabled/);
+  // Its form edits connections only: no management or separate SSH and data switches.
+  h.deviceForm.edit(h.deviceList.devices[0]);
+  assert.doesNotMatch(h.deviceSettings(), /device-management|device-ssh-enabled|device-data-enabled/);
 });
 
 test('configuration lives in Settings and Settings loading makes no remote requests', async () => {
@@ -193,16 +212,19 @@ test('traffic range changes reject late responses from the previous selection', 
 });
 
 test('Devices button is visible only with configured peers and the redundant Devices block is removed', () => {
-  const top = source.slice(source.indexOf('function renderTop()'), source.indexOf('function renderPage(', source.indexOf('function renderTop()')));
   let html;
-  const context = { ui: { page: 'main', snap: { version: 'test', settings: { deviceCount: 0 } } }, deviceList: { loaded: false }, esc: v => v, $: () => ({ set innerHTML(value) { html = value; } }) };
-  vm.createContext(context); vm.runInContext(top, context);
+  const p = scripts.panel({ elements: { top: { set innerHTML(value) { html = value; } } } });
+  const context = { ui: Object.assign(p.get('ui'), { page: 'main', snap: { version: 'test', settings: { deviceCount: 0 } } }), deviceList: p.get('deviceList'), renderTop: p.context.renderTop };
   context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
   context.ui.snap.settings.deviceCount = 1; context.renderTop(); assert.match(html, /data-page="devices"/);
   context.deviceList.loaded = true; context.deviceList.devices = []; context.renderTop(); assert.doesNotMatch(html, /data-page="devices"/);
-  const page = fs.readFileSync(require('node:path').join(__dirname, '../ui/devices_page.js'), 'utf8');
-  const devices = page.slice(page.indexOf('function devicesPage()'), page.indexOf('function deviceSettings()'));
-  assert.doesNotMatch(devices, /block\("Devices"/);
+  // The Devices page draws no Devices block of its own; that one is Settings'.
+  const h = harness(async () => []);
+  const titles = [];
+  h.block = (title, aside, body) => { titles.push(title); return body; };
+  h.deviceList.devices = [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }];
+  h.devicesPage();
+  assert.ok(titles.includes('This Device') && !titles.includes('Devices'), titles.join(', '));
 });
 
 test('automatic alignment retains previous traffic while refreshing without an error message', async () => {
@@ -241,11 +263,11 @@ test('upstream account disclosures retain per-device expansion and place rings b
 });
 
 test('Devices title contains only a settings icon and no redundant update/configure text', () => {
-  const top = source.slice(source.indexOf('function renderTop()'), source.indexOf('function renderPage()', source.indexOf('function renderTop()')));
   let html;
-  const context = { ui: { page: 'devices' }, ICON: { settings: '<settings-icon>', back: '' }, BACK_KEYS: 'Alt+Left', $: () => ({ set innerHTML(value) { html = value; } }) };
-  vm.createContext(context); vm.runInContext(top, context); context.renderTop();
-  assert.match(html, /data-page="settings"/); assert.match(html, /<settings-icon>/);
+  const p = scripts.panel({ elements: { top: { set innerHTML(value) { html = value; } } } });
+  p.get('ui').page = 'devices';
+  p.context.renderTop();
+  assert.match(html, /data-page="settings"/); assert.ok(html.includes(p.get('ICON').settings));
   assert.doesNotMatch(html, /Updates automatically|Configure in Settings/);
 });
 
@@ -273,8 +295,9 @@ test('Settings devices retain verified results and label older results as cached
   h.deviceList.fetchedAt = Date.now();
   h.deviceList.views = { '30:model': { sources: [{ name: 'Working', included: true }, { name: 'Failed', included: false, error: 'Data rejected' }] } };
   let html = h.deviceSettings();
-  assert.match(html, /data-action="device-new"[^>]*><plus>/);
-  assert.match(html, /data-action="device-remove"[^>]*><trash>/);
+  assert.ok(html.includes(`data-action="device-new" data-tip="Add device" aria-label="Add device">${h.ICON.plus}`));
+  assert.match(html, /data-action="device-remove"[^>]*>/);
+  assert.ok(html.includes(h.ICON.trash));
   assert.match(html, /dot running/); assert.match(html, /dot failed/);
   assert.doesNotMatch(html, />Remove<|>Add Device</);
   h.deviceList.fetchedAt = Date.now() - 46000;
@@ -381,8 +404,8 @@ test('switching range during a remote refresh waits for it instead of reading th
   const view = minutes => ({ minutes, scope: 'model', local: { requests: minutes }, traffic: { requests: minutes }, sources: [{ name: 'MS', included: true, traffic: { requests: minutes } }] });
   const refresh = h.deviceList.loadMerged(true, true);
   pending[0].args.onUpdate.onmessage([view(30)]);
-  const start = source.indexOf('  if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {');
-  const handler = vm.runInContext(`(async event => { ${source.slice(start, source.indexOf('  if (event.target.id === "home-traffic-scope"', start))} })`, h);
+  // The range control as the panel handles its change.
+  const handler = (event) => h.listeners.change({ target: Object.assign(scripts.element(event.target.id), event.target) });
   const switching = handler({ target: { id: 'devices-traffic-range', value: '10080' } });
   await Promise.resolve();
   assert.equal(pending.length, 1, 'A cache read must not supersede the remote refresh');
@@ -458,8 +481,8 @@ test('waiting for a range keeps peer errors, statuses and queued work intact', a
   });
   const refresh = h.deviceList.loadMerged(true, true);
   pending[0].args.onUpdate.onmessage([{ minutes: 30, scope: 'model', local: { requests: 1 }, traffic: { requests: 1 }, sources: [{ name: 'MS', included: false, error: 'Permission denied' }] }]);
-  const start = source.indexOf('  if (event.target.id === "devices-traffic-scope" || event.target.id === "devices-traffic-range") {');
-  const handler = vm.runInContext(`(async event => { ${source.slice(start, source.indexOf('  if (event.target.id === "home-traffic-scope"', start))} })`, h);
+  // The range control as the panel handles its change.
+  const handler = (event) => h.listeners.change({ target: Object.assign(scripts.element(event.target.id), event.target) });
   await handler({ target: { id: 'devices-traffic-range', value: '10080' } });
   assert.equal(h.deviceList.merged, null);
   assert.match(h.devicesPage(), /MS: Permission denied|Permission denied/);
@@ -686,13 +709,12 @@ test('Devices statistics start without waiting for forwarding or capability read
 
 test('Settings timer never polls remote devices', () => {
   const calls = [];
-  let tick;
-  vm.runInNewContext(source.slice(source.indexOf('// Refresh even when no new requests arrive')), {
-    ui: { page: 'settings', devices: [{ id: 'remote' }] }, document: { hidden: false },
-    setInterval: callback => { tick = callback; },
-    refresh: () => calls.push('refresh'), loadDevices: () => calls.push('devices'),
-    loadMergedData: () => calls.push('remote-statistics'), refreshForwardingStatus: () => calls.push('local-forwarding-status'),
-  });
+  const p = scripts.panel();
+  p.get('ui').page = 'settings';
+  Object.assign(p.context, { refresh: () => calls.push('refresh'), refreshForwardingStatus: () => calls.push('local-forwarding-status') });
+  Object.assign(p.get('deviceList'), { devices: [{ id: 'remote' }], load: () => calls.push('devices'), loadMerged: () => calls.push('remote-statistics') });
+  // The rolling window's timer: the last one the panel starts, every 15 s.
+  const tick = p.timers.findLast((t) => t.ms === 15000).fn;
   for (let i = 0; i < 5; i++) tick();
   assert.deepEqual(calls, Array(5).fill('local-forwarding-status'));
 });
