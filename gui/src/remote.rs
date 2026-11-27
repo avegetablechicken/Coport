@@ -179,7 +179,9 @@ fn discovery_command(script: &str, operation: &str) -> String {
     )
 }
 
-/// Published privately at daemon startup, never by a summary request.
+/// Records the running executable for SSH discovery. Published privately at
+/// daemon startup, never by a summary request; the standalone helper is
+/// preserved apart from it by `preserve_summary_executable`.
 pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
     if !binary.is_absolute() {
         return Err(io::Error::other(
@@ -197,27 +199,35 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
         }
         let mut record = path.to_vec();
         record.push(b'\n');
-        // Record the running executable first: if the copy below fails, an
-        // older registered path must not keep pointing discovery elsewhere.
+        // Recorded before the helper is copied: if that copy fails, an older
+        // registered path must not keep pointing discovery elsewhere.
         crate::settings::write_private(&dir.join("summary-executable"), &record)?;
-        preserve_summary_executable(dir, binary)?;
     }
-    #[cfg(not(unix))]
-    preserve_summary_executable(dir, binary)?;
     Ok(())
 }
 
 /// Keep the helper independent of build directories and replaceable app bundles.
-/// Only daemon startup publishes it; read-only SSH requests never repair files.
-fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
+/// Only daemon startup publishes it, after it is ready: discovery runs the
+/// recorded executable while it exists, and the helper only once it is gone.
+/// Read-only SSH requests never repair files.
+pub(crate) fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    // The daemon becomes ready only after this returns, so the copy must stay
-    // cheap. Copying to a fresh path lets the platform clone the file (APFS,
-    // Btrfs, XFS) or copy it inside the kernel. The copy is not flushed:
-    // flushing tens of MiB took seconds on a busy disk, and a helper damaged
-    // by a crash is replaced by the next start. The staging directory is
-    // private, so the copy is never reachable with the source's permissions.
+    // Copying the whole executable took seconds on a busy disk. Copying to a
+    // fresh path lets the platform clone the file (APFS, Btrfs, XFS) or copy
+    // it inside the kernel. The copy is not flushed, and a helper damaged by a
+    // crash is replaced by the next start. The staging directory is private,
+    // so the copy is never reachable with the source's permissions.
     let helper = dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
+    // A daemon stopped while copying leaves its staging directory behind.
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".summary-helper")
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
     let result = (|| {
         let staging = tempfile::Builder::new()
             .prefix(".summary-helper")
@@ -800,9 +810,8 @@ mod tests {
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::write(&binary, b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --summary ] || exit 9\nprintf '{\"result\":\"summary-only\",\"services\":\"%s\"}\\n' \"$COPORT_SUMMARY_SERVICES\"\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        register_summary_executable(&dir, &binary).unwrap();
         // This fixture models older installations with only a path record.
-        std::fs::remove_file(dir.join("summary-helper")).unwrap();
+        register_summary_executable(&dir, &binary).unwrap();
         (home, dir, binary)
     }
 
@@ -944,7 +953,6 @@ mod tests {
         assert!(!run_discovery(home.path(), "").status.success());
         std::fs::remove_file(&marker).unwrap();
         register_summary_executable(&dir, &binary).unwrap();
-        std::fs::remove_file(dir.join("summary-helper")).unwrap();
         std::fs::remove_file(&binary).unwrap();
         let output = run_discovery(home.path(), "");
         assert!(!output.status.success());
@@ -956,7 +964,7 @@ mod tests {
     fn preserved_helper_survives_installation_removal_and_repeated_reads() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let (home, dir, binary) = discovery_fixture();
-        register_summary_executable(&dir, &binary).unwrap();
+        preserve_summary_executable(&dir, &binary).unwrap();
         let helper = dir.join("summary-helper");
         let before = std::fs::read(&helper).unwrap();
         let record = std::fs::read(dir.join("summary-executable")).unwrap();
@@ -988,11 +996,16 @@ mod tests {
         let state = temp.path().join("state");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, b"old executable").unwrap();
-        register_summary_executable(&state, &source).unwrap();
+        preserve_summary_executable(&state, &source).unwrap();
         let helper = state.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&source, b"new executable").unwrap();
         assert_eq!(std::fs::read(&helper).unwrap(), b"old executable");
-        register_summary_executable(&state, &source).unwrap();
+        // A copy interrupted by a stopped daemon is cleared by the next one.
+        let interrupted = state.join(".summary-helperXYZ");
+        std::fs::create_dir(&interrupted).unwrap();
+        std::fs::write(interrupted.join("helper"), b"partial").unwrap();
+        preserve_summary_executable(&state, &source).unwrap();
+        assert!(!interrupted.exists());
         std::fs::remove_file(&source).unwrap();
         assert_eq!(std::fs::read(&helper).unwrap(), b"new executable");
     }
@@ -1126,7 +1139,8 @@ mod tests {
         std::fs::copy(&binary, &replaced).unwrap();
         // Executable but unreadable: copying it into a helper fails.
         std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o100)).unwrap();
-        let _ = register_summary_executable(&dir, &replaced);
+        register_summary_executable(&dir, &replaced).unwrap();
+        assert!(preserve_summary_executable(&dir, &replaced).is_err());
         // The old path must not stay registered, or discovery could run it.
         assert_eq!(
             std::fs::read(dir.join("summary-executable")).unwrap(),

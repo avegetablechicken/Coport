@@ -632,15 +632,29 @@ async fn serve_until(
         );
     }
     // Publishing the SSH discovery hint is independent of proxy/HTTP startup.
-    if let Err(error) = std::env::current_exe()
-        .and_then(|binary| crate::remote::register_summary_executable(dir, &binary))
-    {
+    // The record is written now; the helper, a copy of the whole executable,
+    // is copied beside startup, since discovery runs the recorded executable
+    // while it exists.
+    let discovery_unavailable = |logger: &Logger, error: io::Error| {
         logger.write(
             "statistics_discovery_unavailable",
             [("reason".to_owned(), error.to_string().into())]
                 .into_iter()
                 .collect(),
         );
+    };
+    match std::env::current_exe().and_then(|binary| {
+        crate::remote::register_summary_executable(dir, &binary).map(|()| binary)
+    }) {
+        Ok(binary) => {
+            let (dir, logger) = (dir.to_owned(), logger.clone());
+            std::thread::spawn(move || {
+                if let Err(error) = crate::remote::preserve_summary_executable(&dir, &binary) {
+                    discovery_unavailable(&logger, error);
+                }
+            });
+        }
+        Err(error) => discovery_unavailable(&logger, error),
     }
     let _data_api = if allow_external_access {
         Some(crate::data_api::start(config.clone(), dir, log_path.clone()).await?)
@@ -877,6 +891,46 @@ pub(crate) mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// A daemon is ready once it records its executable; the helper, a copy
+    /// of the whole executable, follows without holding up startup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_discovery_record_is_ready_with_the_daemon_and_the_helper_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let log = dir.path().join("proxy.log");
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(&config, format!("listen_port: {port}\nrequest_timeout_seconds: 3\nallow_external_access: false\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+        let state = dir.path().to_owned();
+        let checked = async {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.join(ENDPOINT).exists() {
+                assert!(Instant::now() < deadline, "Daemon did not become ready");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let record = std::fs::read(state.join("summary-executable")).unwrap();
+            let running = std::env::current_exe().unwrap();
+            assert_eq!(record, format!("{}\n", running.display()).as_bytes());
+            let helper = state.join("summary-helper");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !helper.exists() {
+                assert!(Instant::now() < deadline, "The helper was never preserved");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                std::fs::metadata(&helper).unwrap().len(),
+                std::fs::metadata(&running).unwrap().len()
+            );
+        };
+        serve_until(dir.path(), &config, &log, checked)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
