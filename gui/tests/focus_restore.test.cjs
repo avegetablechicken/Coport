@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 const vm = require("node:vm");
+const scripts = require("./panel_harness.cjs");
 
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 const from = source.indexOf("function render() {");
@@ -68,6 +69,7 @@ function panel(page, top, content) {
     },
   };
   vm.createContext(context);
+  scripts.load(context, "focus_restore.js");
   vm.runInContext(`${helpers}\nthis.render = render;`, context);
   context.render();
   return { parts, render: () => context.render(), focused: () => context.document.activeElement };

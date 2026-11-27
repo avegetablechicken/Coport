@@ -7,6 +7,7 @@ const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 const { createTrafficViews } = require("../ui/traffic_views.js");
 const { createDeviceList } = require("../ui/device_list.js");
+const scripts = require("./panel_harness.cjs");
 const handlers = source.slice(source.indexOf('listen("state-changed", scheduleRefresh);'));
 const timeout = 60 * 1000;
 
@@ -141,6 +142,7 @@ async function navigation(page = "main") {
     document: { activeElement: null },
   };
   vm.createContext(context);
+  scripts.load(context, "focus_restore.js");
   vm.runInContext(source.slice(source.indexOf("function render()"), source.indexOf("\nfunction renderTop()")), context);
   vm.runInContext(source.slice(source.indexOf("async function act("), source.indexOf("// Any scroll or input")), context);
   const go = (target) => context.act("page", { dataset: { page: target } });
