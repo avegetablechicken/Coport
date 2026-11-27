@@ -3,7 +3,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
-const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const { createTrafficViews } = require('../ui/traffic_views.js');
 const scripts = require('./panel_harness.cjs');
 function setup(scope = 'model') {
@@ -430,14 +429,18 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   // One successful call keeps the full row.
   const mixed = { ...failed, errors: 15, errorRate: 15 / 16, errorCounts: [6, 0, 9], tokenCounts: [0, 0, 40] };
   assert.ok(full(context.accountRow(mixed, 'model', mixed)));
-  // Activity and Devices account rows both go through it.
-  const devicesPage = fs.readFileSync(path.join(__dirname, '../ui/devices_page.js'), 'utf8');
-  const activityPage = fs.readFileSync(path.join(__dirname, '../ui/activity_page.js'), 'utf8');
-  for (const [text, from, to] of [[activityPage, 'function renderActivityTraffic(', '\nconst SEARCH_MODES'], [devicesPage, 'function deviceTrafficContent(', '\nfunction mergedDataBlock(']]) {
-    const body = text.slice(text.indexOf(from), text.indexOf(to));
-    assert.match(body, /accountRow\(c, scope, /);
-    assert.doesNotMatch(body, /chart\(c,|Avg\. Time|traffic-identity/);
-  }
+  // Devices and Activity draw their account rows with it, so the row is one line there too.
+  const traffic = { ...failed, scope: 'model', start: 0, end: 180000, bucketMinutes: 1, credentials: [failed] };
+  scripts.under(context, 'devices_page.js', 'activity_page.js');
+  assert.match(context.deviceTrafficContent(traffic, 'model', 'device/x'), /16 calls · /);
+  const el = { innerHTML: '', setAttribute() {} };
+  Object.assign(context, {
+    trafficViews: { scope: 'model', activity: traffic }, menus: { holdRender: () => false, current: () => null, close() {} },
+    $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null, trafficControls: () => '', trafficReview: () => '',
+    panelMotion: { queueFit() {} }, scrollToLog() {},
+  });
+  context.renderActivityTraffic();
+  assert.match(el.innerHTML, /16 calls · /);
   // The single line drops the gap that a chart would follow.
   const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
   assert.match(css, /\.traffic-identity\.brief \{ margin-bottom: 0; \}/);
