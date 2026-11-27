@@ -85,3 +85,22 @@ test("hover alone does not light an item; focus does", () => {
   assert.doesNotMatch(css, /\.select-menu button:hover/);
   assert.match(css, /\.select-menu button:focus \{[^}]*background: var\(--accent\)/);
 });
+
+test("a select menu as wide as its trigger stays right-aligned under it", () => {
+  const document = { activeElement: null, body: { append() {} } };
+  const item = { value: "30", focus() {}, closest: () => null };
+  const menu = {
+    style: {}, children: [item], set innerHTML(_) {}, setAttribute() {}, addEventListener() {},
+    // Its options are 60px wide; a minimum width widens it.
+    getBoundingClientRect: () => ({ width: Math.max(60, parseFloat(menu.style.minWidth) || 0), height: 40 }),
+  };
+  document.createElement = () => menu;
+  const trigger = {
+    value: "30", dataset: { options: JSON.stringify([["30", "30 minutes"]]) },
+    getAttribute: () => "Range", setAttribute() {},
+    getBoundingClientRect: () => ({ width: 150, right: 200, bottom: 20 }),
+  };
+  const context = scripts.load(scripts.sandbox(), "panel_format.js", "menus.js");
+  context.createMenus({ document, window: { innerWidth: 300, innerHeight: 400 }, rerender() {} }).showSelect(trigger);
+  assert.equal(menu.style.left, "50px");
+});

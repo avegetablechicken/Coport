@@ -45,8 +45,9 @@ function createMenus({ document, window, rerender }) {
     menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
     menu.innerHTML = options.map(([value, label]) => `<button type="button" role="option"
       tabindex="-1" value="${esc(value)}" aria-selected="${String(value) === trigger.value}">${esc(label)}</button>`).join("");
-    place(trigger, menu);
+    // At least as wide as its trigger before it is placed against it.
     menu.style.minWidth = `${trigger.getBoundingClientRect().width}px`;
+    place(trigger, menu);
     const choices = [...menu.children];
     (last ? choices.at(-1) : choices.find((el) => el.value === trigger.value) ?? choices[0]).focus();
     menu.addEventListener("click", (event) => {
