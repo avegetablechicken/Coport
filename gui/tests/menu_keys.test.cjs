@@ -2,21 +2,9 @@
 // ←/→ it does not use move the navigation to the neighbouring item; every
 // other key, ↑/↓ included, keeps the meaning it has after a click.
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 const { test } = require("node:test");
-const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
-const between = (start, end) => {
-  const from = source.indexOf(start);
-  const to = source.indexOf(end, from);
-  assert.ok(from >= 0 && to > from, `${start} … ${end}`);
-  return source.slice(from, to);
-};
-const helpers = between("/// Whether keys on `el` edit text", 'document.addEventListener("keydown"');
-const keydown = between('document.addEventListener("keydown"', 'document.addEventListener("focusout"');
-const shown = between("let panelHiddenAt", "refresh().then(probeStale);");
+const scripts = require("./panel_harness.cjs");
 
 /// An element; `text` makes it a text field, whose `closest` matches only the
 /// text-entry selector.
@@ -33,38 +21,25 @@ function element(name, { text = false, select = false } = {}) {
 
 let context;
 function panel({ navigating = true } = {}) {
-  const listeners = {};
-  const events = {};
   const invoked = [];
   const opened = [];
-  const body = element("body");
-  context = {
-    IS_MAC: true,
-    ui: { page: "main", menuBarNavigation: navigating },
-    deviceList: { loaded: false },
-    routeTooltip: { hide() {}, refresh() {} },
-    menus: {
-      open: null, current() { return this.open; }, close() {}, items: () => [],
-      showSelect: (trigger, last) => opened.push([trigger.name, last]),
-    },
-    PANEL_PAGE_TIMEOUT_MS: 60 * 1000,
-    invoke: (command, args) => { invoked.push([command, args]); return Promise.resolve(); },
-    act() {},
-    listen: (name, handler) => { events[name] = handler; },
-    refresh: async () => {},
-    $: () => null,
-    document: {
-      body,
-      activeElement: body,
-      addEventListener: (type, handler) => { listeners[type] = handler; },
-    },
-    Date,
+  const menus = {
+    open: null, current() { return this.open; }, close() {}, items: () => [], holdRender: () => false, install() {},
+    showSelect: (trigger, last) => opened.push([trigger.name, last]),
   };
-  vm.createContext(context);
-  vm.runInContext(`${helpers}\n${keydown}\n${shown}`, context);
+  const p = scripts.panel({
+    globals: { navigator: { userAgent: "Mac" } },
+    invoke: (command, args) => { invoked.push([command, args]); return Promise.resolve(); },
+    before: (sandbox) => { sandbox.createMenus = () => menus; },
+  });
+  context = p.context;
+  context.ui = Object.assign(p.get("ui"), { page: "main", menuBarNavigation: navigating });
+  context.menus = menus;
+  Object.assign(context, { act() {}, refresh: async () => {} });
+  const events = Object.fromEntries(Object.entries(p.events).map(([name, [fn]]) => [name, (...args) => fn(...args)]));
   const press = (key, target = context.document.activeElement, modifiers = {}) => {
     const event = { key, target, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...modifiers };
-    listeners.keydown(event);
+    for (const listener of p.listeners.keydown) listener(event);
     return event;
   };
   // Calls made inside the context compare as plain data.

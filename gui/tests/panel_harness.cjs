@@ -69,7 +69,8 @@ function element(id) {
 /// what it reaches outside itself faked:
 /// - `invoke(command, args)` answers the app once the panel has loaded; what
 ///   the panel asks while it starts stays unanswered, so a test's `invoke`
-///   sees only what the test causes. By default nothing answers.
+///   sees only what the test causes; `answerStart` answers those too. By
+///   default nothing answers.
 /// - `elements` are what `$(id)` finds; any other id gets a stand-in.
 /// - `document`, `window` and `globals` replace the fakes they name.
 /// - `before(context)` runs after the modules load and before app.js, where
@@ -78,7 +79,7 @@ function element(id) {
 ///   another platform has them.
 /// Listeners, Tauri events, observers and timers are kept, not run: tests
 /// call them as the WebView would.
-function panel({ invoke = () => new Promise(() => {}), elements = {}, document, window, globals = {}, before, newline } = {}) {
+function panel({ invoke = () => new Promise(() => {}), answerStart = false, elements = {}, document, window, globals = {}, before, newline } = {}) {
   const listeners = {};
   const windowListeners = {};
   const events = {};
@@ -100,7 +101,7 @@ function panel({ invoke = () => new Promise(() => {}), elements = {}, document, 
     querySelector: () => null, querySelectorAll: () => [], elementFromPoint: () => null,
   };
   const media = () => ({ matches: false, addEventListener() {} });
-  let started = false;
+  let started = answerStart;
   const win = window ?? { innerWidth: 480, innerHeight: 640, addEventListener: add(windowListeners), matchMedia: media };
   win.__TAURI__ ??= {
     core: { invoke: (command, args) => (started ? invoke(command, args) : new Promise(() => {})), Channel: class { constructor() { this.onmessage = null; } } },

@@ -1,46 +1,46 @@
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 const { test } = require("node:test");
-const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 const { createTrafficViews } = require("../ui/traffic_views.js");
 const { createDeviceList } = require("../ui/device_list.js");
 const scripts = require("./panel_harness.cjs");
-const handlers = source.slice(source.indexOf('listen("state-changed", scheduleRefresh);'));
 const timeout = 60 * 1000;
 
-function panel(page = "settings") {
+async function panel(page = "settings") {
   let now = 0;
-  const events = {};
   const content = { scrollTop: 120 };
-  const ui = { page };
   const rendered = [];
   const probes = [];
   const sshChecks = [];
   const loginReads = [];
-  vm.runInNewContext(handlers, {
-    ui,
-    Date: { now: () => now },
-    listen: (name, handler) => { events[name] = handler; },
-    scheduleRefresh() {},
-    menus: { current: () => null, holdRender: () => false, close() {} },
-    routeTooltip: { hide() {}, refresh() {} },
-    render: () => rendered.push(ui.page),
-    $: () => content,
-    refresh: async () => {},
-    probeStale: () => probes.push("stale"),
-    deviceList: { loaded: false, checkSsh: () => sshChecks.push("startup") },
-    refreshLaunchAtLogin: async () => loginReads.push(ui.page),
-    invoke: command => probes.push(command),
-    setInterval() {},
+  const p = scripts.panel({
+    // The panel's first refresh is answered: the stale proxy probe follows it.
+    answerStart: true, elements: { content }, globals: { Date: { now: () => now } },
+    invoke: async (command) => {
+      if (command === "probe_proxy") probes.push("stale");
+      return command === "get_state" ? { config: {} } : command === "get_activity" ? { rows: [] } : [];
+    },
+    before(context) {
+      const create = context.createDeviceList;
+      context.createDeviceList = (deps) => Object.assign(create(deps), { checkSsh: () => sshChecks.push("startup") });
+    },
   });
+  const ui = Object.assign(p.get("ui"), { page });
+  Object.assign(p.context, {
+    render: () => rendered.push(ui.page), refreshLaunchAtLogin: async () => loginReads.push(ui.page),
+    scheduleRefresh() {}, tagColors: () => ({}),
+  });
+  const events = Object.fromEntries(Object.entries(p.events).map(([name, [fn]]) => [name, (...args) => fn(...args)]));
+  // Once the first refresh and its probe are done, later refreshes draw
+  // nothing, so what is drawn is what the panel's own events draw.
+  await new Promise(setImmediate);
+  p.context.refresh = async () => {};
+  rendered.length = 0;
   return { ui, content, rendered, events, probes, sshChecks, loginReads, advance: (ms) => { now += ms; } };
 }
 
 test("first show and short reopening preserve the current page", async () => {
-  const p = panel();
+  const p = await panel();
   p.advance(timeout);
   await p.events["panel-shown"]();
   assert.equal(p.ui.page, "settings");
@@ -53,7 +53,7 @@ test("first show and short reopening preserve the current page", async () => {
 
 for (const page of ["settings", "activity"]) {
   test(`${page} returns home after one minute hidden, including repeated hide events`, async () => {
-    const p = panel(page);
+    const p = await panel(page);
     p.events["panel-hidden"]();
     p.advance(timeout - 1);
     p.events["panel-hidden"]();
@@ -66,7 +66,7 @@ for (const page of ["settings", "activity"]) {
 }
 
 test("each reopen clears the old hidden timestamp", async () => {
-  const p = panel();
+  const p = await panel();
   p.events["panel-hidden"]();
   p.advance(timeout - 1);
   await p.events["panel-shown"]();
@@ -85,7 +85,7 @@ test("each reopen clears the old hidden timestamp", async () => {
 
 
 test("startup tests proxies once and repeated panel reopening does not repeat them", async () => {
-  const p = panel();
+  const p = await panel();
   await Promise.resolve();
   for (let i = 0; i < 5; i++) {
     p.events['panel-hidden']();
@@ -97,7 +97,7 @@ test("startup tests proxies once and repeated panel reopening does not repeat th
 
 
 test("SSH availability is checked once at app startup, not on every panel reopen", async () => {
-  const p = panel();
+  const p = await panel();
   assert.deepEqual(p.sshChecks, ['startup']);
   for (let i = 0; i < 3; i++) {
     p.events['panel-hidden']();
@@ -107,12 +107,12 @@ test("SSH availability is checked once at app startup, not on every panel reopen
 });
 
 test("reopening Settings rereads the login item that System Settings may have changed", async () => {
-  const p = panel();
+  const p = await panel();
   await p.events["panel-shown"]();
   p.events["panel-hidden"]();
   p.advance(timeout);
   await p.events["panel-shown"]();
-  const other = panel("activity");
+  const other = await panel("activity");
   await other.events["panel-shown"]();
   assert.deepEqual(p.loginReads, ["settings"]);
   assert.deepEqual(other.loginReads, []);
@@ -123,7 +123,7 @@ test("reopening Settings rereads the login item that System Settings may have ch
 async function navigation(page = "main") {
   const traffic = createTrafficViews({ invoke: async (_, { minutes, scope }) => ({ minutes, credentials: [] }) });
   await traffic.local(30, "model");
-  const ui = { page, snap: { settings: {} } };
+  let ui;
   const deviceList = createDeviceList({
     invoke: async () => [], Channel: class {}, trafficViews: traffic, page: () => ui.page,
     minutes: () => ui.deviceTrafficMinutes, snap: () => ui.snap, render() {}, toast() {},
@@ -132,19 +132,26 @@ async function navigation(page = "main") {
   const rendered = [];
   const changes = [];
   const loads = [];
-  const context = {
-    ui, trafficViews: traffic, deviceList, menus: { current: () => null, holdRender: () => false, close() {} }, renderTop() {}, renderPage: () => rendered.push(ui.page),
-    panelMotion: { queueFit() {}, changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); } },
-    loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
-    activityLog: { resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) },
-    $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
-    // Nothing in the panel has focus to keep across renders.
-    document: { activeElement: null },
-  };
-  vm.createContext(context);
-  scripts.load(context, "focus_restore.js");
-  vm.runInContext(source.slice(source.indexOf("function render()"), source.indexOf("\nfunction renderTop()")), context);
-  vm.runInContext(source.slice(source.indexOf("async function act("), source.indexOf("// Any scroll or input")), context);
+  const p = scripts.panel({
+    before(context) {
+      Object.assign(context, {
+        createTrafficViews: () => traffic,
+        createDeviceList: () => deviceList,
+        createActivityPager: () => ({ resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) }),
+        createPageMotion: () => ({
+          install() {}, watchPage() {}, moving: () => false, queueFit() {},
+          changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); },
+        }),
+      });
+    },
+  });
+  ui = Object.assign(p.get("ui"), { page, snap: { settings: {} } });
+  const { context } = p;
+  Object.assign(context, {
+    renderTop() {}, renderPage: () => rendered.push(ui.page),
+    loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null, scrollToLog() {}, toast() {},
+  });
+  context.deviceList = deviceList;
   const go = (target) => context.act("page", { dataset: { page: target } });
   return { ui, traffic, rendered, changes, loads, render: context.render, go, context };
 }
@@ -199,10 +206,9 @@ test("Devices opens with the merged traffic of the range Home shows", async () =
 test("a range chosen on any traffic page applies to Home, Activity and Devices", async () => {
   const pending = [];
   const traffic = createTrafficViews({ invoke: () => new Promise((resolve) => pending.push(resolve)) });
-  const ui = { deviceTrafficMinutes: 30 };
-  const context = { ui, trafficViews: traffic };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf("function setTrafficMinutes("), source.indexOf("\nasync function loadTraffic(")), context);
+  const p = scripts.panel({ before: (context) => { context.createTrafficViews = () => traffic; } });
+  const ui = Object.assign(p.get("ui"), { deviceTrafficMinutes: 30 });
+  const { context } = p;
   const reads = [traffic.loadActivity(), traffic.loadHome(null)];
   Object.assign(traffic, { activityError: "old", homeError: "old", homeFetchedAt: 5 });
   context.setTrafficMinutes(360);
@@ -212,8 +218,13 @@ test("a range chosen on any traffic page applies to Home, Activity and Devices",
   for (const resolve of pending) resolve({ credentials: [] });
   assert.deepEqual(await Promise.all(reads), [false, false]);
   // Every range control on the three pages calls it.
-  const handlers = source.slice(source.indexOf('document.addEventListener("change"'));
-  for (const id of ["devices-traffic-range", "home-traffic-range", "traffic-range"]) assert.match(handlers, new RegExp(`"${id}"[^]*?setTrafficMinutes\\(`));
+  for (const id of ["devices-traffic-range", "home-traffic-range", "traffic-range"]) {
+    const chosen = [];
+    context.setTrafficMinutes = (minutes) => chosen.push(minutes);
+    // The handlers go on to read traffic, which nothing answers here.
+    p.fire("change", { target: Object.assign(scripts.element(id), { value: "720" }) });
+    assert.deepEqual(chosen, [720], id);
+  }
 });
 
 test("page changes move only what is shown, not content of a closed disclosure", () => {
