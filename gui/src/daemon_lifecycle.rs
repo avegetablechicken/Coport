@@ -74,6 +74,15 @@ pub struct Restarted {
     pub rolled_back: Option<String>,
 }
 
+/// How the last Restart ended, for the Restarts that joined it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Outcome {
+    /// The Daemon it left running.
+    pid: Option<u32>,
+    rolled_back: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Lifecycle<P = Native> {
     dir: PathBuf,
@@ -157,8 +166,23 @@ impl<P: Platform> Lifecycle<P> {
         }
         // A request a cancelled Restart left must not force this one.
         let _ = fs::remove_file(self.force_request());
+        let _ = fs::remove_file(self.outcome());
         let _held = daemon::Held(lock);
-        self.restart_locked(launch, wait, progress)
+        let result = self.restart_locked(launch, wait, progress);
+        let outcome = match &result {
+            Ok(restarted) => Outcome {
+                pid: Some(restarted.status.pid),
+                rolled_back: restarted.rolled_back.clone(),
+                error: None,
+            },
+            Err(error) => Outcome {
+                pid: None,
+                rolled_back: None,
+                error: Some(error.to_string()),
+            },
+        };
+        let _ = fs::write(self.outcome(), serde_json::to_vec(&outcome)?);
+        result
     }
 
     /// Wait for the Restart holding `lock`; a forced one forces it.
@@ -174,10 +198,25 @@ impl<P: Platform> Lifecycle<P> {
         }
         progress(Progress::Joining);
         lock.lock()?;
+        let outcome = fs::read(self.outcome())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Outcome>(&bytes).ok());
         lock.unlock()?;
+        if let Some(error) = outcome.as_ref().and_then(|o| o.error.as_ref()) {
+            return Err(io::Error::other(format!(
+                "The restart in progress failed: {error}"
+            )));
+        }
         let (client, status) = self.find()?.ok_or_else(|| {
             io::Error::other("The restart in progress left no proxy daemon running.")
         })?;
+        if let Some(outcome) = outcome.filter(|o| o.pid == Some(status.pid)) {
+            return Ok(Restarted {
+                client,
+                status,
+                rolled_back: outcome.rolled_back,
+            });
+        }
         if before == Some(status.pid) {
             return Err(io::Error::other(
                 "The restart in progress was cancelled; the proxy daemon keeps running.",
@@ -422,6 +461,11 @@ impl<P: Platform> Lifecycle<P> {
         self.dir.join("restart")
     }
 
+    /// Left by a Restart for the Restarts that joined it.
+    fn outcome(&self) -> PathBuf {
+        self.restarts().join("outcome.json")
+    }
+
     /// Left by a forced Restart for the one it joins.
     fn force_request(&self) -> PathBuf {
         self.restarts().join("force-request")
@@ -647,8 +691,7 @@ mod tests {
         assert_eq!(progress, [Progress::Waiting(1), Progress::Stopping]);
         assert!(forced.is_err());
         assert!(daemon.stopped());
-        // The fake daemon outlives its Stop, so the joined restart sees it
-        // unchanged.
-        assert!(message(joined).contains("cancelled"));
+        // The joined restart reports how the one it joined ended.
+        assert!(message(joined).contains("failed: Cannot stop proxy daemon"));
     }
 }
