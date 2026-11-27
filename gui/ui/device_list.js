@@ -40,7 +40,7 @@ function createDeviceList({ invoke, Channel, trafficViews, page, minutes, snap, 
   };
 
   function frameFresh(frame) {
-    return !!frame?.local && now() - (frame.loadedAt || 0) < DEVICE_FRAME_MS;
+    return !!(frame?.local || frame?.localError) && now() - (frame.loadedAt || 0) < DEVICE_FRAME_MS;
   }
   const DEVICE_FRAME_MS = 30000;
 

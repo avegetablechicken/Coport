@@ -113,8 +113,12 @@ impl Inputs {
         let parts = std::sync::Mutex::new(DeviceParts::default());
         let selected = |view: &Merged| view.minutes == minutes && view.scope == scope;
         let complete = |views: &mut [Merged], parts: &DeviceParts| {
+            let Some(local) = &parts.local else { return };
             for view in views.iter_mut().filter(|view| selected(view)) {
-                view.with_devices(parts.local.as_ref(), parts.forwarded.as_ref());
+                view.with_devices(
+                    local.as_ref().map_err(String::as_str),
+                    parts.forwarded.as_ref(),
+                );
             }
         };
         let publish = |mut views: Vec<Merged>| {
@@ -123,7 +127,7 @@ impl Inputs {
                 if let Some(view) = views.iter().find(|view| selected(view)) {
                     parts.last = Some(view.clone());
                 }
-                if parts.read {
+                if parts.local.is_some() {
                     complete(&mut views, &parts);
                 } else {
                     // A frame without this device would replace a completed one.
@@ -138,7 +142,7 @@ impl Inputs {
         let republish = || {
             let parts = parts.lock().unwrap();
             if let Some(mut view) = parts.last.clone() {
-                view.with_devices(parts.local.as_ref(), parts.forwarded.as_ref());
+                complete(std::slice::from_mut(&mut view), &parts);
                 drop(parts);
                 let _ = on_update(vec![view]);
             }
@@ -149,8 +153,7 @@ impl Inputs {
                 self.live_forwarded(minutes, scope)
             );
             let mut parts = parts.lock().unwrap();
-            parts.read = true;
-            parts.local = local.ok();
+            parts.local = Some(local);
             parts.forwarded = forwarded;
             drop(parts);
             republish();
@@ -266,8 +269,8 @@ impl Inputs {
 /// and the peers' last frame of it.
 #[derive(Default)]
 struct DeviceParts {
-    read: bool,
-    local: Option<View>,
+    /// This device's read, once it finished.
+    local: Option<Result<View, String>>,
     forwarded: Option<ForwardedTraffic>,
     last: Option<Merged>,
 }

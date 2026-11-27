@@ -1189,6 +1189,29 @@ test('a forwarded device already counted via another entry gets no card', async 
   assert.doesNotMatch(h.devicesPage(), /device\/fw:/);
 });
 
+test('a frame that could not read this device says why instead of loading forever', async () => {
+  const h = devicesHarness(async () => []);
+  h.deviceTrafficContent = (traffic, scope, key) => `${key}:${traffic.requests};`;
+  h.ui.page = 'devices';
+  h.deviceList.devices = [];
+  h.deviceList.merged = { minutes: 30, scope: 'model', windowStart: 0, windowEnd: 60000, bucketMinutes: 1, localError: 'Cannot read proxy.log', sources: [] };
+  const merged = h.mergedDataBlock();
+  assert.match(merged, /This device: Cannot read proxy\.log/);
+  assert.doesNotMatch(merged, /Loading traffic/);
+  assert.match(h.devicesPage(), /This Device[\s\S]*<\/div>Cannot read proxy\.log/);
+  // Such a frame is complete: the next tick waits like after a successful read.
+  assert.ok(h.deviceList.frameFresh({ ...h.deviceList.merged, loadedAt: Date.now() }));
+  // This device's own view from another read still fills its card.
+  await seedTraffic(h, { local: { '30:model': { requests: 7, credentials: [] } } });
+  assert.match(h.devicesPage(), /local:7;/);
+  // A read that failed as a whole shows its error, not loading.
+  h.deviceList.merged = null;
+  h.deviceList.error = 'Cannot read traffic history';
+  const failed = h.mergedDataBlock();
+  assert.match(failed, /Cannot read traffic history/);
+  assert.doesNotMatch(failed, /Loading traffic/);
+});
+
 test('between refreshes the Devices timer reads no statistics for peers', async () => {
   const calls = [];
   const h = devicesHarness(async (command, args) => { calls.push(command); return command === 'get_devices' ? [{ id: 'ms', name: 'MS', ssh: { host: 'MS' } }] : []; });

@@ -1753,9 +1753,11 @@ function mergedDataBlock() {
   if (deviceList.error) body += message("bad", esc(deviceList.error));
   // The backend adds every device once on the newest one's time axis; peers
   // still loading are added once they arrive, and the sum so far stays visible.
-  const { merged, scope } = deviceCardViews();
-  if (!merged) body += `<div class="placeholder">Loading traffic…</div>`;
-  else body += deviceTrafficContent(merged, scope, "merged", merged);
+  const { merged, localError, scope } = deviceCardViews();
+  if (localError) body += message("warn", `This device: ${esc(localError)}`);
+  else if (merged) body += deviceTrafficContent(merged, scope, "merged", merged);
+  // A read that failed says so above; it is not shown as loading.
+  else if (!deviceList.error) body += `<div class="placeholder">Loading traffic…</div>`;
   if (data) {
     for (const source of data.sources) {
       if (source.error === "TRAFFIC_UPDATING") body += `<div class="placeholder">${esc(source.name)}: Loading traffic…</div>`;
@@ -1808,7 +1810,8 @@ function deviceCardViews() {
   const data = deviceList.merged?.minutes === minutes && deviceList.merged.scope === scope ? deviceList.merged : null;
   // A frame completed for this range carries this device and the forwarded
   // device's live view beside the peers, and Merged Traffic is their sum.
-  const complete = !!data?.local;
+  // A frame whose read of this device failed is complete too: it says why.
+  const complete = !!(data?.local || data?.localError);
   const forwarded = complete ? data.forwarded?.device : ui.snap?.forwarding?.deviceId;
   const cards = new Map();
   for (const device of deviceList.devices) {
@@ -1820,16 +1823,19 @@ function deviceCardViews() {
     if (live && (complete || live.device === device.id)) { cards.set(device.id, { view: live, window: live }); continue; }
     if (source?.traffic) cards.set(device.id, { view: source.traffic, window: source.traffic.end != null ? source.traffic : data });
   }
-  return { local: complete ? data.local : trafficViews.localView(minutes, scope), cards, merged: complete ? data.traffic : null, scope };
+  return {
+    local: data?.local || trafficViews.localView(minutes, scope), localError: complete ? data.localError : null,
+    cards, merged: complete ? data.traffic : null, scope,
+  };
 }
 function devicesPage() {
   const local = ui.snap.phase;
   const data = deviceList.merged;
-  const { local: localTraffic, cards: views, scope } = deviceCardViews();
+  const { local: localTraffic, localError, cards: views, scope } = deviceCardViews();
   let cards = block("This Device", "",
     `<div class="row"><span class="row-label" data-morph="address">127.0.0.1:${local.port}</span><span class="state" data-morph="proxy-state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
     (local.error ? message("warn", esc(local.error)) : "") +
-    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : `<div class="placeholder">Loading traffic…</div>`), "this-device");
+    (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : localError ? message("warn", esc(localError)) : `<div class="placeholder">Loading traffic…</div>`), "this-device");
   for (const device of deviceList.devices) {
     const source = (data || deviceList.latest)?.sources.find(source => source.name === device.name);
     const card = views.get(device.id);

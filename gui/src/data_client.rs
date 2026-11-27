@@ -168,6 +168,9 @@ pub struct Merged {
     /// This device's traffic, in the frame of the range the panel asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local: Option<crate::traffic_stats::View>,
+    /// Why this device's traffic could not be read for that frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_error: Option<String>,
     /// The forwarded device's live traffic, shown in place of its last summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<LiveDevice>,
@@ -189,7 +192,7 @@ impl Merged {
     /// there is no Merged Traffic yet.
     pub fn with_devices(
         &mut self,
-        local: Option<&crate::traffic_stats::View>,
+        local: Result<&crate::traffic_stats::View, &str>,
         forwarded: Option<&ForwardedTraffic>,
     ) {
         let live_id = forwarded.map(|live| live.device_id.as_str());
@@ -197,7 +200,9 @@ impl Merged {
             source.device_id.as_deref() == live_id
                 && source.exclusion == Some(SourceExclusion::Duplicate)
         });
-        self.local = local.cloned();
+        self.local = local.ok().cloned();
+        self.local_error = local.err().map(str::to_owned);
+        let local = local.ok();
         self.forwarded = forwarded.filter(|_| !duplicate).map(|live| LiveDevice {
             device: live.device_id.clone(),
             traffic: live.traffic.clone(),
@@ -1147,6 +1152,7 @@ fn merge_fetched(
     states.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Merged {
         local: None,
+        local_error: None,
         forwarded: None,
         traffic: None,
         window_start: end - minutes as i64 * 60_000,
@@ -1236,6 +1242,7 @@ mod tests {
             scope: crate::traffic::TrafficScope::Model,
             bucket_minutes: 1,
             local: None,
+            local_error: None,
             forwarded: None,
             traffic: None,
         };
@@ -1251,11 +1258,15 @@ mod tests {
             traffic: traffic(1000),
         };
         let local = traffic(1);
-        // Without this device's traffic there is no Merged Traffic yet.
-        merged.with_devices(None, Some(&live("forwarded")));
+        // Without this device's traffic there is no Merged Traffic, and the
+        // frame says why.
+        merged.with_devices(Err("Cannot read the request log"), Some(&live("forwarded")));
         assert!(merged.traffic.is_none());
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["localError"], "Cannot read the request log");
+        assert!(json.get("local").is_none() && json.get("traffic").is_none());
         // The forwarded device's live view replaces its last summary.
-        merged.with_devices(Some(&local), Some(&live("forwarded")));
+        merged.with_devices(Ok(&local), Some(&live("forwarded")));
         let total = merged.traffic.as_ref().unwrap();
         assert_eq!(total.stats.requests, 1 + 10 + 1000);
         assert_eq!(total.credentials[0].stats.requests, 1011);
@@ -1266,14 +1277,14 @@ mod tests {
         assert_eq!(json["traffic"]["requests"], 1011);
         assert!(json["sources"][0].get("deviceId").is_none());
         // A duplicate entry is never counted, live or not.
-        merged.with_devices(Some(&local), Some(&live("copy")));
+        merged.with_devices(Ok(&local), Some(&live("copy")));
         assert!(merged.forwarded.is_none());
         assert_eq!(
             merged.traffic.as_ref().unwrap().stats.requests,
             1 + 10 + 100
         );
         // Without forwarding every device's summary counts.
-        merged.with_devices(Some(&local), None);
+        merged.with_devices(Ok(&local), None);
         assert_eq!(merged.traffic.as_ref().unwrap().stats.requests, 111);
     }
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
