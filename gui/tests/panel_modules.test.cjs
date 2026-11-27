@@ -1,17 +1,16 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
 const { test } = require('node:test');
 const { createLatest } = require('../ui/latest.js');
 const { createDeviceForm } = require('../ui/device_form.js');
 const { createActivityPager } = require('../ui/activity_pager.js');
+const harness = require('./panel_harness.cjs');
 
 const ui = path.join(__dirname, '../ui');
 
 test('the panel loads its scripts in an order where each finds what it uses', () => {
-  const html = fs.readFileSync(path.join(ui, 'index.html'), 'utf8');
-  const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
+  const scripts = harness.scripts();
   // Every script in the folder is loaded, app.js last.
   assert.deepEqual([...scripts].sort(), fs.readdirSync(ui).filter((f) => f.endsWith('.js')).sort());
   assert.equal(scripts.at(-1), 'app.js');
@@ -22,17 +21,13 @@ test('the panel loads its scripts in an order where each finds what it uses', ()
     construct: () => anything,
   });
   const never = () => new Promise(() => {});
-  const context = {
+  const context = harness.sandbox({
     window: { __TAURI__: { core: { invoke: never, Channel: class {} }, event: { listen: never } }, addEventListener() {}, matchMedia: () => anything },
     navigator: { userAgent: 'Linux' }, document: anything, getComputedStyle: () => anything,
     MutationObserver: class { observe() {} }, ResizeObserver: class { observe() {} },
     matchMedia: () => anything, setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, requestAnimationFrame: () => 0, queueMicrotask() {},
-  };
-  context.globalThis = context;
-  vm.createContext(context);
-  for (const script of scripts) {
-    assert.doesNotThrow(() => vm.runInContext(fs.readFileSync(path.join(ui, script), 'utf8'), context, { filename: script }), script);
-  }
+  });
+  for (const script of scripts) assert.doesNotThrow(() => harness.load(context, script), script);
 });
 
 test('only the newest read is current, and a read in flight is found by its key', () => {
