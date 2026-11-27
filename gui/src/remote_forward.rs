@@ -28,13 +28,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 /// The destination helper resolves only the running daemon's proxy, never its
 /// control socket or an arbitrary host/port supplied by the SSH client.
 pub async fn serve_stdio(dir: &Path) -> io::Result<()> {
-    let dir = dir.to_owned();
-    let (_, status) = tokio::task::spawn_blocking(move || crate::daemon::Client::discover(&dir))
-        .await
-        .map_err(io::Error::other)?
-        .ok_or_else(|| {
-            io::Error::other("Start Coport on the destination before forwarding requests.")
-        })?;
+    let (_, status) = crate::daemon::find(dir).await?.ok_or_else(|| {
+        io::Error::other("Start Coport on the destination before forwarding requests.")
+    })?;
     if status.forwarding.is_some() {
         return Err(io::Error::other(
             "The destination already forwards to another device; chained forwarding is not supported.",

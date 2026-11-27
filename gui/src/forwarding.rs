@@ -216,8 +216,7 @@ impl Forwarding {
     }
 
     async fn daemon(&self) -> Result<Option<(daemon::Client, daemon::Status)>, String> {
-        let dir = self.dir.clone();
-        tokio::task::spawn_blocking(move || daemon::Client::discover(&dir))
+        daemon::find(&self.dir)
             .await
             .map_err(|error| error.to_string())
     }

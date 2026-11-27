@@ -148,6 +148,16 @@ pub struct Client {
     directory: PathBuf,
 }
 
+/// The running Daemon serving `dir`, looked up afresh off the async runtime.
+/// Not finding one is no proof that none runs: see `Lifecycle::find`. An
+/// error only when the lookup itself could not run.
+pub async fn find(dir: &Path) -> io::Result<Option<(Client, Status)>> {
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || Client::discover(&dir))
+        .await
+        .map_err(io::Error::other)
+}
+
 impl Client {
     pub fn discover(dir: &Path) -> Option<(Self, Status)> {
         let endpoint = serde_json::from_slice(&std::fs::read(dir.join(ENDPOINT)).ok()?).ok()?;
