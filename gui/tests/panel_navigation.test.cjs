@@ -120,7 +120,7 @@ test("reopening Settings rereads the login item that System Settings may have ch
 
 // Page changes: the shown page stays while the next one reads its first data,
 // then one motion (changePage) shows it.
-async function navigation(page = "main") {
+async function navigation(page = "main", invoke = undefined) {
   const traffic = createTrafficViews({ invoke: async (_, { minutes, scope }) => ({ minutes, credentials: [] }) });
   await traffic.local(30, "model");
   let ui;
@@ -133,6 +133,7 @@ async function navigation(page = "main") {
   const changes = [];
   const loads = [];
   const p = scripts.panel({
+    invoke,
     before(context) {
       Object.assign(context, {
         createTrafficViews: () => traffic,
@@ -147,13 +148,14 @@ async function navigation(page = "main") {
   });
   ui = Object.assign(p.get("ui"), { page, snap: { settings: {} } });
   const { context } = p;
+  const original = { refreshLaunchAtLogin: context.refreshLaunchAtLogin };
   Object.assign(context, {
     renderTop() {}, renderPage: () => rendered.push(ui.page),
     loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null, scrollToLog() {}, toast() {},
   });
   context.deviceList = deviceList;
   const go = (target) => context.act("page", { dataset: { page: target } });
-  return { ui, traffic, rendered, changes, loads, render: context.render, go, context };
+  return { ui, traffic, rendered, changes, loads, render: context.render, go, context, original };
 }
 
 test("the shown page stays while the next one loads, then changes once", async () => {
@@ -179,6 +181,27 @@ test("a later page change supersedes one still loading", async () => {
   await activity;
   assert.equal(p.ui.page, "main");
   assert.deepEqual(p.changes.map((c) => c.page), ["main"]);
+});
+
+test("a superseded page change reads nothing for the page that replaced it", async () => {
+  const p = await navigation();
+  const homeReads = [];
+  p.context.loadHomeTraffic = () => homeReads.push(p.ui.page);
+  const activity = p.go("activity");
+  await Promise.resolve();
+  await p.go("main");
+  p.loads[0]();
+  await activity;
+  assert.deepEqual(homeReads, ["main"]);
+});
+
+test("Settings opens even when Launch at login cannot be read", async () => {
+  const p = await navigation("main", async (command) => {
+    if (command === "refresh_launch_at_login") throw "Launch at login unavailable";
+  });
+  p.context.refreshLaunchAtLogin = p.original.refreshLaunchAtLogin;
+  await p.go("settings");
+  assert.deepEqual(p.changes.map((c) => c.page), ["settings"]);
 });
 
 test("Home and Activity open with the ring the other already read", async () => {

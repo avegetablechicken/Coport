@@ -96,9 +96,12 @@ async function refresh() {
 }
 
 /// Rereads the login item, which System Settings can change while the app runs.
+/// Settings keeps the last Launch at login state it read when a read fails.
 async function refreshLaunchAtLogin() {
-  const state = await invoke("refresh_launch_at_login");
-  if (ui.snap) ui.snap.settings.launchAtLogin = state;
+  try {
+    const state = await invoke("refresh_launch_at_login");
+    if (ui.snap) ui.snap.settings.launchAtLogin = state;
+  } catch {}
 }
 
 let refreshTimer;
@@ -300,15 +303,17 @@ async function act(action, el) {
   const s = ui.snap;
   switch (action) {
     case "page": {
-      ui.page = el.dataset.page;
+      const page = ui.page = el.dataset.page;
       // The shown page stays while the next one reads what it shows first, so
-      // the change happens in one motion. A later change supersedes this one.
+      // the change happens in one motion. A later change supersedes this one
+      // and does its own reads.
       const change = ui.pageChange = (ui.pageChanges || 0) + 1;
       ui.pageChanges = change;
       try {
-        if (ui.page === "activity") {
+        if (page === "activity") {
           if (s.settings?.deviceCount > 0) {
             try { await deviceList.loadDefinitions(); } catch (error) { toast(String(error)); }
+            if (ui.pageChanges !== change) break;
           }
           // Home's ring, already read, opens Activity unchanged.
           trafficViews.activity = trafficViews.cached(null) ?? trafficViews.activity;
@@ -316,17 +321,14 @@ async function act(action, el) {
           // Presets follow the clock; a custom range stays as chosen.
           activityLog.resolveRange();
           await activityLog.load();
-        }
-        if (ui.page === "main") {
+        } else if (page === "main") {
           trafficViews.home = trafficViews.cached(homeTrafficDevice()) ?? trafficViews.home;
           loadHomeTraffic();
-        }
-        if (ui.page === "devices") {
+        } else if (page === "devices") {
           // Peers' views for the shared range, from the last refresh, open with the page.
           deviceList.select();
           deviceList.load();
-        }
-        if (ui.page === "settings") await Promise.all([deviceList.load(), refreshLaunchAtLogin()]);
+        } else if (page === "settings") await Promise.all([deviceList.load(), refreshLaunchAtLogin()]);
       } finally {
         if (ui.pageChange === change) ui.pageChange = null;
       }
