@@ -212,17 +212,30 @@ pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Resu
 /// Read-only SSH requests never repair files.
 pub(crate) fn preserve_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    let lock = crate::daemon::lock_file(&summary_helper_lock(dir))?;
+    lock.lock()?;
+    copy_summary_helper(dir, binary, crate::daemon::Held(lock))
+}
+
+/// The lock one copy of the helper holds at a time. A Daemon that stopped
+/// may still be copying, and a copy that fails removes the helper: holding
+/// it, neither removes the other's staging directory or helper.
+pub(crate) fn summary_helper_lock(dir: &Path) -> std::path::PathBuf {
+    dir.join("summary-helper.lock")
+}
+
+/// `preserve_summary_executable` with its lock already `held`.
+pub(crate) fn copy_summary_helper(
+    dir: &Path,
+    binary: &Path,
+    _held: crate::daemon::Held,
+) -> io::Result<()> {
     // Copying the whole executable took seconds on a busy disk. Copying to a
     // fresh path lets the platform clone the file (APFS, Btrfs, XFS) or copy
     // it inside the kernel. The copy is not flushed, and a helper damaged by a
     // crash is replaced by the next start. The staging directory is private,
     // so the copy is never reachable with the source's permissions.
     let helper = dir.join(format!("summary-helper{}", std::env::consts::EXE_SUFFIX));
-    // A Daemon that stopped may still be copying, and a copy that fails
-    // removes the helper: one copy at a time, so neither removes the other's
-    // staging directory or helper. The lock ends with its process.
-    let lock = crate::daemon::lock_file(&dir.join("summary-helper.lock"))?;
-    lock.lock()?;
     // A daemon stopped while copying leaves its staging directory behind.
     for entry in std::fs::read_dir(dir)?.flatten() {
         if entry

@@ -646,6 +646,41 @@ async fn termination() {
     }
 }
 
+/// Publishes the SSH discovery hint once this Daemon is ready, so one that
+/// fails to start leaves the last one's. The record is written now; the
+/// helper, a copy of the whole executable, is copied beside serving, since
+/// discovery runs the recorded executable while it exists. Its lock is
+/// taken before this Daemon can be stopped, so a later Daemon copies after.
+fn publish_summary_executable(dir: &Path, logger: &Arc<Logger>) {
+    let unavailable = |logger: &Logger, error: io::Error| {
+        logger.write(
+            "statistics_discovery_unavailable",
+            [("reason".to_owned(), error.to_string().into())]
+                .into_iter()
+                .collect(),
+        );
+    };
+    let binary = match std::env::current_exe().and_then(|binary| {
+        crate::remote::register_summary_executable(dir, &binary).map(|()| binary)
+    }) {
+        Ok(binary) => binary,
+        Err(error) => return unavailable(logger, error),
+    };
+    let held = try_hold(&crate::remote::summary_helper_lock(dir));
+    let (dir, logger) = (dir.to_owned(), logger.clone());
+    std::thread::spawn(move || {
+        let copied = match held {
+            Ok(Some(held)) => crate::remote::copy_summary_helper(&dir, &binary, held),
+            // A stopped Daemon is still copying: this copy follows it.
+            Ok(None) => crate::remote::preserve_summary_executable(&dir, &binary),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = copied {
+            unavailable(&logger, error);
+        }
+    });
+}
+
 /// Runs without Tauri, a WebView, a tray icon, or any GUI lifecycle hooks.
 pub async fn serve(dir: &Path, config: &Path, log: &Path) -> io::Result<()> {
     serve_until(dir, config, log, termination()).await
@@ -686,31 +721,6 @@ async fn serve_until(
                 .into_iter()
                 .collect(),
         );
-    }
-    // Publishing the SSH discovery hint is independent of proxy/HTTP startup.
-    // The record is written now; the helper, a copy of the whole executable,
-    // is copied beside startup, since discovery runs the recorded executable
-    // while it exists.
-    let discovery_unavailable = |logger: &Logger, error: io::Error| {
-        logger.write(
-            "statistics_discovery_unavailable",
-            [("reason".to_owned(), error.to_string().into())]
-                .into_iter()
-                .collect(),
-        );
-    };
-    match std::env::current_exe().and_then(|binary| {
-        crate::remote::register_summary_executable(dir, &binary).map(|()| binary)
-    }) {
-        Ok(binary) => {
-            let (dir, logger) = (dir.to_owned(), logger.clone());
-            std::thread::spawn(move || {
-                if let Err(error) = crate::remote::preserve_summary_executable(&dir, &binary) {
-                    discovery_unavailable(&logger, error);
-                }
-            });
-        }
-        Err(error) => discovery_unavailable(&logger, error),
     }
     let _data_api = if allow_external_access {
         Some(crate::data_api::start(config.clone(), dir, log_path.clone()).await?)
@@ -790,6 +800,7 @@ async fn serve_until(
         crate::settings::create_private(&staged, &serde_json::to_vec(&endpoint)?)?;
         std::fs::rename(staged, &registration.path)?;
     }
+    publish_summary_executable(dir, &logger);
 
     let token: Arc<str> = endpoint.token.into();
     let status = Arc::new(Status {
@@ -1066,6 +1077,18 @@ pub(crate) mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), b"broken-statistics-file");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_cannot_start_leaves_the_discovery_hint_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, format!("listen_port: {}\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n", taken.local_addr().unwrap().port())).unwrap();
+        let result =
+            serve_until(dir.path(), &config, &dir.path().join("proxy.log"), async {}).await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("summary-executable").exists());
     }
 
     #[tokio::test]
