@@ -383,6 +383,36 @@ async fn codex_url_routes_stream_through_declared_transport_without_credential_l
 }
 
 #[tokio::test]
+async fn only_antigravity_errors_are_read_before_their_headers() {
+    let fixture = fixture("direct", "permission_denied").await;
+    let running = running("proxies:\n  selected: none\ncodex:\n  routing:\n    api_key:\n      'upstream.invalid/v1': selected\n").await;
+    trust(&running, &fixture, "none");
+    let response = http()
+        .post(format!(
+            "{}/codex/https://upstream.invalid/v1/responses",
+            running.url
+        ))
+        .bearer_auth("url-route-secret")
+        .body("model-body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("IAM_PERMISSION_DENIED")
+    );
+    running.server.logger.flush().unwrap();
+    let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
+    // A Codex, Claude or Grok error message can echo the request.
+    assert!(log.contains("\"status\":\"403\""), "{log}");
+    assert!(!log.contains("upstream_error"), "{log}");
+}
+
+#[tokio::test]
 async fn codex_token_refresh_uses_saved_account_proxy_without_injecting_credentials() {
     let mut fixture = fixture("http", "sse").await;
     let endpoint = format!("http://127.0.0.1:{}", fixture.addr.port());

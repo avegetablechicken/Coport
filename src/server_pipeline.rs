@@ -293,7 +293,7 @@ impl Server {
         };
         A::record(self, &route).stamp(log);
         let relay = A::build(self, route, &parts, target, log)?;
-        self.send(parts, body, target, relay, websocket, snapshot, log)
+        self.send(parts, body, target, app, relay, websocket, snapshot, log)
             .await
     }
 
@@ -303,6 +303,7 @@ impl Server {
         parts: Parts,
         body: Incoming,
         target: &Target,
+        app: Service,
         relay: Relay,
         websocket: bool,
         snapshot: Option<Snapshot>,
@@ -358,7 +359,13 @@ impl Server {
                 log,
             )
             .await?;
-        Ok(self.location_cooldowns.observe(relay.cooldown, response))
+        // Only Antigravity's errors are read before their headers: another
+        // App's error message can echo the request.
+        Ok(if app == Service::Antigravity {
+            self.location_cooldowns.observe(relay.cooldown, response)
+        } else {
+            response
+        })
     }
 }
 
