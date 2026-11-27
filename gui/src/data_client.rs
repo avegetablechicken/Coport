@@ -152,9 +152,15 @@ pub struct SourceState {
     /// The configured device this source reads; never sent to the panel.
     #[serde(skip)]
     device_id: Option<String>,
+    /// The node its summary came from; never sent to the panel.
+    #[serde(skip)]
+    node_id: Option<String>,
     name: String,
     included: bool,
     exclusion: Option<SourceExclusion>,
+    /// `exclusion` before the forwarded device's live view was placed.
+    #[serde(skip)]
+    fetched_exclusion: Option<SourceExclusion>,
     error: Option<String>,
     traffic: Option<crate::traffic_stats::View>,
 }
@@ -190,18 +196,35 @@ impl Merged {
     /// Completes this range's frame with this device's traffic and the
     /// forwarded device's live traffic, and adds Merged Traffic: each device
     /// once, the forwarded one by its live view rather than its last summary,
-    /// a duplicate entry not at all (ADR-0001). Without this device's traffic
-    /// there is no Merged Traffic yet.
+    /// a duplicate entry not at all (ADR-0001). Entries are the same device
+    /// when they share its node. Without this device's traffic there is no
+    /// Merged Traffic yet.
     pub fn with_devices(
         &mut self,
+        node_id: &str,
         local: Result<&crate::traffic_stats::View, &str>,
         forwarded: Option<&ForwardedTraffic>,
     ) {
         let live_id = forwarded.map(|live| live.device_id.as_str());
-        let duplicate = self.sources.iter().any(|source| {
-            source.device_id.as_deref() == live_id
-                && source.exclusion == Some(SourceExclusion::Duplicate)
-        });
+        let duplicate = forwarded.is_some_and(|live| live.node_id == node_id)
+            || self.sources.iter().any(|source| {
+                source.device_id.as_deref() == live_id
+                    && source.fetched_exclusion == Some(SourceExclusion::Duplicate)
+            });
+        let live_node = forwarded
+            .filter(|_| !duplicate)
+            .map(|live| live.node_id.as_str());
+        for source in &mut self.sources {
+            let same_node = live_node.is_some()
+                && source.device_id.as_deref() != live_id
+                && source.node_id.as_deref() == live_node;
+            source.exclusion = if same_node {
+                Some(SourceExclusion::Duplicate)
+            } else {
+                source.fetched_exclusion.clone()
+            };
+            source.included = source.traffic.is_some() && source.exclusion.is_none();
+        }
         self.local = local.ok().cloned();
         self.local_error = local.err().map(str::to_owned);
         let local = local.ok();
@@ -215,6 +238,7 @@ impl Merged {
                 .sources
                 .iter()
                 .filter(|source| live.is_none() || source.device_id.as_deref() != live_id)
+                .filter(|source| source.included)
                 .filter_map(|source| source.traffic.as_ref());
             crate::traffic_stats::merge(
                 std::iter::once(local)
@@ -418,6 +442,9 @@ fn add_groups(
 #[serde(rename_all = "camelCase")]
 pub struct ForwardedTraffic {
     device_id: String,
+    /// The node the forwarded device's traffic came from.
+    #[serde(skip)]
+    node_id: String,
     name: String,
     fetched_at: u64,
     error: Option<String>,
@@ -446,6 +473,7 @@ pub async fn forwarded_traffic(
     );
     Ok(ForwardedTraffic {
         device_id: remote.device_id,
+        node_id: remote.node_id,
         name: remote.name,
         fetched_at: remote.fetched_at,
         error: remote.error,
@@ -719,9 +747,11 @@ async fn render_views(
                 .iter()
                 .map(|source| SourceState {
                     device_id: source.device_id.clone(),
+                    node_id: None,
                     name: source.name.clone(),
                     included: false,
                     exclusion: Some(SourceExclusion::NotRefreshed),
+                    fetched_exclusion: Some(SourceExclusion::NotRefreshed),
                     error: None,
                     traffic: None,
                 })
@@ -1122,6 +1152,7 @@ fn merge_fetched(
         let name = source.name.clone();
         let mut source_traffic = None;
         let mut exclusion = None;
+        let node_id = result.as_ref().ok().map(|summary| summary.node_id.clone());
         let (included, error) = match result {
             Ok(summary) if !seen.insert(summary.node_id.clone()) => {
                 exclusion = Some(SourceExclusion::Duplicate);
@@ -1150,8 +1181,10 @@ fn merge_fetched(
         };
         states.push(SourceState {
             device_id: source.device_id.clone(),
+            node_id,
             name,
             included,
+            fetched_exclusion: exclusion.clone(),
             exclusion,
             error,
             traffic: source_traffic,
@@ -1231,14 +1264,17 @@ mod tests {
                 )],
             )
         };
-        let source = |id: &str, requests: Option<u64>, exclusion| SourceState {
-            device_id: Some(id.into()),
-            name: id.into(),
-            included: requests.is_some(),
-            exclusion,
-            error: None,
-            traffic: requests.map(traffic),
-        };
+        let source =
+            |id: &str, requests: Option<u64>, exclusion: Option<SourceExclusion>| SourceState {
+                device_id: Some(id.into()),
+                node_id: Some(format!("{id}-node")),
+                name: id.into(),
+                included: requests.is_some(),
+                fetched_exclusion: exclusion.clone(),
+                exclusion,
+                error: None,
+                traffic: requests.map(traffic),
+            };
         let mut merged = Merged {
             window_start: window.start,
             window_end: window.end,
@@ -1257,6 +1293,7 @@ mod tests {
         };
         let live = |device: &str| ForwardedTraffic {
             device_id: device.into(),
+            node_id: format!("{device}-node"),
             name: device.into(),
             fetched_at: 0,
             error: None,
@@ -1269,13 +1306,17 @@ mod tests {
         let local = traffic(1);
         // Without this device's traffic there is no Merged Traffic, and the
         // frame says why.
-        merged.with_devices(Err("Cannot read the request log"), Some(&live("forwarded")));
+        merged.with_devices(
+            "local-node",
+            Err("Cannot read the request log"),
+            Some(&live("forwarded")),
+        );
         assert!(merged.traffic.is_none());
         let json = serde_json::to_value(&merged).unwrap();
         assert_eq!(json["localError"], "Cannot read the request log");
         assert!(json.get("local").is_none() && json.get("traffic").is_none());
         // The forwarded device's live view replaces its last summary.
-        merged.with_devices(Ok(&local), Some(&live("forwarded")));
+        merged.with_devices("local-node", Ok(&local), Some(&live("forwarded")));
         let total = merged.traffic.as_ref().unwrap();
         assert_eq!(total.stats.requests, 1 + 10 + 1000);
         assert_eq!(total.credentials[0].stats.requests, 1011);
@@ -1286,15 +1327,34 @@ mod tests {
         assert_eq!(json["traffic"]["requests"], 1011);
         assert!(json["sources"][0].get("deviceId").is_none());
         // A duplicate entry is never counted, live or not.
-        merged.with_devices(Ok(&local), Some(&live("copy")));
+        merged.with_devices("local-node", Ok(&local), Some(&live("copy")));
         assert!(merged.forwarded.is_none());
         assert_eq!(
             merged.traffic.as_ref().unwrap().stats.requests,
             1 + 10 + 100
         );
         // Without forwarding every device's summary counts.
-        merged.with_devices(Ok(&local), None);
+        merged.with_devices("local-node", Ok(&local), None);
         assert_eq!(merged.traffic.as_ref().unwrap().stats.requests, 111);
+        // Another entry for the forwarded device's node is the same device:
+        // the live view counts in its place, and its card says so.
+        let mut other_entry = live("forwarded");
+        other_entry.device_id = "ssh-only".into();
+        merged.with_devices("local-node", Ok(&local), Some(&other_entry));
+        assert_eq!(
+            merged.traffic.as_ref().unwrap().stats.requests,
+            1 + 10 + 1000
+        );
+        let forwarded = &merged.sources[1];
+        assert_eq!(forwarded.exclusion, Some(SourceExclusion::Duplicate));
+        assert!(!forwarded.included);
+        // Forwarding to this device's own node counts it once.
+        let mut itself = live("ssh-only");
+        itself.node_id = "local-node".into();
+        merged.with_devices("local-node", Ok(&local), Some(&itself));
+        assert!(merged.forwarded.is_none());
+        assert_eq!(merged.traffic.as_ref().unwrap().stats.requests, 111);
+        assert!(merged.sources[1].included && merged.sources[1].exclusion.is_none());
     }
     use crate::test_support::{DATA_KEY as KEY, DATA_KEY_ENV, data_key_in_subprocess};
     #[tokio::test]

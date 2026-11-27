@@ -110,12 +110,14 @@ impl Inputs {
     ) -> Result<Vec<Merged>, String> {
         crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
         let device = self.device()?;
+        let node_id = device.node_id.clone();
         let parts = std::sync::Mutex::new(DeviceParts::default());
         let selected = |view: &Merged| view.minutes == minutes && view.scope == scope;
         let complete = |views: &mut [Merged], parts: &DeviceParts| {
             let Some(local) = &parts.local else { return };
             for view in views.iter_mut().filter(|view| selected(view)) {
                 view.with_devices(
+                    &node_id,
                     local.as_ref().map_err(String::as_str),
                     parts.forwarded.as_ref(),
                 );
