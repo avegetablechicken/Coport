@@ -10,14 +10,19 @@ impl Platform for Native {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe and does not access Rust state.
+            // SAFETY: setsid and signal are async-signal-safe and do not
+            // access Rust state.
             unsafe {
                 command.pre_exec(|| {
                     if libc::setsid() == -1 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
+                        return Err(io::Error::last_os_error());
                     }
+                    // An ignored signal stays ignored across exec: a Restart
+                    // ignores these while it stops the old Daemon.
+                    for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM] {
+                        libc::signal(signal, libc::SIG_DFL);
+                    }
+                    Ok(())
                 });
             }
         }
@@ -110,6 +115,22 @@ pub(super) fn established(table: &str, port: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_detached_program_does_not_inherit_ignored_signals() {
+        // SAFETY: ignoring a signal installs no handler code.
+        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let mut command = Command::new("grep");
+        command.args(["^SigIgn:", "/proc/self/status"]);
+        Native.detach(&mut command);
+        let output = command.output();
+        // SAFETY: restores the disposition read above.
+        unsafe { libc::signal(libc::SIGHUP, previous) };
+        let line = String::from_utf8(output.unwrap().stdout).unwrap();
+        let ignored = u64::from_str_radix(line.trim_start_matches("SigIgn:").trim(), 16).unwrap();
+        assert_eq!(ignored & (1 << (libc::SIGHUP - 1)), 0, "{line}");
+    }
 
     #[test]
     fn only_a_service_that_is_no_desktop_session_supervises() {
