@@ -17,6 +17,7 @@ pub mod settings;
 pub mod tasks;
 pub mod traffic;
 pub mod traffic_identity;
+pub mod traffic_read;
 pub mod traffic_stats;
 
 #[cfg(test)]

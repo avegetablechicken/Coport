@@ -14,6 +14,18 @@ use std::{
     time::Duration,
 };
 
+/// This device as a merge reads it, taken once per traffic read.
+#[derive(Clone)]
+pub struct ThisDevice {
+    pub config: Config,
+    /// Its request log, where its identity evidence and device queries are.
+    pub log: PathBuf,
+    /// Credential labels already known; a merge never looks an account up.
+    pub labels: BTreeMap<(String, String), String>,
+    /// The node ID its summaries carry: a peer answering with it is this device.
+    pub node_id: String,
+}
+
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -485,15 +497,13 @@ pub struct ForwardedTraffic {
 }
 pub async fn forwarded_traffic(
     remote: crate::remote_forward::RemoteWindow,
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
+    device: ThisDevice,
 ) -> Result<ForwardedTraffic, String> {
     let window = remote.window;
     let bucket = crate::data_api::bucket_minutes(window.minutes)
         .filter(|bucket| *bucket == window.bucket_minutes)
         .ok_or("Invalid remote traffic window")?;
-    let context = prepare_merge_range(config, log, credential_labels, window.minutes).await?;
+    let context = prepare_merge_range(device, window.minutes).await?;
     let mut groups = BTreeMap::new();
     add_groups(
         &mut groups,
@@ -524,40 +534,21 @@ pub async fn forwarded_traffic(
 }
 pub async fn merge(
     sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
+    device: ThisDevice,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
-) -> Result<Merged, String> {
-    let labels = config.local_traffic_credential_labels().await;
-    merge_with_labels(sources, config, log, minutes, scope, labels).await
-}
-pub async fn merge_with_labels(
-    sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
-    credential_labels: BTreeMap<(String, String), String>,
 ) -> Result<Merged, String> {
     crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
     if sources.len() > crate::devices::LIMIT {
         return Err("At most 32 data sources are supported.".into());
     }
-    let context = std::sync::Arc::new(prepare_merge(config, log, credential_labels).await?);
+    let context = std::sync::Arc::new(prepare_merge(device).await?);
     let (fetched, end) = align_sources(&context, sources, &[(minutes, scope)]).await?;
     merge_fetched(&context, &fetched, minutes, scope, end)
 }
 
-pub async fn merge_views_with_labels(
-    sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
-) -> Result<Vec<Merged>, String> {
-    MergeCache::default()
-        .views(sources, config, log, credential_labels, true)
-        .await
+pub async fn merge_views(sources: Vec<Source>, device: ThisDevice) -> Result<Vec<Merged>, String> {
+    MergeCache::default().views(sources, device, true).await
 }
 
 fn cache_source_key(source: &Source) -> Result<Vec<u8>, String> {
@@ -585,16 +576,13 @@ impl MergeCache {
     pub async fn refresh_progressive(
         &mut self,
         sources: Vec<Source>,
-        config: Config,
-        log: PathBuf,
-        labels: BTreeMap<(String, String), String>,
+        device: ThisDevice,
         selection: (u64, crate::traffic::TrafficScope),
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
         let key = self.begin_refresh(&sources)?;
         let result =
-            merge_progressive_snapshot(sources, config, log, labels, selection.into(), on_update)
-                .await?;
+            merge_progressive_snapshot(sources, device, selection.into(), on_update).await?;
         self.commit_refresh(&key, result)
     }
 
@@ -603,15 +591,12 @@ impl MergeCache {
     pub async fn refresh_shared(
         cache: &tokio::sync::Mutex<Self>,
         sources: Vec<Source>,
-        config: Config,
-        log: PathBuf,
-        labels: BTreeMap<(String, String), String>,
+        device: ThisDevice,
         refresh: Refresh,
         on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
     ) -> Result<Vec<Merged>, String> {
         let key = cache.lock().await.begin_refresh(&sources)?;
-        let result =
-            merge_progressive_snapshot(sources, config, log, labels, refresh, on_update).await?;
+        let result = merge_progressive_snapshot(sources, device, refresh, on_update).await?;
         cache.lock().await.commit_refresh(&key, result)
     }
 
@@ -654,20 +639,11 @@ impl MergeCache {
     pub async fn views(
         &mut self,
         sources: Vec<Source>,
-        config: Config,
-        log: PathBuf,
-        credential_labels: BTreeMap<(String, String), String>,
+        device: ThisDevice,
         refresh_remote: bool,
     ) -> Result<Vec<Merged>, String> {
-        self.views_selected_first(
-            sources,
-            config,
-            log,
-            credential_labels,
-            refresh_remote,
-            None,
-        )
-        .await
+        self.views_selected_first(sources, device, refresh_remote, None)
+            .await
     }
 
     /// Like `views`, but publishes `first` through `on_update` before merging
@@ -675,18 +651,14 @@ impl MergeCache {
     pub async fn views_selected_first(
         &mut self,
         sources: Vec<Source>,
-        config: Config,
-        log: PathBuf,
-        credential_labels: BTreeMap<(String, String), String>,
+        device: ThisDevice,
         refresh_remote: bool,
         first: Option<FirstView<'_>>,
     ) -> Result<Vec<Merged>, String> {
         self.cached_state(&sources)?;
         let mut full = None;
         if refresh_remote {
-            let context = std::sync::Arc::new(
-                prepare_merge(config.clone(), log.clone(), credential_labels.clone()).await?,
-            );
+            let context = std::sync::Arc::new(prepare_merge(device.clone()).await?);
             let (fetched, end) =
                 align_sources(&context, sources.clone(), &all_selections()).await?;
             self.fetched = Some((std::sync::Arc::new(fetched), end));
@@ -694,7 +666,7 @@ impl MergeCache {
             full = Some(context);
         }
         let state = self.cached_state(&sources)?;
-        render_views(state, sources, config, log, credential_labels, first, full).await
+        render_views(state, sources, device, first, full).await
     }
 
     /// Passive reads hold the cache lock only to capture its state, so a
@@ -702,13 +674,11 @@ impl MergeCache {
     pub async fn views_shared(
         cache: &tokio::sync::Mutex<Self>,
         sources: Vec<Source>,
-        config: Config,
-        log: PathBuf,
-        credential_labels: BTreeMap<(String, String), String>,
+        device: ThisDevice,
         first: Option<FirstView<'_>>,
     ) -> Result<Vec<Merged>, String> {
         let state = cache.lock().await.cached_state(&sources)?;
-        render_views(state, sources, config, log, credential_labels, first, None).await
+        render_views(state, sources, device, first, None).await
     }
 
     /// Reset the cache for a changed device set and map cached results to
@@ -764,9 +734,7 @@ fn all_selections() -> Vec<(u64, crate::traffic::TrafficScope)> {
 async fn render_views(
     state: CachedState,
     sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
+    device: ThisDevice,
     first: Option<FirstView<'_>>,
     full: Option<std::sync::Arc<MergeContext>>,
 ) -> Result<Vec<Merged>, String> {
@@ -811,13 +779,7 @@ async fn render_views(
         // from an earlier refresh is still covered.
         let behind = u64::try_from(at - end).unwrap_or(0).div_ceil(60_000);
         let evidence = (minutes + behind).min(43200);
-        let mut context = prepare_merge_range(
-            config.clone(),
-            log.clone(),
-            credential_labels.clone(),
-            evidence,
-        )
-        .await?;
+        let mut context = prepare_merge_range(device.clone(), evidence).await?;
         context.at = at;
         let mut view = merge_fetched(&context, fetched, minutes, scope, end)?;
         decorate(&mut view);
@@ -826,7 +788,7 @@ async fn render_views(
     let context = match full {
         Some(context) => context,
         None => {
-            let mut context = prepare_merge(config, log, credential_labels).await?;
+            let mut context = prepare_merge(device).await?;
             context.at = at;
             std::sync::Arc::new(context)
         }
@@ -836,25 +798,18 @@ async fn render_views(
     Ok(views)
 }
 /// Publish the selected view as peers respond, then fill the other cached views.
-pub async fn merge_progressive_with_labels(
+pub async fn merge_progressive(
     sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
+    device: ThisDevice,
     minutes: u64,
     scope: crate::traffic::TrafficScope,
     on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
 ) -> Result<Vec<Merged>, String> {
-    Ok(merge_progressive_snapshot(
-        sources,
-        config,
-        log,
-        credential_labels,
-        (minutes, scope).into(),
-        on_update,
+    Ok(
+        merge_progressive_snapshot(sources, device, (minutes, scope).into(), on_update)
+            .await?
+            .views,
     )
-    .await?
-    .views)
 }
 /// A refresh of one range/category first. Devices whose summary was just read
 /// elsewhere (the forwarded device, by the daemon's monitor) are not read again.
@@ -881,9 +836,7 @@ struct ProgressiveResult {
 }
 async fn merge_progressive_snapshot(
     sources: Vec<Source>,
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
+    device: ThisDevice,
     refresh: Refresh,
     on_update: impl Fn(Vec<Merged>) -> Result<(), String>,
 ) -> Result<ProgressiveResult, String> {
@@ -916,7 +869,7 @@ async fn merge_progressive_snapshot(
             continue;
         }
         let tx = tx.clone();
-        let log = log.clone();
+        let log = device.log.clone();
         tasks.spawn(async move {
             let started = std::time::Instant::now();
             let result = async {
@@ -957,8 +910,7 @@ async fn merge_progressive_snapshot(
     }
     drop(tx);
     // Remote I/O runs while local identity evidence is prepared.
-    let context =
-        std::sync::Arc::new(prepare_merge_range(config, log, credential_labels, minutes).await?);
+    let context = std::sync::Arc::new(prepare_merge_range(device, minutes).await?);
 
     // Placeholders show at once; peers replace them as they answer.
     on_update(vec![merge_fetched(
@@ -967,7 +919,7 @@ async fn merge_progressive_snapshot(
     // While peers answer, parse this device's 30-day archives into the cache.
     // Archives never change, so the complete views below reuse them at any
     // boundary; a scan still running is awaited there, never repeated.
-    let warm_log = context.log.clone();
+    let warm_log = context.device.log.clone();
     let _warm = tokio::task::spawn_blocking(move || {
         crate::traffic::observed_identity_labels_range(&warm_log, BTreeMap::new(), 43200)
     });
@@ -980,7 +932,7 @@ async fn merge_progressive_snapshot(
         if result.is_ok() || fetched[index].1.is_err() {
             fetched[index].1 = result;
         }
-        let mut seen = BTreeSet::from([context.local_id.clone()]);
+        let mut seen = BTreeSet::from([context.device.node_id.clone()]);
         let summaries: Vec<_> = fetched
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
@@ -1011,12 +963,7 @@ async fn merge_progressive_snapshot(
             ]
         })
         .collect();
-    let mut complete_context = prepare_merge(
-        context.config.clone(),
-        context.log.clone(),
-        context.credential_labels.clone(),
-    )
-    .await?;
+    let mut complete_context = prepare_merge(context.device.clone()).await?;
     complete_context.at = context.at;
     let context = std::sync::Arc::new(complete_context);
     let (fetched, end) = align_fetched(&context, fetched, &selections, false).await?;
@@ -1036,27 +983,22 @@ async fn merge_progressive_snapshot(
     })
 }
 
+/// `device` with the labels its identity evidence adds.
 struct MergeContext {
-    config: Config,
-    log: PathBuf,
+    device: ThisDevice,
     accounts: BTreeMap<String, String>,
-    credential_labels: BTreeMap<(String, String), String>,
-    local_id: String,
     at: i64,
 }
-async fn prepare_merge(
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
-) -> Result<MergeContext, String> {
-    prepare_merge_range(config, log, credential_labels, 43200).await
+async fn prepare_merge(device: ThisDevice) -> Result<MergeContext, String> {
+    prepare_merge_range(device, 43200).await
 }
-async fn prepare_merge_range(
-    config: Config,
-    log: PathBuf,
-    credential_labels: BTreeMap<(String, String), String>,
-    minutes: u64,
-) -> Result<MergeContext, String> {
+async fn prepare_merge_range(device: ThisDevice, minutes: u64) -> Result<MergeContext, String> {
+    let ThisDevice {
+        config,
+        log,
+        labels: credential_labels,
+        node_id,
+    } = device;
     let evidence_path = log.clone();
     let credential_labels = tokio::task::spawn_blocking(move || {
         crate::traffic::observed_identity_labels_range(&evidence_path, credential_labels, minutes)
@@ -1078,12 +1020,13 @@ async fn prepare_merge_range(
         }
     }
     Ok(MergeContext {
-        config,
-        log,
+        device: ThisDevice {
+            config,
+            log,
+            labels: credential_labels,
+            node_id,
+        },
         accounts,
-        credential_labels,
-        local_id: std::fs::read_to_string(crate::settings::app_dir().join("data-node-id"))
-            .unwrap_or_else(|_| "local".into()),
         at: chrono::Utc::now().timestamp_millis() / 60_000 * 60_000,
     })
 }
@@ -1093,7 +1036,7 @@ async fn align_sources(
     sources: Vec<Source>,
     selections: &[(u64, crate::traffic::TrafficScope)],
 ) -> Result<(Fetched, i64), String> {
-    let fetched = fetch_sources(sources, &context.log).await?;
+    let fetched = fetch_sources(sources, &context.device.log).await?;
     align_fetched(context, fetched, selections, true).await
 }
 async fn align_fetched(
@@ -1103,7 +1046,7 @@ async fn align_fetched(
     allow_refetch: bool,
 ) -> Result<(Fetched, i64), String> {
     for attempt in 0..3 {
-        let mut seen = BTreeSet::from([context.local_id.clone()]);
+        let mut seen = BTreeSet::from([context.device.node_id.clone()]);
         let valid: Vec<_> = fetched
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
@@ -1146,7 +1089,7 @@ async fn align_fetched(
             let (ok, mut failed): (Fetched, Fetched) =
                 fetched.into_iter().partition(|(_, result)| result.is_ok());
             let sources = ok.into_iter().map(|(s, _)| s).collect();
-            failed.extend(fetch_sources(sources, &context.log).await?);
+            failed.extend(fetch_sources(sources, &context.device.log).await?);
             failed.sort_by(|a, b| a.0.name.cmp(&b.0.name));
             fetched = failed;
         }
@@ -1160,7 +1103,7 @@ fn align_partially(
     mut fetched: Fetched,
     selections: &[(u64, crate::traffic::TrafficScope)],
 ) -> (Fetched, i64) {
-    let mut seen = BTreeSet::from([context.local_id.clone()]);
+    let mut seen = BTreeSet::from([context.device.node_id.clone()]);
     let valid: Vec<(usize, &Summary)> = fetched
         .iter()
         .enumerate()
@@ -1236,7 +1179,7 @@ fn merge_fetched(
         end,
         bucket_minutes: bucket,
     };
-    let mut seen = BTreeSet::from([context.local_id.clone()]);
+    let mut seen = BTreeSet::from([context.device.node_id.clone()]);
     let mut states = Vec::new();
     for (source, result) in fetched {
         let name = source.name.clone();
@@ -1294,6 +1237,19 @@ fn merge_fetched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// This device with `config`, `log` and `labels`, and a node ID no peer has.
+    fn this_device(
+        config: Config,
+        log: PathBuf,
+        labels: BTreeMap<(String, String), String>,
+    ) -> ThisDevice {
+        ThisDevice {
+            config,
+            log,
+            labels,
+            node_id: "local".into(),
+        }
+    }
     /// A peer's Model traffic over `buckets` one-minute buckets.
     fn traffic_view(groups: &[MergedGroup], buckets: usize) -> crate::traffic_stats::View {
         super::traffic_view(
@@ -1420,6 +1376,7 @@ mod tests {
                 &log,
                 &DataKey::new(KEY).unwrap(),
                 &uuid::Uuid::new_v4().to_string(),
+                &[],
             )
             .unwrap();
             let mut selected: Summary = serde_json::from_slice(&bytes).unwrap();
@@ -1473,9 +1430,7 @@ mod tests {
             Duration::from_secs(10),
             cache.refresh_progressive(
                 sources.clone(),
-                config.clone(),
-                log.clone(),
-                BTreeMap::new(),
+                this_device(config.clone(), log.clone(), BTreeMap::new()),
                 (1440, crate::traffic::TrafficScope::All),
                 |views| {
                     assert_eq!(views.len(), 1);
@@ -1525,7 +1480,7 @@ mod tests {
         }
         // Listeners are gone: cached page reads must retain successful snapshots.
         let cached = cache
-            .views(sources, config, log, BTreeMap::new(), false)
+            .views(sources, this_device(config, log, BTreeMap::new()), false)
             .await
             .unwrap();
         assert_eq!(cached.len(), 12);
@@ -1566,9 +1521,7 @@ mod tests {
                 Duration::from_secs(2),
                 cache.views(
                     sources.clone(),
-                    config.clone(),
-                    log.clone(),
-                    BTreeMap::new(),
+                    this_device(config.clone(), log.clone(), BTreeMap::new()),
                     false,
                 ),
             )
@@ -1589,7 +1542,7 @@ mod tests {
         sources[0].name = "First".into();
         sources[1].name = "Second".into();
         let views = cache
-            .views(sources, config, log, BTreeMap::new(), false)
+            .views(sources, this_device(config, log, BTreeMap::new()), false)
             .await
             .unwrap();
         assert_eq!(views[0].sources[0].name, "First");
@@ -1654,9 +1607,7 @@ mod tests {
         let views = cache
             .refresh_progressive(
                 sources.clone(),
-                config.clone(),
-                log.clone(),
-                BTreeMap::new(),
+                this_device(config.clone(), log.clone(), BTreeMap::new()),
                 (30, crate::traffic::TrafficScope::Model),
                 |_| Ok(()),
             )
@@ -1690,7 +1641,7 @@ mod tests {
         // The partial result is cached; reading it never reconnects.
         check(
             &cache
-                .views(sources, config, log, BTreeMap::new(), false)
+                .views(sources, this_device(config, log, BTreeMap::new()), false)
                 .await
                 .unwrap(),
         );
@@ -1755,9 +1706,7 @@ mod tests {
         let views = cache
             .views_selected_first(
                 vec![source],
-                config,
-                log,
-                labels,
+                this_device(config, log, labels),
                 false,
                 Some((30, crate::traffic::TrafficScope::Model, &publish)),
             )
@@ -1791,9 +1740,7 @@ mod tests {
         let views = MergeCache::views_shared(
             &cache,
             Vec::new(),
-            config,
-            log,
-            BTreeMap::new(),
+            this_device(config, log, BTreeMap::new()),
             Some((30, crate::traffic::TrafficScope::Model, &publish)),
         )
         .await
@@ -1817,9 +1764,7 @@ mod tests {
         let views = MergeCache::default()
             .views_selected_first(
                 Vec::new(),
-                config,
-                log,
-                BTreeMap::new(),
+                this_device(config, log, BTreeMap::new()),
                 false,
                 Some((1440, crate::traffic::TrafficScope::All, &publish)),
             )
@@ -1919,9 +1864,7 @@ mod tests {
         let views = MergeCache::default()
             .views_selected_first(
                 Vec::new(),
-                config,
-                log,
-                BTreeMap::new(),
+                this_device(config, log, BTreeMap::new()),
                 false,
                 Some((30, crate::traffic::TrafficScope::Model, &publish)),
             )
@@ -1958,9 +1901,7 @@ mod tests {
         let result = MergeCache::default()
             .views_selected_first(
                 Vec::new(),
-                config,
-                log,
-                BTreeMap::new(),
+                this_device(config, log, BTreeMap::new()),
                 false,
                 Some((30, crate::traffic::TrafficScope::Model, &publish)),
             )
@@ -1988,6 +1929,7 @@ mod tests {
             &peer_log,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2042,9 +1984,7 @@ mod tests {
             MergeCache::default()
                 .refresh_progressive(
                     vec![source],
-                    config,
-                    log,
-                    BTreeMap::new(),
+                    this_device(config, log, BTreeMap::new()),
                     (30, crate::traffic::TrafficScope::Model),
                     |_| Ok(()),
                 )
@@ -2093,6 +2033,7 @@ mod tests {
             &log,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let source = Source {
@@ -2148,9 +2089,7 @@ mod tests {
                 MergeCache::refresh_shared(
                     &cache,
                     vec![source],
-                    config,
-                    log,
-                    BTreeMap::new(),
+                    this_device(config, log, BTreeMap::new()),
                     (30, crate::traffic::TrafficScope::Model).into(),
                     |_| Ok(()),
                 )
@@ -2167,9 +2106,7 @@ mod tests {
                 .await
                 .views(
                     vec![source.clone()],
-                    config.clone(),
-                    log.clone(),
-                    BTreeMap::new(),
+                    this_device(config.clone(), log.clone(), BTreeMap::new()),
                     false,
                 )
                 .await
@@ -2193,7 +2130,11 @@ mod tests {
         let cached = cache
             .lock()
             .await
-            .views(vec![source], config, log, BTreeMap::new(), false)
+            .views(
+                vec![source],
+                this_device(config, log, BTreeMap::new()),
+                false,
+            )
             .await
             .unwrap();
         assert!(cached.iter().all(|view| view.sources[0].included));
@@ -2262,13 +2203,11 @@ mod tests {
             source("peer-1", &skewed),
             source("denied", &denied),
         ];
-        let result = merge_with_labels(
+        let result = merge(
             sources,
-            config,
-            log,
+            this_device(config, log, BTreeMap::new()),
             30,
             crate::traffic::TrafficScope::Model,
-            BTreeMap::new(),
         )
         .await;
         assert!(matches!(result, Err(error) if error == "TRAFFIC_UPDATING"));
@@ -2375,7 +2314,7 @@ mod tests {
         }
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let before = crate::traffic::live_scans(&log);
-        let result = merge_views_with_labels(sources, config, log.clone(), BTreeMap::new()).await;
+        let result = merge_views(sources, this_device(config, log.clone(), BTreeMap::new())).await;
         if recover {
             let views = result.unwrap();
             assert_eq!(views.len(), 12);
@@ -2749,6 +2688,7 @@ mod tests {
             &log,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let encoded = std::str::from_utf8(&body).unwrap();
@@ -2758,7 +2698,7 @@ mod tests {
         let summary: Summary = serde_json::from_slice(&body).unwrap();
         assert_eq!(summary.groups.len(), 2);
         let labels = config.local_traffic_credential_labels().await;
-        let context = prepare_merge(config.clone(), log.clone(), labels.clone())
+        let context = prepare_merge(this_device(config.clone(), log.clone(), labels.clone()))
             .await
             .unwrap();
         // Merged Traffic adds accounts by name, so this device's card must
@@ -2830,6 +2770,7 @@ mod tests {
             &log,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let encoded = std::str::from_utf8(&bytes).unwrap();
@@ -2916,6 +2857,7 @@ mod tests {
             &log,
             &DataKey::new(&"e".repeat(64)).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let encoded = std::str::from_utf8(&body).unwrap();
@@ -2958,7 +2900,7 @@ mod tests {
         };
         let labels = config.local_traffic_credential_labels().await;
         let (config_for_views, labels_for_views) = (config.clone(), labels.clone());
-        let views = merge_views_with_labels(vec![source], config, log.clone(), labels)
+        let views = merge_views(vec![source], this_device(config, log.clone(), labels))
             .await
             .unwrap();
         let audit: Vec<serde_json::Value> = std::fs::read_to_string(&log)
@@ -3054,11 +2996,13 @@ mod tests {
         );
         let end = summary.window_end;
         let context = MergeContext {
-            config,
-            log: log.clone(),
+            device: ThisDevice {
+                config,
+                log: log.clone(),
+                labels: BTreeMap::new(),
+                node_id: "local-test".into(),
+            },
             accounts: BTreeMap::new(),
-            credential_labels: BTreeMap::new(),
-            local_id: "local-test".into(),
             at: end,
         };
         let source = |name: &str| Source {
@@ -3231,9 +3175,12 @@ mod tests {
                 ],
             },
         };
-        let view = forwarded_traffic(remote.clone(), config.clone(), log.clone(), labels.clone())
-            .await
-            .unwrap();
+        let view = forwarded_traffic(
+            remote.clone(),
+            this_device(config.clone(), log.clone(), labels.clone()),
+        )
+        .await
+        .unwrap();
         let view = serde_json::to_value(view).unwrap();
         let credentials: Vec<_> = view["traffic"]["credentials"]
             .as_array()
@@ -3257,7 +3204,7 @@ mod tests {
         let mut invalid = remote;
         invalid.window.bucket_minutes = 10;
         assert!(
-            forwarded_traffic(invalid, config, log, labels)
+            forwarded_traffic(invalid, this_device(config, log, labels))
                 .await
                 .is_err()
         );
@@ -3291,7 +3238,7 @@ mod tests {
             lines.push_str(&format!("{record}\n"));
         }
         std::fs::write(&log, &lines).unwrap();
-        let context = crate::traffic::ExportIdentities::from_config(&config);
+        let context = crate::traffic::ExportIdentities::from_config(&config, &[]);
         let key = DataKey::new(KEY).unwrap();
         let options = crate::traffic::ExportOptions {
             end,
@@ -3316,9 +3263,12 @@ mod tests {
         let local_log = dir.path().join("local.log");
         std::fs::write(&local_log, "").unwrap();
         let labels = config.local_traffic_credential_labels().await;
-        let merge = prepare_merge_range(config.clone(), local_log.clone(), labels.clone(), 30)
-            .await
-            .unwrap();
+        let merge = prepare_merge_range(
+            this_device(config.clone(), local_log.clone(), labels.clone()),
+            30,
+        )
+        .await
+        .unwrap();
         let mut device_groups = BTreeMap::new();
         add_groups(
             &mut device_groups,
@@ -3343,7 +3293,7 @@ mod tests {
                 groups,
             },
         };
-        let forwarded = forwarded_traffic(remote, config, local_log, labels)
+        let forwarded = forwarded_traffic(remote, this_device(config, local_log, labels))
             .await
             .unwrap();
         let mut devices = devices;
@@ -3403,9 +3353,7 @@ mod tests {
         let views = MergeCache::refresh_shared(
             &cache,
             vec![source.clone()],
-            config.clone(),
-            log.clone(),
-            BTreeMap::new(),
+            this_device(config.clone(), log.clone(), BTreeMap::new()),
             refresh(summary.clone()),
             |_| Ok(()),
         )
@@ -3437,11 +3385,9 @@ mod tests {
             MergeCache::refresh_shared(
                 &cache,
                 vec![source],
-                config,
-                log,
-                BTreeMap::new(),
+                this_device(config, log, BTreeMap::new()),
                 refresh(stale),
-                |_| Ok(()),
+                |_| Ok(())
             ),
             tokio::time::timeout(Duration::from_secs(5), async {
                 drop(listener.accept().await.unwrap());

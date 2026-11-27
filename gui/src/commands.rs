@@ -222,41 +222,33 @@ pub async fn get_traffic(
     minutes: u64,
     scope: Option<crate::traffic::TrafficScope>,
 ) -> Result<coport_gui::traffic_stats::View> {
-    read_local_traffic(&state, minutes, scope.unwrap_or_default()).await
+    traffic_inputs(&state)
+        .await
+        .local(minutes, scope.unwrap_or_default())
+        .await
 }
 
-/// This device's traffic, from its logs, with the panel's assignments.
-async fn read_local_traffic(
-    state: &AppState,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
-) -> Result<coport_gui::traffic_stats::View> {
-    let (path, config, task) = {
+/// One snapshot of what a traffic read reads. Only credential labels
+/// already known are read; reading traffic never starts an account probe.
+async fn traffic_inputs(state: &AppState) -> coport_gui::traffic_read::Inputs {
+    let (config, log, sources, tasks) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();
         (
-            core.logs.path(),
             core.loaded_config().cloned(),
+            core.logs.path(),
+            core.settings.data_sources(),
             core.account_tasks(),
         )
     };
-    // An unreadable file leaves every changed configuration to be reviewed.
-    let assignments =
-        Compatibility::load(&crate::settings::traffic_compatibility_path()).unwrap_or_default();
-    let assignments = assignments.assignments;
-    let identities = config
-        .as_ref()
-        .map(|config| crate::traffic_identity::Identities::from_config(config, &assignments))
-        .unwrap_or_default();
-    let labels = match task {
-        Some(task) => task.cached_credential_labels().await,
-        None => Default::default(),
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::traffic::read(&path, minutes, &labels, scope, &identities)
-    })
+    coport_gui::traffic_read::Inputs::take(
+        coport_gui::settings::app_dir(),
+        config,
+        log,
+        sources,
+        tasks,
+    )
     .await
-    .map_err(|_| "Cannot load traffic history".to_owned())?
 }
 
 /// Records where traffic logged under `name` and `base` is counted: a current
@@ -800,86 +792,7 @@ pub async fn get_forwarding_traffic(
     minutes: u64,
     scope: crate::traffic::TrafficScope,
 ) -> Result<coport_gui::data_client::ForwardedTraffic> {
-    coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let (client, status) = local_daemon()
-        .await?
-        .ok_or("Start the local proxy to show forwarded traffic.")?;
-    if !status.forwarding_traffic_supported {
-        return Err("Restart the local proxy to show the forwarded device's traffic.".into());
-    }
-    read_forwarded_traffic(&state, &client, minutes, scope).await
-}
-
-async fn read_forwarded_traffic(
-    state: &AppState,
-    client: &coport_gui::daemon::Client,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
-) -> Result<coport_gui::data_client::ForwardedTraffic> {
-    let window = client
-        .forwarding_traffic(minutes, scope)
-        .await
-        .map_err(|error| error.to_string())?;
-    let (config, log, task) = {
-        let mut core = state.core.lock().unwrap();
-        core.refresh_config();
-        (
-            core.loaded_config()
-                .cloned()
-                .ok_or("Cannot read local configuration")?,
-            core.logs.path(),
-            core.account_tasks()
-                .ok_or("Cannot prepare credential cache")?,
-        )
-    };
-    // Cached identities only; reading traffic never starts an account probe.
-    let labels = task.cached_credential_labels().await;
-    coport_gui::data_client::forwarded_traffic(window, config, log, labels).await
-}
-
-/// The forwarded device's live traffic while forwarding is on, as Home shows it.
-async fn forwarding_device_traffic(
-    state: &AppState,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
-) -> Option<coport_gui::data_client::ForwardedTraffic> {
-    let (client, status) = local_daemon().await.ok()??;
-    if !status.forwarding_traffic_supported || status.forwarding.is_none() {
-        return None;
-    }
-    read_forwarded_traffic(state, &client, minutes, scope)
-        .await
-        .ok()
-}
-/// The forwarded device's summary if the daemon read it within the last minute.
-/// Reading it never contacts the device; without one, the refresh reads as usual.
-async fn forwarded_summary() -> std::collections::BTreeMap<String, coport_gui::data_api::Summary> {
-    let Ok(Some((client, status))) = local_daemon().await else {
-        return Default::default();
-    };
-    if !status.forwarding_traffic_supported || status.forwarding.is_none() {
-        return Default::default();
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    match client.forwarding_summary().await {
-        Ok(Some(reused)) if now.saturating_sub(reused.fetched_at) <= 60_000 => {
-            [(reused.device_id, reused.summary)].into()
-        }
-        _ => Default::default(),
-    }
-}
-/// This device's and the forwarded device's traffic for the selected range,
-/// read beside the peers'. Each frame of that range carries them and Merged
-/// Traffic, so the range's frames wait until both were read; the peers' last
-/// frame by then is published as they arrive.
-#[derive(Default)]
-struct DeviceParts {
-    read: bool,
-    local: Option<coport_gui::traffic_stats::View>,
-    forwarded: Option<coport_gui::data_client::ForwardedTraffic>,
-    last: Option<coport_gui::data_client::Merged>,
+    traffic_inputs(&state).await.forwarded(minutes, scope).await
 }
 
 #[tauri::command]
@@ -890,111 +803,18 @@ pub async fn get_merged_data(
     on_update: tauri::ipc::Channel<Vec<coport_gui::data_client::Merged>>,
     refresh_remote: Option<bool>,
 ) -> Result<Vec<coport_gui::data_client::Merged>> {
-    use coport_gui::data_client::Merged;
-    coport_gui::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let (sources, config, log, task) = {
-        let mut core = state.core.lock().unwrap();
-        core.refresh_config();
-        (
-            core.settings.data_sources(),
-            core.loaded_config()
-                .cloned()
-                .ok_or("Cannot read local configuration")?,
-            core.logs.path(),
-            core.account_tasks()
-                .ok_or("Cannot prepare credential cache")?,
-        )
-    };
-    // Read identities learned by background probes without starting a probe.
-    let labels = task.cached_credential_labels().await;
-    let parts = std::sync::Mutex::new(DeviceParts::default());
-    let selected = |view: &Merged| view.minutes == minutes && view.scope == scope;
-    let complete = |views: &mut [Merged], parts: &DeviceParts| {
-        for view in views.iter_mut().filter(|view| selected(view)) {
-            view.with_devices(parts.local.as_ref(), parts.forwarded.as_ref());
-        }
-    };
-    let send = |views: Vec<Merged>| {
-        on_update
-            .send(views)
-            .map_err(|_| "Traffic view closed".to_owned())
-    };
-    let publish = |mut views: Vec<Merged>| {
-        {
-            let mut parts = parts.lock().unwrap();
-            if let Some(view) = views.iter().find(|view| selected(view)) {
-                parts.last = Some(view.clone());
-            }
-            if parts.read {
-                complete(&mut views, &parts);
-            } else {
-                // A frame without this device would replace a completed one.
-                views.retain(|view| !selected(view));
-                if views.is_empty() {
-                    return Ok(());
-                }
-            }
-        }
-        send(views)
-    };
-    let republish = || {
-        let parts = parts.lock().unwrap();
-        if let Some(mut view) = parts.last.clone() {
-            view.with_devices(parts.local.as_ref(), parts.forwarded.as_ref());
-            drop(parts);
-            let _ = send(vec![view]);
-        }
-    };
-    let devices = async {
-        let (local, forwarded) = tokio::join!(
-            read_local_traffic(&state, minutes, scope),
-            forwarding_device_traffic(&state, minutes, scope),
-        );
-        let mut parts = parts.lock().unwrap();
-        parts.read = true;
-        parts.local = local.ok();
-        parts.forwarded = forwarded;
-        drop(parts);
-        republish();
-    };
-    let peers = async {
-        if refresh_remote != Some(true) {
-            // Publish the selected range first; the 30-day views follow.
-            return coport_gui::data_client::MergeCache::views_shared(
-                &state.merged_cache,
-                sources,
-                config,
-                log,
-                labels,
-                Some((minutes, scope, &publish)),
-            )
-            .await;
-        }
-        let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        if let Some(previous) = state.traffic_request.lock().unwrap().replace(cancel) {
-            let _ = previous.send(());
-        }
-        // The daemon's monitor has just read the forwarded device; reuse that
-        // summary instead of opening another SSH connection to it.
-        let refresh = coport_gui::data_client::Refresh {
+    traffic_inputs(&state)
+        .await
+        .merged(
+            &state.peers,
             minutes,
             scope,
-            reused: forwarded_summary().await,
-        };
-        // Cached views remain readable while peers respond to this refresh.
-        let operation = coport_gui::data_client::MergeCache::refresh_shared(
-            &state.merged_cache,
-            sources,
-            config,
-            log,
-            labels,
-            refresh,
-            &publish,
-        );
-        tokio::select! {result=operation=>result,_=cancelled=>Err("Traffic request superseded".into())}
-    };
-    let (views, ()) = tokio::join!(peers, devices);
-    let mut views = views?;
-    complete(&mut views, &parts.lock().unwrap());
-    Ok(views)
+            refresh_remote == Some(true),
+            |views| {
+                on_update
+                    .send(views)
+                    .map_err(|_| "Traffic view closed".to_owned())
+            },
+        )
+        .await
 }

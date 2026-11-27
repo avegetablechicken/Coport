@@ -28,6 +28,9 @@ pub struct TrafficTarget {
     pub base: String,
 }
 
+/// The traffic compatibility file's name in a state directory.
+pub const FILE: &str = "traffic-compatibility.json";
+
 /// The traffic compatibility file: the user's choices, kept apart from the
 /// GUI settings and the proxy configuration.
 #[derive(Default, Serialize, Deserialize)]
@@ -46,6 +49,12 @@ impl Compatibility {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(_) => Err("Cannot read the traffic compatibility file".to_owned()),
         }
+    }
+
+    /// The choices kept in the state directory `dir`. An unreadable file
+    /// holds none, so every changed configuration is left to be reviewed.
+    pub fn assignments_in(dir: &Path) -> Vec<TrafficAssignment> {
+        Self::load(&dir.join(FILE)).unwrap_or_default().assignments
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {

@@ -913,6 +913,18 @@ pub(crate) mod tests {
         edit: impl Fn(&mut Status) + Send + 'static,
         actions: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> u16 {
+        fake_daemon_answering(dir, up, edit, |_| None, actions)
+    }
+
+    /// Like `fake_daemon_with`, answering an action with `answer`'s response,
+    /// in the daemon's JSON form, or else with its status.
+    pub(crate) fn fake_daemon_answering(
+        dir: &Path,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        edit: impl Fn(&mut Status) + Send + 'static,
+        answer: impl Fn(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
+        actions: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> u16 {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let endpoint = Endpoint {
@@ -935,8 +947,14 @@ pub(crate) mod tests {
                 if stream.read_exact(&mut request).is_err() {
                     continue;
                 }
-                if let Ok(request) = serde_json::from_slice::<serde_json::Value>(&request) {
-                    actions.lock().unwrap().push(request["action"].to_string());
+                let request =
+                    serde_json::from_slice::<serde_json::Value>(&request).unwrap_or_default();
+                actions.lock().unwrap().push(request["action"].to_string());
+                if let Some(response) = answer(&request["action"]) {
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&bytes);
+                    continue;
                 }
                 let mut status = Status {
                     pid: 1,

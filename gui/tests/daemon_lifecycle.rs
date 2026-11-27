@@ -877,7 +877,11 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
             );
             let labels = tasks.cached_credential_labels().await;
             cache
-                .views(Vec::new(), config.clone(), log.clone(), labels, false)
+                .views(
+                    Vec::new(),
+                    this_device(config.clone(), log.clone(), labels),
+                    false,
+                )
                 .await
                 .unwrap();
         }
@@ -887,9 +891,7 @@ fn display_metadata_and_summary_helpers_never_contact_account_upstream() {
             cache
                 .refresh_progressive(
                     Vec::new(),
-                    config.clone(),
-                    log.clone(),
-                    config_labels,
+                    this_device(config.clone(), log.clone(), config_labels),
                     (minutes, coport_gui::traffic::TrafficScope::Model),
                     |_| Ok(()),
                 )
@@ -1128,4 +1130,18 @@ fn a_new_daemon_that_fails_to_start_gives_way_to_the_previous_program() {
         daemon::Client::discover(dir.path()).unwrap().1.pid,
         restarted.status.pid
     );
+}
+
+/// This device as a merge reads it, with a node ID no peer has.
+fn this_device(
+    config: coport::config::Config,
+    log: PathBuf,
+    labels: std::collections::BTreeMap<(String, String), String>,
+) -> coport_gui::data_client::ThisDevice {
+    coport_gui::data_client::ThisDevice {
+        config,
+        log,
+        labels,
+        node_id: "local".into(),
+    }
 }

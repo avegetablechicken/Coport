@@ -547,7 +547,7 @@ pub fn prepare_identity(dir: &Path) -> io::Result<String> {
     }
     read_node_id(dir)
 }
-fn read_node_id(dir: &Path) -> io::Result<String> {
+pub(crate) fn read_node_id(dir: &Path) -> io::Result<String> {
     let bytes = coport::external_access::read_limited(&dir.join("data-node-id"), false, 64)
         .map_err(io::Error::other)?;
     let id = String::from_utf8(bytes).map_err(|_| io::Error::other("Invalid node identity"))?;
@@ -564,7 +564,8 @@ pub fn read_summary(dir: &Path, services: ReaderServices) -> io::Result<Summary>
     let config = Config::read(&config_path).map_err(io::Error::other)?;
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
-    let bytes = publish(&config, &log, &key, &node).map_err(io::Error::other)?;
+    let assignments = crate::traffic_identity::Compatibility::assignments_in(dir);
+    let bytes = publish(&config, &log, &key, &node, &assignments).map_err(io::Error::other)?;
     let mut summary: Summary = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     summary.only_for(services);
     Ok(summary)
@@ -596,13 +597,22 @@ fn stream_summary_at(
     let config = Config::read(&config_path).map_err(io::Error::other)?;
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
-    let first = publish_selected(&config, &log, &key, &node, minutes, scope, end)
-        .and_then(|bytes| for_reader(&bytes, services))
-        .map_err(io::Error::other)?;
+    let assignments = crate::traffic_identity::Compatibility::assignments_in(dir);
+    let first = publish_selected(
+        &config,
+        &log,
+        &key,
+        &node,
+        &assignments,
+        (minutes, scope),
+        end,
+    )
+    .and_then(|bytes| for_reader(&bytes, services))
+    .map_err(io::Error::other)?;
     output.write_all(&first)?;
     output.write_all(b"\n")?;
     output.flush()?;
-    let rest = publish_at(&config, &log, &key, &node, end)
+    let rest = publish_at(&config, &log, &key, &node, &assignments, end)
         .and_then(|bytes| for_reader(&bytes, services))
         .map_err(io::Error::other)?;
     output.write_all(&rest)?;
@@ -615,12 +625,12 @@ fn publish_selected(
     log: &Path,
     key: &DataKey,
     node: &str,
-    minutes: u64,
-    scope: crate::traffic::TrafficScope,
+    assignments: &[crate::traffic_identity::TrafficAssignment],
+    (minutes, scope): (u64, crate::traffic::TrafficScope),
     end: i64,
 ) -> Result<Vec<u8>, String> {
     let bucket = bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let identities = crate::traffic::ExportIdentities::from_config(config);
+    let identities = crate::traffic::ExportIdentities::from_config(config, assignments);
     let snapshots = crate::traffic::Snapshot::load_many(
         log,
         &[end, end - 60_000, end - 120_000],
@@ -719,6 +729,7 @@ pub async fn start(config: Config, dir: &Path, log: PathBuf) -> io::Result<Runni
         .transpose()
         .map_err(io::Error::other)?;
     let node_id = prepare_identity(dir)?;
+    let dir = dir.to_owned();
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, data.port)).await?;
     let port = listener.local_addr()?.port();
     // A statistics scan must never delay the proxy listener. Authenticated
@@ -735,9 +746,10 @@ pub async fn start(config: Config, dir: &Path, log: PathBuf) -> io::Result<Runni
                 Some(result)=tasks.join_next(), if !tasks.is_empty()=> { if matches!(result,Ok(true)) {updating=false;} },
                 _=refresh.tick(), if !updating=> {
                     updating=true;
-                    let (config,log,identity,node,shared)=(config.clone(),log.clone(),identity.clone(),node_id.clone(),shared.clone());
+                    let (config,log,identity,node,shared,dir)=(config.clone(),log.clone(),identity.clone(),node_id.clone(),shared.clone(),dir.clone());
                     tasks.spawn(async move {
-                        if let Ok(Ok(bytes))=tokio::task::spawn_blocking(move||publish(&config,&log,&identity,&node)).await {
+                        // Read each time: the panel's choices apply to the next summary.
+                        if let Ok(Ok(bytes))=tokio::task::spawn_blocking(move||publish(&config,&log,&identity,&node,&crate::traffic_identity::Compatibility::assignments_in(&dir))).await {
                             *shared.write().await=Some((Instant::now(),Arc::new(bytes)));
                         }
                         true
@@ -769,20 +781,22 @@ pub(crate) fn publish(
     log: &Path,
     key: &DataKey,
     node: &str,
+    assignments: &[crate::traffic_identity::TrafficAssignment],
 ) -> Result<Vec<u8>, String> {
     let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
-    publish_at(config, log, key, node, end)
+    publish_at(config, log, key, node, assignments, end)
 }
 fn publish_at(
     config: &Config,
     log: &Path,
     key: &DataKey,
     node: &str,
+    assignments: &[crate::traffic_identity::TrafficAssignment],
     end: i64,
 ) -> Result<Vec<u8>, String> {
     // Keep two previous boundaries so clock offsets and cached HTTP responses
     // can align without asking a user to refresh or changing a machine's clock.
-    let identities = crate::traffic::ExportIdentities::from_config(config);
+    let identities = crate::traffic::ExportIdentities::from_config(config, assignments);
     let snapshots = crate::traffic::Snapshot::load_many(
         log,
         &[end, end - 60_000, end - 120_000],
@@ -1067,8 +1081,8 @@ mod tests {
                     &log,
                     &key,
                     &uuid::Uuid::new_v4().to_string(),
-                    minutes,
-                    scope,
+                    &[],
+                    (minutes, scope),
                     chrono::Utc::now().timestamp_millis() / 60_000 * 60_000,
                 )
                 .unwrap();
@@ -1111,7 +1125,7 @@ mod tests {
         std::fs::write(&log, "").unwrap();
         let config = Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let key = DataKey::new(KEY).unwrap();
-        let bytes = publish(&config, &log, &key, &uuid::Uuid::new_v4().to_string()).unwrap();
+        let bytes = publish(&config, &log, &key, &uuid::Uuid::new_v4().to_string(), &[]).unwrap();
         let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes.clone())))));
         let (mut client, server) = tokio::io::duplex(1024 * 1024);
         let cache = shared.clone();
@@ -1206,6 +1220,7 @@ mod tests {
             &log,
             &key,
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes)))));
@@ -1346,6 +1361,7 @@ mod tests {
             &log,
             &key,
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let shared = Arc::new(RwLock::new(Some((Instant::now(), Arc::new(bytes)))));
@@ -1579,6 +1595,7 @@ mod tests {
             &path,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let summary: Summary = serde_json::from_slice(&bytes).unwrap();
@@ -1650,6 +1667,7 @@ mod tests {
             &log,
             &DataKey::new(KEY).unwrap(),
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let body = String::from_utf8(bytes.clone()).unwrap();
@@ -1842,6 +1860,7 @@ mod tests {
             &dir.path().join("missing.log"),
             &key,
             &uuid::Uuid::new_v4().to_string(),
+            &[],
         )
         .unwrap();
         let summary: Summary = serde_json::from_slice(&bytes).unwrap();

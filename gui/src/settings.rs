@@ -107,7 +107,7 @@ pub fn log_path() -> PathBuf {
 
 /// Choices for traffic logged under configurations that changed since.
 pub fn traffic_compatibility_path() -> PathBuf {
-    app_dir().join("traffic-compatibility.json")
+    app_dir().join(crate::traffic_identity::FILE)
 }
 
 /// Where versions that kept their data in the cache ran the daemon and kept `gui.json`.

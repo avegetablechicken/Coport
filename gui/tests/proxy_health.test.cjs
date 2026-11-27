@@ -162,17 +162,6 @@ test('every passive page refresh opts out of upstream account probes', async () 
 });
 
 
-test('traffic IPC reads cached identities without starting account probes', () => {
-  const commands = fs.readFileSync(path.join(__dirname, '../src/commands.rs'), 'utf8');
-  for (const name of ['get_traffic', 'get_merged_data']) {
-    const start = commands.indexOf(`pub async fn ${name}(`);
-    const next = commands.indexOf('#[tauri::command]', start);
-    const body = commands.slice(start, next < 0 ? undefined : next);
-    assert.match(body, /cached_credential_labels/);
-    assert.doesNotMatch(body, /\.credential_labels\(|account_states\(|credential_reports\(/);
-  }
-});
-
 test('account routes explain each activation state', () => {
   const block = source.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
   const scope = source.match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];

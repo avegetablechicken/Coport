@@ -35,8 +35,8 @@ struct ExitState {
 pub struct AppState {
     pub core: Mutex<core::Core>,
     pub forwarding_operations: tokio::sync::Mutex<()>,
-    pub merged_cache: tokio::sync::Mutex<coport_gui::data_client::MergeCache>,
-    pub traffic_request: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Peers' last summaries, shared by every traffic read.
+    pub peers: coport_gui::traffic_read::Peers,
 }
 
 const USAGE: &str = "\
@@ -163,10 +163,9 @@ fn main() {
                 let _ = core.start_if_stopped();
             }
             app.manage(AppState {
-                traffic_request: Mutex::new(None),
                 core: Mutex::new(core),
                 forwarding_operations: Default::default(),
-                merged_cache: Default::default(),
+                peers: Default::default(),
             });
             tauri::async_runtime::spawn(commands::monitor_config(app.handle().clone()));
             tauri::async_runtime::spawn(commands::monitor_credentials(app.handle().clone()));

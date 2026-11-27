@@ -445,8 +445,11 @@ fn check(path: &Path, credentials: bool) -> io::Result<()> {
 /// forwarding to another device relays every connection there, and an
 /// offline device would fail a healthy Daemon.
 fn listening(port: u16) -> bool {
-    TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, port).into(), Duration::from_millis(500))
-        .is_ok()
+    TcpStream::connect_timeout(
+        &(Ipv4Addr::LOCALHOST, port).into(),
+        Duration::from_millis(500),
+    )
+    .is_ok()
 }
 
 #[cfg(test)]

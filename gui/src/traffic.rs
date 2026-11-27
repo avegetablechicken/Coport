@@ -1075,12 +1075,11 @@ pub(crate) struct ExportIdentities {
 }
 
 impl ExportIdentities {
-    pub(crate) fn from_config(config: &coport::config::Config) -> Self {
-        let assignments = crate::traffic_identity::Compatibility::load(
-            &crate::settings::traffic_compatibility_path(),
-        )
-        .unwrap_or_default();
-        let identities = Identities::from_config(config, &assignments.assignments);
+    pub(crate) fn from_config(
+        config: &coport::config::Config,
+        assignments: &[crate::traffic_identity::TrafficAssignment],
+    ) -> Self {
+        let identities = Identities::from_config(config, assignments);
         let config = config.clone();
         let (labels, references) = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -2135,6 +2134,7 @@ mod tests {
                     &path,
                     &key,
                     "00000000-0000-4000-8000-000000000001",
+                    &[],
                 )
                 .unwrap();
                 eprintln!(
