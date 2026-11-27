@@ -89,32 +89,13 @@ pub(crate) async fn monitor_proxies(app: AppHandle) {
 /// `monitor_account_states` refreshes; reading state starts no account work.
 #[tauri::command]
 pub async fn get_state(state: State<'_, AppState>) -> Result<Snapshot> {
-    let daemon = local_daemon().await?.map(|(_, status)| status);
-    let stopped_restore = if daemon.is_none() {
-        let result = tauri::async_runtime::spawn_blocking(|| {
-            coport_gui::remote_forward::Routing::stored_restore(&coport_gui::settings::app_dir())
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-        Some(result)
-    } else {
-        None
-    };
+    let forwarding = state.forwarding.state().await?;
     let mut core = state.core.lock().unwrap();
     let mut snapshot = core.snapshot();
-    if let Some(daemon) = daemon {
-        snapshot.forwarding = daemon.forwarding;
-        snapshot.forwarding_restore = daemon.forwarding_restore;
-        snapshot.forwarding_restore_supported = daemon.forwarding_restore_supported;
-    } else if let Some(restore) = stopped_restore {
-        match restore {
-            Ok(restore) => {
-                snapshot.forwarding_restore = restore;
-                snapshot.forwarding_restore_supported = true;
-            }
-            Err(error) => snapshot.forwarding_restore_error = Some(error),
-        }
-    }
+    snapshot.forwarding = forwarding.target;
+    snapshot.forwarding_restore = forwarding.restore;
+    snapshot.forwarding_restore_supported = forwarding.restore_supported;
+    snapshot.forwarding_restore_error = forwarding.restore_error;
     if snapshot.forwarding.is_some() {
         return Ok(snapshot);
     }
@@ -590,87 +571,22 @@ pub fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-async fn local_daemon() -> Result<Option<(coport_gui::daemon::Client, coport_gui::daemon::Status)>>
-{
-    tauri::async_runtime::spawn_blocking(|| {
-        coport_gui::daemon_lifecycle::Lifecycle::local().discover()
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-async fn stop_device_forwarding(id: &str) -> Result {
-    match local_daemon().await? {
-        Some((client, status))
-            if status
-                .forwarding
-                .as_ref()
-                .is_some_and(|target| target.device_id == id) =>
-        {
-            client
-                .set_forwarding(None)
-                .await
-                .map_err(|e| e.to_string())?
-        }
-        None => {
-            let id = id.to_owned();
-            tauri::async_runtime::spawn_blocking(move || {
-                coport_gui::remote_forward::Routing::configure_stopped(
-                    &coport_gui::settings::app_dir(),
-                    None,
-                    Some(&id),
-                )
-            })
-            .await
-            .map_err(|e| e.to_string())??;
-        }
-        _ => {}
-    }
-    Ok(())
-}
 #[tauri::command]
-pub async fn get_device_forwarders() -> Result<Vec<coport_gui::remote_forward::Status>> {
-    Ok(local_daemon()
-        .await?
-        .and_then(|(_, status)| status.forwarding)
-        .into_iter()
-        .collect())
+pub async fn get_device_forwarders(
+    state: State<'_, AppState>,
+) -> Result<Vec<coport_gui::remote_forward::Status>> {
+    state.forwarding.forwarders().await
 }
 #[tauri::command]
 pub async fn set_forwarding_restore(state: State<'_, AppState>, enabled: bool) -> Result {
-    let _guard = state.forwarding_operations.lock().await;
-    let Some((client, status)) = local_daemon().await? else {
-        return tauri::async_runtime::spawn_blocking(move || {
-            coport_gui::remote_forward::Routing::configure_stopped(
-                &coport_gui::settings::app_dir(),
-                Some(enabled),
-                None,
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    };
-    if !status.forwarding_restore_supported {
-        return Err("Update and restart the local daemon to configure startup restore.".into());
-    }
-    client
-        .set_forwarding_restore(enabled)
-        .await
-        .map_err(|e| e.to_string())
+    state.forwarding.set_restore(enabled).await
 }
 #[tauri::command]
-pub async fn get_device_capabilities() -> Result<Vec<coport_gui::device_capabilities::Status>> {
-    match local_daemon().await? {
-        Some((client, _)) => client
-            .device_capabilities()
-            .await
-            .map_err(|e| e.to_string()),
-        None => Ok(Vec::new()),
-    }
-}
-async fn refresh_device_capabilities() {
-    if let Ok(Some((client, _))) = local_daemon().await {
-        let _ = client.refresh_device_capabilities().await;
-    }
+pub async fn get_device_capabilities(
+    state: State<'_, AppState>,
+) -> Result<Vec<coport_gui::device_capabilities::Status>> {
+    let devices = state.core.lock().unwrap().settings.managed_devices.clone();
+    state.forwarding.checks(&devices).await
 }
 #[tauri::command]
 pub async fn set_device_forwarding(
@@ -678,55 +594,7 @@ pub async fn set_device_forwarding(
     id: String,
     enabled: bool,
 ) -> Result {
-    let _guard = state.forwarding_operations.lock().await;
-    if !enabled {
-        return stop_device_forwarding(&id).await;
-    }
-    let target = {
-        let core = state.core.lock().unwrap();
-        let device = core
-            .settings
-            .managed_devices
-            .iter()
-            .find(|device| device.id == id)
-            .ok_or("Device no longer exists")?;
-        coport_gui::remote_forward::Target {
-            device_id: id,
-            name: device.name.clone(),
-            connection: device
-                .ssh_connection()
-                .ok_or("Request forwarding requires SSH")?,
-        }
-    };
-    let (client, status) = local_daemon()
-        .await?
-        .ok_or("Start the local proxy before enabling SSH forwarding.")?;
-    if !status.forwarding_supported {
-        return Err("Update and restart the local proxy to enable unified SSH forwarding.".into());
-    }
-    client
-        .refresh_device_capabilities()
-        .await
-        .map_err(|e| e.to_string())?;
-    let checks = client
-        .device_capabilities()
-        .await
-        .map_err(|e| e.to_string())?;
-    let supported = checks
-        .iter()
-        .find(|entry| entry.device_id == target.device_id)
-        .and_then(|entry| entry.capabilities.as_ref())
-        .is_some_and(|caps| caps.forwarding && caps.forwarding_available);
-    if !supported {
-        return Err(
-            "Remote forwarding is unavailable or its capabilities have not been verified yet."
-                .into(),
-        );
-    }
-    client
-        .set_forwarding(Some(target))
-        .await
-        .map_err(|e| e.to_string())
+    state.forwarding.forward(&*state, &id, enabled).await
 }
 #[tauri::command]
 pub fn get_devices(state: State<AppState>) -> Vec<coport_gui::devices::Device> {
@@ -751,38 +619,11 @@ pub async fn save_device(
     state: State<'_, AppState>,
     device: coport_gui::devices::Draft,
 ) -> Result<String> {
-    let _guard = state.forwarding_operations.lock().await;
-    let (id, devices) = {
-        let mut devices = state.core.lock().unwrap().settings.managed_devices.clone();
-        let id = coport_gui::devices::save(&mut devices, device)?;
-        (id, devices)
-    };
-    stop_device_forwarding(&id).await?;
-    {
-        // General preferences can change while the daemon operation is pending.
-        // Commit only the device list against the latest settings snapshot.
-        let mut core = state.core.lock().unwrap();
-        let mut settings = core.settings.clone();
-        settings.managed_devices = devices;
-        settings.try_save().map_err(|e| e.to_string())?;
-        core.settings = settings;
-    }
-    refresh_device_capabilities().await;
-    Ok(id)
+    state.forwarding.save(&*state, device).await
 }
 #[tauri::command]
 pub async fn remove_device(state: State<'_, AppState>, id: String) -> Result {
-    let _guard = state.forwarding_operations.lock().await;
-    stop_device_forwarding(&id).await?;
-    {
-        let mut core = state.core.lock().unwrap();
-        let mut settings = core.settings.clone();
-        settings.managed_devices.retain(|device| device.id != id);
-        settings.try_save().map_err(|e| e.to_string())?;
-        core.settings = settings;
-    }
-    refresh_device_capabilities().await;
-    Ok(())
+    state.forwarding.remove(&*state, &id).await
 }
 /// While forwarding, Home shows the destination's traffic from the daemon's
 /// last summary. Neither the device nor any upstream is contacted.

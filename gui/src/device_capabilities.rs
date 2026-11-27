@@ -1,10 +1,11 @@
-//! Daemon-owned, bounded capability checks for configured SSH devices.
+//! Daemon-owned, bounded capability checks for the SSH devices the GUI
+//! manages. The GUI names them with every request; the daemon keeps them in
+//! memory only and never reads the GUI's preferences.
 use crate::remote::{Capabilities, Device};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{self, Read},
-    path::{Path, PathBuf},
+    io,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -30,48 +31,17 @@ struct Entry {
 }
 #[derive(Default)]
 pub struct Checks {
-    file: Option<PathBuf>,
     entries: Mutex<BTreeMap<String, Entry>>,
     changed: tokio::sync::Notify,
 }
 impl Checks {
-    pub fn new(dir: &Path) -> Self {
-        let checks = Self {
-            file: Some(dir.join("gui.json")),
-            ..Self::default()
-        };
-        let _ = checks.reload();
-        checks
-    }
-    fn devices(&self) -> io::Result<Vec<Device>> {
-        let Some(file) = &self.file else {
-            return Ok(Vec::new());
-        };
-        let file = match std::fs::File::open(file) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut bytes = Vec::new();
-        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(io::Error::other("Device preferences exceed the size limit"));
-        }
-        let settings: crate::settings::Settings =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        if settings.managed_devices.len() > crate::devices::LIMIT {
+    /// Check `devices` from now on: a device that is new or changed is checked
+    /// at once, one no longer named is forgotten with its result, and the
+    /// others keep theirs.
+    pub fn set(&self, devices: Vec<Device>) -> io::Result<()> {
+        if devices.len() > crate::devices::LIMIT {
             return Err(io::Error::other("Too many configured devices"));
         }
-        Ok(settings
-            .managed_devices
-            .iter()
-            .filter_map(|device| device.ssh_connection())
-            .collect())
-    }
-    pub fn reload(&self) -> io::Result<()> {
-        // An unreadable file is not a configuration change: keep earlier results so
-        // a transient read error cannot requeue SSH checks that were denied.
-        let devices = self.devices()?;
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|id, _| devices.iter().any(|device| &device.name == id));
         for device in devices {
@@ -81,6 +51,7 @@ impl Checks {
             {
                 continue;
             }
+            self.changed.notify_one();
             entries.insert(
                 device.name.clone(),
                 Entry {
@@ -100,10 +71,9 @@ impl Checks {
         }
         Ok(())
     }
-    pub fn refresh(&self) -> io::Result<()> {
-        self.reload()?;
+    /// Check now whatever is waiting to be checked.
+    pub fn refresh(&self) {
         self.changed.notify_one();
-        Ok(())
     }
     pub fn statuses(&self) -> Vec<Status> {
         self.entries
@@ -156,7 +126,6 @@ impl Checks {
     }
     pub async fn monitor(self: &Arc<Self>) {
         loop {
-            let _ = self.reload();
             let mut pending = self.take_pending().into_iter();
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -187,7 +156,7 @@ impl Checks {
                     self.finish(device, result);
                 }
             }
-            // This only watches local configuration. Completed/failed checks are
+            // Only a new or changed device is checked. Completed/failed checks are
             // never retried because a timer fires or a GUI reads their results.
             tokio::select! { _=self.changed.notified()=>{}, _=tokio::time::sleep(Duration::from_secs(30))=>{} }
         }
@@ -196,54 +165,48 @@ impl Checks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn device(host: &str) -> Device {
+        Device {
+            name: "device".into(),
+            host: host.into(),
+            binary: "coportd".into(),
+        }
+    }
     #[test]
     fn successful_and_denied_checks_are_not_requeued_by_refresh_or_polling() {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |host: &str| {
-            std::fs::write(dir.path().join("gui.json"),format!(r#"{{"managed_devices":[{{"id":"device","name":"Device","ssh":{{"host":"{host}","binary":"coportd"}},"data":null}}]}}"#)).unwrap()
-        };
-        write("old-host");
-        let checks = Checks::new(dir.path());
-        let device = checks.take_pending().pop().unwrap();
+        let checks = Checks::default();
+        checks.set(vec![device("old-host")]).unwrap();
+        let checked = checks.take_pending().pop().unwrap();
         assert!(checks.take_pending().is_empty());
-        checks.finish(device, Err("Access denied".into()));
+        checks.finish(checked, Err("Access denied".into()));
         let observed = checks.statuses().remove(0);
         assert!(observed.checked_at.is_some());
         assert_eq!(observed.host, "old-host");
         assert_eq!(observed.binary, "coportd");
         for _ in 0..10 {
-            checks.refresh().unwrap();
+            checks.set(vec![device("old-host")]).unwrap();
+            checks.refresh();
             assert!(checks.take_pending().is_empty());
             assert_eq!(checks.statuses()[0].checked_at, observed.checked_at);
         }
-        std::fs::write(dir.path().join("gui.json"), "{not json").unwrap();
-        assert!(checks.refresh().is_err());
+        // A list too long to check changes nothing.
+        assert!(checks.set(vec![device("old-host"); 33]).is_err());
         assert_eq!(checks.statuses()[0].error.as_deref(), Some("Access denied"));
-        write("old-host");
-        checks.refresh().unwrap();
-        assert!(checks.take_pending().is_empty());
-        write("new-host");
-        checks.refresh().unwrap();
+        checks.set(vec![device("new-host")]).unwrap();
         assert_eq!(checks.take_pending().len(), 1);
     }
     #[test]
     fn configuration_changes_discard_old_capabilities_and_late_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |host: &str| {
-            std::fs::write(dir.path().join("gui.json"),format!(r#"{{"managed_devices":[{{"id":"device","name":"Test","ssh":{{"host":"{host}","binary":"coportd"}},"data":null}}]}}"#)).unwrap()
-        };
-        write("old-host");
-        let checks = Checks::new(dir.path());
+        let checks = Checks::default();
+        checks.set(vec![device("old-host")]).unwrap();
         assert!(checks.statuses()[0].pending);
         let old = checks.entries.lock().unwrap()["device"].device.clone();
-        write("new-host");
-        checks.refresh().unwrap();
+        checks.set(vec![device("new-host")]).unwrap();
         checks.finish(old, Err("stale".into()));
         let status = checks.statuses().remove(0);
         assert!(status.pending);
         assert!(status.error.is_none());
-        std::fs::write(dir.path().join("gui.json"), "{}").unwrap();
-        checks.refresh().unwrap();
+        checks.set(Vec::new()).unwrap();
         assert!(checks.statuses().is_empty());
     }
 }

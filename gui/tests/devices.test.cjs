@@ -965,18 +965,6 @@ test('cached statistics retain success without hiding a later failure', () => {
   assert.equal(h.deviceConnectionStatus(device).label,'new failure');
 });
 
-test('saving a device merges only its list after asynchronous forwarding work', () => {
-  const commands=fs.readFileSync(require('node:path').join(__dirname,'../src/commands.rs'),'utf8');
-  const save=commands.slice(commands.indexOf('pub async fn save_device('),commands.indexOf('pub async fn remove_device('));
-  const before=save.slice(0,save.indexOf('stop_device_forwarding(&id).await?'));
-  const after=save.slice(save.indexOf('stop_device_forwarding(&id).await?'));
-  assert.doesNotMatch(before,/settings\.clone\(\)/);
-  assert.match(before,/managed_devices\.clone\(\)/);
-  assert.match(after,/core\.settings\.clone\(\)/);
-  assert.match(after,/settings\.managed_devices = devices/);
-});
-
-
 test('Devices Refresh performs only one explicitly authorized statistics read', async () => {
   const calls = [];
   const h = harness(async (command, args) => {

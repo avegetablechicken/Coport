@@ -672,7 +672,6 @@ IFS= read -r request || exit 0
 printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
 "#;
     std::fs::write(&ssh, ssh_script).unwrap();
-    std::fs::write(dir.path().join("gui.json"), r#"{"managed_devices":[{"id":"test-device","name":"Remote","ssh":{"host":"fake-host","binary":"coportd"},"data":null}]}"#).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let wrapper = dir.path().join("start-daemon");
@@ -696,10 +695,15 @@ printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nremote'
     assert!(status.forwarding_supported);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let client = rt.block_on(async {
-        // The daemon checks configured devices without any GUI request to inspect them.
+        // The daemon checks the devices the GUI names, in the background.
+        let device = coport_gui::remote::Device {
+            name: "test-device".into(),
+            host: "fake-host".into(),
+            binary: "coportd".into(),
+        };
         let started=Instant::now();
         loop {
-            let checks=client.device_capabilities().await.unwrap();
+            let checks=client.device_checks(vec![device.clone()]).await.unwrap();
             if let Some(caps)=checks.first().and_then(|check|check.capabilities.as_ref()) {
                 assert!(caps.forwarding && caps.forwarding_available);
                 assert_eq!(caps.version,"test-capabilities");

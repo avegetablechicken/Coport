@@ -54,6 +54,10 @@ pub struct Status {
     /// older daemons probe upstream to answer the same query.
     #[serde(default)]
     pub passive_account_states_supported: bool,
+    /// Device checks take the GUI's device list; older daemons read it from
+    /// the GUI's preferences.
+    #[serde(default)]
+    pub device_list_supported: bool,
     pub port: u16,
     #[serde(default)]
     pub allow_external_access: bool,
@@ -98,8 +102,14 @@ enum Action {
     SetForwardRestore {
         enabled: bool,
     },
+    /// From GUIs before `DeviceChecks`: the known devices' checks.
     DeviceCapabilities,
+    /// From GUIs before `DeviceChecks`: check waiting devices now.
     RefreshDeviceCapabilities,
+    /// The capability checks of `devices`, the SSH devices the GUI manages.
+    DeviceChecks {
+        devices: Vec<crate::remote::Device>,
+    },
     ForwardingTraffic {
         minutes: u64,
         scope: crate::traffic::TrafficScope,
@@ -165,6 +175,20 @@ impl Client {
             _ => Err(io::Error::other(
                 "Update the local proxy for automatic capability checks.",
             )),
+        }
+    }
+    /// The checks of `devices`, which the daemon checks from now on: a new
+    /// or changed one at once.
+    pub async fn device_checks(
+        &self,
+        devices: Vec<crate::remote::Device>,
+    ) -> io::Result<Vec<crate::device_capabilities::Status>> {
+        match self
+            .request_async(Action::DeviceChecks { devices }, STATUS_TIMEOUT)
+            .await?
+        {
+            Response::DeviceCapabilities(value) => Ok(value),
+            _ => Err(io::Error::other("Unexpected daemon device response")),
         }
     }
     pub async fn refresh_device_capabilities(&self) -> io::Result<()> {
@@ -505,12 +529,19 @@ async fn handle_control(
                 ..Status::clone(&status)
             })),
             Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
+            Action::DeviceChecks { devices } => match routing.device_checks.set(devices) {
+                Ok(()) => Response::DeviceCapabilities(routing.device_checks.statuses()),
+                Err(error) => Response::Error(error.to_string()),
+            },
             Action::ForwardingSummary => Response::ForwardingSummary(routing.summary().map(Box::new)),
             Action::ForwardingTraffic { minutes, scope } => match routing.traffic_window(minutes, scope) {
                 Ok(window) => Response::ForwardingTraffic(Box::new(window)),
                 Err(error) => Response::Error(error),
             },
-            Action::RefreshDeviceCapabilities => match routing.device_checks.refresh() { Ok(())=>Response::Recorded, Err(error)=>Response::Error(error.to_string()) },
+            Action::RefreshDeviceCapabilities => {
+                routing.device_checks.refresh();
+                Response::Recorded
+            }
             Action::SetForwardRestore { enabled } => match routing.set_restore(enabled).await {
                 Ok(()) => Response::ForwardingSet,
                 Err(error) => Response::Error(error),
@@ -703,6 +734,7 @@ async fn serve_until(
         metadata_supported: true,
         credential_checks_supported: true,
         passive_account_states_supported: true,
+        device_list_supported: true,
         requests_in_flight: None,
         port,
         uptime_ms: 0,
@@ -968,6 +1000,7 @@ pub(crate) mod tests {
                     metadata_supported: false,
                     credential_checks_supported: false,
                     passive_account_states_supported: false,
+                    device_list_supported: false,
                     requests_in_flight: None,
                     port,
                     uptime_ms: 0,

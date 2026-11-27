@@ -8,6 +8,7 @@ pub mod data_migration;
 pub mod device_capabilities;
 mod device_events;
 pub mod devices;
+pub mod forwarding;
 pub mod logs;
 pub mod proxy;
 pub mod remote;

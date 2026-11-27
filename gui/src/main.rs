@@ -34,9 +34,26 @@ struct ExitState {
 
 pub struct AppState {
     pub core: Mutex<core::Core>,
-    pub forwarding_operations: tokio::sync::Mutex<()>,
+    pub forwarding: coport_gui::forwarding::Forwarding,
     /// Peers' last summaries, shared by every traffic read.
     pub peers: coport_gui::traffic_read::Peers,
+}
+
+/// The Device list is kept in the GUI's preferences.
+impl coport_gui::forwarding::DeviceStore for AppState {
+    fn devices(&self) -> Vec<coport_gui::devices::Device> {
+        self.core.lock().unwrap().settings.managed_devices.clone()
+    }
+    fn commit(&self, devices: Vec<coport_gui::devices::Device>) -> Result<(), String> {
+        // Other preferences can change while forwarding work is pending.
+        // Commit only the device list against the latest settings.
+        let mut core = self.core.lock().unwrap();
+        let mut settings = core.settings.clone();
+        settings.managed_devices = devices;
+        settings.try_save().map_err(|e| e.to_string())?;
+        core.settings = settings;
+        Ok(())
+    }
 }
 
 const USAGE: &str = "\
@@ -164,7 +181,7 @@ fn main() {
             }
             app.manage(AppState {
                 core: Mutex::new(core),
-                forwarding_operations: Default::default(),
+                forwarding: coport_gui::forwarding::Forwarding::new(settings::app_dir()),
                 peers: Default::default(),
             });
             tauri::async_runtime::spawn(commands::monitor_config(app.handle().clone()));
