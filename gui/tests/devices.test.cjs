@@ -769,6 +769,29 @@ test('startup SSH checks have at most four connections in flight', async () => {
   assert.equal(maximum, 4);
 });
 
+test('a device removed while its startup SSH check waits is not checked and the rest still are', async () => {
+  let devices = Array.from({ length: 6 }, (_, i) => ({ id: String(i), ssh: { host: `host-${i}` } }));
+  const pending = [];
+  const checked = [];
+  const h = harness(async (command, args) => {
+    if (command === 'get_devices') return devices;
+    if (command === 'remove_device') { devices = devices.filter(device => device.id !== args.id); return; }
+    if (command !== 'check_ssh_device') return {};
+    checked.push(args.id);
+    await new Promise(resolve => pending.push(resolve));
+  });
+  const started = h.deviceList.checkSsh();
+  while (pending.length < 4) await new Promise(setImmediate);
+  await h.deviceList.remove('4');
+  for (let i = 0; i < 20 && !(checked.length === 5 && !pending.length); i++) {
+    pending.splice(0).forEach(resolve => resolve());
+    await new Promise(setImmediate);
+  }
+  await started;
+  assert.deepEqual(checked, ['0', '1', '2', '3', '5']);
+  assert.equal(h.deviceList.status(devices.at(-1)).label, 'SSH reachable at startup');
+});
+
 test('remote home distinguishes health and recovery from whole-device statistics', () => {
   const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
   vm.createContext(context); scripts.under(context, 'home_page.js');

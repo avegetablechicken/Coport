@@ -170,6 +170,8 @@ function createDeviceList({ invoke, Channel, trafficViews, page, minutes, snap, 
       while (pending.length) {
         const device = pending.shift();
         const result = list.startup[device.id];
+        // Removed while it waited.
+        if (!result) continue;
         result.checkedAt = now();
         try {
           await invoke("check_ssh_device", { id: device.id });
