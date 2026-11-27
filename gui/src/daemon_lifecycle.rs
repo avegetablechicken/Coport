@@ -351,7 +351,9 @@ impl<P: Platform> Lifecycle<P> {
                     reported = Some(busy);
                 }
             }
-            if Instant::now() >= deadline {
+            // A Daemon gone quiet just before the deadline is waited on
+            // until its quiet checks are done.
+            if busy > 0 && Instant::now() >= deadline {
                 return Err(io::Error::other(format!(
                     "{busy} request(s) still in flight; the restart was cancelled and the proxy daemon keeps running. Force the restart to interrupt them."
                 )));
@@ -525,6 +527,10 @@ mod tests {
         /// A fake Daemon reporting `requests` in flight, with a valid
         /// configuration to restart it with.
         fn serving(requests: Option<usize>) -> Self {
+            Self::counting(move || requests)
+        }
+        /// A fake Daemon reporting `requests()` in flight at each Status.
+        fn counting(requests: impl Fn() -> Option<usize> + Send + 'static) -> Self {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(
                 dir.path().join("config.yaml"),
@@ -535,7 +541,7 @@ mod tests {
             fake_daemon_with(
                 dir.path(),
                 Arc::new(AtomicBool::new(true)),
-                move |status| status.requests_in_flight = requests,
+                move |status| status.requests_in_flight = requests(),
                 Arc::clone(&actions),
             );
             Self { dir, actions }
@@ -629,6 +635,20 @@ mod tests {
         assert!(message(result).contains("1 request(s)"));
         assert_eq!(heard, [Progress::Waiting(1)]);
         assert!(!old.stopped());
+    }
+
+    #[test]
+    fn a_daemon_gone_quiet_at_the_deadline_is_restarted() {
+        let _guard = daemon::spawn_guard();
+        let started = Instant::now();
+        let daemon = Daemon::counting(move || {
+            Some(usize::from(started.elapsed() < Duration::from_millis(250)))
+        });
+        let (result, heard) =
+            daemon.restart(Fake::default(), Wait::Idle(Duration::from_millis(300)));
+        // The fake daemon answers Stop as no daemon does.
+        assert!(message(result).contains("Cannot stop proxy daemon"));
+        assert_eq!(heard, [Progress::Waiting(1), Progress::Stopping]);
     }
 
     #[test]
