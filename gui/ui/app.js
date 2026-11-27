@@ -89,8 +89,10 @@ async function refresh() {
   ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
   ui.tagColors = tagColors(proxies.map((p) => p.name));
   ui.fetchedAt = Date.now();
-  // Switching forwarding on or off changes which source Home reads at once.
-  if (ui.page === "main" && (Date.now() - trafficViews.homeFetchedAt >= 15000 || (trafficViews.home?.device ?? null) !== homeTrafficDevice())) loadHomeTraffic();
+  // Switching forwarding on or off changes which source Home reads at once,
+  // even while the previous source's read runs.
+  const moved = (trafficViews.home?.device ?? null) !== homeTrafficDevice();
+  if (ui.page === "main" && (moved || Date.now() - trafficViews.homeFetchedAt >= 15000)) loadHomeTraffic(moved);
   if (ui.page === "activity") scheduleActivityLog();
   render();
 }

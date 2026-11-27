@@ -250,6 +250,41 @@ test("a range chosen on any traffic page applies to Home, Activity and Devices",
   }
 });
 
+test("a category change ends the Activity read it supersedes", async () => {
+  const pending = [];
+  const traffic = createTrafficViews({ invoke: () => new Promise((resolve) => pending.push(resolve)) });
+  const read = traffic.loadActivity();
+  traffic.setScope("all");
+  assert.equal(traffic.activityLoading, false);
+  pending[0]({ credentials: [] });
+  assert.equal(await read, false);
+  assert.equal(traffic.activityLoading, false);
+});
+
+test("Home rereads its traffic at once when forwarding changes its source", async () => {
+  const p = scripts.panel({
+    invoke: async (command) => command === "get_state" ? { config: {}, forwarding: { deviceId: "remote" } } : { rows: [] },
+  });
+  const ui = Object.assign(p.get("ui"), { page: "main" });
+  const forces = [];
+  Object.assign(p.context, { render() {}, tagColors: () => ({}), loadHomeTraffic: (force) => forces.push(force) });
+  // This machine's traffic was read just now, and its read is still running.
+  Object.assign(p.get("trafficViews"), { home: { device: null }, homeFetchedAt: Date.now(), homeLoading: true });
+  await p.context.refresh();
+  assert.deepEqual(forces, [true]);
+});
+
+test("Home's forced read of a source is not repeated while it runs", async () => {
+  const pending = [];
+  const traffic = createTrafficViews({ invoke: () => new Promise((resolve) => pending.push(resolve)) });
+  const first = traffic.loadHome(null);
+  const forced = traffic.loadHome("remote", true);
+  assert.equal(await traffic.loadHome("remote", true), false);
+  assert.equal(pending.length, 2);
+  pending.forEach((resolve) => resolve({ credentials: [] }));
+  assert.deepEqual([await first, await forced], [false, true]);
+});
+
 test("page changes move only what is shown, not content of a closed disclosure", () => {
   const context = scripts.load(scripts.sandbox({
     getComputedStyle: () => ({ getPropertyValue: () => "", fontSize: "11px" }),

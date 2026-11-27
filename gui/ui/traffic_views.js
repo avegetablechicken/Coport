@@ -94,7 +94,7 @@ function createTrafficViews({ invoke, now = () => Date.now() }) {
       activityReads.cancel();
       homeReads.cancel();
       views.homeFetchedAt = 0;
-      views.homeLoading = false;
+      views.activityLoading = views.homeLoading = false;
     },
     clearErrors() {
       views.activityError = views.homeError = "";
@@ -125,13 +125,15 @@ function createTrafficViews({ invoke, now = () => Date.now() }) {
       return true;
     },
     /// Reads what Home shows: the forwarded `device`'s traffic, or this
-    /// device's. Unless `force`d, a read already running is not repeated.
+    /// device's. Unless `force`d, a read already running is not repeated;
+    /// one of the same device, range and category never is.
     /// True when its result landed.
     async loadHome(device, force = false) {
-      if (views.homeLoading && !force) return false;
-      const read = homeReads.begin();
-      views.homeLoading = true;
       const { minutes, scope } = views;
+      const key = `${device}:${minutes}:${scope}`;
+      if (views.homeLoading && (!force || homeReads.loading(key))) return false;
+      const read = homeReads.begin(key);
+      views.homeLoading = true;
       try {
         const view = await (device ? views.forwarded(device, minutes, scope) : views.local(minutes, scope));
         if (!read.current()) return false;
@@ -143,6 +145,7 @@ function createTrafficViews({ invoke, now = () => Date.now() }) {
         views.homeError = String(error);
       } finally {
         if (read.current()) views.homeLoading = false;
+        read.done();
       }
       return true;
     },
