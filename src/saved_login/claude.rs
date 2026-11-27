@@ -84,12 +84,13 @@ impl SavedLogin for Claude {
         if payload["refresh_token"].is_string() {
             oauth["refreshToken"] = payload["refresh_token"].clone();
         }
+        // Both expiries count from one moment.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
         for (field, saved) in [
             ("expires_in", "expiresAt"),
             ("refresh_token_expires_in", "refreshTokenExpiresAt"),
         ] {
             if let Some(seconds) = payload[field].as_u64() {
-                let now = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
                 oauth[saved] = now.saturating_add(seconds).saturating_mul(1000).into();
             }
         }
