@@ -1163,6 +1163,7 @@ fn a_new_daemon_that_fails_to_start_gives_way_to_the_previous_program() {
 }
 
 /// This device as a merge reads it, with a node ID no peer has.
+#[cfg(unix)]
 fn this_device(
     config: coport::config::Config,
     log: PathBuf,
