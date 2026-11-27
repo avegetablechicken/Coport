@@ -191,8 +191,12 @@ impl Inputs {
                 _ = cancelled => Err("Traffic request superseded".into()),
             }
         };
-        let (views, ()) = tokio::join!(peers_read, devices);
-        let mut views = views?;
+        // A superseded or failed read stops reading this device's parts too,
+        // and publishes nothing more.
+        let (mut views, ()) = tokio::try_join!(peers_read, async {
+            devices.await;
+            Ok(())
+        })?;
         complete(&mut views, &parts.lock().unwrap());
         Ok(views)
     }
