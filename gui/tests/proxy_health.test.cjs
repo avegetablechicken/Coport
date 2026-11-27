@@ -2,20 +2,25 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
-const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
-const homePage = fs.readFileSync(path.join(__dirname, "../ui/home_page.js"), "utf8");
-const block = homePage.match(/function proxiesBlock\(\) \{[\s\S]*?\r?\n\}/)[0];
-const { createLatest } = require('../ui/latest.js');
+const scripts = require("./panel_harness.cjs");
+
+/// The whole panel showing `page`, answered by `answer`; drawing and proxy
+/// colours are left out.
+function panelFor(page, answer) {
+  const p = scripts.panel({ invoke: answer });
+  Object.assign(p.context, { render() {}, tagColors: () => ({}) });
+  p.get("ui").page = page;
+  return p;
+}
 
 function renderProxies(proxies) {
-  return vm.runInNewContext(`${block}\nproxiesBlock()`, {
+  return scripts.under(scripts.sandbox({
     ui: { snap: { config: { details: { proxies } } } },
     block: (_title, _aside, body) => body,
     flag: () => "", tag: (name) => name, esc: (value) => value,
     ICON: { restart: '<svg data-icon="restart"></svg>' },
-  });
+  }), "home_page.js").proxiesBlock();
 }
 
 function render(probe, proxy = {}) {
@@ -47,16 +52,12 @@ test("standalone probe results retain latency and failure display", () => {
 
 test("visible home refresh does not start another proxy probe", async () => {
   const calls = [];
-  let tick;
-  const ui = { page: "main" };
-  const document = { hidden: false };
-  vm.runInNewContext(source.slice(source.indexOf("// Refresh even when no new requests arrive")), {
-    ui, document,
-    setInterval: (callback) => { tick = callback; },
-    refresh: async () => { calls.push("refresh"); },
-    deviceList: { loadCapabilities: () => { calls.push("cached-device-status"); } },
-    probeStale: () => { calls.push("probeStale"); },
-  });
+  const p = panelFor("main", async (command) => { if (command === "probe_proxy") calls.push("probeStale"); });
+  p.context.refresh = async () => { calls.push("refresh"); };
+  p.get("deviceList").loadCapabilities = () => { calls.push("cached-device-status"); };
+  // The rolling window's timer: the last one the panel starts, every 15 s.
+  const tick = p.timers.findLast((t) => t.ms === 15000).fn;
+  const { document } = p;
   tick();
   await Promise.resolve();
   assert.deepEqual(calls, ["refresh", "cached-device-status"]);
@@ -136,16 +137,10 @@ test('an exit IP service failure leaves proxy reachability unverified', () => {
 
 test("Settings state refresh requests no account work", async () => {
   const calls = [];
-  const refresh = source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;'));
-  const context = {
-    ui: { page: 'settings' }, refreshes: createLatest(), deviceList: { loaded: false },
-    invoke: async (command, args) => {
-      calls.push([command, args]);
-      return command === 'get_state' ? { config: {} } : { rows: [] };
-    },
-    tagColors: () => ({}), render() {},
-  };
-  vm.runInNewContext(refresh, context);
+  const { context } = panelFor('settings', async (command, args) => {
+    calls.push([command, args]);
+    return command === 'get_state' ? { config: {} } : { rows: [] };
+  });
   await context.refresh();
   assert.equal(calls[0][0], 'get_state');
   // Account states come from the backend's own schedule, never from a page read.
@@ -153,24 +148,21 @@ test("Settings state refresh requests no account work", async () => {
 });
 
 test('every passive page refresh opts out of upstream account probes', async () => {
-  const code=source.slice(source.indexOf('async function refresh()'),source.indexOf('let refreshTimer;'));
   for(const page of ['main','devices','settings','activity']) {
     const calls=[];
-    const context={ui:{page},refreshes:createLatest(),deviceList:{loaded:false},trafficViews:{homeFetchedAt:Date.now(),home:null},invoke:async(command,args)=>{calls.push([command,args]);return command==='get_state'?{config:{details:{proxies:[]}}}:{rows:[]};},tagColors:()=>({}),render(){},scheduleActivityLog(){},homeTrafficDevice:()=>null};
-    vm.runInNewContext(code,context);await context.refresh();await context.refresh();
+    const { context } = panelFor(page, async(command,args)=>{calls.push([command,args]);return command==='get_state'?{config:{details:{proxies:[]}}}:{rows:[]};});
+    Object.assign(context, { scheduleActivityLog(){}, homeTrafficDevice:()=>null });
+    await context.refresh();await context.refresh();
     assert.ok(calls.filter(([command])=>command==='get_state').every(([,args])=>args===undefined),page);
   }
 });
 
 
 test('account routes explain each activation state', () => {
-  const block = homePage.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
-  const scope = fs.readFileSync(path.join(__dirname, '../ui/traffic_render.js'), 'utf8').match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];
-  const row = (activation) => vm.runInNewContext(`${scope}\n${block}\nroutingRow(route, true, true)`, {
-    route: { selector: 'you@example.com', proxies: [], activation },
+  const row = (activation) => scripts.under(scripts.sandbox({
     routeIdentity: (name) => ({ kind: 'account', name }), routingChain: () => '',
     ROUTE_ICON: { account: '' }, ICON: { warning: '' }, esc: (value) => value,
-  });
+  }), 'traffic_render.js', 'home_page.js').routingRow({ selector: 'you@example.com', proxies: [], activation }, true, true);
   // Not yet identified is not a failed probe.
   assert.match(row('unknown'), /not identified yet/);
   assert.doesNotMatch(row('unknown'), /Probe failed|could not confirm/);

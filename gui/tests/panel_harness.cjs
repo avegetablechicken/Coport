@@ -67,7 +67,9 @@ function element(id) {
 
 /// The whole panel, app.js included, loaded as the WebView loads it, with
 /// what it reaches outside itself faked:
-/// - `invoke(command, args)` answers the app; by default nothing answers.
+/// - `invoke(command, args)` answers the app once the panel has loaded; what
+///   the panel asks while it starts stays unanswered, so a test's `invoke`
+///   sees only what the test causes. By default nothing answers.
 /// - `elements` are what `$(id)` finds; any other id gets a stand-in.
 /// - `document`, `window` and `globals` replace the fakes they name.
 /// - `before(context)` runs after the modules load and before app.js, where
@@ -98,9 +100,10 @@ function panel({ invoke = () => new Promise(() => {}), elements = {}, document, 
     querySelector: () => null, querySelectorAll: () => [], elementFromPoint: () => null,
   };
   const media = () => ({ matches: false, addEventListener() {} });
+  let started = false;
   const win = window ?? { innerWidth: 480, innerHeight: 640, addEventListener: add(windowListeners), matchMedia: media };
   win.__TAURI__ ??= {
-    core: { invoke: (command, args) => invoke(command, args), Channel: class { constructor() { this.onmessage = null; } } },
+    core: { invoke: (command, args) => (started ? invoke(command, args) : new Promise(() => {})), Channel: class { constructor() { this.onmessage = null; } } },
     event: { listen: (name, fn) => { (events[name] ||= []).push(fn); return Promise.resolve(() => {}); } },
   };
   const timer = (fn, ms) => timers.push({ fn, ms });
@@ -125,6 +128,7 @@ function panel({ invoke = () => new Promise(() => {}), elements = {}, document, 
   load(context, ...scripts().filter((name) => name !== 'app.js'));
   before?.(context);
   load(context, 'app.js');
+  started = true;
   return {
     context, document: doc, window: win, listeners, windowListeners, events, observers, timers,
     get: (name) => get(context, name),

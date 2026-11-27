@@ -3,8 +3,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
-const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
-const { createLatest } = require('../ui/latest.js');
 const scripts = require('./panel_harness.cjs');
 
 test('pending proxy operations remain visible and disable duplicate power requests', () => {
@@ -73,9 +71,9 @@ test('a proxy CA missing hosts warns with what still works, then shrinks once ke
 test('a failed asynchronous restart does not display success', async () => {
   const messages = [];
   let refreshed = false;
-  const context = { ui: { snap: {} }, invoke: async () => { throw new Error('stop failed'); }, toast: text => messages.push(text), refresh: async () => { refreshed = true; } };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('async function act('), source.indexOf('// Any scroll or input')), context);
+  const { context, get } = scripts.panel({ invoke: async () => { throw new Error('stop failed'); } });
+  get('ui').snap = {};
+  Object.assign(context, { toast: text => messages.push(text), refresh: async () => { refreshed = true; } });
   await context.act('restart');
   assert.deepEqual(messages, ['Error: stop failed']);
   assert.equal(refreshed, true);
@@ -102,22 +100,20 @@ test('Restart publishes new proxies before announcing success, including concurr
   const messages = [];
   const rendered = [];
   const snap = name => ({ config: { details: { proxies: [{ name }] } } });
-  const ui = { page: 'settings', snap: snap('old'), proxies: { old: { name: 'old' } } };
-  const context = {
-    ui, tagColors: () => ({}), refreshes: createLatest(), deviceList: { loaded: false }, trafficViews: { homeFetchedAt: Date.now(), home: null, cached: () => null },
-    homeTrafficDevice: () => null, loadHomeTraffic() {},
-    panelMotion: { changePage: update => update(), queueFit() {} }, $: () => ({ scrollTop: 0 }),
+  const p = scripts.panel({
     invoke: async command => {
       if (command === 'get_state') return new Promise(resolve => pending.push(resolve));
       if (command === 'get_activity') return { rows: [] };
       assert.equal(command, 'restart_proxy');
     },
+  });
+  const ui = Object.assign(p.get('ui'), { page: 'settings', snap: snap('old'), proxies: { old: { name: 'old' } } });
+  const { context } = p;
+  Object.assign(context, {
+    tagColors: () => ({}), homeTrafficDevice: () => null, loadHomeTraffic() {},
     toast: message => messages.push([message, Object.keys(ui.proxies)]),
     render: () => rendered.push(Object.keys(ui.proxies)),
-  };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;')), context);
-  vm.runInContext(source.slice(source.indexOf('async function act('), source.indexOf('// Any scroll or input')), context);
+  });
   const old = context.refresh();
   const restarting = context.act('restart');
   await new Promise(setImmediate);
