@@ -1,11 +1,13 @@
 //! Daemon-owned, bounded capability checks for the SSH devices the GUI
 //! manages. The GUI names them with every request; the daemon keeps them in
-//! memory only and never reads the GUI's preferences.
+//! memory. Only for a GUI too old to name them does it read the GUI's
+//! preferences.
 use crate::remote::{Capabilities, Device};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io,
+    io::{self, Read},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,10 +33,47 @@ struct Entry {
 }
 #[derive(Default)]
 pub struct Checks {
+    /// The GUI's preferences, which list the Devices for a GUI too old to
+    /// name them.
+    preferences: Option<PathBuf>,
     entries: Mutex<BTreeMap<String, Entry>>,
     changed: tokio::sync::Notify,
 }
 impl Checks {
+    /// Checks for the GUI whose preferences are in `dir`.
+    pub fn new(dir: &Path) -> Self {
+        Self {
+            preferences: Some(dir.join("gui.json")),
+            ..Self::default()
+        }
+    }
+    /// For a GUI too old to name its Devices: check the SSH Devices its
+    /// preferences list. An unreadable file is no change to the list, so a
+    /// transient error cannot requeue checks that were denied.
+    pub fn reload_preferences(&self) -> io::Result<()> {
+        let Some(path) = &self.preferences else {
+            return Ok(());
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.set(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(io::Error::other("Device preferences exceed the size limit"));
+        }
+        let settings: crate::settings::Settings =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        self.set(
+            settings
+                .managed_devices
+                .iter()
+                .filter_map(|device| device.ssh_connection())
+                .collect(),
+        )
+    }
     /// Check `devices` from now on: a device that is new or changed is checked
     /// at once, one no longer named is forgotten with its result, and the
     /// others keep theirs.

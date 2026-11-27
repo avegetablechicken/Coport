@@ -315,6 +315,7 @@ impl Routing {
         }
         let routing = Self {
             store: Some(path),
+            device_checks: Arc::new(crate::device_capabilities::Checks::new(dir)),
             ..Self::default()
         };
         if preferences.restore {

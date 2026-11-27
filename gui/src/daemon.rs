@@ -584,7 +584,11 @@ async fn handle_control(
                 requests_in_flight: Some(server.requests_in_flight() + routing.connections_in_flight()),
                 ..Status::clone(&status)
             })),
-            Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
+            // Only a GUI too old to name its Devices asks this way.
+            Action::DeviceCapabilities => {
+                let _ = routing.device_checks.reload_preferences();
+                Response::DeviceCapabilities(routing.device_checks.statuses())
+            }
             Action::DeviceChecks { devices } => match routing.device_checks.set(devices) {
                 Ok(()) => Response::DeviceCapabilities(routing.device_checks.statuses()),
                 Err(error) => Response::Error(error.to_string()),
@@ -594,10 +598,13 @@ async fn handle_control(
                 Ok(window) => Response::ForwardingTraffic(Box::new(window)),
                 Err(error) => Response::Error(error),
             },
-            Action::RefreshDeviceCapabilities => {
-                routing.device_checks.refresh();
-                Response::Recorded
-            }
+            Action::RefreshDeviceCapabilities => match routing.device_checks.reload_preferences() {
+                Ok(()) => {
+                    routing.device_checks.refresh();
+                    Response::Recorded
+                }
+                Err(error) => Response::Error(error.to_string()),
+            },
             Action::SetForwardRestore { enabled } => match routing.set_restore(enabled).await {
                 Ok(()) => Response::ForwardingSet,
                 Err(error) => Response::Error(error),
@@ -958,6 +965,59 @@ pub(crate) mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_gui_too_old_to_name_its_devices_has_them_read_from_its_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let log = dir.path().join("proxy.log");
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(&config,format!("listen_port: {port}\nrequest_timeout_seconds: 3\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n")).unwrap();
+        std::fs::write(
+            dir.path().join("gui.json"),
+            r#"{"managed_devices":[{"id":"peer","name":"Peer","ssh":{"host":"peer.invalid","binary":"coportd"},"data":null}]}"#,
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let directory = dir.path().to_owned();
+        let server = tokio::spawn(async move {
+            serve_until(&directory, &config, &log, async {
+                let _ = stopped.await;
+            })
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join(ENDPOINT).exists() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let endpoint: Endpoint =
+            serde_json::from_slice(&std::fs::read(dir.path().join(ENDPOINT)).unwrap()).unwrap();
+        let client = Client {
+            endpoint,
+            directory: dir.path().to_owned(),
+        };
+        // As an older GUI polls Settings, and as it asks after a save.
+        for refresh in [false, true] {
+            if refresh {
+                client.refresh_device_capabilities().await.unwrap();
+            }
+            let checks = client.device_capabilities().await.unwrap();
+            assert_eq!(
+                checks
+                    .iter()
+                    .map(|c| c.device_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["peer"]
+            );
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// A forked child shares the lock's open file description until it execs;
