@@ -42,6 +42,18 @@ struct View {
 }
 
 pub struct Tray {
+    native: MainThreadOnly<Native>,
+    /// The last 30 minutes' requests and errors, as Home counts All traffic.
+    traffic: Mutex<Option<String>>,
+    /// Model calls sent upstream as of the last update.
+    sent: AtomicU64,
+    beacon: Mutex<Beacon>,
+}
+
+/// The icon, its menu and what they show, which only the main thread
+/// reaches. Native setters wait for the main thread, so a worker calling one
+/// while holding `view` deadlocks against an update already running there.
+struct Native {
     icon: TrayIcon,
     headline: MenuItem<Wry>,
     stats: MenuItem<Wry>,
@@ -50,11 +62,46 @@ pub struct Tray {
     restart: MenuItem<Wry>,
     quit: MenuItem<Wry>,
     view: Mutex<Option<View>>,
-    /// The last 30 minutes' requests and errors, as Home counts All traffic.
-    traffic: Mutex<Option<String>>,
-    /// Model calls sent upstream as of the last update.
-    sent: AtomicU64,
-    beacon: Mutex<Beacon>,
+}
+
+use main_thread::{MainThread, MainThreadOnly, on_main_thread};
+mod main_thread {
+    use std::marker::PhantomData;
+    use tauri::AppHandle;
+
+    /// Proof that code runs on the main thread: only `on_main_thread` makes
+    /// one, and it cannot leave that thread.
+    pub struct MainThread(PhantomData<*const ()>);
+
+    /// `T`, reached only with proof of the main thread.
+    pub struct MainThreadOnly<T>(T);
+
+    impl<T> MainThreadOnly<T> {
+        pub fn new(value: T) -> Self {
+            Self(value)
+        }
+
+        pub fn get(&self, _: &MainThread) -> &T {
+            &self.0
+        }
+    }
+
+    impl MainThreadOnly<super::Native> {
+        /// The icon's on-screen rectangle, which any thread may read.
+        pub fn rect(&self) -> tauri::Result<Option<tauri::Rect>> {
+            self.0.icon.rect()
+        }
+    }
+
+    /// Runs `f` on the main thread, with its proof; called on another
+    /// thread, it only queues `f` there.
+    pub fn on_main_thread(
+        app: &AppHandle,
+        f: impl FnOnce(&AppHandle, &MainThread) + Send + 'static,
+    ) {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || f(&handle, &MainThread(PhantomData)));
+    }
 }
 
 #[derive(Default)]
@@ -179,14 +226,16 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         );
     }
     app.manage(Tray {
-        icon,
-        headline,
-        stats,
-        open,
-        toggle,
-        restart,
-        quit,
-        view: Mutex::new(None),
+        native: MainThreadOnly::new(Native {
+            icon,
+            headline,
+            stats,
+            open,
+            toggle,
+            restart,
+            quit,
+            view: Mutex::new(None),
+        }),
         traffic: Mutex::new(None),
         sent: AtomicU64::new(
             app.state::<AppState>()
@@ -204,9 +253,13 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
 }
 
 impl Tray {
+    fn native(&self, main: &MainThread) -> &Native {
+        self.native.get(main)
+    }
+
     /// The icon's on-screen rectangle, when the platform reports one.
     pub fn rect(&self) -> Option<Rect> {
-        let r = self.icon.rect().ok().flatten()?;
+        let r = self.native.rect().ok().flatten()?;
         let p = r.position.to_physical::<f64>(1.0);
         let s = r.size.to_physical::<f64>(1.0);
         Some(Rect {
@@ -218,12 +271,10 @@ impl Tray {
     }
 }
 
-/// Schedule the entire update before taking any state/view locks. Native tray
-/// setters wait for the main thread, so calling them from a worker while holding
-/// the view lock can deadlock against an update already running on that thread.
+/// Schedule the entire update on the main thread, the only one that reaches
+/// the tray's native state.
 pub fn sync(app: &AppHandle) {
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || sync_on_main_thread(&handle));
+    on_main_thread(app, sync_on_main_thread);
 }
 
 /// Counts the last 30 minutes of All traffic from the logs, as Home does,
@@ -297,7 +348,7 @@ pub fn navigate(app: &AppHandle, right: bool) {
 }
 
 /// Pushes proxy state to the icon, tooltip and menu on the main thread only.
-fn sync_on_main_thread(app: &AppHandle) {
+fn sync_on_main_thread(app: &AppHandle, main: &MainThread) {
     let Some(tray) = app.try_state::<Tray>() else {
         return;
     };
@@ -324,36 +375,37 @@ fn sync_on_main_thread(app: &AppHandle) {
         };
         (view, core.logs.sent())
     };
-    let mut last = tray.view.lock().unwrap();
+    let native = tray.native(main);
+    let mut last = native.view.lock().unwrap();
     let old = last.as_ref();
     if old.map(|v| v.status) != Some(view.status) {
-        let _ = tray.icon.set_icon(Some(image(view.status)));
+        let _ = native.icon.set_icon(Some(image(view.status)));
         #[cfg(target_os = "macos")]
-        let _ = tray.icon.set_icon_as_template(true);
+        let _ = native.icon.set_icon_as_template(true);
     }
     if old.map(|v| &v.headline) != Some(&view.headline) {
-        let _ = tray.headline.set_text(&view.headline);
-        let _ = tray
+        let _ = native.headline.set_text(&view.headline);
+        let _ = native
             .icon
             .set_tooltip(Some(format!("Coport — {}", view.headline)));
     }
     if old.map(|v| &v.stats) != Some(&view.stats) {
-        let _ = tray.stats.set_text(&view.stats);
+        let _ = native.stats.set_text(&view.stats);
     }
     let relabel = old.is_none();
     if relabel || old.map(|v| (v.running, v.busy)) != Some((view.running, view.busy)) {
-        let _ = tray.toggle.set_text(if view.running {
+        let _ = native.toggle.set_text(if view.running {
             "Stop Proxy"
         } else {
             "Start Proxy"
         });
-        let _ = tray.toggle.set_enabled(!view.busy);
-        let _ = tray.restart.set_enabled(view.running && !view.busy);
+        let _ = native.toggle.set_enabled(!view.busy);
+        let _ = native.restart.set_enabled(view.running && !view.busy);
     }
     if relabel {
-        let _ = tray.open.set_text("Open Panel");
-        let _ = tray.restart.set_text("Restart Proxy");
-        let _ = tray.quit.set_text("Quit Coport");
+        let _ = native.open.set_text("Open Panel");
+        let _ = native.restart.set_text("Restart Proxy");
+        let _ = native.quit.set_text("Quit Coport");
     }
     let running = view.status == Status::Running;
     *last = Some(view);
@@ -390,8 +442,7 @@ fn turn(app: &AppHandle, tray: &Tray, service: Service) {
                 match beacon.next.take() {
                     Some(next) => service = next,
                     None => {
-                        let h = worker.clone();
-                        let _ = worker.run_on_main_thread(move || show_frame(&h, None));
+                        on_main_thread(&worker, |app, main| show_frame(app, main, None));
                         beacon.playing = false;
                         return;
                     }
@@ -418,8 +469,7 @@ fn play(app: &AppHandle, service: Service) {
             Image::new_owned(icon::badge(64, Some(Status::Running), turn), 64, 64)
         };
         std::thread::sleep((start + TURN * i / FRAMES).saturating_duration_since(Instant::now()));
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || show_frame(&h, Some(frame)));
+        on_main_thread(app, move |app, main| show_frame(app, main, Some(frame)));
     }
     std::thread::sleep((start + TURN).saturating_duration_since(Instant::now()));
 }
@@ -697,10 +747,10 @@ fn menu_bar_is_dark(app: &AppHandle) -> bool {
         NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let h = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        let dark = h.try_state::<Tray>().is_some_and(|tray| {
-            tray.icon
+    on_main_thread(app, move |app, main| {
+        let dark = app.try_state::<Tray>().is_some_and(|tray| {
+            tray.native(main)
+                .icon
                 .with_inner_tray_icon(|inner| {
                     let mtm = objc2::MainThreadMarker::new()?;
                     let button = inner.ns_status_item()?.button(mtm)?;
@@ -724,21 +774,22 @@ fn menu_bar_is_dark(app: &AppHandle) -> bool {
 /// Shows a frame of the turn while the proxy still runs, or with `None` the
 /// icon for the current status. A status update during a turn has already set
 /// its own icon, which later frames leave alone.
-fn show_frame(app: &AppHandle, frame: Option<Image<'static>>) {
+fn show_frame(app: &AppHandle, main: &MainThread, frame: Option<Image<'static>>) {
     let Some(tray) = app.try_state::<Tray>() else {
         return;
     };
-    let view = tray.view.lock().unwrap();
+    let native = tray.native(main);
+    let view = native.view.lock().unwrap();
     let Some(status) = view.as_ref().map(|v| v.status) else {
         return;
     };
     match frame {
         Some(frame) if status == Status::Running => {
-            let _ = tray.icon.set_icon_with_as_template(Some(frame), false);
+            let _ = native.icon.set_icon_with_as_template(Some(frame), false);
         }
         Some(_) => {}
         None => {
-            let _ = tray
+            let _ = native
                 .icon
                 .set_icon_with_as_template(Some(image(status)), cfg!(target_os = "macos"));
         }

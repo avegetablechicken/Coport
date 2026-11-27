@@ -1,6 +1,4 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const scripts = require('./panel_harness.cjs');
@@ -141,35 +139,4 @@ test('Restart publishes new proxies before announcing success, including concurr
   pending[3](snap('newer'));
   await again;
   assert.deepEqual(messages[1], ['Proxy restarted', ['newer']]);
-});
-
-test('tray updates dispatch before taking locks or calling native setters', () => {
-  const tray = fs.readFileSync(path.join(__dirname, '../src/tray.rs'), 'utf8');
-  const sync = tray.match(/pub fn sync\(app: &AppHandle\) \{[\s\S]*?\r?\n\}/)[0];
-  // Stop/restart completion and state notifications can arrive simultaneously
-  // on worker and UI threads. Neither may hold the view lock while dispatching.
-  assert.match(sync, /run_on_main_thread\(move \|\| sync_on_main_thread\(&handle\)\)/);
-  assert.doesNotMatch(sync, /\.lock\(|\.state::<|\.try_state::<|\.set_(?:icon|text|tooltip|enabled)\(/);
-  const update = tray.match(/fn sync_on_main_thread\(app: &AppHandle\) \{[\s\S]*?\r?\n\}/)[0];
-  assert.match(update, /tray\.view\.lock\(/);
-  assert.match(update, /tray\.icon\.set_icon\(/);
-  // The main-thread implementation must remain private, with its only call
-  // originating inside the dispatcher above.
-  assert.doesNotMatch(tray, /pub(?:\([^)]*\))? fn sync_on_main_thread/);
-  assert.equal((tray.match(/sync_on_main_thread\(/g) || []).length, 2);
-  // Turn frames are rendered on a worker, which only dispatches them and
-  // never takes the view lock or calls native setters; the main thread shows
-  // them under the view lock. The menu bar's appearance is read there too.
-  for (const name of ['turn', 'play', 'menu_bar_is_dark']) {
-    const worker = tray.match(new RegExp(`fn ${name}\\(app: &AppHandle[^)]*\\)[^{]*\\{[\\s\\S]*?\\r?\\n\\}`))[0];
-    assert.doesNotMatch(worker, /\.view\.lock\(|\.set_(?:icon|text|tooltip|enabled)\w*\(/, name);
-  }
-  const play = tray.match(/fn play\(app: &AppHandle, service: Service\) \{[\s\S]*?\r?\n\}/)[0];
-  assert.match(play, /run_on_main_thread\(move \|\| show_frame\(&h, Some\(frame\)\)\)/);
-  const appearance = tray.match(/fn menu_bar_is_dark\(app: &AppHandle\) -> bool \{[\s\S]*?\r?\n\}/)[0];
-  assert.match(appearance, /run_on_main_thread\(move \|\|[\s\S]*with_inner_tray_icon/);
-  const frame = tray.match(/fn show_frame\(app: &AppHandle, frame: Option<Image<'static>>\) \{[\s\S]*?\r?\n\}/)[0];
-  assert.match(frame, /tray\.view\.lock\(/);
-  assert.match(frame, /tray\s*\.icon\s*\.set_icon_with_as_template\(/);
-  assert.equal((tray.match(/show_frame\(/g) || []).length, 3);
 });
