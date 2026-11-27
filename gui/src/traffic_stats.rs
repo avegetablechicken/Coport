@@ -281,11 +281,15 @@ fn finish_accounts(accounts: &mut [Account]) {
     for account in accounts.iter_mut() {
         account.metrics = Metrics::of(&account.stats);
     }
-    accounts.sort_by_key(|account| {
-        (
-            account.credential == UNIDENTIFIED,
-            std::cmp::Reverse(account.stats.bytes),
-        )
+    // Ties fall back to a fixed order, so no account's place depends on which
+    // device was read first.
+    accounts.sort_by(|a, b| {
+        (a.credential == UNIDENTIFIED)
+            .cmp(&(b.credential == UNIDENTIFIED))
+            .then(b.stats.bytes.cmp(&a.stats.bytes))
+            .then(b.stats.requests.cmp(&a.stats.requests))
+            .then(a.service.cmp(&b.service))
+            .then_with(|| a.credential.cmp(&b.credential))
     });
 }
 
@@ -448,6 +452,51 @@ mod tests {
         assert_eq!(accounts, [("shared", 6, 60), (UNIDENTIFIED, 2, 20)]);
         assert_eq!(total.credentials[0].sources.len(), 1);
         assert_eq!(total.targets.len(), 1);
+    }
+
+    #[test]
+    fn accounts_alike_in_bytes_keep_one_order_whichever_device_comes_first() {
+        let account = |service, credential: &str, requests| {
+            let mut stats = stats(requests, &[requests]);
+            stats.bytes = 100;
+            Account::new(service, credential.into(), Vec::new(), stats)
+        };
+        let one = window(0, 1);
+        let local = View::reported_by_peer(
+            TrafficScope::Model,
+            one,
+            vec![
+                account(Service::Claude, "b", 1),
+                account(Service::Codex, UNIDENTIFIED, 9),
+            ],
+        );
+        let peer = View::reported_by_peer(
+            TrafficScope::Model,
+            one,
+            vec![
+                account(Service::Codex, "z", 1),
+                account(Service::Claude, "a", 1),
+                account(Service::Codex, "busy", 2),
+            ],
+        );
+        let order = |views: [&View; 2]| -> Vec<(Service, String)> {
+            merge(views)
+                .unwrap()
+                .credentials
+                .into_iter()
+                .map(|account| (account.service, account.credential))
+                .collect()
+        };
+        let expected = [
+            (Service::Codex, "busy"),
+            (Service::Codex, "z"),
+            (Service::Claude, "a"),
+            (Service::Claude, "b"),
+            (Service::Codex, UNIDENTIFIED),
+        ]
+        .map(|(service, credential)| (service, credential.to_owned()));
+        assert_eq!(order([&local, &peer]), expected);
+        assert_eq!(order([&peer, &local]), expected);
     }
 
     #[test]
