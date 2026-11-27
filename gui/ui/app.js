@@ -427,11 +427,14 @@ async function act(action, el) {
         toast(String(e));
         break;
       }
-      const before = el.innerHTML;
+      // Another copy while the check shows restores the icon from before the first.
+      clearTimeout(el.copiedTimer);
+      el.copiedIcon ??= el.innerHTML;
       el.innerHTML = ICON.check;
       el.classList.add("done");
-      setTimeout(() => {
-        el.innerHTML = before;
+      el.copiedTimer = setTimeout(() => {
+        el.innerHTML = el.copiedIcon;
+        el.copiedIcon = undefined;
         el.classList.remove("done");
       }, 1200);
       break;

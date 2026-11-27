@@ -118,8 +118,9 @@ function renderActivityForwarding() {
     : "";
   el.hidden = !target;
   el.dataset.morph = target ? `device/${target.deviceId}` : "";
-  // Refreshes must not replace the link while it is focused or hovered.
-  if (el.innerHTML !== html) el.innerHTML = html;
+  // Refreshes must not replace the link while it is focused or hovered. The
+  // markup is compared as written: read back, a quote in a name is not escaped.
+  if (el.forwardingHtml !== html) { el.innerHTML = html; el.forwardingHtml = html; }
 }
 function activityShell() {
   return `<div class="page">
