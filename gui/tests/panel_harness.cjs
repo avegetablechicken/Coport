@@ -35,6 +35,14 @@ function load(context, ...names) {
   return context;
 }
 
+/// Loads `names` beneath what `context` already has: a test's stubs stay,
+/// and the scripts give everything else.
+function under(context, ...names) {
+  const stubs = { ...context };
+  load(context, ...names);
+  return Object.assign(context, stubs);
+}
+
 /// A top-level `const` or `let` of a loaded script, which is not a property
 /// of the sandbox.
 function get(context, name) {
@@ -45,4 +53,4 @@ function assert(ok, message) {
   if (!ok) throw new Error(message);
 }
 
-module.exports = { UI, scripts, sandbox, load, get };
+module.exports = { UI, scripts, sandbox, load, under, get };

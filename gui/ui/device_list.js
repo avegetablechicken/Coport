@@ -39,6 +39,8 @@ function createDeviceList({ invoke, Channel, trafficViews, page, minutes, snap, 
     refreshQueued: false,
   };
 
+  /// A Devices frame completed with this device's traffic, read within the
+  /// Devices cadence; a Devices visit reads it again only after that.
   function frameFresh(frame) {
     return !!(frame?.local || frame?.localError) && now() - (frame.loadedAt || 0) < DEVICE_FRAME_MS;
   }

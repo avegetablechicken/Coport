@@ -600,13 +600,11 @@ test('forwarding toggles only the selected device and refreshes confirmed state'
 
 
 test('home highlights remote mode and collapses inactive local configuration', () => {
-  const start = source.indexOf('function main()');
-  const end = source.indexOf('function proxyBlock(', start);
   const context = { ui: { snap: { forwarding: { name: 'MS', error: null }, phase: { port: 8787 } } },
     ICON: { chevron: '' }, fmtBytes: v => `${v} B`, esc: v => v, block: (title, aside, body) => title + body,
     message: (_, text) => text, connectBlock: () => '[Connect]', proxyBlock: () => '[Proxy]',
     trafficBlock: () => '[Traffic]', recentBlock: () => '[Recent]', proxiesBlock: () => '[Proxies]', routingBlock: () => '[Routing]' };
-  vm.createContext(context); vm.runInContext(source.slice(start,end), context);
+  vm.createContext(context); scripts.under(context, 'home_page.js');
   const html = context.main();
   assert.match(html, /SSH forwarding/);
   assert.match(html, /MS/);
@@ -750,10 +748,8 @@ test('startup SSH checks have at most four connections in flight', async () => {
 });
 
 test('remote home distinguishes health and recovery from whole-device statistics', () => {
-  const start = source.indexOf('function main()');
-  const end = source.indexOf('function proxyBlock(', start);
   const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
-  vm.createContext(context); vm.runInContext(source.slice(start,end),context);
+  vm.createContext(context); scripts.under(context, 'home_page.js');
   let html = context.remoteForwardingBlock();
   assert.match(html,/Connected/); assert.match(html,/52 ms/); assert.match(html,/Connection restored/);
   assert.match(html,/3 \/ 1 \/ 1/); assert.match(html,/8 B\/s/);

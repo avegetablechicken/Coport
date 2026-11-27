@@ -83,7 +83,7 @@ function panel(page = 'main', script = source) {
   scripts.load(context, 'route_tooltip.js');
   context.routeTooltip = context.createRouteTooltip({ document: doc, window: context.window });
   context.routeTooltip.install();
-  vm.runInContext(between('function renderPage() {', '// ---------------------------------------------------------------- main'), context);
+  vm.runInContext(between('function renderPage() {', 'installHomePage();'), context);
   vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(() => routeTooltip.refresh())'), context);
   assert.equal(typeof observer, 'function', 'content observer is registered');
   content.innerHTML = '';

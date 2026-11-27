@@ -5,7 +5,8 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
-const block = source.match(/function proxiesBlock\(\) \{[\s\S]*?\r?\n\}/)[0];
+const homePage = fs.readFileSync(path.join(__dirname, "../ui/home_page.js"), "utf8");
+const block = homePage.match(/function proxiesBlock\(\) \{[\s\S]*?\r?\n\}/)[0];
 const { createLatest } = require('../ui/latest.js');
 
 function renderProxies(proxies) {
@@ -163,7 +164,7 @@ test('every passive page refresh opts out of upstream account probes', async () 
 
 
 test('account routes explain each activation state', () => {
-  const block = source.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
+  const block = homePage.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
   const scope = fs.readFileSync(path.join(__dirname, '../ui/traffic_render.js'), 'utf8').match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];
   const row = (activation) => vm.runInNewContext(`${scope}\n${block}\nroutingRow(route, true, true)`, {
     route: { selector: 'you@example.com', proxies: [], activation },

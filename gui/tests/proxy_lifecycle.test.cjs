@@ -11,7 +11,7 @@ test('pending proxy operations remain visible and disable duplicate power reques
   const ui = { snap: { phase: { state: 'running', busy: true, port: 8787 }, config: { exists: true } } };
   const context = { ui, block: (_, head, body) => head + body, stat: () => '', fmtUptime: String, uptime: () => 0, message: (_, text) => text, esc: String };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function proxyBlock('), source.indexOf('/// Home shows the forwarded device')), context);
+  scripts.under(context, 'home_page.js');
   assert.match(context.proxyBlock(), /Updating/);
   assert.match(context.proxyBlock(), /data-action="power" disabled/);
   ui.snap.phase.busy = false;
@@ -24,7 +24,7 @@ test('a failed phase names no cause beyond its error', () => {
   const ui = { snap: { phase: { state: 'failed', port: 8787 }, config: { exists: true } } };
   const context = { ui, block: (_, head, body) => head + body, stat: () => '', fmtUptime: String, uptime: () => 0, message: (_, text) => text, esc: String };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function proxyBlock('), source.indexOf('/// Home shows the forwarded device')), context);
+  scripts.under(context, 'home_page.js');
   // Lost contact with a running daemon is not a failed start.
   ui.snap.phase.error = 'Lost contact with the proxy daemon. Restart to reconnect.';
   const html = context.proxyBlock();
@@ -42,7 +42,7 @@ test('a proxy CA missing hosts warns with what still works, then shrinks once ke
     esc: (v) => String(v).replace(/</g, '&lt;'),
   };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function proxyBlock('), source.indexOf('/// Home shows the forwarded device')), context);
+  scripts.under(context, 'home_page.js');
   assert.doesNotMatch(context.proxyBlock(), /Proxy CA/);
   ui.snap.proxyCa = {
     decrypted: ['api.anthropic.com:443', 'chatgpt.com:443'],

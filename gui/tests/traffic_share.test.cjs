@@ -22,7 +22,7 @@ function loadSharedViews(context) {
   scripts.load(context, 'traffic_render.js');
 }
 function loadHome(context) {
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nfunction trafficBlock(')), context);
+  scripts.under(context, 'home_page.js');
 }
 test('Account emails and IDs are shortened for display', () => {
   const { maskAccountName } = setup();
@@ -83,7 +83,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
 });
 test('Home Routing hides part of an account email', () => {
   const context = setup();
-  vm.runInContext(source.slice(source.indexOf('function routeIdentity('), source.indexOf('function routingChain(')), context);
+  scripts.under(context, 'home_page.js');
   assert.equal(context.routeIdentity('suzhi2333@gmail.com', 'account').name, 'su***3@gmail.com');
   assert.equal(context.routeIdentity('default', 'account').name, 'default');
   assert.equal(context.routeIdentity('suzhi2333@gmail.com', 'provider').name, 'suzhi2333@gmail.com');
@@ -106,7 +106,7 @@ test('Connect always offers the Grok URL and both Grok Build endpoints on the li
   const grok = 'http://127.0.0.1:19427/grok/v1';
   context.ui.snap = { urls: { grok }, config: { details: null } };
   Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
-  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const html = context.connectBlock();
   assert.ok(html.includes('[Grok]Grok'));
   assert.ok(html.includes(`data-text="${grok}" data-tip="Copy" aria-label="Copy Grok base URL"`));
@@ -118,7 +118,7 @@ test('Connect gives agy its endpoint variables, and its own proxy and CA with th
   const ag = `${base}/antigravity`;
   const ca = '/Users/u/Library/Application Support/io.github.coport.gui/tls/proxy-ca.pem';
   Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
-  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const endpoints = `CLOUD_CODE_URL=${ag}\nUSER_INFO_OVERRIDE_URL=${ag}/https://www.googleapis.com/oauth2/v2/userinfo\nAICODE_ENDPOINT_URL=${ag}/https://aicode.googleapis.com`;
   const snap = (routing) => ({ urls: { base, antigravity: ag, proxyCaCertificate: ca }, config: { details: { editable: { connect_credential_routing: routing } } } });
   assert.equal(context.agyEnvironment(snap(false)), endpoints);
@@ -135,7 +135,7 @@ test('Connect points Grok Build at this issuer only when Grok logins are routed'
   const base = 'http://127.0.0.1:19427';
   const grok = `${base}/grok/v1`;
   Object.assign(context, { ICON: { copy: '', chevron: '' }, block: (_, __, body) => body });
-  vm.runInContext(source.slice(source.indexOf('function connectBlock('), source.indexOf('function recentBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const endpoints = `[endpoints]\ncli_chat_proxy_base_url = "${grok}"\nxai_api_base_url = "${grok}"`;
   const fallbacks = (proxies) => [{ key: 'accountFallback', proxies }, { key: 'fallback', proxies: null }, { key: 'accountProbe', proxies: ['none'] }];
   const snap = (accountRoutes, proxies) => ({ urls: { base, grok }, config: { details: { editable: {}, grok: { accountRoutes, fallbacks: fallbacks(proxies) } } } });
@@ -371,7 +371,7 @@ test('review menu offers current configurations and Unidentified for each change
 test('Models charts draw one baseline for every bucket without reported tokens', () => {
   const context = setup('model');
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
   const html = context.chart(failed, 'model', true);
   assert.doesNotMatch(html, /chart-peak/);
@@ -396,7 +396,7 @@ test('Models shows the average first token time before Avg. Time where this devi
   const context = setup('model');
   Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: (v) => v == null ? '—' : `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '' });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 300, firstTokenTotalMs: 600, firstTokenSamples: 2, forwardedFirstTokenTotalMs: 600, forwardedFirstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
   for (const html of [context.accountRow(local, 'model', local), context.trafficSummary(local, 'model')]) {
     assert.match(html, /<Error Rate=[^>]*>\s*<First Token=300 ms>\s*<Avg\. Time=4000 ms>\s*<Output TPS<span[^>]*>!<\/span>=—>/);
@@ -416,7 +416,7 @@ test('Models shows Unidentified rows whose calls all failed as one line of calls
   const context = setup('model');
   Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, errorRate: 1, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
   const brief = context.accountRow(failed, 'model', failed, '<review>');
   assert.equal(brief.replace(/ data-tip-scope="[^"]*"/, ''), '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
@@ -520,7 +520,7 @@ test('Claude Input Tokens explain uncached input and cache writes on hover', () 
 test('bar tooltips use their own time bucket and only the plotted metric', () => {
   const context = setup();
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   const start = new Date(2026, 9, 9, 23, 59, 0).getTime();
   const end = start + 150_000;
   const stats = { counts: [2, 3, 0], tokenCounts: [1234, 0, 0], errorCounts: [1, 3, 0] };
@@ -635,7 +635,7 @@ test('assigning traffic refreshes device views and removes stale cached mappings
 test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
   const context = setup();
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   const stats = { counts: [0, 0, 0], tokenCounts: [0, 0, 0], errorCounts: [0, 0, 0] };
   for (const scope of ['model', 'all']) {
     const html = context.chart(stats, scope, true);
@@ -649,7 +649,7 @@ test('home traffic draws the share ring above its chart', () => {
   context.trafficViews.home = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const html = context.trafficBlock();
   assert.match(html, /class="traffic-share"[\s\S]*class="chart"/);
   assert.match(html, /\[Codex\][\s\S]*\[Claude\]/);
@@ -667,7 +667,7 @@ test('Home Traffic hides part of an account email while configuration names stay
   ] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const html = context.trafficBlock();
   assert.match(html, /<span>su\*\*\*3@gmail\.com<\/span>/);
   assert.match(html, /<span>work<\/span>/);
@@ -697,10 +697,10 @@ test('forwarding Home reads the destination from the daemon cache, never local h
 });
 test('forwarding Home Traffic labels the destination and hides another source', () => {
   const context = setup('all');
-  vm.runInContext(source.slice(source.indexOf('function homeTrafficDevice('), source.indexOf('async function loadHomeTraffic(')), context);
+  scripts.under(context, 'home_page.js');
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '' });
   loadSharedViews(context);
-  vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
+  scripts.under(context, 'home_page.js');
   const { ui } = context;
   ui.page = 'main';
   ui.snap = { forwarding: { deviceId: 'ms' } };
