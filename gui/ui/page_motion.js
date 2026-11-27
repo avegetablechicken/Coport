@@ -236,9 +236,10 @@ function createPageMotion({ document, ui, invoke }) {
     // Mount every copy before starting animations, so WebKit starts the effects
     // together on the next rendering update rather than on detached elements.
     const animations = pending.map(({ el, frames, options }) => el.animate(frames, options));
-    Promise.all(animations.map((a) => a.finished)).then(() => {
+    // A cancelled animation ends the motion too, or the page stays hidden.
+    Promise.all(animations.map((a) => a.finished)).catch(() => {}).then(() => {
       if (pageMotion === motion) endPageMotion();
-    }, () => {});
+    });
   }
   /// Moves one named element from its old place to its new one. The same
   /// markup moves as one piece; otherwise the old copy fades into the new one
