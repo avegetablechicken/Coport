@@ -5,14 +5,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
-const vm = require("node:vm");
 const scripts = require("./panel_harness.cjs");
 
-const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
-const from = source.indexOf("function render() {");
-const to = source.indexOf("function renderTop() {", from);
-assert.ok(from >= 0 && to > from, "render … renderTop");
-const helpers = source.slice(from, to);
 
 let context;
 
@@ -52,25 +46,18 @@ function container(id) {
 }
 
 function panel(page, top, content) {
-  const body = { closest: () => null };
   const parts = { top: container("top"), content: container("content") };
-  context = {
-    ui: { snap: {}, page, builtPage: page },
-    menus: { current: () => null, holdRender: () => false, close() {} },
-    panelMotion: { queueFit() {} },
-    document: { body, activeElement: body },
-    $: (id) => parts[id] ?? null,
-    // Each render builds new nodes, as the real one does from markup.
-    renderTop: () => parts.top.fill(top()),
-    renderPage: () => {
-      context.ui.builtPage = context.ui.page;
-      parts.content.fill(content());
-      context.afterRender?.();
-    },
+  const p = scripts.panel({ elements: parts });
+  context = p.context;
+  context.ui = p.get("ui");
+  Object.assign(context.ui, { snap: {}, page, builtPage: page });
+  // Each render builds new nodes, as the real one does from markup.
+  context.renderTop = () => parts.top.fill(top());
+  context.renderPage = () => {
+    context.ui.builtPage = context.ui.page;
+    parts.content.fill(content());
+    context.afterRender?.();
   };
-  vm.createContext(context);
-  scripts.load(context, "focus_restore.js");
-  vm.runInContext(`${helpers}\nthis.render = render;`, context);
   context.render();
   return { parts, render: () => context.render(), focused: () => context.document.activeElement };
 }
