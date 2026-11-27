@@ -64,6 +64,16 @@ _Avoid_: backend, service, helper
 Replacing the running **Daemon** with a new one. The new configuration and credentials are checked before the old one stops. Unless forced, the Restart waits for the old one's requests in flight. If the new one does not become healthy, the previous program runs again. One Restart runs at a time; another started meanwhile joins it.
 _Avoid_: reload, relaunch
 
+### Devices
+
+**Device**:
+Another computer the user adds, whose traffic Coport reads over HTTP or SSH. One reached over SSH can also be forwarded to.
+_Avoid_: peer, node, remote, managed device
+
+**Forwarding**:
+Sending the requests this computer's proxy receives to one SSH **Device**, whose proxy answers them. It starts only once that **Device** was found to support it, stops when the **Device** is edited or removed, and can be restored when the **Daemon** starts.
+_Avoid_: relay, tunnel, remote routing
+
 ### Traffic
 
 **Traffic totals**:
