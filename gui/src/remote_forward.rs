@@ -401,6 +401,11 @@ impl Routing {
             }
         })
     }
+    /// Client connections open through SSH forwarding; each can carry a
+    /// request the local server never sees.
+    pub fn connections_in_flight(&self) -> usize {
+        self.mode.borrow().counters.active.load(Ordering::Relaxed) as usize
+    }
     /// Answers from the monitor's last summary only; never contacts the device.
     pub fn traffic_window(
         &self,
@@ -800,12 +805,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&response, b"active");
+        assert_eq!(routing.connections_in_flight(), 1);
         routing.set(None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), connection)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(client.read(&mut response).await.unwrap(), 0);
+        assert_eq!(routing.connections_in_flight(), 0);
     }
 
     #[test]

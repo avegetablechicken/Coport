@@ -70,7 +70,8 @@ pub struct Status {
     pub config_path: PathBuf,
     pub log_path: PathBuf,
     pub config_modified: Option<SystemTime>,
-    /// Client requests the daemon is serving; absent from older daemons.
+    /// Client requests the daemon is serving, counting each connection
+    /// forwarded over SSH as one; absent from older daemons.
     #[serde(default)]
     pub requests_in_flight: Option<usize>,
 }
@@ -579,7 +580,8 @@ async fn handle_control(
                 uptime_ms: started.elapsed().as_millis() as u64,
                 forwarding: routing.status(),
                 forwarding_restore: routing.restore_enabled(),
-                requests_in_flight: Some(server.requests_in_flight()),
+                // A Restart must not cut a stream forwarded over SSH.
+                requests_in_flight: Some(server.requests_in_flight() + routing.connections_in_flight()),
                 ..Status::clone(&status)
             })),
             Action::DeviceCapabilities => Response::DeviceCapabilities(routing.device_checks.statuses()),
