@@ -164,30 +164,35 @@ impl History {
 }
 static HISTORY: LazyLock<Mutex<History>> = LazyLock::new(|| Mutex::new(History::default()));
 
-pub(crate) async fn record(log: PathBuf, source: &Source, success: bool, elapsed: Duration) {
+/// Records a query of `source` in `log`, through `daemon` when it writes
+/// that log.
+pub(crate) async fn record(
+    daemon: &crate::daemon::Lookup,
+    log: PathBuf,
+    source: &Source,
+    success: bool,
+    elapsed: Duration,
+) {
     let event = HISTORY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record(&log, source, success, elapsed, Instant::now());
     if let Some(event) = event {
-        let result = tokio::task::spawn_blocking(move || persist(&daemon_dir(), &log, event)).await;
+        let daemon = daemon.get().await;
+        let result = tokio::task::spawn_blocking(move || persist(daemon, &log, event)).await;
         if !matches!(result, Ok(Ok(()))) {
             eprintln!("Cannot record device statistics query");
         }
     }
 }
-/// Where the live daemon is discovered. Unit tests query fake peers with
-/// temporary logs and must never contact the user's running daemon.
-fn daemon_dir() -> PathBuf {
-    #[cfg(test)]
-    return std::env::temp_dir().join("coport-unit-tests-without-daemon");
-    #[cfg(not(test))]
-    crate::settings::app_dir()
-}
-fn persist(app_dir: &Path, log: &Path, event: QueryEvent) -> io::Result<()> {
+fn persist(
+    daemon: Option<(crate::daemon::Client, crate::daemon::Status)>,
+    log: &Path,
+    event: QueryEvent,
+) -> io::Result<()> {
     // The live daemon owns log rotation: enqueue through its authenticated local
     // control channel instead of opening a second rotating writer.
-    if let Some((client, status)) = crate::daemon::Client::discover(app_dir)
+    if let Some((client, status)) = daemon
         && status.log_path == log
     {
         return client.record_device_query(event);
@@ -291,10 +296,55 @@ mod tests {
         }
         assert_eq!(history.0.len(), CAPACITY);
     }
-    #[test]
-    fn unit_tests_never_discover_the_users_daemon() {
-        assert_ne!(daemon_dir(), crate::settings::app_dir());
-        assert!(crate::daemon::Client::discover(&daemon_dir()).is_none());
+    #[tokio::test]
+    async fn a_query_is_appended_to_the_log_while_no_daemon_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let daemon = crate::daemon::Lookup::new(dir.path().into());
+        record(
+            &daemon,
+            log.clone(),
+            &source(),
+            false,
+            Duration::from_millis(5),
+        )
+        .await;
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("device_statistics_failed"));
+    }
+    #[tokio::test]
+    async fn a_query_goes_to_the_daemon_writing_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+        let actions = std::sync::Arc::new(Mutex::new(Vec::new()));
+        crate::daemon::tests::fake_daemon_answering(
+            dir.path(),
+            std::sync::Arc::new(true.into()),
+            |_| {},
+            |action| {
+                action
+                    .get("RecordDeviceQuery")
+                    .map(|_| serde_json::json!("Recorded"))
+            },
+            actions.clone(),
+        );
+        let daemon = crate::daemon::Lookup::new(dir.path().into());
+        record(
+            &daemon,
+            log.clone(),
+            &source(),
+            true,
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(!log.exists());
+        assert!(
+            actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|action| action.contains("RecordDeviceQuery"))
+        );
     }
     #[test]
     fn audit_records_exclude_private_fields_and_do_not_change_traffic() {
@@ -312,7 +362,7 @@ mod tests {
             )
             .unwrap();
         assert!(event.validate());
-        persist(dir.path(), &path, event.clone()).unwrap();
+        persist(None, &path, event.clone()).unwrap();
         let bytes = std::fs::read_to_string(&path).unwrap();
         for secret in [
             "private-device-name",

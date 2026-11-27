@@ -1169,6 +1169,7 @@ fn this_device(
     labels: std::collections::BTreeMap<(String, String), String>,
 ) -> coport_gui::data_client::ThisDevice {
     coport_gui::data_client::ThisDevice {
+        daemon: coport_gui::daemon::Lookup::new(log.parent().unwrap().into()),
         config,
         log,
         labels,

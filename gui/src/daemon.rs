@@ -158,6 +158,32 @@ pub async fn find(dir: &Path) -> io::Result<Option<(Client, Status)>> {
         .map_err(io::Error::other)
 }
 
+/// The running Daemon serving `dir`, looked up when first asked for and kept
+/// from then on. Clones share that one lookup: one traffic read takes one,
+/// so all it asks of the Daemon goes to the same one.
+#[derive(Clone)]
+pub struct Lookup {
+    dir: PathBuf,
+    found: Arc<tokio::sync::OnceCell<Option<(Client, Status)>>>,
+}
+
+impl Lookup {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            found: Default::default(),
+        }
+    }
+
+    /// The Daemon this lookup found; none if it found none or could not look.
+    pub async fn get(&self) -> Option<(Client, Status)> {
+        self.found
+            .get_or_init(|| async { find(&self.dir).await.ok().flatten() })
+            .await
+            .clone()
+    }
+}
+
 impl Client {
     pub fn discover(dir: &Path) -> Option<(Self, Status)> {
         let endpoint = serde_json::from_slice(&std::fs::read(dir.join(ENDPOINT)).ok()?).ok()?;
@@ -924,6 +950,22 @@ pub(crate) mod tests {
     /// A forked child shares the lock's open file description until it execs;
     /// `try_clone` shares it the same way. Closing alone leaves the lock with
     /// that copy, which made a following Restart or migration see it held.
+    #[tokio::test]
+    async fn clones_of_a_lookup_share_its_one_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup = Lookup::new(dir.path().into());
+        let clone = lookup.clone();
+        assert!(lookup.get().await.is_none());
+        fake_daemon_with(
+            dir.path(),
+            Arc::new(true.into()),
+            |_| {},
+            Default::default(),
+        );
+        assert!(clone.get().await.is_none());
+        assert!(Lookup::new(dir.path().into()).get().await.is_some());
+    }
+
     #[test]
     fn a_held_lock_is_released_even_while_a_forked_copy_lives() {
         let dir = tempfile::tempdir().unwrap();

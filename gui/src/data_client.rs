@@ -23,6 +23,8 @@ pub struct ThisDevice {
     pub labels: BTreeMap<(String, String), String>,
     /// The node ID its summaries carry: a peer answering with it is this device.
     pub node_id: String,
+    /// Its running daemon as this read found it, which records device queries.
+    pub daemon: crate::daemon::Lookup,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -295,16 +297,18 @@ fn common_end(
 }
 async fn fetch_sources(
     sources: Vec<Source>,
-    log: &std::path::Path,
+    device: &ThisDevice,
     summaries: &Summaries,
 ) -> Result<Vec<(Source, Result<Summary, String>)>, String> {
     let mut tasks = tokio::task::JoinSet::new();
     for source in sources {
-        let (log, summaries) = (log.to_owned(), summaries.clone());
+        let (log, daemon) = (device.log.clone(), device.daemon.clone());
+        let summaries = summaries.clone();
         tasks.spawn(async move {
             let started = std::time::Instant::now();
             let result = summaries.complete(&source).await;
-            crate::device_events::record(log, &source, result.is_ok(), started.elapsed()).await;
+            let elapsed = started.elapsed();
+            crate::device_events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
             (source, result)
         });
     }
@@ -819,7 +823,8 @@ async fn merge_progressive_snapshot(
             continue;
         }
         let tx = tx.clone();
-        let (log, summaries) = (device.log.clone(), summaries.clone());
+        let (log, daemon) = (device.log.clone(), device.daemon.clone());
+        let summaries = summaries.clone();
         tasks.spawn(async move {
             let started = std::time::Instant::now();
             let result = summaries
@@ -828,7 +833,8 @@ async fn merge_progressive_snapshot(
                         .map_err(|_| "Data reader closed".into())
                 })
                 .await;
-            crate::device_events::record(log, &source, result.is_ok(), started.elapsed()).await;
+            let elapsed = started.elapsed();
+            crate::device_events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
             if let Err(error) = result {
                 let _ = tx.send((index, Err(error)));
             }
@@ -924,6 +930,7 @@ async fn prepare_merge_range(device: ThisDevice, minutes: u64) -> Result<MergeCo
         log,
         labels: credential_labels,
         node_id,
+        daemon,
     } = device;
     let evidence_path = log.clone();
     let credential_labels = tokio::task::spawn_blocking(move || {
@@ -951,6 +958,7 @@ async fn prepare_merge_range(device: ThisDevice, minutes: u64) -> Result<MergeCo
             log,
             labels: credential_labels,
             node_id,
+            daemon,
         },
         accounts,
         at: chrono::Utc::now().timestamp_millis() / 60_000 * 60_000,
@@ -963,7 +971,7 @@ async fn align_sources(
     selections: &[(u64, crate::traffic::TrafficScope)],
     summaries: &Summaries,
 ) -> Result<(Fetched, i64), String> {
-    let fetched = fetch_sources(sources, &context.device.log, summaries).await?;
+    let fetched = fetch_sources(sources, &context.device, summaries).await?;
     align_fetched(context, fetched, selections, Some(summaries)).await
 }
 /// The boundary every Summary in `fetched` can be merged at. Devices that
@@ -1018,7 +1026,7 @@ async fn align_fetched(
             let (ok, mut failed): (Fetched, Fetched) =
                 fetched.into_iter().partition(|(_, result)| result.is_ok());
             let sources = ok.into_iter().map(|(s, _)| s).collect();
-            failed.extend(fetch_sources(sources, &context.device.log, summaries).await?);
+            failed.extend(fetch_sources(sources, &context.device, summaries).await?);
             failed.sort_by(|a, b| a.0.name.cmp(&b.0.name));
             fetched = failed;
         }
@@ -1174,6 +1182,7 @@ mod tests {
         labels: BTreeMap<(String, String), String>,
     ) -> ThisDevice {
         ThisDevice {
+            daemon: crate::daemon::Lookup::new(log.parent().unwrap().into()),
             config,
             log,
             labels,
@@ -2912,6 +2921,7 @@ mod tests {
                 log: log.clone(),
                 labels: BTreeMap::new(),
                 node_id: "local-test".into(),
+                daemon: crate::daemon::Lookup::new(dir.path().into()),
             },
             accounts: BTreeMap::new(),
             at: end,

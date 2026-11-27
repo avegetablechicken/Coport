@@ -23,8 +23,8 @@ pub struct Inputs {
     labels: BTreeMap<(String, String), String>,
     assignments: Vec<TrafficAssignment>,
     node_id: String,
-    dir: PathBuf,
-    daemon: tokio::sync::OnceCell<Option<(daemon::Client, daemon::Status)>>,
+    /// The running daemon, asked once per read.
+    daemon: daemon::Lookup,
 }
 
 /// Peers' last summaries and the refresh reading them, kept across reads.
@@ -56,8 +56,7 @@ impl Inputs {
             labels,
             assignments: Compatibility::assignments_in(&dir),
             node_id: crate::data_api::read_node_id(&dir).unwrap_or_else(|_| "local".into()),
-            dir,
-            daemon: Default::default(),
+            daemon: daemon::Lookup::new(dir),
         }
     }
 
@@ -86,7 +85,8 @@ impl Inputs {
     ) -> Result<ForwardedTraffic, String> {
         crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
         let (client, status) = self
-            .daemon()
+            .daemon
+            .get()
             .await
             .ok_or("Start the local proxy to show forwarded traffic.")?;
         if !status.forwarding_traffic_supported {
@@ -205,21 +205,8 @@ impl Inputs {
             log: self.log.clone(),
             labels: self.labels.clone(),
             node_id: self.node_id.clone(),
+            daemon: self.daemon.clone(),
         })
-    }
-
-    /// The running daemon, asked once per read.
-    async fn daemon(&self) -> Option<(daemon::Client, daemon::Status)> {
-        self.daemon
-            .get_or_init(|| async {
-                let dir = self.dir.clone();
-                tokio::task::spawn_blocking(move || daemon::Client::discover(&dir))
-                    .await
-                    .ok()
-                    .flatten()
-            })
-            .await
-            .clone()
     }
 
     async fn forwarded_from(
@@ -237,7 +224,7 @@ impl Inputs {
 
     /// The forwarded device's live traffic while forwarding is on.
     async fn live_forwarded(&self, minutes: u64, scope: TrafficScope) -> Option<ForwardedTraffic> {
-        let (client, status) = self.daemon().await?;
+        let (client, status) = self.daemon.get().await?;
         if !status.forwarding_traffic_supported || status.forwarding.is_none() {
             return None;
         }
@@ -247,7 +234,7 @@ impl Inputs {
     /// The forwarded device's summary if the daemon read it within the last
     /// minute. Reading it never contacts the device.
     async fn forwarded_summary(&self) -> BTreeMap<String, crate::data_api::Summary> {
-        let Some((client, status)) = self.daemon().await else {
+        let Some((client, status)) = self.daemon.get().await else {
             return Default::default();
         };
         if !status.forwarding_traffic_supported || status.forwarding.is_none() {
