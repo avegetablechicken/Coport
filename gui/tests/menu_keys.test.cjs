@@ -41,6 +41,7 @@ function panel({ navigating = true } = {}) {
   context = {
     IS_MAC: true,
     ui: { page: "main", menuBarNavigation: navigating },
+    deviceList: { loaded: false },
     closeSelect() {},
     hideRouteTooltip() {},
     showSelect: (trigger, last) => opened.push([trigger.name, last]),

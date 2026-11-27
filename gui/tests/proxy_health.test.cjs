@@ -53,7 +53,7 @@ test("visible home refresh does not start another proxy probe", async () => {
     ui, document,
     setInterval: (callback) => { tick = callback; },
     refresh: async () => { calls.push("refresh"); },
-    loadDeviceCapabilities: () => { calls.push("cached-device-status"); },
+    deviceList: { loadCapabilities: () => { calls.push("cached-device-status"); } },
     probeStale: () => { calls.push("probeStale"); },
   });
   tick();
@@ -137,7 +137,7 @@ test("Settings state refresh requests no account work", async () => {
   const calls = [];
   const refresh = source.slice(source.indexOf('async function refresh()'), source.indexOf('let refreshTimer;'));
   const context = {
-    ui: { page: 'settings' }, refreshes: createLatest(),
+    ui: { page: 'settings' }, refreshes: createLatest(), deviceList: { loaded: false },
     invoke: async (command, args) => {
       calls.push([command, args]);
       return command === 'get_state' ? { config: {} } : { rows: [] };
@@ -155,7 +155,7 @@ test('every passive page refresh opts out of upstream account probes', async () 
   const code=source.slice(source.indexOf('async function refresh()'),source.indexOf('let refreshTimer;'));
   for(const page of ['main','devices','settings','activity']) {
     const calls=[];
-    const context={ui:{page},refreshes:createLatest(),trafficViews:{homeFetchedAt:Date.now(),home:null},invoke:async(command,args)=>{calls.push([command,args]);return command==='get_state'?{config:{details:{proxies:[]}}}:{rows:[]};},tagColors:()=>({}),render(){},scheduleActivityLog(){},homeTrafficDevice:()=>null};
+    const context={ui:{page},refreshes:createLatest(),deviceList:{loaded:false},trafficViews:{homeFetchedAt:Date.now(),home:null},invoke:async(command,args)=>{calls.push([command,args]);return command==='get_state'?{config:{details:{proxies:[]}}}:{rows:[]};},tagColors:()=>({}),render(){},scheduleActivityLog(){},homeTrafficDevice:()=>null};
     vm.runInNewContext(code,context);await context.refresh();await context.refresh();
     assert.ok(calls.filter(([command])=>command==='get_state').every(([,args])=>args===undefined),page);
   }

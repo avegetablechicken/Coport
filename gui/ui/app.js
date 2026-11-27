@@ -148,19 +148,8 @@ const ui = {
   snap: null,
   // Opened by keyboard navigation of the menu bar (macOS 27); see menuBarStep.
   menuBarNavigation: false,
-  devices: [],
-  mergedData: null,
-  mergedDataError: "",
-  mergedDataLoading: false,
-  mergedDataRequest: 0,
-  deviceTrafficViews: Object.create(null),
-  deviceTrafficFetchedAt: 0,
-  mergedDataUpdating: false,
   deviceTrafficMinutes: 30,
   deviceTrafficOpen: Object.create(null),
-  deviceStates: Object.create(null),
-  devicesLoaded: false,
-  deviceRefresh: false,
   fetchedAt: 0,
   page: "main",
   /// Opened from View All: keep the Log at the top until the user scrolls.
@@ -188,6 +177,10 @@ const activityLog = createActivityPager({
   now: currentMinute,
 });
 const deviceForm = createDeviceForm();
+const deviceList = createDeviceList({
+  invoke, Channel, trafficViews, page: () => ui.page, minutes: () => ui.deviceTrafficMinutes,
+  snap: () => ui.snap, render: () => render(), toast: message => toast(message),
+});
 const refreshes = createLatest();
 
 async function refresh() {
@@ -200,7 +193,7 @@ async function refresh() {
   // In particular, Restart waits until its fresh configuration is displayed.
   if (!request.apply()) return;
   ui.snap = snap;
-  if (ui.devicesLoaded) setDeviceForwarders(snap.forwarding ? [snap.forwarding] : []);
+  if (deviceList.loaded) deviceList.setForwarders(snap.forwarding ? [snap.forwarding] : []);
   ui.recent = recent.rows.slice(0, 5);
   const proxies = snap.config.details?.proxies ?? [];
   ui.proxies = Object.fromEntries(proxies.map((p) => [p.name, p]));
@@ -357,7 +350,7 @@ function renderTop() {
       <span class="app-name">Coport</span><span class="version">v${esc(ui.snap.version)}</span>
       <nav class="links">
         <button class="text-link" data-action="page" data-page="activity" data-morph="title:activity">Activity</button>
-        ${(ui.devicesLoaded ? ui.devices.length : ui.snap.settings?.deviceCount || 0) > 0 ? `<button class="text-link" data-action="page" data-page="devices" data-morph="title:devices">Devices</button>` : ""}
+        ${(deviceList.loaded ? deviceList.devices.length : ui.snap.settings?.deviceCount || 0) > 0 ? `<button class="text-link" data-action="page" data-page="devices" data-morph="title:devices">Devices</button>` : ""}
         <button class="text-link" data-action="page" data-page="settings">Settings</button>
         <button class="text-link" data-action="quit">Quit</button>
       </nav>`;
@@ -631,10 +624,6 @@ function trafficSummary(view, scope, window = view, source = "") {
 
 /// A Devices frame completed with this device's traffic, read within the
 /// Devices cadence; a Devices visit reads it again only after that.
-function trafficFrameFresh(frame) {
-  return !!frame?.local && Date.now() - (frame.loadedAt || 0) < DEVICE_FRAME_MS;
-}
-const DEVICE_FRAME_MS = 30000;
 
 /// Home shows the forwarded device's traffic while SSH forwarding is on, else this machine's.
 function homeTrafficDevice() {
@@ -1519,14 +1508,14 @@ async function assignTraffic(choice) {
     await invoke("set_traffic_assignment", choice);
   } catch (error) {
     trafficViews.activityError = String(error);
-    ui.mergedDataError = String(error);
+    deviceList.error = String(error);
     if (ui.page === "devices") render();
     else renderActivityTraffic();
     return;
   }
   trafficViews.reset();
-  ui.deviceTrafficViews = Object.create(null);
-  await Promise.all([loadTraffic(), loadMergedData(true), refresh()]);
+  deviceList.views = Object.create(null);
+  await Promise.all([loadTraffic(), deviceList.loadMerged(true), refresh()]);
 }
 
 function renderActivityTraffic() {
@@ -1703,7 +1692,7 @@ function renderActivityList() {
 
 function requestRow(e, expandable) {
   const deviceQuery = ["device_statistics_succeeded", "device_statistics_failed", "device_statistics_recovered"].includes(e.event);
-  const queryDevice = deviceQuery && ui.devices.find(device => device.id === e.fields?.device_id);
+  const queryDevice = deviceQuery && deviceList.devices.find(device => device.id === e.fields?.device_id);
   const queryLabel = deviceQuery ? `Statistics query · ${queryDevice?.name || `Device ${String(e.fields?.device_id || "").slice(0, 8)}`}` : "";
   const cancelled = e.event === "request_cancelled" || e.event === "model_call_cancelled";
   const modelCall = e.event.startsWith("model_call_");
@@ -1744,84 +1733,8 @@ function detail(e) {
 
 // ---------------------------------------------------------------- devices
 
-function selectDeviceTraffic() {
-  const cached = ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes}:${trafficViews.scope}`];
-  if (!cached) return false;
-  ui.mergedData = cached;
-  return true;
-}
-/// A refresh first publishes every peer as pending. Such a frame would drop
-/// peers the shown view already has, so that view stays until they answer.
-function dropsShownPeers(view, shown) {
-  return !!shown?.sources?.some(old => old.traffic
-    && view.sources?.find(source => source.name === old.name)?.error === "TRAFFIC_UPDATING");
-}
-async function loadMergedData(force = false, refreshRemote = false) {
-  if (ui.mergedDataLoading && !force) return;
-  const request = ++ui.mergedDataRequest;
-  ui.mergedDataLoading = true;
-  ui.mergedDataRemote = refreshRemote;
-  if (refreshRemote) {
-    ui.deviceTrafficRecoveryPending = false;
-    // Failed attempts count too, so an unreachable peer is not retried sooner.
-    ui.deviceRemoteAttemptAt = Date.now();
-  }
-  let completed = false, completeSelected = false;
-  const requestedDevices = ui.devices ? ui.devices.map(d => ({ id: d.id, name: d.name })) : [];
-  const requestedKey = `${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`;
-  try {
-    const onUpdate = new Channel();
-    onUpdate.onmessage = data => {
-      if (completed || request !== ui.mergedDataRequest) return;
-      relabelDeviceViews(data, requestedDevices, ui.devices || []);
-      ui.deviceTrafficViews ||= Object.create(null);
-      for (const view of data) {
-        view.loadedAt = Date.now();
-        const key = `${view.minutes}:${view.scope}`;
-        if (!dropsShownPeers(view, ui.deviceTrafficViews[key])) ui.deviceTrafficViews[key] = view;
-      }
-      selectDeviceTraffic();
-      // Statuses and errors stay visible while another range waits for peers.
-      ui.mergedDataLatest = ui.mergedData || data[0];
-      ui.mergedDataError = ""; ui.mergedDataUpdating = false;
-      if (ui.page === "devices" || ui.page === "settings") render();
-    };
-    const data = await invoke("get_merged_data", {
-      minutes: ui.deviceTrafficMinutes || 30, scope: trafficViews.scope || "model", onUpdate, refreshRemote,
-    });
-    if (request !== ui.mergedDataRequest) return;
-    if (Array.isArray(data)) {
-      for (const view of data) view.loadedAt = Date.now();
-      relabelDeviceViews(data, requestedDevices, ui.devices || []);
-      ui.deviceTrafficViews = Object.fromEntries(data.map(view => [`${view.minutes}:${view.scope}`, view]));
-      selectDeviceTraffic();
-    } else { ui.mergedData = data; }
-    ui.mergedDataLatest = ui.mergedData || ui.deviceTrafficViews?.["30:model"] || ui.mergedDataLatest;
-    if (refreshRemote) ui.deviceTrafficFetchedAt = Date.now();
-    ui.mergedDataError = ""; ui.mergedDataUpdating = false;
-    // A range chosen during a refresh gets its peers from it, and this device from a read now.
-    const key = `${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`;
-    completeSelected = refreshRemote && key !== requestedKey && !ui.deviceTrafficViews?.[key]?.local;
-  } catch (e) {
-    if (request === ui.mergedDataRequest) {
-      // A cache read retries on its own; a refresh needs the user to press Refresh again.
-      const skew = String(e).includes("TRAFFIC_UPDATING");
-      ui.mergedDataUpdating = skew && !refreshRemote;
-      ui.mergedDataError = skew && refreshRemote ? "Devices reported different time boundaries. Press Refresh to try again." : ui.mergedDataUpdating ? "" : String(e);
-    }
-  }
-  finally {
-    completed = true;
-    if (request === ui.mergedDataRequest) {
-      ui.mergedDataLoading = ui.mergedDataRemote = false;
-      if (ui.page === "devices" || ui.page === "settings") render();
-      if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
-      if (completeSelected) loadMergedData(true);
-    }
-  }
-}
 function deviceTrafficContent(traffic, scope, detailsKey = "merged", window = traffic) {
-  let body = `<div class="traffic-content" aria-busy="${ui.mergedDataLoading}">${trafficSummary(traffic, scope, window, detailsKey)}</div>`;
+  let body = `<div class="traffic-content" aria-busy="${deviceList.loading}">${trafficSummary(traffic, scope, window, detailsKey)}</div>`;
   const pendingReviews = traffic.credentials.reduce((n, c) => n + (c.sources ?? []).filter(s => s.reason).length, 0);
   if (pendingReviews) body += `<div class="placeholder">${ICON.warning} Renamed or changed local configurations need review. Open Upstream accounts and choose where their traffic belongs.</div>`;
   if (traffic.credentials.length) body += `<details class="disclosure" data-device-traffic="${esc(detailsKey)}" ${ui.deviceTrafficOpen?.[detailsKey] ? "open" : ""}><summary>${ICON.chevron}Upstream accounts</summary>${traffic.credentials.map(c => accountRow(c, scope, window, trafficReview(c, traffic.targets, scope), detailsKey)).join("")}</details>`;
@@ -1833,11 +1746,11 @@ document.addEventListener("toggle", event => {
   (ui.deviceTrafficOpen ||= Object.create(null))[details.dataset.deviceTraffic] = details.open;
 }, true);
 function mergedDataBlock() {
-  const data = ui.mergedData;
+  const data = deviceList.merged;
   const range = trafficControls("devices-traffic", ui.deviceTrafficMinutes, "Device traffic time range");
   let body = `<div class="devices-traffic-range">${range}</div>`;
-  if (ui.mergedDataUpdating) body += `<div class="placeholder">Updating traffic…</div>`;
-  if (ui.mergedDataError) body += message("bad", esc(ui.mergedDataError));
+  if (deviceList.updating) body += `<div class="placeholder">Updating traffic…</div>`;
+  if (deviceList.error) body += message("bad", esc(deviceList.error));
   // The backend adds every device once on the newest one's time axis; peers
   // still loading are added once they arrive, and the sum so far stays visible.
   const { merged, scope } = deviceCardViews();
@@ -1850,185 +1763,30 @@ function mergedDataBlock() {
       else if (source.exclusion === "duplicate") body += `<div class="placeholder">${esc(source.name)}: Already counted via another entry.</div>`;
     }
   }
-  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${ui.mergedDataLoading && ui.mergedDataRemote ? "disabled" : ""}>Refresh</button>`, body, "traffic");
-}
-function deviceConnectionKey(devices) {
-  return JSON.stringify(devices.map(d => {
-    const transport = d.data?.transport || (d.ssh ? "ssh" : "http");
-    return [d.id, transport, transport === "ssh"
-      ? [d.ssh?.host, d.ssh?.binary === "coportd" ? "" : d.ssh?.binary || ""]
-      : [d.data?.url, d.data?.tokenFile, d.data?.tokenEnv, d.data?.caCertificate]];
-  }).sort((a,b) => String(a[0]).localeCompare(String(b[0]))));
-}
-function relabelDeviceViews(views, previous, current) {
-  const renamed = new Map(previous.map(d => [d.name, current.find(c => c.id === d.id)?.name || d.name]));
-  for (const view of new Set(views)) {
-    for (const source of view?.sources || []) source.name = renamed.get(source.name) || source.name;
-  }
-}
-async function loadDeviceDefinitions() {
-  let changed = false;
-  try {
-    const devices = await invoke("get_devices");
-    changed = ui.devicesLoaded && deviceConnectionKey(devices) !== deviceConnectionKey(ui.devices);
-    if (changed) {
-      ++ui.mergedDataRequest; ui.mergedDataLoading = false;
-      ui.deviceTrafficViews = Object.create(null); ui.mergedData = ui.mergedDataLatest = null;
-    } else {
-      relabelDeviceViews([...Object.values(ui.deviceTrafficViews || {}), ui.mergedData], ui.devices, devices);
-    }
-    ui.devices = devices; ui.devicesLoaded = true;
-  }
-  catch (error) { toast(String(error)); }
-  if (ui.page === "settings") render();
-  return changed;
-}
-async function checkConfiguredSsh() {
-  if (ui.sshStartupCheckStarted) return;
-  ui.sshStartupCheckStarted = true;
-  await loadDeviceDefinitions();
-  const pending = ui.devices.filter(device => device.ssh);
-  ui.deviceStates ||= Object.create(null);
-  const update = () => { if (ui.snap && (ui.page === "settings" || ui.page === "devices")) render(); };
-  for (const device of pending) {
-    ui.deviceStates[device.id] = { host: device.ssh.host, state: "warn", label: "Checking SSH…", checkedAt: Date.now() };
-  }
-  update();
-  // Bound startup connections and check each configured device only once.
-  await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
-    while (pending.length) {
-      const device = pending.shift();
-      const result = ui.deviceStates[device.id];
-      result.checkedAt = Date.now();
-      try {
-        await invoke("check_ssh_device", { id: device.id });
-        result.state = "running"; result.label = "SSH reachable at startup";
-      } catch (error) {
-        result.state = "failed"; result.label = `Startup SSH check failed: ${String(error)}`;
-      }
-      update();
-    }
-  }));
-}
-// This device's card and the forwarded device's come from the shared views, so
-// they show while a remote refresh is still collecting peers. Errors leave the placeholder.
-async function loadDeviceCards() {
-  const minutes = ui.deviceTrafficMinutes || 30, scope = trafficViews.scope || "model";
-  const forwarded = ui.snap?.forwarding?.deviceId;
-  await Promise.all([
-    trafficViews.local(minutes, scope).catch(() => {}),
-    forwarded && trafficViews.forwarded(forwarded, minutes, scope).catch(() => {}),
-  ]);
-  if (ui.page === "devices") render();
-}
-/// While Devices is open, its visits and timer refresh peers this often.
-const DEVICE_REFRESH_MS = 30000;
-async function loadDevices(refreshRemote = false) {
-  // A visit arriving during another load (e.g. from Settings) runs afterwards,
-  // so the visit still starts a due refresh.
-  if (ui.deviceRefresh) { ui.deviceRefreshQueued = true; return; }
-  ui.deviceRefresh = true;
-  try {
-    await loadDeviceDefinitions();
-    // Forwarding status comes only from the local daemon; read it alongside
-    // statistics instead of delaying the first traffic frame behind it.
-    const local = Promise.all([
-      invoke("get_device_forwarders").then(setDeviceForwarders),
-      loadDeviceCapabilities(),
-    ]);
-    // Remote statistics must not start when Settings is open or the user has left Devices.
-    if (ui.page !== "devices") { await local; return; }
-    // Visits and timer ticks refresh peers once the last attempt is old enough;
-    // a refresh still in flight is neither repeated nor superseded. Between
-    // refreshes the peers' views stay as they are, so they are not merged again.
-    const due = refreshRemote || Date.now() - (ui.deviceRemoteAttemptAt || 0) >= DEVICE_REFRESH_MS;
-    const remote = due && !(ui.mergedDataLoading && ui.mergedDataRemote);
-    // This device's traffic in the frame is reused as briefly as every page reuses it.
-    const missing = !trafficFrameFresh(ui.deviceTrafficViews?.[`${ui.deviceTrafficMinutes || 30}:${trafficViews.scope || "model"}`]);
-    ui.deviceStartupRefreshDone = true;
-    await Promise.all([local, loadDeviceCards(), (remote || missing) && loadMergedData(remote, remote)]);
-
-  } catch (error) { toast(String(error)); }
-  finally {
-    ui.deviceRefresh = false;
-    if (ui.page === "devices" || ui.page === "settings") render();
-    if (ui.deviceRefreshQueued) { ui.deviceRefreshQueued = false; if (ui.page === "devices") loadDevices(); }
-    if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
-  }
-}
-
-function synchronizeDeviceRecovery(before) {
-  for (const device of ui.devices) {
-    if (before.get(device.id) === "failed" && deviceConnectionStatus(device).state === "running"
-        && ui.deviceStartupRefreshDone) ui.deviceTrafficRecoveryPending = true;
-  }
-  if (ui.deviceTrafficRecoveryPending) refreshRecoveredDeviceTraffic();
-}
-function setDeviceForwarders(forwarders) {
-  const before = new Map(ui.devices.map(device => [device.id, deviceConnectionStatus(device).state]));
-  ui.deviceForwarders = forwarders;
-  synchronizeDeviceRecovery(before);
-}
-async function refreshRecoveredDeviceTraffic() {
-  if (!ui.deviceStartupRefreshDone || !ui.deviceTrafficRecoveryPending || ui.mergedDataLoading || ui.deviceRefresh) return;
-  // Peers are read only while Devices is open and no sooner than its cadence,
-  // so a light flipping between a failed read and a healthy tunnel cannot
-  // retry SSH. Elsewhere only the light follows; a due Devices visit refreshes.
-  if (ui.page !== "devices" || Date.now() - (ui.deviceRemoteAttemptAt || 0) < DEVICE_REFRESH_MS) return;
-  ui.deviceTrafficRecoveryPending = false;
-  await loadMergedData(true, true);
-}
-function matchingDeviceCapability(device) {
-  const entry = ui.deviceCapabilities?.[device.id];
-  if (entry?.host && (entry.host !== device.ssh?.host
-      || (entry.binary || "coportd") !== (device.ssh?.binary || "coportd"))) return null;
-  return entry;
-}
-async function loadDeviceCapabilities() {
-  if (ui.deviceCapabilitiesLoading) return;
-  ui.deviceCapabilitiesLoading = true;
-  try {
-    const values = await invoke("get_device_capabilities");
-    const previous = ui.deviceCapabilities || {};
-    const before = new Map(ui.devices.map(device => [device.id, deviceConnectionStatus(device).state]));
-    const signature = entry => JSON.stringify([entry?.host, entry?.binary, entry?.capabilities, entry?.error]);
-    ui.deviceCapabilities = Object.fromEntries(values.map(value => {
-      const old = previous[value.deviceId];
-      // Legacy daemons have no timestamps. Re-reading an unchanged cache must
-      // not make that evidence newer than a real SSH/statistics failure.
-      const checkedAt = value.checkedAt ?? (signature(old) === signature(value) ? old?.checkedAt : Date.now());
-      return [value.deviceId, { ...value, checkedAt }];
-    }));
-    ui.deviceCapabilitiesError = "";
-    synchronizeDeviceRecovery(before);
-  } catch (error) { ui.deviceCapabilitiesError = String(error); }
-  finally {
-    ui.deviceCapabilitiesLoading = false;
-    if (ui.snap && (ui.page === "settings" || ui.page === "devices")) render();
-  }
+  return block("Merged Traffic", `<button class="text-link" data-action="merged-refresh" ${deviceList.loading && deviceList.remote ? "disabled" : ""}>Refresh</button>`, body, "traffic");
 }
 function deviceCapabilities(device) {
   if (!device.ssh) return "";
-  const entry = matchingDeviceCapability(device);
+  const entry = deviceList.capability(device);
   const caps = entry?.capabilities;
-  const error = entry?.error || ui.deviceCapabilitiesError;
+  const error = entry?.error || deviceList.capabilitiesError;
   return error ? `Version unavailable: ${error}` : entry?.pending ? "Checking…" : caps ? `Coport ${caps.version}${caps.runningVersion && caps.runningVersion !== caps.version ? ` · Running ${caps.runningVersion}` : ""} · Statistics ${caps.statistics ? "✓" : "✕"} · Forwarding ${caps.forwarding ? "✓" : "✕"}${caps.running ? caps.forwardingAvailable ? "" : " · Unavailable" : " · Offline"}` : "Checking…";
 }
 async function refreshForwardingStatus() {
   try {
-    setDeviceForwarders(await invoke("get_device_forwarders"));
-    await loadDeviceCapabilities();
-    if (ui.snap) ui.snap.forwarding = ui.deviceForwarders[0] || null;
+    deviceList.setForwarders(await invoke("get_device_forwarders"));
+    await deviceList.loadCapabilities();
+    if (ui.snap) ui.snap.forwarding = deviceList.forwarders[0] || null;
     if (ui.page === "settings") render();
   } catch (error) { toast(String(error)); }
 }
 function deviceForwardingSettings(device) {
   if (!device.ssh) return "";
-  const status = (ui.deviceForwarders || []).find(item => item.deviceId === device.id);
-  const entry = matchingDeviceCapability(device);
+  const status = (deviceList.forwarders || []).find(item => item.deviceId === device.id);
+  const entry = deviceList.capability(device);
   const caps = entry?.capabilities;
   const available = !entry?.error && !entry?.pending && caps?.forwarding && caps.forwardingAvailable
-    && deviceConnectionStatus(device).state !== "failed";
+    && deviceList.status(device).state !== "failed";
   // Keep an active forwarding switch reachable even after the peer goes
   // offline, so the user can stop it without waiting for another connection.
   if (!status && !available) return "";
@@ -2047,13 +1805,13 @@ function forwardingRestoreSettings() {
 function deviceCardViews() {
   const minutes = ui.deviceTrafficMinutes || 30;
   const scope = trafficViews.scope || "model";
-  const data = ui.mergedData?.minutes === minutes && ui.mergedData.scope === scope ? ui.mergedData : null;
+  const data = deviceList.merged?.minutes === minutes && deviceList.merged.scope === scope ? deviceList.merged : null;
   // A frame completed for this range carries this device and the forwarded
   // device's live view beside the peers, and Merged Traffic is their sum.
   const complete = !!data?.local;
   const forwarded = complete ? data.forwarded?.device : ui.snap?.forwarding?.deviceId;
   const cards = new Map();
-  for (const device of ui.devices) {
+  for (const device of deviceList.devices) {
     const source = data?.sources.find((source) => source.name === device.name);
     // A device already counted via another entry gets no view, live or not.
     if (source?.exclusion === "duplicate") continue;
@@ -2066,58 +1824,29 @@ function deviceCardViews() {
 }
 function devicesPage() {
   const local = ui.snap.phase;
-  const data = ui.mergedData;
+  const data = deviceList.merged;
   const { local: localTraffic, cards: views, scope } = deviceCardViews();
   let cards = block("This Device", "",
     `<div class="row"><span class="row-label" data-morph="address">127.0.0.1:${local.port}</span><span class="state" data-morph="proxy-state"><span class="dot ${esc(local.state)}"></span>${local.busy ? "Updating…" : { running: "Running", stopped: "Stopped", failed: "Status unavailable" }[local.state] ?? "Unknown"}</span></div>` +
     (local.error ? message("warn", esc(local.error)) : "") +
     (localTraffic ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(localTraffic, scope, "local")}` : `<div class="placeholder">Loading traffic…</div>`), "this-device");
-  for (const device of ui.devices) {
-    const source = (data || ui.mergedDataLatest)?.sources.find(source => source.name === device.name);
+  for (const device of deviceList.devices) {
+    const source = (data || deviceList.latest)?.sources.find(source => source.name === device.name);
     const card = views.get(device.id);
     const ssh = device.data?.transport === "ssh" || !device.data;
     const protocol = ssh ? "SSH" : device.data.url.startsWith("https:") ? "HTTPS" : "HTTP";
-    const status = deviceConnectionStatus(device);
+    const status = deviceList.status(device);
     cards += block(esc(device.name), "",
       `<div class="row"><span class="row-label selectable">${esc(device.data?.transport === "ssh" || !device.data ? device.ssh?.host : device.data.url)}</span><span class="state"><span class="dot ${status.state}" role="img" aria-label="${esc(status.label)}" data-tip="${esc(status.label)}"></span>${protocol}</span></div>` +
       (source?.error && source.error !== "TRAFFIC_UPDATING" ? message("warn", esc(source.error)) : "") +
-      (card ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(card.view, scope, `device/${device.id}`, card.window)}<div class="placeholder">Data through ${esc(new Date(card.window.end ?? card.window.windowEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</div>` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : ui.mergedDataLoading && (ui.mergedDataRemote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`), `device/${device.id}`);
+      (card ? `<div class="block-head"><span class="block-title">Traffic</span></div>${deviceTrafficContent(card.view, scope, `device/${device.id}`, card.window)}<div class="placeholder">Data through ${esc(new Date(card.window.end ?? card.window.windowEnd).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</div>` : `<div class="placeholder">${source?.error && source.error !== "TRAFFIC_UPDATING" ? "Traffic unavailable" : source?.exclusion === "duplicate" ? "Already counted via another entry." : deviceList.loading && (deviceList.remote || !data) ? "Loading traffic…" : "Not refreshed"}</div>`), `device/${device.id}`);
   }
   return mergedDataBlock() + cards;
 }
-function deviceConnectionStatus(device) {
-  const age = Date.now() - (ui.deviceTrafficFetchedAt || 0);
-  const source = (ui.mergedData || ui.mergedDataLatest || ui.deviceTrafficViews?.["30:model"])?.sources?.find(s => s.name === device.name);
-  const evidence = [];
-  const ssh = device.ssh && (!device.data || device.data.transport === "ssh");
-  if (ssh) {
-    const startup = ui.deviceStates?.[device.id];
-    if (startup?.host === device.ssh.host && startup.state !== "warn") evidence.push(startup);
-    const cap = matchingDeviceCapability(device);
-    if (cap?.error) evidence.push({ state: "failed", label: `SSH check failed: ${cap.error}`, checkedAt: cap.checkedAt });
-    else if (cap?.capabilities) evidence.push({ state: "running", label: "SSH capability check succeeded (cached)", checkedAt: cap.checkedAt });
-    const forwarding = ui.deviceForwarders?.find(item => item.deviceId === device.id);
-    if (forwarding?.health?.state === "connected") evidence.push({ state: "running", label: "SSH forwarding connection verified", checkedAt: forwarding.health.lastCheckedAt });
-    else if (forwarding?.health?.state === "disconnected") evidence.push({ state: "failed", label: forwarding.health.error || "SSH forwarding disconnected", checkedAt: forwarding.health.lastCheckedAt });
-    if (forwarding?.remoteTrafficError && forwarding.remoteTrafficCheckedAt) evidence.push({ state: "failed", label: forwarding.remoteTrafficError, checkedAt: forwarding.remoteTrafficCheckedAt });
-    else if (forwarding?.remoteTraffic) evidence.push({ state: "running", label: "Read-only statistics available", checkedAt: forwarding.remoteTraffic.fetchedAt });
-  }
-  let statistics;
-  if (source?.error && source.error !== "TRAFFIC_UPDATING") statistics = { state: "failed", label: String(source.error) };
-  else if (source?.exclusion === "duplicate") statistics = { state: "warn", label: "Statistics available; already counted via another entry." };
-  else if (source?.included) statistics = { state: "running", label: age < 0 || age > 45000 || ui.mergedDataError ? "Last statistics refresh succeeded (cached)" : "Read-only statistics available" };
-  if (statistics) evidence.push({ ...statistics, checkedAt: ui.deviceTrafficFetchedAt });
-  // Compare evidence by time, not by whether it succeeded. A startup failure
-  // cannot permanently override a later successful capability/statistics check.
-  if (evidence.length) return evidence.reduce((latest, item) => (item.checkedAt || 0) >= (latest.checkedAt || 0) ? item : latest);
-  if (source?.error === "TRAFFIC_UPDATING") return { state: "warn", label: "Loading traffic…" };
-  if (!source || source.exclusion === "not_refreshed") return ui.mergedDataRemote ? { state: "warn", label: "Refreshing statistics…" } : { state: "", label: "Not checked" };
-  return { state: "warn", label: "Statistics not included" };
-}
 function deviceSettings() {
   const d = deviceForm.draft || { transport: "ssh" };
-  const rows = ui.devices.map(device => {
-    const status = deviceConnectionStatus(device);
+  const rows = deviceList.devices.map(device => {
+    const status = deviceList.status(device);
     const forwarding = deviceForwardingSettings(device);
     const capabilities = deviceCapabilities(device);
     const tip = capabilities ? ` data-tip="${esc(capabilities)}" tabindex="0"` : "";
@@ -2804,7 +2533,7 @@ async function act(action, el) {
       try {
         if (ui.page === "activity") {
           if (s.settings?.deviceCount > 0) {
-            try { await loadDeviceDefinitions(); } catch (error) { toast(String(error)); }
+            try { await deviceList.loadDefinitions(); } catch (error) { toast(String(error)); }
           }
           // Home's ring, already read, opens Activity unchanged.
           trafficViews.activity = trafficViews.cached(null) ?? trafficViews.activity;
@@ -2819,10 +2548,10 @@ async function act(action, el) {
         }
         if (ui.page === "devices") {
           // Peers' views for the shared range, from the last refresh, open with the page.
-          selectDeviceTraffic();
-          loadDevices();
+          deviceList.select();
+          deviceList.load();
         }
-        if (ui.page === "settings") await Promise.all([loadDevices(), refreshLaunchAtLogin()]);
+        if (ui.page === "settings") await Promise.all([deviceList.load(), refreshLaunchAtLogin()]);
       } finally {
         if (ui.pageChange === change) ui.pageChange = null;
       }
@@ -2848,9 +2577,7 @@ async function act(action, el) {
       if (ui.deviceForwardingBusy) break;
       ui.deviceForwardingBusy = el.dataset.id; render();
       try {
-        await invoke("set_device_forwarding", { id: el.dataset.id, enabled: el.dataset.enabled === "true" });
-        setDeviceForwarders(await invoke("get_device_forwarders"));
-        ui.snap.forwarding = ui.deviceForwarders[0] || null;
+        ui.snap.forwarding = await deviceList.forward(el.dataset.id, el.dataset.enabled === "true");
       } catch (error) { toast(String(error)); }
       finally { ui.deviceForwardingBusy = null; render(); }
       break;
@@ -2862,24 +2589,23 @@ async function act(action, el) {
       deviceForm.close(); render();
       break;
     case "device-edit": {
-      const d = ui.devices.find(device => device.id === el.dataset.id);
+      const d = deviceList.devices.find(device => device.id === el.dataset.id);
       if (d) {
         deviceForm.edit(d); render(); $("device-name")?.focus();
       }
       break;
     }
     case "merged-refresh":
-      if (ui.mergedDataLoading && ui.mergedDataRemote) break;
-      await loadMergedData(true, true);
+      await deviceList.refresh();
       break;
     case "device-save": {
       captureDeviceDraft(); const device = deviceForm.device();
-      try { await invoke("save_device", { device }); deviceForm.close(); const changed = await loadDeviceDefinitions(); await loadDeviceCapabilities(); if (changed || (!ui.mergedData && !(ui.mergedDataLoading && ui.mergedDataRemote))) loadMergedData(true); }
+      try { await deviceList.save(device, () => deviceForm.close()); }
       catch (e) { toast(String(e)); }
       break;
     }
     case "device-remove":
-      try { await invoke("remove_device", { id: el.dataset.id }); delete ui.deviceStates[el.dataset.id]; await loadDeviceDefinitions(); if (ui.devices.length) loadMergedData(true); }
+      try { await deviceList.remove(el.dataset.id); }
       catch (e) { toast(String(e)); }
       break;
     case "power":
@@ -3076,14 +2802,14 @@ document.addEventListener("change", async (event) => {
     if (event.target.id === "devices-traffic-scope") {
       trafficViews.setScope(event.target.value);
     } else { setTrafficMinutes(Number(event.target.value)); }
-    const cards = loadDeviceCards();
-    const shown = selectDeviceTraffic();
+    const cards = deviceList.loadCards();
+    const shown = deviceList.select();
     // A remote refresh delivers every range when it completes. A cache read now
     // would supersede it and show peers as not refreshed, so wait for it instead.
-    if (ui.mergedDataLoading && ui.mergedDataRemote) { if (!shown) ui.mergedData = null; render(); await cards; return; }
-    if (shown && trafficFrameFresh(ui.mergedData)) { render(); await cards; return; }
+    if (deviceList.loading && deviceList.remote) { if (!shown) deviceList.merged = null; render(); await cards; return; }
+    if (shown && deviceList.frameFresh(deviceList.merged)) { render(); await cards; return; }
     // A cached frame shows at once while a read completes it with this device.
-    const loading = loadMergedData(true); render(); await Promise.all([loading, cards]);
+    const loading = deviceList.loadMerged(true); render(); await Promise.all([loading, cards]);
     return;
   }
   if (event.target.id === "home-traffic-scope" || event.target.id === "traffic-scope") {
@@ -3261,7 +2987,7 @@ listen("panel-shown", async ({ payload } = {}) => {
     render();
     $("content").scrollTop = 0;
   }
-  if (ui.devicesLoaded) loadDeviceCapabilities();
+  if (deviceList.loaded) deviceList.loadCapabilities();
   // Returning from System Settings may have allowed or blocked the login item.
   if (ui.page === "settings") await refreshLaunchAtLogin();
   return refresh();
@@ -3274,16 +3000,16 @@ listen("panel-hidden", () => {
   closeSelect();
 });
 refresh().then(probeStale);
-checkConfiguredSsh();
+deviceList.checkSsh();
 
 // Refresh even when no new requests arrive, so the rolling window advances.
 setInterval(() => {
   if (document.hidden) return;
   if (ui.page === "activity") {
-    loadDeviceCapabilities();
+    deviceList.loadCapabilities();
     loadTraffic();
     scheduleActivityLog();
-  } else if (ui.page === "devices") { refresh(); loadDevices(); }
-  else if (ui.page === "main") { refresh(); loadDeviceCapabilities(); }
+  } else if (ui.page === "devices") { refresh(); deviceList.load(); }
+  else if (ui.page === "main") { refresh(); deviceList.loadCapabilities(); }
   else if (ui.page === "settings") refreshForwardingStatus();
 }, 15000);

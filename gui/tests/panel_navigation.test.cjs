@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 const { createTrafficViews } = require("../ui/traffic_views.js");
+const { createDeviceList } = require("../ui/device_list.js");
 const handlers = source.slice(source.indexOf('listen("state-changed", scheduleRefresh);'));
 const timeout = 60 * 1000;
 
@@ -29,7 +30,7 @@ function panel(page = "settings") {
     $: () => content,
     refresh: async () => {},
     probeStale: () => probes.push("stale"),
-    checkConfiguredSsh: () => sshChecks.push("startup"),
+    deviceList: { loaded: false, checkSsh: () => sshChecks.push("startup") },
     refreshLaunchAtLogin: async () => loginReads.push(ui.page),
     invoke: command => probes.push(command),
     setInterval() {},
@@ -122,13 +123,18 @@ async function navigation(page = "main") {
   const traffic = createTrafficViews({ invoke: async (_, { minutes, scope }) => ({ minutes, credentials: [] }) });
   await traffic.local(30, "model");
   const ui = { page, snap: { settings: {} } };
+  const deviceList = createDeviceList({
+    invoke: async () => [], Channel: class {}, trafficViews: traffic, page: () => ui.page,
+    minutes: () => ui.deviceTrafficMinutes, snap: () => ui.snap, render() {}, toast() {},
+  });
+  deviceList.load = () => {};
   const rendered = [];
   const changes = [];
   const loads = [];
   const context = {
-    ui, trafficViews: traffic, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
-    changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: ui.mergedData }); update(); },
-    loadTraffic() {}, loadHomeTraffic() {}, loadDevices() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
+    ui, trafficViews: traffic, deviceList, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
+    changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); },
+    loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
     activityLog: { resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) },
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
     // Nothing in the panel has focus to keep across renders.
@@ -180,14 +186,10 @@ test("Home and Activity open with the ring the other already read", async () => 
 
 test("Devices opens with the merged traffic of the range Home shows", async () => {
   const p = await navigation();
-  const context = { ui: p.ui, trafficViews: p.traffic };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf("function selectDeviceTraffic("), source.indexOf("async function loadMergedData(")), context);
   const day = { minutes: 1440, scope: "model", sources: [] };
-  p.ui.mergedData = { minutes: 30, scope: "model", sources: [] };
-  p.ui.deviceTrafficViews = { "30:model": p.ui.mergedData, "1440:model": day };
+  p.context.deviceList.merged = { minutes: 30, scope: "model", sources: [] };
+  p.context.deviceList.views = { "30:model": p.context.deviceList.merged, "1440:model": day };
   p.traffic.minutes = p.ui.deviceTrafficMinutes = 1440;
-  p.context.selectDeviceTraffic = context.selectDeviceTraffic;
   await p.go("devices");
   assert.equal(p.changes[0].mergedData, day);
 });

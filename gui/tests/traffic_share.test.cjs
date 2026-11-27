@@ -6,7 +6,7 @@ const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const { createTrafficViews } = require('../ui/traffic_views.js');
 function setup(scope = 'model') {
-  const context = { ui: {}, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
+  const context = { ui: {}, deviceList: { loading: false }, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('function tooltipScopeKey('), source.indexOf('function trafficSummary(')), context);
   vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
@@ -617,13 +617,12 @@ test('assigning traffic refreshes device views and removes stale cached mappings
   const context = setup();
   const calls = [];
   Object.assign(context, { invoke: async () => calls.push('assign'),
-    loadTraffic: async () => calls.push('activity'), loadMergedData: async force => calls.push(force),
+    loadTraffic: async () => calls.push('activity'), deviceList: { views: { old: {} }, loadMerged: async force => calls.push(force) },
     refresh: async () => calls.push('refresh'), trafficViews: { reset: () => calls.push('reset') } });
   loadSharedViews(context);
-  context.ui.deviceTrafficViews = { old: {} };
   await context.assignTraffic({});
   assert.deepEqual(calls, ['assign', 'reset', 'activity', true, 'refresh']);
-  assert.equal(Object.keys(context.ui.deviceTrafficViews).length, 0);
+  assert.equal(Object.keys(context.deviceList.views).length, 0);
 });
 test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
   const context = setup();

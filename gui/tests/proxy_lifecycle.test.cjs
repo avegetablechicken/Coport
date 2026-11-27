@@ -102,7 +102,7 @@ test('Restart publishes new proxies before announcing success, including concurr
   const snap = name => ({ config: { details: { proxies: [{ name }] } } });
   const ui = { page: 'settings', snap: snap('old'), proxies: { old: { name: 'old' } } };
   const context = {
-    ui, tagColors: () => ({}), refreshes: createLatest(), trafficViews: { homeFetchedAt: Date.now(), home: null, cached: () => null },
+    ui, tagColors: () => ({}), refreshes: createLatest(), deviceList: { loaded: false }, trafficViews: { homeFetchedAt: Date.now(), home: null, cached: () => null },
     homeTrafficDevice: () => null, loadHomeTraffic() {},
     changePage: update => update(), $: () => ({ scrollTop: 0 }),
     invoke: async command => {
