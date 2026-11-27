@@ -57,7 +57,7 @@ function panel(page, top, content) {
   context = {
     ui: { snap: {}, page, builtPage: page },
     menus: { current: () => null, holdRender: () => false, close() {} },
-    queueFit() {},
+    panelMotion: { queueFit() {} },
     document: { body, activeElement: body },
     $: (id) => parts[id] ?? null,
     // Each render builds new nodes, as the real one does from markup.

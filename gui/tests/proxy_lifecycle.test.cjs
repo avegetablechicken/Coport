@@ -104,7 +104,7 @@ test('Restart publishes new proxies before announcing success, including concurr
   const context = {
     ui, tagColors: () => ({}), refreshes: createLatest(), deviceList: { loaded: false }, trafficViews: { homeFetchedAt: Date.now(), home: null, cached: () => null },
     homeTrafficDevice: () => null, loadHomeTraffic() {},
-    changePage: update => update(), $: () => ({ scrollTop: 0 }),
+    panelMotion: { changePage: update => update(), queueFit() {} }, $: () => ({ scrollTop: 0 }),
     invoke: async command => {
       if (command === 'get_state') return new Promise(resolve => pending.push(resolve));
       if (command === 'get_activity') return { rows: [] };

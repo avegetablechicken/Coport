@@ -133,8 +133,8 @@ async function navigation(page = "main") {
   const changes = [];
   const loads = [];
   const context = {
-    ui, trafficViews: traffic, deviceList, menus: { current: () => null, holdRender: () => false, close() {} }, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
-    changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); },
+    ui, trafficViews: traffic, deviceList, menus: { current: () => null, holdRender: () => false, close() {} }, renderTop() {}, renderPage: () => rendered.push(ui.page),
+    panelMotion: { queueFit() {}, changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); } },
     loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
     activityLog: { resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) },
     $: () => ({ scrollTop: 0 }), scrollToLog() {}, toast() {},
@@ -217,9 +217,10 @@ test("a range chosen on any traffic page applies to Home, Activity and Devices",
 });
 
 test("page changes move only what is shown, not content of a closed disclosure", () => {
-  const context = { MORPH_TEXT: ["color"], getComputedStyle: () => ({ getPropertyValue: () => "", fontSize: "11px" }) };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf("function morphTargets("), source.indexOf("\nfunction motionLayer(")), context);
+  const context = scripts.load(scripts.sandbox({
+    getComputedStyle: () => ({ getPropertyValue: () => "", fontSize: "11px" }),
+    matchMedia: () => ({ matches: false }), navigator: { userAgent: "Linux" },
+  }), "page_motion.js");
   // WebKit lays out a closed disclosure's content, so it has a place but is not seen.
   const element = (morph, { closed = false, summary = false } = {}) => ({
     dataset: { morph }, classList: { contains: () => false },

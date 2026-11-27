@@ -76,7 +76,7 @@ function panel(page = 'main', script = source) {
     queueMicrotask(fn) { microtasks.push(fn); },
     menus: { current: () => null, holdRender: () => false, close() {} }, main: () => '', devicesPage: () => '', settings: () => '',
     renderActivityForwarding() {}, renderActivityList() {},
-    fitObserver: { observe() {}, unobserve() {} }, observedPage: null,
+    panelMotion: { watchPage() {} },
     MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },
   };
   vm.createContext(context);

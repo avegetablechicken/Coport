@@ -38,7 +38,7 @@ const code = source.slice(start, source.indexOf('// ----------------------------
 function harness(invoke) {
   const ui = { page: 'devices', snap: { phase: { state: 'running', port: 8787 }, settings: {} } };
   const fields = {}, listeners = {};
-  const context = { ui, invoke, Promise, deviceForm: createDeviceForm(), seeding: null, clock: () => Date.now(), ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', toast() {}, changePage: update => update(),
+  const context = { ui, invoke, Promise, deviceForm: createDeviceForm(), seeding: null, clock: () => Date.now(), ICON: { plus: '<plus>', trash: '<trash>' }, mergedDataBlock: () => '', toast() {}, panelMotion: { changePage: update => update(), queueFit() {} },
     message: (_, text) => text, esc: v => String(v).replace(/</g, '&lt;'), block: (title, aside, body) => `${title}${aside}${body}`,
     $: id => fields[id], document: { addEventListener: (event, callback) => { listeners[event] = callback; } } };
   context.trafficViews = createTrafficViews({ invoke: (command, args) => (context.seeding || context.invoke)(command, args), now: () => context.clock() });

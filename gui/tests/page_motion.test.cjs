@@ -1,9 +1,6 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
 const { test } = require('node:test');
-const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+const scripts = require('./panel_harness.cjs');
 
 function harness() {
   const parent = { id: 'activity-list', children: [] };
@@ -13,9 +10,10 @@ function harness() {
     remove() { parent.children.splice(parent.children.indexOf(this), 1); },
     replaceWith(other) { parent.children.splice(parent.children.indexOf(this), 1, other); },
   });
-  const context = { document: { createElement: () => node('spacer') } };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function motionRows('), source.indexOf('function morphCopy(')), context);
+  const context = scripts.load(scripts.sandbox({
+    document: { createElement: () => node('spacer') },
+    matchMedia: () => ({ matches: false }), navigator: { userAgent: 'Linux' },
+  }), 'page_motion.js');
   return { context, parent, node };
 }
 

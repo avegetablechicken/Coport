@@ -73,7 +73,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
       credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
     menus: { current: () => null, holdRender: () => false, close() {} }, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
     trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
-    fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
+    fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, panelMotion: { queueFit() {} }, scrollToLog() {},
   });
   loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
