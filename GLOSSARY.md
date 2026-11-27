@@ -74,6 +74,10 @@ _Avoid_: peer, node, remote, managed device
 Sending the requests this computer's proxy receives to one SSH **Device**, whose proxy answers them. It starts only once that **Device** was found to support it, stops when the **Device** is edited or removed, and can be restored when the **Daemon** starts.
 _Avoid_: relay, tunnel, remote routing
 
+**Summary**:
+What a **Device** reports about its traffic for other devices to merge: its **Traffic totals** for each range and category, with accounts and upstreams named only by opaque references. A **Device** may send the requested range first and the rest after it.
+_Avoid_: snapshot, export, peer data
+
 ### Traffic
 
 **Traffic totals**:
