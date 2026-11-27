@@ -183,6 +183,8 @@ fn discovery_command(script: &str, operation: &str) -> String {
 /// daemon startup, never by a summary request; the standalone helper is
 /// preserved apart from it by `preserve_summary_executable`.
 pub(crate) fn register_summary_executable(dir: &Path, binary: &Path) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = dir;
     if !binary.is_absolute() {
         return Err(io::Error::other(
             "Invalid Coport executable path for SSH discovery",

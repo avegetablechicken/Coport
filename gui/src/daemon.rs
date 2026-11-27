@@ -851,7 +851,11 @@ async fn serve_until(
                 // Do not poll the completed JoinHandle again during cleanup.
                 controls.shutdown().await;
                 startup.abort();
+                let _ = startup.await;
                 logger.write("server_stopped", Default::default());
+                tokio::task::spawn_blocking(move || logger.flush())
+                    .await
+                    .map_err(io::Error::other)??;
                 return result.map_err(io::Error::other)?;
             }
             Some(stream) = stop_requests.recv() => { stop_client = Some(stream); break Ok(()); }
@@ -875,7 +879,15 @@ async fn serve_until(
         }
     };
     startup.abort();
+    let _ = startup.await;
     logger.write("server_stopped", Default::default());
+    // The helper copy may still own the logger. Drain accepted records before
+    // acknowledging Stop rather than relying on the last Arc being dropped.
+    let flushed = tokio::task::spawn_blocking(move || logger.flush())
+        .await
+        .map_err(io::Error::other)
+        .and_then(|result| result);
+    let stopped = stopped.and(flushed);
     // Remove discovery and unlock before acknowledging, so an immediate restart works.
     drop(control);
     drop(registration);
@@ -1400,8 +1412,11 @@ pub(crate) mod tests {
         assert!(client.record_device_query(invalid).is_err());
         client.record_device_query(event.clone()).unwrap();
         client.stop().unwrap();
+        // Stop acknowledges only after accepted records, including the final
+        // shutdown event, are written, even if the helper is still copying.
+        let raw = std::fs::read_to_string(&status.log_path).unwrap();
         daemon.join().unwrap().unwrap();
-        let raw = std::fs::read_to_string(status.log_path).unwrap();
+        assert!(raw.contains("\"event\":\"server_stopped\""));
         let events: Vec<serde_json::Value> = raw
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
