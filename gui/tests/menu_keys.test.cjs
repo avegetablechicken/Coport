@@ -42,11 +42,12 @@ function panel({ navigating = true } = {}) {
     IS_MAC: true,
     ui: { page: "main", menuBarNavigation: navigating },
     deviceList: { loaded: false },
-    closeSelect() {},
     hideRouteTooltip() {},
-    showSelect: (trigger, last) => opened.push([trigger.name, last]),
+    menus: {
+      open: null, current() { return this.open; }, close() {}, items: () => [],
+      showSelect: (trigger, last) => opened.push([trigger.name, last]),
+    },
     PANEL_PAGE_TIMEOUT_MS: 60 * 1000,
-    openSelect: null,
     invoke: (command, args) => { invoked.push([command, args]); return Promise.resolve(); },
     act() {},
     listen: (name, handler) => { events[name] = handler; },
@@ -105,8 +106,7 @@ test("left and right stay in a text field, an open select and with modifiers", (
     p.press("ArrowRight", undefined, { [modifier]: true });
   }
   p.press("ArrowRight", undefined, { isComposing: true });
-  p.context.openSelect = { trigger: element("trigger"), menu: {} };
-  p.context.menuItems = () => [];
+  p.context.menus.open = { trigger: element("trigger"), menu: {} };
   p.press("ArrowRight");
   assert.deepEqual(p.invoked, []);
 });

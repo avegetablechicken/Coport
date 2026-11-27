@@ -73,7 +73,7 @@ function panel(page = 'main', script = source) {
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
     clearTimeout(id) { timers.delete(id); },
     queueMicrotask(fn) { microtasks.push(fn); },
-    closeSelect() {}, main: () => '', devicesPage: () => '', settings: () => '',
+    menus: { current: () => null, holdRender: () => false, close() {} }, main: () => '', devicesPage: () => '', settings: () => '',
     renderActivityForwarding() {}, renderActivityList() {},
     fitObserver: { observe() {}, unobserve() {} }, observedPage: null,
     MutationObserver: class { constructor(fn) { observer = fn; } observe() {} },

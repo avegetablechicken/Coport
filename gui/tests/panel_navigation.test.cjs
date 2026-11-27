@@ -24,7 +24,7 @@ function panel(page = "settings") {
     Date: { now: () => now },
     listen: (name, handler) => { events[name] = handler; },
     scheduleRefresh() {},
-    closeSelect() {},
+    menus: { current: () => null, holdRender: () => false, close() {} },
     hideRouteTooltip() {},
     render: () => rendered.push(ui.page),
     $: () => content,
@@ -132,7 +132,7 @@ async function navigation(page = "main") {
   const changes = [];
   const loads = [];
   const context = {
-    ui, trafficViews: traffic, deviceList, openSelect: null, selectRenderPending: false, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
+    ui, trafficViews: traffic, deviceList, menus: { current: () => null, holdRender: () => false, close() {} }, renderTop() {}, renderPage: () => rendered.push(ui.page), queueFit() {},
     changePage: (update) => { changes.push({ page: ui.page, traffic: traffic.activity, homeTraffic: traffic.home, mergedData: deviceList.merged }); update(); },
     loadTraffic() {}, loadHomeTraffic() {}, refreshLaunchAtLogin() {}, homeTrafficDevice: () => null,
     activityLog: { resolveRange() {}, load: () => new Promise((resolve) => loads.push(resolve)) },

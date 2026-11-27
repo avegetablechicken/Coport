@@ -55,7 +55,7 @@ function panel(page, top, content) {
   const parts = { top: container("top"), content: container("content") };
   context = {
     ui: { snap: {}, page, builtPage: page },
-    openSelect: null,
+    menus: { current: () => null, holdRender: () => false, close() {} },
     queueFit() {},
     document: { body, activeElement: body },
     $: (id) => parts[id] ?? null,

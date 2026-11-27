@@ -54,7 +54,8 @@ function harness(invoke) {
   context.loadMerged = context.deviceList.loadMerged;
   context.deviceList.loadMerged = () => {};
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf("function panelSelect("), source.indexOf("let openSelect = null;")), context);
+  scripts.load(context, 'menus.js');
+  context.menus = { current: () => null, holdRender: () => false, close() {} };
   // Shared traffic views, markup and merging, as every page uses them.
   scripts.load(context, 'traffic_render.js');
   vm.runInContext(source.slice(source.indexOf('const MATCH_REASONS'), source.indexOf('\nfunction renderActivityTraffic(')), context);

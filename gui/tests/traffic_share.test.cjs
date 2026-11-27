@@ -71,7 +71,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
   Object.assign(context, {
     ui: {}, trafficViews: { scope: 'all', activity: { scope: 'all', start: 0, end: 60000, bucketMinutes: 1,
       credentials: [{ service: 'Codex', credential: 'suzhi2333@gmail.com', requests: 1, errors: 0, bytes: 0, counts: [1], errorCounts: [0], tokenCounts: [0] }] } },
-    openSelect: null, closeSelect() {}, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
+    menus: { current: () => null, holdRender: () => false, close() {} }, $: (id) => (id === 'activity-traffic' ? el : null), logOffset: () => null,
     trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
   });

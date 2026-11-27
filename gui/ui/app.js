@@ -142,7 +142,7 @@ function keepLogScroll(update) {
 /// present (or a preset moved with the clock). Waits while a choice is open or
 /// an older page is loading.
 function refreshActivityLog() {
-  if (ui.page !== "activity" || document.hidden || openSelect || activityLog.loadingMore) return;
+  if (ui.page !== "activity" || document.hidden || menus.current() || activityLog.loadingMore) return;
   if (!$("range-editor")?.hidden) return;
   activityLog.refresh();
 }
@@ -170,7 +170,7 @@ const BACK_KEYS = IS_MAC ? "Meta+[" : "Alt+ArrowLeft";
 
 function render() {
   if (!ui.snap) return;
-  if (openSelect) { selectRenderPending = true; return; }
+  if (menus.holdRender()) return;
   // The shown page stays until the next one has its data (act "page").
   if (ui.pageChange) return;
   const focus = focusPlace(document.activeElement);
@@ -264,7 +264,7 @@ function renderPage() {
   for (const details of content.querySelectorAll("details[data-device-traffic]")) (ui.deviceTrafficOpen ||= Object.create(null))[details.dataset.deviceTraffic] = details.open;
   if (ui.page === "activity") {
     if (ui.builtPage !== "activity") {
-      closeSelect();
+      menus.close();
       content.innerHTML = activityShell();
       ui.builtPage = "activity";
       renderActivityTraffic();
@@ -273,7 +273,7 @@ function renderPage() {
     renderActivityList();
     return;
   }
-  closeSelect();
+  menus.close();
   ui.builtPage = ui.page;
   // State refreshes must not discard what is being typed.
   const focused = content.contains(document.activeElement) && document.activeElement.matches("input[id]")
@@ -836,123 +836,19 @@ function routingBlock() {
 
 const TRAFFIC_RANGES = [[30, "30 minutes"], [360, "6 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "7 days"], [43200, "30 days"]];
 
-// Native select popups can take OS focus away from the tray window, which
-// dismisses the panel. Keep every selector's options inside the WebView.
-function panelSelect(id, options, selected, label, cls = "", attrs = "") {
-  const value = String(selected);
-  const text = options.find(([v]) => String(v) === value)?.[1] ?? "";
-  return `<button type="button" id="${id}" class="select ${cls}" value="${esc(value)}"
-    data-options="${esc(JSON.stringify(options))}" aria-label="${esc(label)}"
-    aria-haspopup="listbox" aria-expanded="false" ${attrs}>${esc(text)}</button>`;
-}
-
-let openSelect = null;
-let selectRenderPending = false;
-
-function closeSelect(restoreFocus = false) {
-  if (!openSelect) return;
-  const { trigger, menu } = openSelect;
-  openSelect = null;
-  trigger.setAttribute("aria-expanded", "false");
-  trigger.removeAttribute("aria-controls");
-  menu.remove();
-  if (restoreFocus && trigger.isConnected) trigger.focus();
-  // Live traffic can refresh while a choice is being made. Replace controls
-  // only after the menu closes, so its trigger and options stay mounted.
-  if (selectRenderPending) {
-    selectRenderPending = false;
-    queueMicrotask(() => {
-      render();
-      if (ui.page === "activity") renderActivityTraffic();
-    });
-  }
-}
-
-function showSelect(trigger, last = false) {
-  const wasOpen = openSelect?.trigger === trigger;
-  closeSelect();
-  if (wasOpen) return;
-  const options = JSON.parse(trigger.dataset.options);
-  const menu = document.createElement("div");
-  menu.id = "panel-select-options";
-  menu.className = "select-menu";
-  menu.setAttribute("role", "listbox");
-  menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
-  menu.innerHTML = options.map(([value, label]) => `<button type="button" role="option"
-    tabindex="-1" value="${esc(value)}" aria-selected="${String(value) === trigger.value}">${esc(label)}</button>`).join("");
-  placeMenu(trigger, menu);
-  menu.style.minWidth = `${trigger.getBoundingClientRect().width}px`;
-  const items = [...menu.children];
-  (last ? items.at(-1) : items.find((el) => el.value === trigger.value) ?? items[0]).focus();
-  menu.addEventListener("click", (event) => {
-    const option = event.target.closest('[role="option"]');
-    if (!option) return;
-    const changed = trigger.value !== option.value;
-    trigger.value = option.value;
-    trigger.textContent = option.textContent;
-    closeSelect(true);
-    if (changed) trigger.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-}
-
-/// Opens `menu` below `trigger`, right-aligned and kept inside the panel.
-function placeMenu(trigger, menu) {
-  openSelect = { trigger, menu };
-  trigger.setAttribute("aria-expanded", "true");
-  trigger.setAttribute("aria-controls", menu.id);
-  document.body.append(menu);
-  // One highlight, as in a native menu: the item under the pointer takes
-  // focus, so the one focused on opening or by keys does not stay lit.
-  menu.addEventListener("pointermove", (event) => {
-    const item = event.target.closest?.("button");
-    if (item && item !== document.activeElement) item.focus({ preventScroll: true });
-  });
-  const rect = trigger.getBoundingClientRect();
-  menu.style.maxHeight = `${Math.max(0, window.innerHeight - 8)}px`;
-  const bounds = menu.getBoundingClientRect();
-  menu.style.left = `${Math.max(4, Math.min(rect.right - bounds.width, window.innerWidth - bounds.width - 4))}px`;
-  menu.style.top = `${Math.max(4, Math.min(rect.bottom + 3, window.innerHeight - bounds.height - 4))}px`;
-}
-
-/// An action menu: placed and dismissed like a select, but each item runs its
-/// own `data-action`. `null` entries become separators.
-function showMenu(trigger, last = false) {
-  const wasOpen = openSelect?.trigger === trigger;
-  closeSelect();
-  if (wasOpen) return;
-  const menu = document.createElement("div");
-  menu.id = "panel-select-options";
-  menu.className = "select-menu action-menu";
-  menu.setAttribute("role", "menu");
-  menu.setAttribute("aria-label", trigger.getAttribute("aria-label"));
-  menu.innerHTML = JSON.parse(trigger.dataset.menu).map((item) => item?.heading
-    ? `<div class="menu-heading" role="presentation"><strong>${esc(item.heading)}</strong>${item.detail ? `<span>${esc(item.detail)}</span>` : ""}</div>`
-    : item
-    ? `<button type="button" role="${item.checked == null ? "menuitem" : "menuitemradio"}" tabindex="-1" data-action="${esc(item.action)}"${
-      item.target ? ` data-target="${esc(item.target)}"` : ""}${item.checked == null ? "" : ` aria-checked="${item.checked}"`}>${esc(item.label)}</button>`
-    : '<div class="menu-separator" role="separator"></div>').join("");
-  placeMenu(trigger, menu);
-  const items = menuItems(menu);
-  (last ? items.at(-1) : items.find((el) => el.getAttribute("aria-checked") === "true") ?? items[0])?.focus();
-  // Close before the document's click handler runs the item's action.
-  menu.addEventListener("click", (event) => {
-    if (event.target.closest("[data-action]")) closeSelect(true);
-  });
-}
-
-function menuItems(menu) {
-  return [...menu.querySelectorAll("button")];
-}
-
+const menus = createMenus({
+  document,
+  window,
+  rerender() {
+    render();
+    if (ui.page === "activity") renderActivityTraffic();
+  },
+});
+menus.install();
 document.addEventListener("pointerdown", (event) => {
-  if (openSelect && !openSelect.menu.contains(event.target) && !openSelect.trigger.contains(event.target)) closeSelect();
   const editor = $("range-editor");
   if (editor && !editor.hidden && !editor.contains(event.target) && !event.target.closest?.(".select-menu")) showRangeEditor(false);
 });
-document.addEventListener("scroll", (event) => {
-  if (openSelect && !openSelect.menu.contains(event.target)) closeSelect();
-}, true);
-window.addEventListener("resize", () => closeSelect());
 
 function trafficRangeSelect(id, selected, label) {
   return panelSelect(id, TRAFFIC_RANGES.map(([minutes, text]) => [minutes, `Last ${text}`]), selected, label, "traffic-range");
@@ -1027,8 +923,8 @@ async function assignTraffic(choice) {
 }
 
 function renderActivityTraffic() {
-  if (openSelect) { selectRenderPending = true; return; }
-  closeSelect();
+  if (menus.holdRender()) return;
+  menus.close();
   const el = $("activity-traffic");
   if (!el) return;
   // While the Log is at or above the top, Traffic changing height must not move it.
@@ -2021,7 +1917,7 @@ async function act(action, el) {
     case "traffic-review": {
       const first = document.querySelector(".traffic-review.review");
       first?.scrollIntoView({ block: "center", behavior: "smooth" });
-      if (first) setTimeout(() => showMenu(first), 250);
+      if (first) setTimeout(() => menus.showMenu(first), 250);
       break;
     }
     case "clear-traffic-compatibility":
@@ -2120,9 +2016,9 @@ for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
 
 document.addEventListener("click", (event) => {
   const select = event.target.closest("[data-options]");
-  if (select) { showSelect(select); return; }
+  if (select) { menus.showSelect(select); return; }
   const menu = event.target.closest("[data-menu]");
-  if (menu) { showMenu(menu); return; }
+  if (menu) { menus.showMenu(menu); return; }
   const el = event.target.closest("[data-action]");
   if (el && !el.disabled) act(el.dataset.action, el);
 });
@@ -2222,12 +2118,13 @@ document.addEventListener("keydown", (event) => {
     else applyRangeEditor();
     return;
   }
-  if (openSelect) {
-    const { menu } = openSelect;
-    const items = menuItems(menu);
+  const open = menus.current();
+  if (open) {
+    const { menu } = open;
+    const items = menus.items(menu);
     const index = items.indexOf(document.activeElement);
     if (event.key === "Escape" || event.key === "Tab") {
-      closeSelect(true);
+      menus.close(true);
       if (event.key === "Escape") event.preventDefault();
       return;
     }
@@ -2240,7 +2137,7 @@ document.addEventListener("keydown", (event) => {
     }
   } else if (event.target.matches("[data-options], [data-menu]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
     event.preventDefault();
-    (event.target.dataset.menu ? showMenu : showSelect)(event.target, event.key === "ArrowUp");
+    (event.target.dataset.menu ? menus.showMenu : menus.showSelect)(event.target, event.key === "ArrowUp");
     return;
   }
   if (event.target.matches("[data-config]") && (event.key === "Enter" || event.key === "Escape")) {
@@ -2248,7 +2145,7 @@ document.addEventListener("keydown", (event) => {
     event.target.blur();
     return;
   }
-  const step = openSelect ? null : menuBarStep(event);
+  const step = menus.current() ? null : menuBarStep(event);
   if (step) {
     event.preventDefault();
     invoke("navigate_menu_bar", { right: step === "right" });
@@ -2325,7 +2222,7 @@ listen("panel-shown", async ({ payload } = {}) => {
   panelHiddenAt = null;
   if (returnHome) {
     ui.page = "main";
-    closeSelect();
+    menus.close();
     render();
     $("content").scrollTop = 0;
   }
@@ -2339,7 +2236,7 @@ listen("panel-hidden", () => {
   hideRouteTooltip();
   // Repeated native hide events must not extend the previous page's lifetime.
   panelHiddenAt ??= Date.now();
-  closeSelect();
+  menus.close();
 });
 refresh().then(probeStale);
 deviceList.checkSsh();
