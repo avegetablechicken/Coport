@@ -10,6 +10,8 @@ function createActivityPager({ invoke, show, failed, now }) {
   const { createLatest } = typeof module !== "undefined" ? require("./latest.js") : globalThis;
   const reads = createLatest();
   const HOUR = 60 * 60 * 1000;
+  /// The read of the latest older page, while it runs.
+  let moreRead = null;
 
   const log = {
     /// requests, models, errors or all.
@@ -70,7 +72,8 @@ function createActivityPager({ invoke, show, failed, now }) {
       const read = reads.begin(key);
       const current = () => read.current() && query.filter === log.backendFilter() && query.search === log.search
         && query.searchMode === log.searchMode && query.range.from === log.from && query.range.to === log.to + 60 * 1000;
-      if (mode === "more") log.loadingMore = true;
+      // The latest older page's read ends its loading, whatever read follows.
+      if (mode === "more") { log.loadingMore = true; moreRead = read; }
       let activity;
       try {
         activity = await invoke("get_activity", query);
@@ -91,7 +94,7 @@ function createActivityPager({ invoke, show, failed, now }) {
         return;
       } finally {
         read.done();
-        if (mode === "more") log.loadingMore = false;
+        if (moreRead === read) { log.loadingMore = false; moreRead = null; }
       }
       if (!current()) return;
       log.error = "";

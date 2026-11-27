@@ -123,3 +123,20 @@ test('a preset range follows the clock and a past custom range is not read again
   await log.refresh();
   assert.deepEqual([queries.length, queries[0].fresh, queries[0].range.to], [1, true, now + 60000]);
 });
+
+test('an older page stays loading until its latest read ends', async () => {
+  const pending = [];
+  const log = createActivityPager({ invoke: () => new Promise((resolve) => pending.push(resolve)), show: (update) => update(), failed() {}, now: () => 0 });
+  log.resolveRange();
+  log.next = 'cursor';
+  const first = log.load('more');
+  // A filter changed while it loaded, then the next older page was asked for.
+  log.filter = 'errors';
+  const second = log.load('more');
+  pending[0]({ rows: [], next: null });
+  await first;
+  assert.equal(log.loadingMore, true);
+  pending[1]({ rows: [], next: null });
+  await second;
+  assert.equal(log.loadingMore, false);
+});
