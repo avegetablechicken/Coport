@@ -72,8 +72,10 @@ function createActivityPager({ invoke, show, failed, now }) {
       const read = reads.begin(key);
       const current = () => read.current() && query.filter === log.backendFilter() && query.search === log.search
         && query.searchMode === log.searchMode && query.range.from === log.from && query.range.to === log.to + 60 * 1000;
-      // The latest older page's read ends its loading, whatever read follows.
+      // The latest older page's read ends its loading, whatever live read
+      // follows. Another query replaces the pages that one was adding to.
       if (mode === "more") { log.loadingMore = true; moreRead = read; }
+      else if (mode !== "live") { log.loadingMore = false; moreRead = null; }
       let activity;
       try {
         activity = await invoke("get_activity", query);

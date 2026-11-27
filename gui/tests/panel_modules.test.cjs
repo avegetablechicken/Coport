@@ -140,3 +140,17 @@ test('an older page stays loading until its latest read ends', async () => {
   await second;
   assert.equal(log.loadingMore, false);
 });
+
+test('another query ends the loading of an older page it replaces', async () => {
+  const pending = [];
+  const log = createActivityPager({ invoke: () => new Promise((resolve) => pending.push(resolve)), show: (update) => update(), failed() {}, now: () => 0 });
+  log.resolveRange();
+  log.next = 'cursor';
+  const more = log.load('more');
+  log.search = 'error';
+  const query = log.load();
+  assert.equal(log.loadingMore, false);
+  pending.forEach((resolve) => resolve({ rows: [], next: null }));
+  await Promise.all([more, query]);
+  assert.equal(log.loadingMore, false);
+});
