@@ -20,12 +20,17 @@ function sandbox(globals = {}) {
   return vm.createContext(context);
 }
 
-/// Runs `names` in `context`, in the order index.html loads them.
+const loaded = new WeakMap();
+
+/// Runs `names` in `context`, in the order index.html loads them. A script
+/// already loaded there is not run again, as the WebView runs each once.
 function load(context, ...names) {
   const order = scripts();
   for (const name of names) assert(order.includes(name), `${name} is not a panel script`);
-  for (const name of order.filter((n) => names.includes(n))) {
+  const done = loaded.get(context) ?? loaded.set(context, new Set()).get(context);
+  for (const name of order.filter((n) => names.includes(n) && !done.has(n))) {
     vm.runInContext(fs.readFileSync(path.join(UI, name), 'utf8'), context, { filename: name });
+    done.add(name);
   }
   return context;
 }

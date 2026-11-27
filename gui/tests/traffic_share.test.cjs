@@ -5,11 +5,12 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const { createTrafficViews } = require('../ui/traffic_views.js');
+const scripts = require('./panel_harness.cjs');
 function setup(scope = 'model') {
   const context = { ui: {}, deviceList: { loading: false }, trafficViews: { scope, activity: null }, esc: (v) => String(v), serviceMark: (s) => `[${s}]`, ICON: { warning: '!' } };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function tooltipScopeKey('), source.indexOf('function trafficSummary(')), context);
-  vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  scripts.load(context, 'traffic_render.js');
+  vm.runInContext(source.slice(source.indexOf('const MATCH_REASONS'), source.indexOf('\nfunction renderActivityTraffic(')), context);
   return context;
 }
 // Arrays built inside the VM context have another realm's prototype.
@@ -18,7 +19,7 @@ const credential = (credential, requests, service = 'Codex', tokens = {}) => ({ 
 const requests = (c) => c.requests;
 // Shared traffic views, markup and merging, as every page uses them.
 function loadSharedViews(context) {
-  vm.runInContext(source.slice(source.indexOf('const trafficMarkup = new WeakMap();'), source.indexOf('/// Home shows the forwarded device')), context);
+  scripts.load(context, 'traffic_render.js');
 }
 function loadHome(context) {
   vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nfunction trafficBlock(')), context);
@@ -74,7 +75,7 @@ test('Activity Traffic shortens account emails in its rows and ring', () => {
     trafficControls: () => '', trafficReview: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '', serviceMark: () => '', ICON: { info: '', warning: '' }, queueFit() {}, scrollToLog() {},
   });
-  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function renderActivityTraffic('), source.indexOf('\nconst SEARCH_MODES')), context);
   context.renderActivityTraffic();
   assert.match(el.innerHTML, /<strong>su\*\*\*3@gmail\.com<\/strong>/);
@@ -369,7 +370,8 @@ test('review menu offers current configurations and Unidentified for each change
 });
 test('Models charts draw one baseline for every bucket without reported tokens', () => {
   const context = setup('model');
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  loadSharedViews(context);
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { tokenCounts: [0, 0, 0], counts: [1, 0, 2], errorCounts: [1, 0, 2] };
   const html = context.chart(failed, 'model', true);
   assert.doesNotMatch(html, /chart-peak/);
@@ -393,7 +395,8 @@ test('Models charts draw one baseline for every bucket without reported tokens',
 test('Models shows the average first token time before Avg. Time where this device logged it', () => {
   const context = setup('model');
   Object.assign(context, { stat: (label, value) => `<${label}=${value}>`, fmtMs: (v) => v == null ? '—' : `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '' });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  loadSharedViews(context);
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const local = { service: 'Codex', credential: 'work', requests: 3, errors: 0, avgMs: 4000, firstTokenMs: 300, firstTokenTotalMs: 600, firstTokenSamples: 2, forwardedFirstTokenTotalMs: 600, forwardedFirstTokenSamples: 2, bytes: 9, tokenCounts: [1], counts: [3], errorCounts: [0], credentials: [], start: 0, end: 60000, bucketMinutes: 1 };
   for (const html of [context.accountRow(local, 'model', local), context.trafficSummary(local, 'model')]) {
     assert.match(html, /<Error Rate=[^>]*>\s*<First Token=300 ms>\s*<Avg\. Time=4000 ms>\s*<Output TPS<span[^>]*>!<\/span>=—>/);
@@ -412,7 +415,8 @@ test('Models shows the average first token time before Avg. Time where this devi
 test('Models shows Unidentified rows whose calls all failed as one line of calls and errors', () => {
   const context = setup('model');
   Object.assign(context, { stat: (label, value, cls = '') => `<${label}=${value}${cls ? `:${cls}` : ''}>`, fmtMs: (v) => `${v} ms`, fmtBytes: (v) => `${v} B`, modelTokenStats: () => '<tokens>' });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  loadSharedViews(context);
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const failed = { service: 'Grok', credential: 'Unidentified', requests: 16, errors: 16, errorRate: 1, avgMs: 0, bytes: 0, tokenCounts: [0, 0, 0], counts: [6, 0, 10], errorCounts: [6, 0, 10] };
   const brief = context.accountRow(failed, 'model', failed, '<review>');
   assert.equal(brief.replace(/ data-tip-scope="[^"]*"/, ''), '<div class="credential-traffic"><div class="traffic-identity brief"><span class="traffic-service">[Grok]Grok</span><strong>Unidentified</strong>'
@@ -502,7 +506,7 @@ test('Claude Input Tokens explain uncached input and cache writes on hover', () 
   const context = setup('model');
   context.ICON = { warning: '!' };
   context.stat = (label, value) => `<${label}=${value}>`;
-  vm.runInContext(source.slice(source.indexOf('function modelTokenStats('), source.indexOf('const SHARE_SERVICES')), context);
+  loadSharedViews(context);
   const claude = { service: 'Claude', inputTokens: 50, uncachedInputTokens: 10, cacheWriteTokens: 10, cachedInputTokens: 30, outputTokens: 5, cacheHitRate: 0.6 };
   const html = context.modelTokenStats(claude, 'model');
   assert.match(html, /data-tip="Uncached input: 10\nCache writes: 10\nCache reads: 30 \(Cached Input\)"/);
@@ -513,7 +517,8 @@ test('Claude Input Tokens explain uncached input and cache writes on hover', () 
 
 test('bar tooltips use their own time bucket and only the plotted metric', () => {
   const context = setup();
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  loadSharedViews(context);
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const start = new Date(2026, 9, 9, 23, 59, 0).getTime();
   const end = start + 150_000;
   const stats = { counts: [2, 3, 0], tokenCounts: [1234, 0, 0], errorCounts: [1, 3, 0] };
@@ -596,7 +601,7 @@ test('device traffic exposes renamed local sources with assignment choices', () 
     trafficShare: () => '', chart: () => '', stat: () => '', fmtMs: () => '',
     fmtBytes: () => '', modelTokenStats: () => '',
   });
-  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), context);
+  loadSharedViews(context);
   loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function deviceTrafficContent('), source.indexOf('document.addEventListener("toggle"')), context);
   const traffic = { requests: 2, errors: 0, credentials: [{ service: 'Claude', credential: 'myServer', requests: 2,
@@ -626,7 +631,8 @@ test('assigning traffic refreshes device views and removes stale cached mappings
 });
 test('every bucket in an idle chart retains its one-pixel baseline in both scopes', () => {
   const context = setup();
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('\nasync function loadHomeTraffic(')), context);
+  loadSharedViews(context);
+  vm.runInContext(source.slice(source.indexOf('/// Home shows the forwarded device'), source.indexOf('\nasync function loadHomeTraffic(')), context);
   const stats = { counts: [0, 0, 0], tokenCounts: [0, 0, 0], errorCounts: [0, 0, 0] };
   for (const scope of ['model', 'all']) {
     const html = context.chart(stats, scope, true);
@@ -639,7 +645,7 @@ test('home traffic draws the share ring above its chart', () => {
   const context = setup('all');
   context.trafficViews.home = { requests: 4, errors: 0, avgMs: 10, bytes: 0, counts: [4], errorCounts: [0], start: 0, end: 60000, bucketMinutes: 1, scope: 'all', credentials: [credential('a', 3), credential('b', 1, 'Claude')] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
   const html = context.trafficBlock();
   assert.match(html, /class="traffic-share"[\s\S]*class="chart"/);
@@ -657,7 +663,7 @@ test('Home Traffic hides part of an account email while configuration names stay
     { service: 'Codex', credential: 'work', ...stats(1) },
   ] };
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '', homeTrafficDevice: () => null });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
   const html = context.trafficBlock();
   assert.match(html, /<span>su\*\*\*3@gmail\.com<\/span>/);
@@ -690,7 +696,7 @@ test('forwarding Home Traffic labels the destination and hides another source', 
   const context = setup('all');
   vm.runInContext(source.slice(source.indexOf('function homeTrafficDevice('), source.indexOf('async function loadHomeTraffic(')), context);
   Object.assign(context, { block: (title, aside, body) => title + body, stat: (label, value) => `${label}:${value}`, fmtMs: String, fmtBytes: String, modelTokenStats: () => '', trafficControls: () => '' });
-  vm.runInContext(source.slice(source.indexOf('function chart('), source.indexOf('/// Home shows the forwarded device')), context);
+  loadSharedViews(context);
   vm.runInContext(source.slice(source.indexOf('function trafficBlock('), source.indexOf('\nfunction connectBlock(')), context);
   const { ui } = context;
   ui.page = 'main';
@@ -735,7 +741,7 @@ test('Output TPS renders the backend rate and unknown measurements', () => {
   const context = setup('model');
   loadSharedViews(context);
   Object.assign(context, { ICON: { warning: '!' }, stat: (label, value) => `<stat>${label}=${value}</stat>` });
-  vm.runInContext(source.slice(source.indexOf('function modelTokenStats('), source.indexOf('const SHARE_SERVICES')), context);
+  loadSharedViews(context);
   const total = { outputTps: 40, credentials: [] };
   assert.match(context.outputTpsStat(total, 'model'), /Output TPS[^]*=40\.0 tok\/s/);
   assert.doesNotMatch(context.modelTokenStats(total, 'model'), /Output TPS/);
@@ -747,11 +753,8 @@ test('Output TPS replaces Received in the summary and account row, leaving four 
   const context = setup('model');
   loadSharedViews(context);
   Object.assign(context, { ICON: { warning: '!' }, chart: () => '', fmtMs: String, fmtBytes: String });
-  for (const [start, end] of [
-    ['function stat(', '// ---------------------------------------------------------------- main'],
-    ["/// One account's row", '/// The share ring, chart and totals'],
-    ['function modelTokenStats(', 'const SHARE_SERVICES'],
-  ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
+  // The real stat cell; the setup's formatting stubs stay.
+  context.stat = scripts.load(scripts.sandbox(), 'panel_format.js').stat;
   const view = { service: 'Codex', credential: 'work', requests: 1, errors: 0,
     firstTokenSamples: 1, firstTokenMs: 500, avgMs: 2500, outputTps: 50,
     inputTokens: 10, outputTokens: 101, cachedInputTokens: 0, cacheHitRate: 0, credentials: [] };

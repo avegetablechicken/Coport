@@ -164,7 +164,7 @@ test('every passive page refresh opts out of upstream account probes', async () 
 
 test('account routes explain each activation state', () => {
   const block = source.match(/function routingRow\([\s\S]*?\r?\n\}/)[0];
-  const scope = source.match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];
+  const scope = fs.readFileSync(path.join(__dirname, '../ui/traffic_render.js'), 'utf8').match(/function tooltipScopeKey\([\s\S]*?\r?\n\}/)[0];
   const row = (activation) => vm.runInNewContext(`${scope}\n${block}\nroutingRow(route, true, true)`, {
     route: { selector: 'you@example.com', proxies: [], activation },
     routeIdentity: (name) => ({ kind: 'account', name }), routingChain: () => '',

@@ -96,3 +96,19 @@ function serviceMark(service) {
   const name = { Claude: "claude", Codex: "codex", Antigravity: "antigravity", Grok: "grok" }[service];
   return name ? `<span class="service-mark ${name}-mark" aria-hidden="true"></span>` : "";
 }
+
+/// A block: titled box with an optional right-aligned headline. `morph` names
+/// what it shows, so another page's block of that name turns into it.
+function block(title, aside, body, morph = "") {
+  return `<section class="block"${morph ? ` data-morph="${esc(morph)}"` : ""}>
+    <div class="block-head"><span class="block-title">${title}</span>${aside ? `<span class="block-aside">${aside}</span>` : ""}</div>
+    ${body}</section>`;
+}
+function stat(label, value, cls = "") {
+  return `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${value}</div></div>`;
+}
+function message(kind, text, actions = "") {
+  return `<div class="message ${kind}"><span class="message-dot"></span><div class="message-body">${text}${
+    actions ? `<div class="message-actions">${actions}</div>` : ""
+  }</div></div>`;
+}

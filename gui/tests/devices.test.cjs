@@ -6,6 +6,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.j
 const { createTrafficViews } = require('../ui/traffic_views.js');
 const { createDeviceForm } = require('../ui/device_form.js');
 const { createDeviceList } = require('../ui/device_list.js');
+const scripts = require('./panel_harness.cjs');
 /// The Device list of the panel `context`, through its invoke, Channel,
 /// traffic views, page, range and redraw as they are when used.
 function deviceListOf(context) {
@@ -55,8 +56,8 @@ function harness(invoke) {
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf("function panelSelect("), source.indexOf("let openSelect = null;")), context);
   // Shared traffic views, markup and merging, as every page uses them.
-  vm.runInContext(source.slice(source.indexOf('const trafficMarkup = new WeakMap();'), source.indexOf('/// Home shows the forwarded device')), context);
-  vm.runInContext(source.slice(source.indexOf('const SHARE_SERVICES'), source.indexOf('\nfunction renderActivityTraffic(')), context);
+  scripts.load(context, 'traffic_render.js');
+  vm.runInContext(source.slice(source.indexOf('const MATCH_REASONS'), source.indexOf('\nfunction renderActivityTraffic(')), context);
   // One range for Home, Activity and Devices.
   vm.runInContext(source.slice(source.indexOf('function setTrafficMinutes('), source.indexOf('\nasync function loadTraffic(')), context);
   vm.runInContext(code, context);
@@ -214,7 +215,6 @@ test('upstream account disclosures retain per-device expansion and place rings b
   const h = harness(async () => []);
   const events = {};
   Object.assign(h, { trafficReview: () => '', chart: () => '<chart>', trafficShare: () => '<ring>', modelTokenStats: () => '', stat: () => '', fmtMs: () => '', fmtBytes: () => '', serviceMark: () => '', ICON: { chevron: '' }, document: { addEventListener: (name, callback) => { events[name] = callback; } } });
-  vm.runInContext(source.slice(source.indexOf('/// One account\'s row'), source.indexOf('\n/// The share ring, chart and totals')), h);
   const start = source.indexOf('function deviceTrafficContent(');
   vm.runInContext(source.slice(start, source.indexOf('function mergedDataBlock(', start)), h);
   const traffic = { requests: 2, errors: 0, credentials: [
@@ -597,7 +597,7 @@ test('forwarding toggles only the selected device and refreshes confirmed state'
 
 test('home highlights remote mode and collapses inactive local configuration', () => {
   const start = source.indexOf('function main()');
-  const end = source.indexOf('function message(', start);
+  const end = source.indexOf('function proxyBlock(', start);
   const context = { ui: { snap: { forwarding: { name: 'MS', error: null }, phase: { port: 8787 } } },
     ICON: { chevron: '' }, fmtBytes: v => `${v} B`, esc: v => v, block: (title, aside, body) => title + body,
     message: (_, text) => text, connectBlock: () => '[Connect]', proxyBlock: () => '[Proxy]',
@@ -749,7 +749,7 @@ test('startup SSH checks have at most four connections in flight', async () => {
 
 test('remote home distinguishes health and recovery from whole-device statistics', () => {
   const start = source.indexOf('function main()');
-  const end = source.indexOf('function message(', start);
+  const end = source.indexOf('function proxyBlock(', start);
   const context = { ui: { snap: { phase: { port: 8787 }, forwarding: { name: 'MS', health: { state: 'connected', latencyMs: 52, lastConnectedAt: Date.now(), recoveredAt: Date.now() }, traffic: { connections: 3, active: 1, failures: 1, uploadBytes: 20, downloadBytes: 40, downloadBytesPerSecond: 8 }, remoteTraffic: { requests: 10, errors: 2, fetchedAt: Date.now() } } } }, esc: v => v, fmtBytes: v => `${v} B`, block: (title, _, body) => title + body, message: (_, text) => text };
   vm.createContext(context); vm.runInContext(source.slice(start,end),context);
   let html = context.remoteForwardingBlock();

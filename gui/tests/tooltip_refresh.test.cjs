@@ -80,7 +80,7 @@ function panel(page = 'main', script = source) {
   };
   vm.createContext(context);
   vm.runInContext(between('let routeTooltipTimer;', 'function routingBlock('), context);
-  vm.runInContext(between('function renderPage() {', '/// A block:'), context);
+  vm.runInContext(between('function renderPage() {', '// ---------------------------------------------------------------- main'), context);
   vm.runInContext(between('new MutationObserver(() => {', 'new MutationObserver(refreshRouteTooltip)'), context);
   assert.equal(typeof observer, 'function', 'content observer is registered');
   content.innerHTML = '';
