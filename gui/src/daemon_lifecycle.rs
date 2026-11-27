@@ -87,6 +87,9 @@ pub struct Lifecycle<P = Native> {
 const READY: Duration = Duration::from_secs(15);
 /// Idle checks in a row, a check interval apart, before a Restart proceeds.
 const QUIET_CHECKS: u32 = 4;
+/// How long a started Daemon's executable may stay busy, held open for
+/// writing by a child forked before its exec.
+const BUSY: Duration = Duration::from_secs(2);
 const CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 impl Lifecycle {
@@ -339,7 +342,22 @@ impl<P: Platform> Lifecycle<P> {
             .stdout(Stdio::null())
             .stderr(stderr);
         self.platform.detach(&mut command);
-        let mut child = command.spawn().map_err(|e| {
+        // A child that another thread forks keeps a copy of a just-written
+        // executable's write handle until it execs, and starting it then
+        // fails as busy. That copy is gone once the child execs.
+        let busy_until = Instant::now() + BUSY;
+        let spawned = loop {
+            match command.spawn() {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < busy_until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        let mut child = spawned.map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(

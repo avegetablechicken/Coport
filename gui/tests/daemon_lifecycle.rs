@@ -1100,6 +1100,32 @@ fn a_second_control_restart_forces_the_waiting_one() {
     );
 }
 
+/// A child that another thread forks keeps a copy of a just-written
+/// executable's write handle until it execs, and starting the executable
+/// meanwhile fails with "Text file busy". Here the test holds that handle.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_executable_still_open_for_writing_starts_once_it_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = Cleanup(dir.path().to_owned());
+    fixture(dir.path());
+    let copy = dir.path().join("coportd");
+    std::fs::copy(helper(), &copy).unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(&copy).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(writer);
+    });
+    let started = start(
+        &copy,
+        dir.path(),
+        &dir.path().join("config.yaml"),
+        &dir.path().join("proxy.log"),
+    );
+    release.join().unwrap();
+    started.unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_new_daemon_that_fails_to_start_gives_way_to_the_previous_program() {
