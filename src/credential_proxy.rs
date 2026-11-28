@@ -139,11 +139,11 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     };
     let claude = &config.claude.routing;
     let codex = &config.codex.routing;
-    let url = |value: &str| crate::url_routing::validate_upstream(value);
+    let url = |value: &str| crate::routing::by_url::validate_upstream(value);
     let credential_selectors = |routes: &BTreeMap<String, crate::config::Choice>| {
         routes
             .keys()
-            .any(|key| !crate::url_routing::is_url_selector(key))
+            .any(|key| !crate::routing::by_url::is_url_selector(key))
     };
     if !claude.account.is_empty()
         || claude.account_fallback.is_some()
@@ -173,7 +173,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     for key in codex
         .api_key
         .keys()
-        .filter(|k| crate::url_routing::is_url_selector(k))
+        .filter(|k| crate::routing::by_url::is_url_selector(k))
     {
         add(&url(key)?, "/codex/");
     }
@@ -186,7 +186,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         .routing
         .api_key
         .keys()
-        .filter(|k| crate::url_routing::is_url_selector(k))
+        .filter(|k| crate::routing::by_url::is_url_selector(k))
     {
         add(&url(key)?, "/antigravity/");
     }
@@ -215,7 +215,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         .routing
         .api_key
         .keys()
-        .filter(|k| crate::url_routing::is_url_selector(k))
+        .filter(|k| crate::routing::by_url::is_url_selector(k))
     {
         add(&url(key)?, "/grok/");
     }

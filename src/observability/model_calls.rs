@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-pub use crate::target::is_model_endpoint;
+pub use crate::routing::target::is_model_endpoint;
 
 // Unknown fields (including prompts, generated text, and tool arguments) are
 // skipped by serde and never copied into log records.

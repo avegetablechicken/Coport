@@ -55,7 +55,7 @@ impl Bases {
         ] {
             let reserved = Url::parse(reserved)
                 .map_err(|_| Error::config("Invalid Codex account upstream."))?;
-            if crate::url_routing::overlaps(url, &reserved) {
+            if crate::routing::by_url::overlaps(url, &reserved) {
                 return Err(Error::config(
                     "Codex API key upstream overlaps an account API or token refresh endpoint.",
                 ));
@@ -284,7 +284,7 @@ impl Config {
             .routing
             .api_key
             .iter()
-            .filter(|(key, _)| !crate::url_routing::is_url_selector(key))
+            .filter(|(key, _)| !crate::routing::by_url::is_url_selector(key))
             .map(|(selector, proxy)| Provider {
                 selector: selector.clone(),
                 proxy: proxy.clone(),
@@ -354,7 +354,7 @@ impl Config {
             return Err(Error::config("Invalid port or timeout (1–3600 seconds)."));
         }
         self.websocket.validate()?;
-        crate::url_routing::validate_routes(&self.codex.routing.api_key)?;
+        crate::routing::by_url::validate_routes(&self.codex.routing.api_key)?;
         let account = validate_upstream(&self.codex.base_url.account)?;
         if account.path().trim_matches('/') == "backend-api/codex" {
             return Err(Error::config(
@@ -369,11 +369,11 @@ impl Config {
             .routing
             .api_key
             .keys()
-            .filter(|s| crate::url_routing::is_url_selector(s))
+            .filter(|s| crate::routing::by_url::is_url_selector(s))
         {
             self.codex
                 .base_url
-                .validate_api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
+                .validate_api_upstream(&crate::routing::by_url::validate_upstream(selector)?)?;
         }
         if let Some(name) = &self.codex.auth_env {
             validate_env(name)?;
@@ -603,7 +603,7 @@ pub fn validate_upstream(value: &str) -> Result<Url> {
 // Values without a scheme keep the strict hostname check.
 fn validate_provider_upstream(value: &str) -> Result<()> {
     if value.contains("://") {
-        crate::url_routing::validate_upstream(value).map(|_| ())
+        crate::routing::by_url::validate_upstream(value).map(|_| ())
     } else {
         validate_upstream(value).map(|_| ())
     }
@@ -1069,8 +1069,11 @@ codex:
         assert!(
             c.resolve_url(
                 Some("Bearer key"),
-                crate::target::Target::new("POST", "/codex/https://provider.invalid/v1/responses")
-                    .rest()
+                crate::routing::target::Target::new(
+                    "POST",
+                    "/codex/https://provider.invalid/v1/responses"
+                )
+                .rest()
             )
             .unwrap()
             .is_some()

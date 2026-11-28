@@ -12,7 +12,7 @@ pub(crate) fn oauth_path(url: &url::Url) -> bool {
 
 pub(crate) fn check_api_base(url: &url::Url) -> crate::Result<()> {
     let token = url::Url::parse(crate::claude::TOKEN_REFRESH_UPSTREAM).unwrap();
-    if oauth_path(url) || crate::url_routing::overlaps(url, &token) {
+    if oauth_path(url) || crate::routing::by_url::overlaps(url, &token) {
         return Err(crate::Error::config(
             "Claude API upstream overlaps an OAuth-only endpoint.",
         ));
@@ -21,7 +21,7 @@ pub(crate) fn check_api_base(url: &url::Url) -> crate::Result<()> {
 }
 
 pub(crate) fn validate_api_upstream(value: &str) -> crate::Result<url::Url> {
-    let url = crate::url_routing::validate_upstream(value)?;
+    let url = crate::routing::by_url::validate_upstream(value)?;
     check_api_base(&url)?;
     Ok(url)
 }

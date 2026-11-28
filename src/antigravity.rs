@@ -814,14 +814,14 @@ impl Antigravity {
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
         self.api_upstream(&validate_upstream(&self.base_url.api_key)?)?;
         for (selector, choice) in &self.routing.api_key {
-            if crate::url_routing::is_url_selector(selector) {
-                self.api_upstream(&crate::url_routing::validate_upstream(selector)?)?;
+            if crate::routing::by_url::is_url_selector(selector) {
+                self.api_upstream(&crate::routing::by_url::validate_upstream(selector)?)?;
             } else {
                 crate::config::validate_env(selector)?;
             }
             config.validate_choice(choice)?;
         }
-        crate::url_routing::validate_routes(&self.routing.api_key)
+        crate::routing::by_url::validate_routes(&self.routing.api_key)
     }
 
     /// Refuses a Gemini API upstream on a Cloud Code, token or login
@@ -851,7 +851,7 @@ impl Antigravity {
         self.routing
             .api_key
             .iter()
-            .filter(|(selector, _)| !crate::url_routing::is_url_selector(selector))
+            .filter(|(selector, _)| !crate::routing::by_url::is_url_selector(selector))
     }
 
     /// Whether API keys without a URL route are served: by name or `fallback`.
@@ -861,7 +861,7 @@ impl Antigravity {
 
     /// Display classification, as Codex's and Claude's `api_key_kind`.
     pub fn api_key_kind(&self, selector: &str) -> &'static str {
-        if crate::url_routing::is_url_selector(selector) {
+        if crate::routing::by_url::is_url_selector(selector) {
             "gateway"
         } else {
             "api_key"
@@ -871,19 +871,20 @@ impl Antigravity {
     /// The upstream a selector forwards to when its request names none, as
     /// Claude's `api_key_upstream`; none for URL routes, whose requests name it.
     pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
-        (!crate::url_routing::is_url_selector(selector)).then_some(self.base_url.api_key.as_str())
+        (!crate::routing::by_url::is_url_selector(selector))
+            .then_some(self.base_url.api_key.as_str())
     }
 
     /// Whether an API key route serves this unprefixed target.
     pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
-        Ok(crate::url_routing::match_route(&self.routing.api_key, target)?.is_some())
+        Ok(crate::routing::by_url::match_route(&self.routing.api_key, target)?.is_some())
     }
 
     /// The URL route of an explicit target, as for Codex and Claude: any key,
     /// forwarded as sent, for the upstream to validate.
     pub(crate) fn api_route(&self, headers: &HeaderMap, target: &str) -> Result<Option<ApiRoute>> {
         let Some((selector, proxy)) =
-            crate::url_routing::match_route(&self.routing.api_key, target)?
+            crate::routing::by_url::match_route(&self.routing.api_key, target)?
         else {
             return Ok(None);
         };
@@ -894,7 +895,7 @@ impl Antigravity {
         Ok(Some(ApiRoute {
             selector: selector.into(),
             proxy: proxy.clone(),
-            upstream: crate::url_routing::validate_upstream(selector)?.into(),
+            upstream: crate::routing::by_url::validate_upstream(selector)?.into(),
             key,
             credential,
             configured: false,
@@ -941,7 +942,7 @@ impl Antigravity {
             return Ok(route);
         }
         let origin = named.origin().ascii_serialization();
-        self.api_upstream(&crate::url_routing::validate_upstream(&origin)?)?;
+        self.api_upstream(&crate::routing::by_url::validate_upstream(&origin)?)?;
         route.upstream = origin;
         route.custom_upstream = true;
         Ok(route)

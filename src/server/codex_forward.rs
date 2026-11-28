@@ -29,7 +29,9 @@ impl Adapter for Codex {
             return Ok(Plan::Own(()));
         }
         let rest = target.rest();
-        if crate::url_routing::match_route(&server.config.codex.routing.api_key, rest)?.is_some() {
+        if crate::routing::by_url::match_route(&server.config.codex.routing.api_key, rest)?
+            .is_some()
+        {
             if let Some(route) = server
                 .config
                 .resolve_url(header(parts, "authorization"), rest)?

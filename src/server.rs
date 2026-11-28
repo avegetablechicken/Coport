@@ -4,9 +4,10 @@ use crate::{
     observability::logger::{Logger, Outcome, RequestLog},
     routing::{
         MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
-        query_url, refresh_token, upstream_url,
+        query_url, refresh_token,
+        target::{Kind, Target},
+        upstream_url,
     },
-    target::{Kind, Target},
 };
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
@@ -470,7 +471,7 @@ impl Server {
         let head = incoming.method() == hyper::Method::HEAD;
         // What the request is needs no configuration, so even a request
         // refused below is recorded as the Model call it asked for.
-        let target = crate::target::Target::new(incoming.method().as_str(), &target);
+        let target = crate::routing::target::Target::new(incoming.method().as_str(), &target);
         if target.kind() == Kind::ModelCall {
             log.model_call(uuid::Uuid::new_v4());
             log.field("model_transport", "http");

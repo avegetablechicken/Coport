@@ -94,7 +94,7 @@ async fn saved_provider_auth(home: &Path) -> Result<(String, Option<String>)> {
 impl Codex {
     /// Display classification uses the same provider definitions as credential routing.
     pub fn api_key_kind(&self, selector: &str) -> Result<&'static str> {
-        if crate::url_routing::is_url_selector(selector) {
+        if crate::routing::by_url::is_url_selector(selector) {
             return Ok("gateway");
         }
         let provider = Provider {
@@ -130,9 +130,9 @@ impl Provider {
             .map(|home| {
                 let defs = definitions(home.as_deref())?;
                 let upstream = provider_upstream(self.definition(&defs)?, default)?;
-                codex
-                    .base_url
-                    .validate_api_upstream(&crate::url_routing::validate_upstream(&upstream)?)?;
+                codex.base_url.validate_api_upstream(
+                    &crate::routing::by_url::validate_upstream(&upstream)?,
+                )?;
                 Ok(upstream)
             })
             .collect()

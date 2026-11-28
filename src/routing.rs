@@ -5,6 +5,10 @@ use crate::{
     identity::valid_token,
 };
 use url::Url;
+
+pub mod by_url;
+pub mod target;
+
 #[derive(Clone)]
 pub struct Route {
     pub token: String,
@@ -51,13 +55,11 @@ impl Service {
     }
 }
 
-pub use crate::target::logged_service;
+pub use target::logged_service;
 
 impl Config {
     pub fn resolve_url(&self, authorization: Option<&str>, target: &str) -> Result<Option<Route>> {
-        let Some((base, proxy)) =
-            crate::url_routing::match_route(&self.codex.routing.api_key, target)?
-        else {
+        let Some((base, proxy)) = by_url::match_route(&self.codex.routing.api_key, target)? else {
             return Ok(None);
         };
         let token = authorization
@@ -70,7 +72,7 @@ impl Config {
             account_label: None,
             provider: Some(base.into()),
             proxy: proxy.clone(),
-            upstream: crate::url_routing::validate_upstream(base)?.into(),
+            upstream: by_url::validate_upstream(base)?.into(),
             custom_upstream: true,
             configured: false,
         }))
@@ -118,7 +120,7 @@ impl Config {
                         let custom_upstream = credential.upstream != self.codex.base_url.api_key;
                         if custom_upstream {
                             self.codex.base_url.validate_api_upstream(
-                                &crate::url_routing::validate_upstream(&credential.upstream)?,
+                                &by_url::validate_upstream(&credential.upstream)?,
                             )?;
                         }
                         matches.push(Route {
@@ -539,7 +541,7 @@ mod tests {
             "/https://api.invalid/v1/responses",
             "/codex/https://api.invalid/v1/responses",
         ] {
-            let classified = crate::target::Target::new("POST", target);
+            let classified = target::Target::new("POST", target);
             let target = classified.rest();
             let route = config
                 .resolve_url(Some("Bearer supplied-key"), target)

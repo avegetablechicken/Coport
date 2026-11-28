@@ -305,7 +305,7 @@ impl Claude {
             }
             config.validate_choice(choice)?;
         }
-        crate::url_routing::validate_routes(&self.url_routes())?;
+        crate::routing::by_url::validate_routes(&self.url_routes())?;
         for choice in [
             &self.routing.account_fallback,
             &self.routing.account_probe,
@@ -649,7 +649,7 @@ impl Claude {
         let Some(explicit) = api::explicit_target(target) else {
             return Ok(false);
         };
-        Ok(crate::url_routing::match_route(&self.url_routes(), explicit)?.is_some())
+        Ok(crate::routing::by_url::match_route(&self.url_routes(), explicit)?.is_some())
     }
 
     pub(crate) fn explicit_api_route(
@@ -661,7 +661,7 @@ impl Claude {
             return Ok(None);
         };
         let routes = self.url_routes();
-        let Some((base, proxy)) = crate::url_routing::match_route(&routes, explicit)? else {
+        let Some((base, proxy)) = crate::routing::by_url::match_route(&routes, explicit)? else {
             return Ok(None);
         };
         // A root URL selector may serve Messages on the account origin. Its
@@ -697,7 +697,7 @@ impl Claude {
             proxy: proxy.clone(),
             identity: None,
             needs_profile: false,
-            upstream: crate::url_routing::validate_upstream(base)?.into(),
+            upstream: crate::routing::by_url::validate_upstream(base)?.into(),
             oauth: false,
             custom_upstream: true,
             configured: false,
@@ -1120,9 +1120,9 @@ claude:
         ] {
             for prefix in ["/anthropic", "/claude"] {
                 let prefixed = format!("{prefix}{path}");
-                let target = crate::target::Target::new("POST", &prefixed);
+                let target = crate::routing::target::Target::new("POST", &prefixed);
                 assert_eq!(
-                    crate::target::logged_service(&prefixed),
+                    crate::routing::target::logged_service(&prefixed),
                     crate::routing::Service::Claude
                 );
                 assert_eq!(target.rest(), path);
@@ -1140,13 +1140,13 @@ claude:
             "/anthropic-evil/v1/messages",
         ] {
             assert_eq!(
-                crate::target::logged_service(path),
+                crate::routing::target::logged_service(path),
                 crate::routing::Service::Codex,
                 "{path}"
             );
         }
         assert_eq!(
-            crate::target::logged_service("/v1/messages?beta=true"),
+            crate::routing::target::logged_service("/v1/messages?beta=true"),
             crate::routing::Service::Claude
         );
         for path in [
@@ -1420,7 +1420,7 @@ claude:
                 "/https://182.92.106.196:6060/v1/models",
                 "/anthropic/https://182.92.106.196:6060/v1/messages",
             ] {
-                let target = crate::target::Target::new("POST", path);
+                let target = crate::routing::target::Target::new("POST", path);
                 let route = c
                     .explicit_api_route(&headers, target.rest())
                     .unwrap()
