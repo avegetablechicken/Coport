@@ -414,7 +414,7 @@ mod tests {
         );
         let mut headers = hyper::HeaderMap::new();
         headers.insert("authorization", "Bearer access".parse().unwrap());
-        let route = config.claude.resolve(&headers).await.unwrap();
+        let route = config.claude.resolve(&headers).await.unwrap().account();
         assert!(route.needs_profile);
         assert_eq!(route.proxy.label(), "none");
         for routing in [&mut config.codex.routing, &mut config.claude.routing] {
@@ -456,10 +456,16 @@ mod tests {
             "mapped"
         );
         assert_eq!(
-            config.claude.resolve(&headers).await.unwrap().proxy.label(),
+            config
+                .claude
+                .resolve(&headers)
+                .await
+                .unwrap()
+                .proxy()
+                .label(),
             "probe"
         );
-        let mut route = config.claude.resolve(&headers).await.unwrap();
+        let mut route = config.claude.resolve(&headers).await.unwrap().account();
         config
             .claude
             .apply_profile(&mut route, claude_identity.clone())
@@ -495,7 +501,13 @@ mod tests {
         headers.remove("authorization");
         headers.insert("x-api-key", "api-key".parse().unwrap());
         assert_eq!(
-            config.claude.resolve(&headers).await.unwrap().proxy.label(),
+            config
+                .claude
+                .resolve(&headers)
+                .await
+                .unwrap()
+                .proxy()
+                .label(),
             "none"
         );
         let account_token = "h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC0xIn19.s";

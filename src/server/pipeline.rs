@@ -531,7 +531,8 @@ mod tests {
         assert!(relay.native_tls && !relay.renews && relay.claude_identity.is_none());
         assert!(matches!(
             relay.credential,
-            Credential::Claude(ref route) if route.token == KEY && !route.bearer
+            Credential::Claude(crate::claude::ClaudeRoute::Api(ref route))
+                if route.key == KEY && route.ext == crate::claude::KeyHeader::ApiKey
         ));
         assert_eq!(
             record.provider.as_deref(),

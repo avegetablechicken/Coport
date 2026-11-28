@@ -3,7 +3,7 @@
 use super::identity_directory::{Directory, Lookup, State, Texts};
 use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
-use crate::claude::{ClaudeIdentity, ClaudeRoute};
+use crate::claude::{ClaudeIdentity, ClaudeRoute, KeyHeader};
 use crate::route_activation::Login;
 use hyper::http::request::Parts;
 
@@ -185,7 +185,11 @@ impl Adapter for Claude {
     /// A Bearer token on Claude's own upstream may be a Saved login's; only
     /// one whose account the lookup matches is renewed.
     fn saved_login(pending: &ClaudeRoute) -> Option<&str> {
-        (pending.bearer && !pending.custom_upstream).then_some(pending.token.as_str())
+        match pending {
+            ClaudeRoute::Account(route) => Some(&route.token),
+            ClaudeRoute::Api(route) => (route.ext == KeyHeader::Bearer && !route.custom_upstream)
+                .then_some(route.key.as_str()),
+        }
     }
 
     async fn complete(
@@ -193,16 +197,22 @@ impl Adapter for Claude {
         mut route: ClaudeRoute,
         log: &mut RequestLog,
     ) -> Result<ClaudeRoute> {
-        if route.needs_profile {
+        if let ClaudeRoute::Account(route) = &mut route
+            && route.needs_profile
+        {
             let identity = server
                 .lookup_account::<Claude>(&route.token, &route.proxy, log)
                 .await?;
-            server.config.claude.apply_profile(&mut route, identity)?;
+            server.config.claude.apply_profile(route, identity)?;
         }
         Ok(route)
     }
 
     fn record(server: &Server, r: &ClaudeRoute) -> RouteRecord {
+        let r = match r {
+            ClaudeRoute::Api(route) => return RouteRecord::api("Claude", route),
+            ClaudeRoute::Account(route) => route,
+        };
         RouteRecord {
             provider: Some(r.label.clone()),
             upstream_base_url: Some(r.upstream.clone()),
@@ -232,6 +242,11 @@ impl Adapter for Claude {
         _: &mut RequestLog,
     ) -> Result<Relay> {
         let url = route.url(target.rest())?;
+        let account = match &route {
+            ClaudeRoute::Account(account) => Some(account),
+            ClaudeRoute::Api(_) => None,
+        };
+        let matched_account = account.is_some_and(|a| a.matched_account);
         let decoded_path = percent_encoding::percent_decode_str(url.path())
             .decode_utf8()
             .map_err(|_| Error::new(400, "Invalid Claude request path."))?;
@@ -239,7 +254,7 @@ impl Adapter for Claude {
             .trim_end_matches('/')
             .ends_with("/api/oauth/usage")
         {
-            if !route.matched_account {
+            if !matched_account {
                 return Err(Error::new(
                     403,
                     "Claude usage requires a matched OAuth account.",
@@ -251,10 +266,10 @@ impl Adapter for Claude {
         }
         Ok(Relay {
             url,
-            proxy: route.proxy.clone(),
-            native_tls: route.custom_upstream,
-            renews: route.matched_account && route.bearer,
-            claude_identity: route.identity.clone(),
+            proxy: route.proxy().clone(),
+            native_tls: matches!(&route, ClaudeRoute::Api(api) if api.custom_upstream),
+            renews: matched_account,
+            claude_identity: account.and_then(|a| a.identity.clone()),
             cooldown: None,
             credential: Credential::Claude(route),
         })
