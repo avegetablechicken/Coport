@@ -327,24 +327,16 @@ impl Adapter for super::pipeline::Grok {
 
     fn record(_: &Server, route: &Route) -> RouteRecord {
         match route {
-            Route::Account(route) => RouteRecord {
-                upstream_base_url: Some(route.url.origin().ascii_serialization()),
-                account_id: route
-                    .identity
-                    .as_ref()
-                    .and_then(|i| i.account())
-                    .map(|a| a.to_string()),
-                account_label: route.account_label.clone(),
-                configured: route.configured,
-                ..Default::default()
-            },
+            Route::Account(route) => {
+                RouteRecord::account(route, route.ext.origin().ascii_serialization())
+            }
             Route::Api(route, _) => RouteRecord::api("Grok", route),
         }
     }
 
     fn build(_: &Server, route: Route, _: &Parts, _: &Target, _: &mut RequestLog) -> Result<Relay> {
         let (url, proxy, native_tls, token) = match route {
-            Route::Account(route) => (route.url, route.proxy, false, route.token),
+            Route::Account(route) => (route.ext, route.proxy, false, route.token),
             Route::Api(route, url) => (url, route.proxy, route.custom_upstream, route.key),
         };
         Ok(Relay {

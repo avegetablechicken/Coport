@@ -201,20 +201,8 @@ pub(crate) fn parse_logins(text: &str) -> Option<Vec<Login>> {
     Some(entries.into_iter().filter_map(|(_, v)| login(v)).collect())
 }
 
-/// How a login's request routes.
-pub struct GrokRoute {
-    pub token: String,
-    pub proxy: Choice,
-    pub identity: Option<GrokIdentity>,
-    /// The token is a saved login's.
-    pub matched_login: bool,
-    /// The routing key that carried it, which records name.
-    pub account_label: Option<String>,
-    /// A saved login or an account the routing maps, not one a fallback
-    /// carries.
-    pub configured: bool,
-    pub url: Url,
-}
+/// How a login's request routes, and the URL it goes to.
+pub type GrokRoute = crate::routing::accounts::AccountRoute<GrokIdentity, Url>;
 
 /// An API key's Route: by its key or upstream URL. Grok adds nothing.
 pub type ApiRoute = crate::routing::api_keys::ApiRoute;
@@ -607,7 +595,9 @@ impl Grok {
             identity,
             matched_login,
             account_label: Some(account_label),
-            url: self.account_url(rest)?,
+            provider: None,
+            needs_profile: false,
+            ext: self.account_url(rest)?,
         }))
     }
 
@@ -1024,7 +1014,7 @@ pub(crate) mod tests {
             assert!(route.matched_login && route.configured);
             assert_eq!(route.identity.unwrap().user_id.as_deref(), Some(USER_ID));
             assert_eq!(
-                route.url.as_str(),
+                route.ext.as_str(),
                 "https://cli-chat-proxy.grok.com/v1/responses"
             );
         }
@@ -1035,7 +1025,7 @@ pub(crate) mod tests {
         // A base URL without `/v1` reaches the same paths.
         let route = account(resolve(&grok, "saved-token", "/chat/completions").await);
         assert_eq!(
-            route.url.as_str(),
+            route.ext.as_str(),
             "https://cli-chat-proxy.grok.com/v1/chat/completions"
         );
         // Explicit targets stay on xAI's hosts.
@@ -1048,11 +1038,11 @@ pub(crate) mod tests {
             .await,
         );
         assert_eq!(
-            route.url.as_str(),
+            route.ext.as_str(),
             "https://cli-chat-proxy.grok.com/v1/settings"
         );
         let route = account(resolve(&grok, "saved-token", "/https://api.x.ai/v1/models").await);
-        assert_eq!(route.url.as_str(), "https://api.x.ai/v1/models");
+        assert_eq!(route.ext.as_str(), "https://api.x.ai/v1/models");
         for foreign in [
             "/https://relay.example.com/v1/responses",
             "/https://cli-chat-proxy.grok.com:8443/v1/responses",
