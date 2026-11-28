@@ -151,7 +151,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
         || claude
             .api_key
             .keys()
-            .any(|key| !crate::claude_settings::is_url(key))
+            .any(|key| !crate::claude::settings::is_url(key))
     {
         add(&url(&config.claude.base_url)?, "/anthropic/");
         add(&url(crate::claude::TOKEN_REFRESH_UPSTREAM)?, "/anthropic/");
@@ -166,7 +166,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     for key in claude
         .api_key
         .keys()
-        .filter(|k| crate::claude_settings::is_url(k))
+        .filter(|k| crate::claude::settings::is_url(k))
     {
         add(&url(key)?, "/anthropic/");
     }
@@ -233,10 +233,10 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     for key in claude
         .api_key
         .keys()
-        .filter(|key| !crate::claude_settings::is_url(key))
+        .filter(|key| !crate::claude::settings::is_url(key))
     {
         if let Ok(Some(upstream)) =
-            crate::claude_settings::upstream(&config.claude.config_dirs, key)
+            crate::claude::settings::upstream(&config.claude.config_dirs, key)
         {
             add(&url(&upstream)?, "/anthropic/");
         }

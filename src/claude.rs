@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use url::Url;
 
+pub(crate) mod api;
+pub(crate) mod refresh_lock;
+pub(crate) mod settings;
+
 fn default_base() -> String {
     "https://api.anthropic.com".into()
 }
@@ -269,7 +273,7 @@ impl Claude {
 
     pub(crate) fn validate(&self, config: &Config) -> Result<()> {
         crate::config::validate_directories(&self.config_dirs)?;
-        crate::claude_api::check_api_base(&validate_upstream(&self.base_url)?)?;
+        api::check_api_base(&validate_upstream(&self.base_url)?)?;
         if self.routing.mcp_fallback.is_some() {
             return Err(Error::config(
                 "mcp_fallback is only supported under codex.routing.",
@@ -294,10 +298,10 @@ impl Claude {
             config.validate_choice(choice)?;
         }
         for (name, choice) in &self.routing.api_key {
-            if crate::claude_settings::is_url(name) {
-                crate::claude_api::validate_api_upstream(name)?;
+            if settings::is_url(name) {
+                api::validate_api_upstream(name)?;
             } else {
-                crate::claude_settings::validate_name(name)?;
+                settings::validate_name(name)?;
             }
             config.validate_choice(choice)?;
         }
@@ -319,32 +323,30 @@ impl Claude {
         self.routing
             .api_key
             .iter()
-            .filter(|(name, _)| crate::claude_settings::is_url(name))
+            .filter(|(name, _)| settings::is_url(name))
             .map(|(name, choice)| (name.clone(), choice.clone()))
             .collect()
     }
 
     /// Display classification follows named-settings precedence, not spelling.
     pub fn api_key_kind(&self, selector: &str) -> Result<&'static str> {
-        if crate::claude_settings::is_url(selector) {
+        if settings::is_url(selector) {
             return Ok("gateway");
         }
-        Ok(
-            if crate::claude_settings::load(&self.config_dirs, selector)?.is_some() {
-                "profile"
-            } else {
-                "api_key"
-            },
-        )
+        Ok(if settings::load(&self.config_dirs, selector)?.is_some() {
+            "profile"
+        } else {
+            "api_key"
+        })
     }
 
     /// The same named settings lookup used for forwarding, without exposing credentials.
     pub fn api_key_upstream(&self, selector: &str) -> Result<Option<String>> {
-        if crate::claude_settings::is_url(selector) {
+        if settings::is_url(selector) {
             return Ok(None);
         }
         Ok(Some(
-            crate::claude_settings::load(&self.config_dirs, selector)?
+            settings::load(&self.config_dirs, selector)?
                 .map(|profile| profile.upstream)
                 .unwrap_or_else(|| self.base_url.clone()),
         ))
@@ -369,13 +371,8 @@ impl Claude {
                 }
             }
         }
-        for name in self
-            .routing
-            .api_key
-            .keys()
-            .filter(|s| !crate::claude_settings::is_url(s))
-        {
-            let token = match crate::claude_settings::load(&self.config_dirs, name)? {
+        for name in self.routing.api_key.keys().filter(|s| !settings::is_url(s)) {
+            let token = match settings::load(&self.config_dirs, name)? {
                 Some(profile) => profile.token,
                 None => {
                     validate_env(name)?;
@@ -558,9 +555,9 @@ impl Claude {
             .routing
             .api_key
             .iter()
-            .filter(|(s, _)| !crate::claude_settings::is_url(s))
+            .filter(|(s, _)| !settings::is_url(s))
         {
-            let profile = crate::claude_settings::load(&self.config_dirs, name)?;
+            let profile = settings::load(&self.config_dirs, name)?;
             let (credential, upstream) = match profile {
                 Some(profile) => (Ok(profile.token), Some(profile.upstream)),
                 None => (
@@ -649,7 +646,7 @@ impl Claude {
 
     /// Whether `explicit_api_route` applies to this target, before headers.
     pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
-        let Some(explicit) = crate::claude_api::explicit_target(target) else {
+        let Some(explicit) = api::explicit_target(target) else {
             return Ok(false);
         };
         Ok(crate::url_routing::match_route(&self.url_routes(), explicit)?.is_some())
@@ -660,7 +657,7 @@ impl Claude {
         headers: &HeaderMap,
         target: &str,
     ) -> Result<Option<ClaudeRoute>> {
-        let Some(explicit) = crate::claude_api::explicit_target(target) else {
+        let Some(explicit) = api::explicit_target(target) else {
             return Ok(None);
         };
         let routes = self.url_routes();
@@ -669,10 +666,7 @@ impl Claude {
         };
         // A root URL selector may serve Messages on the account origin. Its
         // OAuth endpoints still resolve by account credential.
-        if self
-            .url(explicit)
-            .is_ok_and(|url| crate::claude_api::oauth_path(&url))
-        {
+        if self.url(explicit).is_ok_and(|url| api::oauth_path(&url)) {
             return Ok(None);
         }
         let auth = headers.get("authorization");
@@ -768,7 +762,7 @@ fn api_url(base: &str, target: &str) -> Result<Url> {
 impl ClaudeRoute {
     pub fn url(&self, target: &str) -> Result<Url> {
         let url = api_url(&self.upstream, target)?;
-        if !self.oauth && crate::claude_api::oauth_path(&url) {
+        if !self.oauth && api::oauth_path(&url) {
             return Err(Error::new(
                 403,
                 "Claude OAuth endpoints require an account credential.",

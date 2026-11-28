@@ -1,7 +1,7 @@
 //! Opt-in, reactive renewal of saved OAuth logins for model requests only.
 use super::*;
 use crate::{
-    claude_refresh_lock::RefreshLock,
+    claude::refresh_lock::RefreshLock,
     config::AccountSource,
     saved_login::{self as login, SavedLogin, Store, with_login},
 };

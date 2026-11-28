@@ -179,7 +179,7 @@ fn read_upstream(document: &Value) -> Result<String> {
         .filter(|s| !s.is_empty())
         .ok_or(Error::config("Claude settings require ANTHROPIC_BASE_URL."))?;
     let upstream = crate::config::unwrap_upstream(upstream)?;
-    crate::claude_api::validate_api_upstream(&upstream)?;
+    crate::claude::api::validate_api_upstream(&upstream)?;
     Ok(upstream)
 }
 

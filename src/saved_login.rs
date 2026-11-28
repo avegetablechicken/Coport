@@ -134,7 +134,7 @@ pub(crate) trait SavedLogin {
     async fn lock(
         _source: Option<&AccountSource>,
         _wait: Result<Duration>,
-    ) -> Result<Option<crate::claude_refresh_lock::RefreshLock>> {
+    ) -> Result<Option<crate::claude::refresh_lock::RefreshLock>> {
         Ok(None)
     }
     /// The Token refresh spending `refresh`, the login's refresh token.

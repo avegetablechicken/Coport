@@ -3,7 +3,7 @@
 //! so one refresh token is spent only once.
 use super::*;
 use crate::claude::ClaudeIdentity;
-use crate::claude_refresh_lock::{RefreshLock, Wait};
+use crate::claude::refresh_lock::{RefreshLock, Wait};
 
 pub(crate) struct Claude;
 

@@ -261,7 +261,7 @@ async fn auto_refresh_merges_its_rotation_into_unrelated_edits_made_meanwhile() 
     for claude in [false, true] {
         let (home, file, running, mut fixture) =
             auto_refresh_setup(claude, true, "auto_wait").await;
-        let locks = crate::claude_refresh_lock::lock_paths(home.path());
+        let locks = crate::claude::refresh_lock::lock_paths(home.path());
         let call = spawn_auto_model(&running, claude);
         await_refresh(&mut fixture).await;
         // Claude Code's lock is held for the whole Claude renewal, and only
@@ -305,7 +305,7 @@ async fn auto_refresh_merges_its_rotation_into_unrelated_edits_made_meanwhile() 
 #[tokio::test]
 async fn auto_refresh_waits_for_claude_code_and_never_spends_the_token_it_renewed() {
     let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
-    let locks = crate::claude_refresh_lock::lock_paths(home.path());
+    let locks = crate::claude::refresh_lock::lock_paths(home.path());
     // Claude Code holds its refresh lock (both directories) and is renewing.
     for lock in &locks {
         std::fs::create_dir(lock).unwrap();
@@ -344,7 +344,7 @@ async fn auto_refresh_takes_over_from_a_claude_code_that_died_holding_its_lock()
     let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
     // Claude Code exited mid-renewal seconds ago: its locks are far from
     // stale, but its owner record proves it gone.
-    let locks = crate::claude_refresh_lock::hold_as_dead_claude_code(home.path());
+    let locks = crate::claude::refresh_lock::hold_as_dead_claude_code(home.path());
     let response = auto_model(&running, true).await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().await.unwrap(), "model-result");
@@ -361,7 +361,7 @@ async fn auto_refresh_takes_over_from_a_claude_code_that_died_holding_its_lock()
     assert!(
         !home
             .path()
-            .join(crate::claude_refresh_lock::OWNER_FILE)
+            .join(crate::claude::refresh_lock::OWNER_FILE)
             .exists()
     );
 }
@@ -370,7 +370,7 @@ async fn auto_refresh_takes_over_from_a_claude_code_that_died_holding_its_lock()
 async fn auto_refresh_gives_up_while_another_renewal_holds_the_lock() {
     let (home, file, running, mut fixture) = auto_refresh_setup(true, true, "auto_success").await;
     let before = std::fs::read(&file).unwrap();
-    let locks = crate::claude_refresh_lock::lock_paths(home.path());
+    let locks = crate::claude::refresh_lock::lock_paths(home.path());
     // Held by a live process: the current lock alone, or the legacy one alone.
     for held in [&locks[..], &locks[..1], &locks[1..]] {
         for lock in held {
@@ -396,7 +396,7 @@ async fn auto_refresh_gives_up_while_another_renewal_holds_the_lock() {
     // A dead holder's stale lock does not block renewal for good.
     for lock in &locks {
         std::fs::create_dir(lock).unwrap();
-        crate::claude_refresh_lock::touch(
+        crate::claude::refresh_lock::touch(
             lock,
             std::time::SystemTime::now() - Duration::from_secs(120),
         )

@@ -671,9 +671,9 @@ impl Config {
             .routing
             .api_key
             .keys()
-            .filter(|name| !crate::claude_settings::is_url(name))
+            .filter(|name| !crate::claude::settings::is_url(name))
         {
-            let pair = match crate::claude_settings::load(&self.claude.config_dirs, name) {
+            let pair = match crate::claude::settings::load(&self.claude.config_dirs, name) {
                 Ok(Some(profile)) => Some((profile.upstream, profile.token)),
                 Ok(None) => environment_key_with_shell(name, false)
                     .await
