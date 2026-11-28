@@ -85,7 +85,7 @@ impl super::Codex {
         api_keys::ApiKeys::new(
             &self.routing.api_key,
             api_keys::Texts {
-                ambiguous: "Bearer token matches multiple routes; configure distinct credentials.",
+                ambiguous: AMBIGUOUS,
                 duplicate: "Multiple routes have the same credential.",
             },
         )

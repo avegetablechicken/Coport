@@ -579,7 +579,6 @@ impl Claude {
                 "Claude credential matches multiple routes.",
             ));
         }
-        let matched_api = found.named.is_some();
         if let Some((selector, proxy, upstream)) = found.named {
             return Ok(ClaudeRoute::Api(ApiRoute {
                 selector: selector.clone(),
@@ -595,7 +594,7 @@ impl Claude {
                 },
             }));
         }
-        if bearer && !matched_account && !matched_api && self.account_auth_file_only {
+        if bearer && !matched_account && self.account_auth_file_only {
             if unavailable {
                 return Err(Error::config(
                     "No matching Claude route; credential source unavailable.",
@@ -606,7 +605,7 @@ impl Claude {
                 "Claude token does not match a saved account credential.",
             ));
         }
-        let needs_profile = local_needs_profile || (bearer && !matched_account && !matched_api);
+        let needs_profile = local_needs_profile || (bearer && !matched_account);
         // A saved login is configured; a profile lookup decides for an
         // unknown token (see `apply_profile`); fallbacks are not.
         let (label, proxy, configured) = if let Some((label, proxy)) = matches.pop() {
@@ -618,8 +617,6 @@ impl Claude {
                     "Claude profile lookup requires routing.account_probe or routing.account_fallback/fallback.",
                 ))?;
             ("claude-profile".into(), proxy.clone(), matched_account)
-        } else if let Some(proxy) = bearer.then(|| self.routing.account_default()).flatten() {
-            ("claude-account-fallback".into(), proxy.clone(), false)
         } else if let Some(proxy) = self.routing.fallback.as_ref().filter(|_| !bearer) {
             return Ok(ClaudeRoute::Api(ApiRoute {
                 selector: "claude-api-key-fallback".into(),

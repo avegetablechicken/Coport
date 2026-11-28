@@ -129,7 +129,7 @@ impl Adapter for Codex {
 
     fn saved_login(pending: &CodexRoute) -> Option<&str> {
         match &pending.route {
-            Some(Route::Account(route)) => route.saved_login(),
+            Some(Route::Account(route)) if !pending.docs => route.saved_login(),
             _ => None,
         }
     }
@@ -144,9 +144,11 @@ impl Adapter for Codex {
             Some(Route::Account(r)) => RouteRecord::account(r, r.ext.clone()),
             // A provider's ChatGPT login is recorded by its account.
             Some(Route::Api(r)) if r.ext.is_some() => RouteRecord {
-                credential_ref: None,
+                provider: Some(r.selector.clone()),
+                upstream_base_url: Some(r.upstream.clone()),
                 account_id: r.ext.clone(),
-                ..RouteRecord::api("Codex", r)
+                configured: r.configured,
+                ..Default::default()
             },
             Some(Route::Api(r)) => RouteRecord::api("Codex", r),
         }

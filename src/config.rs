@@ -267,7 +267,7 @@ impl Config {
             return Err(Error::config("Invalid port or timeout (1–3600 seconds)."));
         }
         self.websocket.validate()?;
-        crate::routing::by_url::validate_routes(&self.codex.routing.api_key)?;
+        self.codex.api_keys().validate_urls()?;
         let account = validate_upstream(&self.codex.base_url.account)?;
         if account.path().trim_matches('/') == "backend-api/codex" {
             return Err(Error::config(

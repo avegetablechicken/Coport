@@ -122,9 +122,6 @@ impl Server {
             .await
     }
 
-    /// The route a credential takes, as records name it: the saved login's
-    /// email route, else `default`; another account's email route; else the
-    /// fallback that carried it.
     /// Keeps the account a lookup named for the saved login. A failure to
     /// save it is logged; the request goes on.
     pub(crate) fn learn_antigravity_login(

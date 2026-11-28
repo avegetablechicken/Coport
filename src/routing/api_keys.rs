@@ -14,7 +14,7 @@ use std::future::Future;
 use url::Url;
 
 /// A Route by API key, with what its App adds (`ext`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ApiRoute<E = ()> {
     /// The `routing.api_key` selector the key matched, the URL route that
     /// carried it, or the App's fallback name: records name it as `provider`.
@@ -99,7 +99,7 @@ impl<'a> ApiKeys<'a> {
     }
 
     /// Checks each selector: a URL with `upstream`, any other with `named`;
-    /// then its proxy, and that no two URL routes overlap.
+    /// then its proxy, and that no two URL routes share a base.
     pub(crate) fn validate(
         &self,
         config: &Config,
@@ -114,7 +114,12 @@ impl<'a> ApiKeys<'a> {
             }
             config.validate_choice(choice)?;
         }
-        by_url::validate_routes(&self.url_routes())
+        self.validate_urls()
+    }
+
+    /// Checks that no two URL routes share a base.
+    pub(crate) fn validate_urls(&self) -> Result<()> {
+        by_url::validate_routes(self.urls().map(|(s, _)| s.as_str()))
     }
 
     /// The selectors that name a key, not an upstream URL.
@@ -123,23 +128,17 @@ impl<'a> ApiKeys<'a> {
         self.routes.iter().filter(move |(s, _)| !is_url(s))
     }
 
-    fn url_routes(&self) -> BTreeMap<String, Choice> {
-        self.routes
-            .iter()
-            .filter(|(s, _)| self.is_url(s))
-            .map(|(s, c)| (s.clone(), c.clone()))
-            .collect()
+    fn urls(&self) -> impl Iterator<Item = (&'a String, &'a Choice)> + use<'a> {
+        let is_url = self.is_url;
+        self.routes.iter().filter(move |(s, _)| is_url(s))
     }
 
     /// The URL route serving an explicit target: its selector, proxy and
     /// upstream.
     pub(crate) fn url_route(&self, target: &str) -> Result<Option<(String, Choice, Url)>> {
-        let routes = self.url_routes();
-        let Some((selector, choice)) = by_url::match_route(&routes, target)? else {
-            return Ok(None);
-        };
-        let upstream = by_url::validate_upstream(selector)?;
-        Ok(Some((selector.to_owned(), choice.clone(), upstream)))
+        let routes = self.urls().map(|(s, c)| (s.as_str(), c));
+        Ok(by_url::match_route(routes, target)?
+            .map(|(selector, choice, upstream)| (selector.to_owned(), choice.clone(), upstream)))
     }
 
     /// Display classification: a URL route is a gateway.

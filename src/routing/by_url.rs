@@ -1,6 +1,6 @@
 //! Routing by explicitly configured API upstream URL.
-use crate::{Error, Result, config::Choice};
-use std::collections::{BTreeMap, HashSet};
+use crate::{Error, Result};
+use std::collections::HashSet;
 use url::Url;
 
 pub(crate) fn is_url_selector(value: &str) -> bool {
@@ -23,9 +23,10 @@ pub(crate) fn overlaps(a: &Url, b: &Url) -> bool {
     covers(&a, &b) || covers(&b, &a)
 }
 
-pub(crate) fn validate_routes(routes: &BTreeMap<String, Choice>) -> Result<()> {
+/// Rejects two URL selectors that normalize to the same base.
+pub(crate) fn validate_routes<'a>(bases: impl IntoIterator<Item = &'a str>) -> Result<()> {
     let mut seen = HashSet::new();
-    for base in routes.keys().filter(|s| is_url_selector(s)) {
+    for base in bases {
         let url = validate_upstream(base)?;
         if !seen.insert(url.as_str().trim_end_matches('/').to_owned()) {
             return Err(Error::config("Duplicate API upstream URL routes."));
@@ -34,34 +35,35 @@ pub(crate) fn validate_routes(routes: &BTreeMap<String, Choice>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn match_route<'a>(
-    routes: &'a BTreeMap<String, Choice>,
+/// The longest URL route base covering an explicit `/https://` target, with
+/// its validated upstream.
+pub(crate) fn match_route<'a, C>(
+    routes: impl IntoIterator<Item = (&'a str, C)>,
     target: &str,
-) -> Result<Option<(&'a str, &'a Choice)>> {
+) -> Result<Option<(&'a str, C, Url)>> {
     if !target.starts_with("/https://") {
         return Ok(None);
     }
     let dest =
         Url::parse(&target[1..]).map_err(|_| Error::new(400, "Invalid explicit API target."))?;
-    let mut selected: Option<(&str, &Choice, usize)> = None;
-    for (base, choice) in routes.iter().filter(|(s, _)| is_url_selector(s)) {
+    let mut selected: Option<(&str, C, Url, usize)> = None;
+    for (base, choice) in routes {
         let url = validate_upstream(base)?;
         let root = url.path().trim_end_matches('/');
-        if dest.scheme() == url.scheme()
+        let length = root.len();
+        let covers = dest.scheme() == url.scheme()
             && dest.host_str() == url.host_str()
             && dest.port_or_known_default() == url.port_or_known_default()
-            && (dest.path() == root || dest.path().starts_with(&format!("{root}/")))
-            && selected.is_none_or(|(_, _, length)| root.len() > length)
-        {
-            selected = Some((base, choice, root.len()));
+            && (dest.path() == root || dest.path().starts_with(&format!("{root}/")));
+        if covers && selected.as_ref().is_none_or(|s| length > s.3) {
+            selected = Some((base, choice, url, length));
         }
     }
-    if let Some((base, choice, _)) = selected {
-        let normalized = validate_upstream(base)?;
-        crate::routing::upstream_url(normalized.as_str(), target, false)?;
-        return Ok(Some((base, choice)));
-    }
-    Ok(None)
+    let Some((base, choice, url, _)) = selected else {
+        return Ok(None);
+    };
+    crate::routing::upstream_url(url.as_str(), target, false)?;
+    Ok(Some((base, choice, url)))
 }
 
 // A public IP is allowed only as a configured API route destination. This
@@ -105,6 +107,15 @@ pub(crate) fn validate_upstream(value: &str) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Choice;
+    use std::collections::BTreeMap;
+
+    fn urls(routes: &BTreeMap<String, Choice>) -> impl Iterator<Item = (&str, &Choice)> {
+        routes.iter().map(|(s, c)| (s.as_str(), c))
+    }
+    fn bases<'a>(bases: &[&'a str]) -> impl Iterator<Item = &'a str> {
+        bases.iter().copied()
+    }
     #[test]
     fn schemeless_routes_default_to_https_and_detect_equivalent_duplicates() {
         for (input, normalized) in [
@@ -126,19 +137,19 @@ mod tests {
         }
         let routes = BTreeMap::from([("api.example.com/v1".into(), Choice::direct())]);
         assert!(
-            match_route(&routes, "/https://api.example.com/v1/responses")
+            match_route(urls(&routes), "/https://api.example.com/v1/responses")
                 .unwrap()
                 .is_some()
         );
         assert!(
-            match_route(&routes, "/https://api.example.com/v1-evil/responses")
+            match_route(urls(&routes), "/https://api.example.com/v1-evil/responses")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            validate_routes(&BTreeMap::from([
-                ("api.example.com/v1".into(), Choice::direct()),
-                ("https://api.example.com:443/v1/".into(), Choice::direct()),
+            validate_routes(bases(&[
+                "api.example.com/v1",
+                "https://api.example.com:443/v1/"
             ]))
             .is_err()
         );
@@ -167,7 +178,7 @@ mod tests {
             ("/v1-other/responses", "jp"),
         ] {
             assert_eq!(
-                match_route(&routes, &format!("/https://api.example.com{path}"))
+                match_route(urls(&routes), &format!("/https://api.example.com{path}"))
                     .unwrap()
                     .unwrap()
                     .1
@@ -176,7 +187,7 @@ mod tests {
             );
         }
         assert!(
-            match_route(&routes, "/https://api.example.com:8443/v1/responses")
+            match_route(urls(&routes), "/https://api.example.com:8443/v1/responses")
                 .unwrap()
                 .is_none()
         );
@@ -188,15 +199,18 @@ mod tests {
             ("https://api.invalid/v1/special".into(), Choice::direct()),
         ]);
         assert_eq!(
-            match_route(&routes, "/https://api.invalid/v1/responses?stream=true")
-                .unwrap()
-                .unwrap()
-                .1
-                .label(),
+            match_route(
+                urls(&routes),
+                "/https://api.invalid/v1/responses?stream=true"
+            )
+            .unwrap()
+            .unwrap()
+            .1
+            .label(),
             "jp"
         );
         assert_eq!(
-            match_route(&routes, "/https://api.invalid/v1/special/responses")
+            match_route(urls(&routes), "/https://api.invalid/v1/special/responses")
                 .unwrap()
                 .unwrap()
                 .1
@@ -209,10 +223,10 @@ mod tests {
             "/https://evil.invalid/v1/responses",
             "/v1/responses",
         ] {
-            assert!(match_route(&routes, target).unwrap().is_none());
+            assert!(match_route(urls(&routes), target).unwrap().is_none());
         }
-        assert!(match_route(&routes, "/https://api.invalid/v1/%2e%2e/v1/responses").is_err());
-        assert!(match_route(&routes, "/https://secret@api.invalid/v1/responses").is_err());
+        assert!(match_route(urls(&routes), "/https://api.invalid/v1/%2e%2e/v1/responses").is_err());
+        assert!(match_route(urls(&routes), "/https://secret@api.invalid/v1/responses").is_err());
     }
     #[test]
     fn explicit_routes_accept_public_ips_and_reject_invalid_or_duplicate_bases() {
@@ -230,9 +244,9 @@ mod tests {
             assert!(validate_upstream(base).is_err(), "{base}");
         }
         assert!(
-            validate_routes(&BTreeMap::from([
-                ("https://api.invalid/v1/".into(), Choice::direct()),
-                ("https://api.invalid:443/v1".into(), Choice::direct()),
+            validate_routes(bases(&[
+                "https://api.invalid/v1/",
+                "https://api.invalid:443/v1"
             ]))
             .is_err()
         );

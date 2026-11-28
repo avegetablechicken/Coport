@@ -124,7 +124,7 @@ impl Config {
         target.app(|rest, claude_scoped| {
             let claude = self.claude.url_route_matches(rest)?;
             let codex = !claude_scoped
-                && crate::routing::by_url::match_route(&self.codex.routing.api_key, rest)?.is_some();
+                && self.codex.api_keys().url_route(rest)?.is_some();
             let antigravity = !claude_scoped && self.antigravity.url_route_matches(rest)?;
             let grok = !claude_scoped && self.grok.url_route_matches(rest)?;
             match (claude, codex, antigravity, grok) {

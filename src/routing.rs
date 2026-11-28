@@ -3,7 +3,7 @@ use url::Url;
 
 pub mod accounts;
 pub mod api_keys;
-pub mod by_url;
+pub(crate) mod by_url;
 pub mod target;
 
 /// The app a proxied request belongs to. The proxy decides it once from the
