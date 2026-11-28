@@ -19,7 +19,7 @@ mod platform;
 mod single_instance;
 mod tray;
 
-use coport_gui::{logs, proxy, settings, traffic, traffic_identity};
+use coport_gui::{logs, proxy, settings, traffic};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -36,7 +36,7 @@ pub struct AppState {
     pub core: Mutex<core::Core>,
     pub forwarding: coport_gui::forwarding::Forwarding,
     /// Peers' last summaries, shared by every traffic read.
-    pub peers: coport_gui::traffic_read::Peers,
+    pub peers: coport_gui::traffic::read::Peers,
 }
 
 /// The Device list is kept in the GUI's preferences.

@@ -564,7 +564,7 @@ pub fn read_summary(dir: &Path, services: ReaderServices) -> io::Result<Summary>
     let config = Config::read(&config_path).map_err(io::Error::other)?;
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
-    let assignments = crate::traffic_identity::Compatibility::assignments_in(dir);
+    let assignments = crate::traffic::identity::Compatibility::assignments_in(dir);
     let bytes = publish(&config, &log, &key, &node, &assignments).map_err(io::Error::other)?;
     let mut summary: Summary = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     summary.only_for(services);
@@ -597,7 +597,7 @@ fn stream_summary_at(
     let config = Config::read(&config_path).map_err(io::Error::other)?;
     let key = identity_key(dir, false)?;
     let node = read_node_id(dir)?;
-    let assignments = crate::traffic_identity::Compatibility::assignments_in(dir);
+    let assignments = crate::traffic::identity::Compatibility::assignments_in(dir);
     let first = publish_selected(
         &config,
         &log,
@@ -625,7 +625,7 @@ fn publish_selected(
     log: &Path,
     key: &DataKey,
     node: &str,
-    assignments: &[crate::traffic_identity::TrafficAssignment],
+    assignments: &[crate::traffic::identity::TrafficAssignment],
     (minutes, scope): (u64, crate::traffic::TrafficScope),
     end: i64,
 ) -> Result<Vec<u8>, String> {
@@ -749,7 +749,7 @@ pub async fn start(config: Config, dir: &Path, log: PathBuf) -> io::Result<Runni
                     let (config,log,identity,node,shared,dir)=(config.clone(),log.clone(),identity.clone(),node_id.clone(),shared.clone(),dir.clone());
                     tasks.spawn(async move {
                         // Read each time: the panel's choices apply to the next summary.
-                        if let Ok(Ok(bytes))=tokio::task::spawn_blocking(move||publish(&config,&log,&identity,&node,&crate::traffic_identity::Compatibility::assignments_in(&dir))).await {
+                        if let Ok(Ok(bytes))=tokio::task::spawn_blocking(move||publish(&config,&log,&identity,&node,&crate::traffic::identity::Compatibility::assignments_in(&dir))).await {
                             *shared.write().await=Some((Instant::now(),Arc::new(bytes)));
                         }
                         true
@@ -781,7 +781,7 @@ pub(crate) fn publish(
     log: &Path,
     key: &DataKey,
     node: &str,
-    assignments: &[crate::traffic_identity::TrafficAssignment],
+    assignments: &[crate::traffic::identity::TrafficAssignment],
 ) -> Result<Vec<u8>, String> {
     let end = chrono::Utc::now().timestamp_millis() / 60_000 * 60_000;
     publish_at(config, log, key, node, assignments, end)
@@ -791,7 +791,7 @@ fn publish_at(
     log: &Path,
     key: &DataKey,
     node: &str,
-    assignments: &[crate::traffic_identity::TrafficAssignment],
+    assignments: &[crate::traffic::identity::TrafficAssignment],
     end: i64,
 ) -> Result<Vec<u8>, String> {
     // Keep two previous boundaries so clock offsets and cached HTTP responses

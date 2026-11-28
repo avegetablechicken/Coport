@@ -5,8 +5,6 @@ pub mod daemon_lifecycle;
 pub mod data_api;
 pub mod data_client;
 pub mod data_migration;
-pub mod device_capabilities;
-mod device_events;
 pub mod devices;
 pub mod forwarding;
 pub mod logs;
@@ -17,9 +15,6 @@ pub mod settings;
 
 pub mod tasks;
 pub mod traffic;
-pub mod traffic_identity;
-pub mod traffic_read;
-pub mod traffic_stats;
 
 #[cfg(test)]
 mod test_support;

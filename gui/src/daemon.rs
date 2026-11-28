@@ -116,7 +116,7 @@ enum Action {
         scope: crate::traffic::TrafficScope,
     },
     ForwardingSummary,
-    RecordDeviceQuery(crate::device_events::QueryEvent),
+    RecordDeviceQuery(crate::devices::events::QueryEvent),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -137,7 +137,7 @@ enum Response {
     CredentialLabels(Vec<((String, String), String)>),
     Recorded,
     ForwardingSet,
-    DeviceCapabilities(Vec<crate::device_capabilities::Status>),
+    DeviceCapabilities(Vec<crate::devices::capabilities::Status>),
     ForwardingTraffic(Box<crate::remote_forward::RemoteWindow>),
     ForwardingSummary(Option<Box<crate::remote_forward::RemoteSummary>>),
     Error(String),
@@ -203,7 +203,9 @@ impl Client {
         }
     }
 
-    pub async fn device_capabilities(&self) -> io::Result<Vec<crate::device_capabilities::Status>> {
+    pub async fn device_capabilities(
+        &self,
+    ) -> io::Result<Vec<crate::devices::capabilities::Status>> {
         match self
             .request_async(Action::DeviceCapabilities, STATUS_TIMEOUT)
             .await?
@@ -219,7 +221,7 @@ impl Client {
     pub async fn device_checks(
         &self,
         devices: Vec<crate::remote::Device>,
-    ) -> io::Result<Vec<crate::device_capabilities::Status>> {
+    ) -> io::Result<Vec<crate::devices::capabilities::Status>> {
         match self
             .request_async(Action::DeviceChecks { devices }, STATUS_TIMEOUT)
             .await?
@@ -402,7 +404,7 @@ impl Client {
 
     pub(crate) fn record_device_query(
         &self,
-        event: crate::device_events::QueryEvent,
+        event: crate::devices::events::QueryEvent,
     ) -> io::Result<()> {
         match self.request(Action::RecordDeviceQuery(event), STATUS_TIMEOUT)? {
             Response::Recorded => Ok(()),
@@ -1397,10 +1399,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_signal, daemon) = serve_in_thread(dir.path());
         let (client, status) = wait_for_daemon(dir.path());
-        let event = crate::device_events::QueryEvent {
+        let event = crate::devices::events::QueryEvent {
             device_id: uuid::Uuid::new_v4().to_string(),
-            transport: crate::device_events::Protocol::Ssh,
-            outcome: crate::device_events::Outcome::Succeeded,
+            transport: crate::devices::events::Protocol::Ssh,
+            outcome: crate::devices::events::Outcome::Succeeded,
             duration_ms: 42,
             query_count: 1,
         };

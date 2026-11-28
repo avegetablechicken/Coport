@@ -1,7 +1,11 @@
 //! Activity traffic is read from retained logs, independently of the capped UI list.
+pub mod identity;
+pub mod read;
+pub mod stats;
+
 use crate::logs::Entry;
-use crate::traffic_identity::{Identities, Reason, Resolution, Source, UNIDENTIFIED};
-use crate::traffic_stats::count;
+use crate::traffic::identity::{Identities, Reason, Resolution, Source, UNIDENTIFIED};
+use crate::traffic::stats::count;
 use chrono::{DateTime, Local};
 use coport::routing::Service;
 use serde::{Deserialize, Serialize};
@@ -696,7 +700,7 @@ struct CredentialTraffic {
     source_counts: BTreeMap<Source, (Option<Reason>, u64)>,
 }
 impl CredentialTraffic {
-    fn into_account(self) -> crate::traffic_stats::Account {
+    fn into_account(self) -> crate::traffic::stats::Account {
         let sources = self
             .source_counts
             .into_iter()
@@ -707,7 +711,7 @@ impl CredentialTraffic {
                 requests,
             })
             .collect();
-        crate::traffic_stats::Account::new(self.service, self.credential, sources, self.stats)
+        crate::traffic::stats::Account::new(self.service, self.credential, sources, self.stats)
     }
 }
 
@@ -717,7 +721,7 @@ pub fn read(
     labels: &BTreeMap<(String, String), String>,
     scope: TrafficScope,
     identities: &Identities,
-) -> Result<crate::traffic_stats::View, String> {
+) -> Result<crate::traffic::stats::View, String> {
     read_at(
         ReadSource::Path(path),
         minutes,
@@ -734,7 +738,7 @@ fn read_at(
     scope: TrafficScope,
     identities: &Identities,
     end: i64,
-) -> Result<crate::traffic_stats::View, String> {
+) -> Result<crate::traffic::stats::View, String> {
     let bucket_minutes = match minutes {
         30 => 1,
         360 => 15,
@@ -765,9 +769,9 @@ fn read_at(
             resolved,
         );
     }
-    Ok(crate::traffic_stats::View::counted_here(
+    Ok(crate::traffic::stats::View::counted_here(
         scope,
-        crate::traffic_stats::Window {
+        crate::traffic::stats::Window {
             start,
             end,
             bucket_minutes,
@@ -854,7 +858,7 @@ fn aggregate(
         .or_insert_with(|| CredentialTraffic {
             service,
             credential,
-            stats: crate::traffic_stats::empty(bucket_count),
+            stats: crate::traffic::stats::empty(bucket_count),
             source_counts: BTreeMap::new(),
         });
     if let Some((source, reason)) = source {
@@ -1080,7 +1084,7 @@ pub(crate) struct ExportIdentities {
 impl ExportIdentities {
     pub(crate) fn from_config(
         config: &coport::config::Config,
-        assignments: &[crate::traffic_identity::TrafficAssignment],
+        assignments: &[crate::traffic::identity::TrafficAssignment],
     ) -> Self {
         let identities = Identities::from_config(config, assignments);
         let config = config.clone();
@@ -1338,7 +1342,7 @@ fn finish_export(window: ExportWindow) -> Vec<crate::data_api::Group> {
                     .and_then(|refs| refs.into_iter().next().flatten()),
                 stats: {
                     let mut stats = g.stats;
-                    crate::traffic_stats::reported(&mut stats, scope);
+                    crate::traffic::stats::reported(&mut stats, scope);
                     stats
                 },
             }
@@ -1856,7 +1860,7 @@ mod tests {
                         .and_then(|refs| refs.into_iter().next().flatten()),
                     stats: {
                         let mut stats = g.stats;
-                        crate::traffic_stats::reported(&mut stats, scope);
+                        crate::traffic::stats::reported(&mut stats, scope);
                         stats
                     },
                 }
@@ -2628,7 +2632,7 @@ mod tests {
     }
 
     fn logged_sources(
-        group: &crate::traffic_stats::Account,
+        group: &crate::traffic::stats::Account,
     ) -> Vec<(&str, Option<&str>, Option<Reason>)> {
         group
             .sources
@@ -2644,11 +2648,11 @@ mod tests {
         let home = serde_json::to_string(dir.path()).unwrap();
         let config = coport::config::Config::parse(&format!("listen_port: 8787\nrequest_timeout_seconds: 3\ncodex:\n  homes: [{home}]\n  routing:\n    api_key: {{main: none, twinA: none, twinB: none}}\n")).unwrap();
         let assign = |name: &str, base: Option<&str>, target: Option<(&str, &str)>| {
-            crate::traffic_identity::TrafficAssignment {
+            crate::traffic::identity::TrafficAssignment {
                 service: "Codex".into(),
                 name: name.into(),
                 base: base.map(Into::into),
-                target: target.map(|(name, base)| crate::traffic_identity::TrafficTarget {
+                target: target.map(|(name, base)| crate::traffic::identity::TrafficTarget {
                     name: name.into(),
                     base: base.into(),
                 }),
@@ -2766,7 +2770,7 @@ mod tests {
         minutes: u64,
         labels: &BTreeMap<(String, String), String>,
         scope: TrafficScope,
-    ) -> Result<crate::traffic_stats::View, String> {
+    ) -> Result<crate::traffic::stats::View, String> {
         super::read(path, minutes, labels, scope, &Default::default())
     }
 
@@ -4059,11 +4063,11 @@ mod tests {
         // The user's choice for it applies.
         let assigned = Identities::from_config(
             &config,
-            &[crate::traffic_identity::TrafficAssignment {
+            &[crate::traffic::identity::TrafficAssignment {
                 service: "Antigravity".into(),
                 name: "OLD_GEMINI_KEY".into(),
                 base: Some(api.into()),
-                target: Some(crate::traffic_identity::TrafficTarget {
+                target: Some(crate::traffic::identity::TrafficTarget {
                     name: "relay.example.com/gemini".into(),
                     base: "https://relay.example.com/gemini".into(),
                 }),

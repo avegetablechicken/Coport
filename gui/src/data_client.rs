@@ -162,7 +162,7 @@ pub struct SourceState {
     #[serde(skip)]
     fetched_exclusion: Option<SourceExclusion>,
     error: Option<String>,
-    traffic: Option<crate::traffic_stats::View>,
+    traffic: Option<crate::traffic::stats::View>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,7 +175,7 @@ pub struct Merged {
     pub bucket_minutes: u64,
     /// This device's traffic, in the frame of the range the panel asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<crate::traffic_stats::View>,
+    pub local: Option<crate::traffic::stats::View>,
     /// Why this device's traffic could not be read for that frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_error: Option<String>,
@@ -184,13 +184,13 @@ pub struct Merged {
     pub forwarded: Option<LiveDevice>,
     /// Merged Traffic: this device and every other device, each given once.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub traffic: Option<crate::traffic_stats::View>,
+    pub traffic: Option<crate::traffic::stats::View>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveDevice {
     pub device: String,
-    pub traffic: crate::traffic_stats::View,
+    pub traffic: crate::traffic::stats::View,
 }
 impl Merged {
     /// Completes this range's frame with this device's traffic and the
@@ -202,7 +202,7 @@ impl Merged {
     pub fn with_devices(
         &mut self,
         node_id: &str,
-        local: Result<&crate::traffic_stats::View, &str>,
+        local: Result<&crate::traffic::stats::View, &str>,
         forwarded: Option<&ForwardedTraffic>,
     ) {
         let live_id = forwarded.map(|live| live.device_id.as_str());
@@ -240,7 +240,7 @@ impl Merged {
                 .filter(|source| live.is_none() || source.device_id.as_deref() != live_id)
                 .filter(|source| source.included)
                 .filter_map(|source| source.traffic.as_ref());
-            crate::traffic_stats::merge(
+            crate::traffic::stats::merge(
                 std::iter::once(local)
                     .chain(live.map(|live| &live.traffic))
                     .chain(peers),
@@ -252,10 +252,10 @@ impl Merged {
 /// their label, and every unlabelled upstream of a service is one Unidentified.
 fn traffic_view(
     groups: &[MergedGroup],
-    window: crate::traffic_stats::Window,
+    window: crate::traffic::stats::Window,
     scope: crate::traffic::TrafficScope,
-) -> crate::traffic_stats::View {
-    let mut accounts = BTreeMap::<(Service, String), crate::traffic_stats::Account>::new();
+) -> crate::traffic::stats::View {
+    let mut accounts = BTreeMap::<(Service, String), crate::traffic::stats::Account>::new();
     for group in groups {
         let identity = if group.anonymous_upstream {
             "unidentified".into()
@@ -265,16 +265,16 @@ fn traffic_view(
         let account = accounts
             .entry((group.service, identity))
             .or_insert_with(|| {
-                crate::traffic_stats::Account::new(
+                crate::traffic::stats::Account::new(
                     group.service,
                     group.upstream.clone(),
                     Vec::new(),
-                    crate::traffic_stats::empty(window.buckets()),
+                    crate::traffic::stats::empty(window.buckets()),
                 )
             });
-        crate::traffic_stats::add(&mut account.stats, &group.stats);
+        crate::traffic::stats::add(&mut account.stats, &group.stats);
     }
-    crate::traffic_stats::View::reported_by_peer(scope, window, accounts.into_values().collect())
+    crate::traffic::stats::View::reported_by_peer(scope, window, accounts.into_values().collect())
 }
 fn selected_groups(
     summary: &Summary,
@@ -332,7 +332,7 @@ async fn fetch_sources(
             let started = std::time::Instant::now();
             let result = summaries.complete(&source).await;
             let elapsed = started.elapsed();
-            crate::device_events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
+            crate::devices::events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
             (source, result)
         });
     }
@@ -362,7 +362,7 @@ fn known_configurations(config: &Config) -> KnownConfigs {
     ] {
         upstreams.insert(canonical(url), name.into());
     }
-    let targets = crate::traffic_identity::Identities::from_config(config, &[]).targets();
+    let targets = crate::traffic::identity::Identities::from_config(config, &[]).targets();
     if let Ok(serde_json::Value::Array(targets)) = serde_json::to_value(targets) {
         for target in targets {
             if let (Some(base), Some(name)) = (
@@ -433,7 +433,7 @@ fn add_groups(
             anonymous_upstream: upstream.is_none(),
             stats: Stats::default(),
         });
-        crate::traffic_stats::add(&mut group.stats, stats);
+        crate::traffic::stats::add(&mut group.stats, stats);
     }
 }
 /// The forwarded device's traffic, labelled as Devices labels that device.
@@ -452,7 +452,7 @@ pub struct ForwardedTraffic {
     window_start: i64,
     window_end: i64,
     bucket_minutes: u64,
-    traffic: crate::traffic_stats::View,
+    traffic: crate::traffic::stats::View,
 }
 pub async fn forwarded_traffic(
     remote: crate::remote_forward::RemoteWindow,
@@ -483,7 +483,7 @@ pub async fn forwarded_traffic(
         bucket_minutes: bucket,
         traffic: traffic_view(
             &groups.into_values().collect::<Vec<_>>(),
-            crate::traffic_stats::Window {
+            crate::traffic::stats::Window {
                 start: window.window_start,
                 end: window.window_end,
                 bucket_minutes: bucket,
@@ -864,7 +864,7 @@ async fn merge_progressive_snapshot(
                 })
                 .await;
             let elapsed = started.elapsed();
-            crate::device_events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
+            crate::devices::events::record(&daemon, log, &source, result.is_ok(), elapsed).await;
             if let Err(error) = result {
                 let _ = tx.send((index, Err(error)));
             }
@@ -976,7 +976,7 @@ async fn prepare_merge_range(device: ThisDevice, minutes: u64) -> Result<MergeCo
         })
         .collect();
     let references = config.traffic_provider_references().await;
-    let identities = crate::traffic_identity::Identities::from_config(&config, &[]);
+    let identities = crate::traffic::identity::Identities::from_config(&config, &[]);
     for provider in &references {
         if let Some(label) = identities.provider_label(provider) {
             accounts.entry(provider.reference.clone()).or_insert(label);
@@ -1141,7 +1141,7 @@ fn merge_fetched(
     end: i64,
 ) -> Result<Merged, String> {
     let bucket = crate::data_api::bucket_minutes(minutes).ok_or("Unsupported traffic range")?;
-    let window = crate::traffic_stats::Window {
+    let window = crate::traffic::stats::Window {
         start: end - minutes as i64 * 60_000,
         end,
         bucket_minutes: bucket,
@@ -1223,10 +1223,10 @@ mod tests {
         }
     }
     /// A peer's Model traffic over `buckets` one-minute buckets.
-    fn traffic_view(groups: &[MergedGroup], buckets: usize) -> crate::traffic_stats::View {
+    fn traffic_view(groups: &[MergedGroup], buckets: usize) -> crate::traffic::stats::View {
         super::traffic_view(
             groups,
-            crate::traffic_stats::Window {
+            crate::traffic::stats::Window {
                 start: 0,
                 end: buckets as i64 * 60_000,
                 bucket_minutes: 1,
@@ -1235,15 +1235,15 @@ mod tests {
         )
     }
     fn empty_stats(buckets: usize) -> Stats {
-        crate::traffic_stats::empty(buckets)
+        crate::traffic::stats::empty(buckets)
     }
     fn add_stats(to: &mut Stats, from: &Stats) {
-        crate::traffic_stats::add(to, from)
+        crate::traffic::stats::add(to, from)
     }
 
     #[test]
     fn merged_traffic_counts_each_device_once_with_the_forwarded_one_live() {
-        use crate::traffic_stats::{Account, View, Window};
+        use crate::traffic::stats::{Account, View, Window};
         let window = Window {
             start: 0,
             end: 60_000,
@@ -1748,7 +1748,7 @@ mod tests {
         labels: &BTreeMap<(String, String), String>,
         minutes: u64,
     ) -> serde_json::Value {
-        let identities = crate::traffic_identity::Identities::from_config(config, &[]);
+        let identities = crate::traffic::identity::Identities::from_config(config, &[]);
         serde_json::to_value(
             crate::traffic::read(
                 log,
@@ -2700,7 +2700,7 @@ mod tests {
                 .iter()
                 .find(|g| g.credential == label)
                 .unwrap();
-            assert_ne!(matched.credential, crate::traffic_identity::UNIDENTIFIED);
+            assert_ne!(matched.credential, crate::traffic::identity::UNIDENTIFIED);
             assert_eq!(group["requests"], matched.stats.requests);
             assert_eq!(group["bytes"], matched.stats.bytes);
         }

@@ -1,4 +1,7 @@
 //! One settings record per device for read-only statistics.
+pub mod capabilities;
+pub(crate) mod events;
+
 use serde::{Deserialize, Serialize};
 
 pub const LIMIT: usize = 32;

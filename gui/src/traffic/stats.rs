@@ -2,8 +2,8 @@
 //! traffic is described, and how every device's traffic adds up to Merged
 //! Traffic. Totals add; metrics are derived once, after the totals are summed.
 use crate::data_api::{Service, Stats};
+use crate::traffic::identity::{Target, UNIDENTIFIED};
 use crate::traffic::{SourceTraffic, TrafficScope};
-use crate::traffic_identity::{Target, UNIDENTIFIED};
 use serde::Serialize;
 
 /// The time a view covers, in epoch milliseconds, and its bucket width.

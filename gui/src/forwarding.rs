@@ -4,8 +4,7 @@
 //! daemon, the forwarding preferences are changed on disk for the next one.
 use crate::{
     daemon,
-    device_capabilities::Status as Checked,
-    devices::{Device, Draft},
+    devices::{Device, Draft, capabilities::Status as Checked},
     remote_forward::{Routing, Status, Target},
 };
 use std::{io, path::PathBuf};

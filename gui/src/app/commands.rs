@@ -7,7 +7,7 @@ use crate::{
     core::{ActivityDto, Snapshot},
     panel, platform,
     settings::Appearance,
-    traffic_identity::{Compatibility, TrafficTarget},
+    traffic::identity::{Compatibility, TrafficTarget},
     tray,
 };
 use serde::Deserialize;
@@ -202,7 +202,7 @@ pub async fn get_traffic(
     state: State<'_, AppState>,
     minutes: u64,
     scope: Option<crate::traffic::TrafficScope>,
-) -> Result<coport_gui::traffic_stats::View> {
+) -> Result<coport_gui::traffic::stats::View> {
     traffic_inputs(&state)
         .await
         .local(minutes, scope.unwrap_or_default())
@@ -211,7 +211,7 @@ pub async fn get_traffic(
 
 /// One snapshot of what a traffic read reads. Only credential labels
 /// already known are read; reading traffic never starts an account probe.
-async fn traffic_inputs(state: &AppState) -> coport_gui::traffic_read::Inputs {
+async fn traffic_inputs(state: &AppState) -> coport_gui::traffic::read::Inputs {
     let (config, log, sources, tasks) = {
         let mut core = state.core.lock().unwrap();
         core.refresh_config();
@@ -222,7 +222,7 @@ async fn traffic_inputs(state: &AppState) -> coport_gui::traffic_read::Inputs {
             core.account_tasks(),
         )
     };
-    coport_gui::traffic_read::Inputs::take(
+    coport_gui::traffic::read::Inputs::take(
         coport_gui::settings::app_dir(),
         config,
         log,
@@ -584,7 +584,7 @@ pub async fn set_forwarding_restore(state: State<'_, AppState>, enabled: bool) -
 #[tauri::command]
 pub async fn get_device_capabilities(
     state: State<'_, AppState>,
-) -> Result<Vec<coport_gui::device_capabilities::Status>> {
+) -> Result<Vec<coport_gui::devices::capabilities::Status>> {
     state.forwarding.checks(&*state).await
 }
 #[tauri::command]

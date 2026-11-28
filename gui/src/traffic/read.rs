@@ -7,9 +7,11 @@ use crate::{
     daemon,
     data_client::{self, ForwardedTraffic, MergeCache, Merged, Source, ThisDevice},
     tasks::Tasks,
-    traffic::TrafficScope,
-    traffic_identity::{Compatibility, Identities, TrafficAssignment},
-    traffic_stats::View,
+    traffic::{
+        TrafficScope,
+        identity::{Compatibility, Identities, TrafficAssignment},
+        stats::View,
+    },
 };
 use coport::config::Config;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -382,7 +384,7 @@ mod tests {
         let mut choices = Compatibility::default();
         choices.assign("Codex".into(), "old".into(), None, Some(None));
         choices
-            .save(&dir.path().join(crate::traffic_identity::FILE))
+            .save(&dir.path().join(crate::traffic::identity::FILE))
             .unwrap();
         let take = |dir: &std::path::Path| {
             Inputs::take(

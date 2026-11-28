@@ -990,7 +990,7 @@ struct TrafficCompatibilityDto {
 impl TrafficCompatibilityDto {
     fn read() -> Self {
         let path = crate::settings::traffic_compatibility_path();
-        let loaded = crate::traffic_identity::Compatibility::load(&path);
+        let loaded = crate::traffic::identity::Compatibility::load(&path);
         Self {
             exists: path.is_file(),
             choices: loaded.as_ref().map_or(0, |file| file.assignments.len()),
