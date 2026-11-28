@@ -267,7 +267,11 @@ mod tests {
             serde_json::to_string(dir.path()).unwrap()
         ))
         .unwrap();
-        let route = c.resolve(Some("Bearer plain-key"), false).await.unwrap();
+        let route = c
+            .resolve(Some("Bearer plain-key"), false)
+            .await
+            .unwrap()
+            .api();
         assert_eq!(route.upstream, c.codex.base_url.api_key);
         assert!(!route.custom_upstream);
     }
@@ -302,7 +306,8 @@ mod tests {
             let route = c
                 .resolve(Some(&format!("Bearer {token}")), false)
                 .await
-                .unwrap();
+                .unwrap()
+                .api();
             assert_eq!(route.upstream, upstream);
             // Own base_url: native TLS, as for explicit URL routes.
             assert!(route.custom_upstream);
@@ -346,7 +351,7 @@ mod tests {
             c.resolve(Some("Bearer saved-b"), false)
                 .await
                 .unwrap()
-                .upstream,
+                .upstream(),
             "https://b.example.com/v1"
         );
     }

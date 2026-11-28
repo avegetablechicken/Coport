@@ -312,7 +312,7 @@ async fn codex_provider_edits_cannot_send_keys_to_account_paths_or_fallback() {
     )).unwrap();
     let auth = Some("Bearer test-provider-key");
     assert_eq!(
-        config.resolve(auth, true).await.unwrap().upstream,
+        config.resolve(auth, true).await.unwrap().upstream(),
         "https://upstream.invalid/v1"
     );
     write_provider("http://127.0.0.1:8787/https://chatgpt.com/backend-api");

@@ -305,17 +305,20 @@ impl Config {
                 }
             }
         }
-        for p in &self.codex.providers {
-            for credential in p
-                .credentials(&self.codex.base_url.api_key, true, &self.codex)
-                .await?
-            {
-                if !keys.insert(credential.token) {
-                    return Err(Error::config("Multiple routes have the same credential."));
-                }
-            }
-        }
-        Ok(())
+        let codex = &self.codex;
+        codex
+            .api_keys()
+            .check_distinct(&mut keys, |selector| async move {
+                let provider = crate::config::Provider {
+                    selector: selector.into(),
+                    proxy: crate::config::Choice::direct(),
+                };
+                let credentials = provider
+                    .credentials(&codex.base_url.api_key, true, codex)
+                    .await?;
+                Ok(credentials.into_iter().map(|c| c.token).collect())
+            })
+            .await
     }
 }
 
@@ -363,8 +366,7 @@ mod tests {
                 c.resolve(Some(&format!("Bearer {token}")), false)
                     .await
                     .unwrap()
-                    .account_id
-                    .as_deref(),
+                    .account_id(),
                 Some(account)
             );
         }
@@ -558,7 +560,8 @@ secret_auth_storage = false
         let route = config
             .resolve(Some(&format!("Bearer {token}")), true)
             .await
-            .unwrap();
+            .unwrap()
+            .account();
         assert_eq!(route.proxy.label(), "none");
         assert_eq!(route.account_label.as_deref(), Some("account-1"));
         let mut email_config = config.clone();
@@ -566,9 +569,10 @@ secret_auth_storage = false
         let route = email_config
             .resolve(Some(&format!("Bearer {token}")), true)
             .await
-            .unwrap();
+            .unwrap()
+            .account();
         assert_eq!(route.account_label.as_deref(), Some("profile@example.com"));
-        assert_eq!(route.account_id.as_deref(), Some("account-1"));
+        assert_eq!(route.account_id, "account-1");
         assert_eq!(route.proxy.label(), "other");
         email_config.codex.account_auth_file_only = true;
         assert!(
@@ -619,8 +623,7 @@ secret_auth_storage = false
             c.resolve(Some("Bearer token-b"), true)
                 .await
                 .unwrap()
-                .account_id
-                .as_deref(),
+                .account_id(),
             Some("b")
         );
         std::fs::write(&env, "SAVED_IDENTITY_TEST_KEY_5170=token-b\n").unwrap();
@@ -665,7 +668,7 @@ secret_auth_storage = false
                 c.resolve(Some(&format!("Bearer {token}")), true)
                     .await
                     .unwrap()
-                    .proxy
+                    .proxy()
                     .label(),
                 label
             );
@@ -678,7 +681,7 @@ secret_auth_storage = false
             c.resolve(Some("Bearer secret-a"), true)
                 .await
                 .unwrap()
-                .proxy
+                .proxy()
                 .label(),
             "none"
         );

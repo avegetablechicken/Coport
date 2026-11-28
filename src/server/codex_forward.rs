@@ -2,11 +2,12 @@
 //! URL route; OpenAI's docs MCP by a login when one is sent.
 use super::pipeline::{Adapter, Codex, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
+use crate::routing::Route;
 use hyper::http::request::Parts;
 
 /// A Codex Route: its credential's, or none for the docs MCP's fallback.
 pub(super) struct CodexRoute {
-    route: Option<crate::routing::Route>,
+    route: Option<Route>,
     proxy: Choice,
     docs: bool,
 }
@@ -29,19 +30,15 @@ impl Adapter for Codex {
             return Ok(Plan::Own(()));
         }
         let rest = target.rest();
-        if crate::routing::by_url::match_route(&server.config.codex.routing.api_key, rest)?
-            .is_some()
+        if let Some(route) = server
+            .config
+            .resolve_url(header(parts, "authorization"), rest)?
         {
-            if let Some(route) = server
-                .config
-                .resolve_url(header(parts, "authorization"), rest)?
-            {
-                return Ok(Plan::Route(CodexRoute {
-                    proxy: route.proxy.clone(),
-                    route: Some(route),
-                    docs: false,
-                }));
-            }
+            return Ok(Plan::Route(CodexRoute {
+                proxy: route.proxy().clone(),
+                route: Some(route),
+                docs: false,
+            }));
         }
         Ok(Plan::Account)
     }
@@ -98,8 +95,8 @@ impl Adapter for Codex {
         let path = target.rest().split('?').next().unwrap_or("");
         if path == MCP_PATH {
             return Ok(match server.config.resolve(auth, false).await {
-                Ok(r) if account.is_none() || account == r.account_id.as_deref() => CodexRoute {
-                    proxy: r.proxy.clone(),
+                Ok(r) if account.is_none() || account == r.account_id() => CodexRoute {
+                    proxy: r.proxy().clone(),
                     route: Some(r),
                     docs: true,
                 },
@@ -117,30 +114,24 @@ impl Adapter for Codex {
             });
         }
         let r = server.config.resolve(auth, true).await?;
-        if r.account_id.is_some() && account.is_some() && account != r.account_id.as_deref() {
+        if r.account_id().is_some() && account.is_some() && account != r.account_id() {
             return Err(Error::new(
                 409,
                 "Account changed; retry with the current login.",
             ));
         }
         Ok(CodexRoute {
-            proxy: r.proxy.clone(),
+            proxy: r.proxy().clone(),
             route: Some(r),
             docs: false,
         })
     }
 
     fn saved_login(pending: &CodexRoute) -> Option<&str> {
-        pending
-            .route
-            .as_ref()
-            .filter(|r| {
-                r.account_id.is_some()
-                    && r.provider.is_none()
-                    && !r.custom_upstream
-                    && !pending.docs
-            })
-            .map(|r| r.token.as_str())
+        match &pending.route {
+            Some(Route::Account(route)) if !pending.docs => Some(&route.token),
+            _ => None,
+        }
     }
 
     async fn complete(_: &Server, pending: CodexRoute, _: &mut RequestLog) -> Result<CodexRoute> {
@@ -148,20 +139,22 @@ impl Adapter for Codex {
     }
 
     fn record(_: &Server, route: &CodexRoute) -> RouteRecord {
-        let Some(r) = &route.route else {
-            return RouteRecord::default();
-        };
-        RouteRecord {
-            provider: r.provider.clone(),
-            upstream_base_url: Some(r.upstream.clone()),
-            credential_ref: r
-                .account_id
-                .is_none()
-                .then(|| crate::identity::shared_api_reference("Codex", &r.upstream, &r.token))
-                .flatten(),
-            account_id: r.account_id.clone(),
-            account_label: r.account_label.clone(),
-            configured: r.configured,
+        match &route.route {
+            None => RouteRecord::default(),
+            Some(Route::Account(r)) => RouteRecord {
+                upstream_base_url: Some(r.upstream.clone()),
+                account_id: Some(r.account_id.clone()),
+                account_label: r.account_label.clone(),
+                configured: r.configured,
+                ..Default::default()
+            },
+            // A provider's ChatGPT login is recorded by its account.
+            Some(Route::Api(r)) if r.ext.is_some() => RouteRecord {
+                credential_ref: None,
+                account_id: r.ext.clone(),
+                ..RouteRecord::api("Codex", r)
+            },
+            Some(Route::Api(r)) => RouteRecord::api("Codex", r),
         }
     }
 
@@ -197,16 +190,21 @@ impl Adapter for Codex {
                 url: Url::parse(&format!("{MCP_UPSTREAM}{}", &target[MCP_PATH.len()..]))
                     .map_err(|_| Error::config("Invalid MCP request target."))?,
                 proxy,
-                native_tls: route.as_ref().is_some_and(|r| r.custom_upstream),
+                native_tls: matches!(route, Some(Route::Api(ref r)) if r.custom_upstream),
                 credential: Credential::Docs,
                 cooldown: None,
                 renews: false,
                 claude_identity: None,
             });
         }
-        let r = route.unwrap();
-        let url = if let Some(method) = account_query_for_route(target, r.account_id.is_some()) {
-            if r.account_id.is_none() {
+        let route = route.unwrap();
+        let account = route.account_id().is_some();
+        let (token, account_id, upstream, custom_upstream, provider) = match route {
+            Route::Account(r) => (r.token, Some(r.account_id), r.upstream, false, false),
+            Route::Api(r) => (r.key, r.ext, r.upstream, r.custom_upstream, true),
+        };
+        let url = if let Some(method) = account_query_for_route(target, account) {
+            if !account {
                 return Err(Error::new(
                     403,
                     "Account usage queries require a matched ChatGPT login credential.",
@@ -222,10 +220,10 @@ impl Adapter for Codex {
                     },
                 ));
             }
-            query_url(&r.upstream, target)?
+            query_url(&upstream, target)?
         } else {
-            let url = upstream_url(&r.upstream, target, r.account_id.is_some())?;
-            if r.provider.is_some() {
+            let url = upstream_url(&upstream, target, account)?;
+            if provider {
                 server.config.codex.base_url.validate_api_upstream(&url)?;
             }
             url
@@ -233,11 +231,8 @@ impl Adapter for Codex {
         Ok(Relay {
             url,
             proxy,
-            native_tls: r.custom_upstream,
-            credential: Credential::Codex {
-                token: r.token,
-                account_id: r.account_id,
-            },
+            native_tls: custom_upstream,
+            credential: Credential::Codex { token, account_id },
             cooldown: None,
             renews: true,
             claude_identity: None,

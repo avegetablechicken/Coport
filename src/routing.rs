@@ -4,24 +4,89 @@ use crate::{
     config::{Choice, Config},
     identity::valid_token,
 };
+use api_keys::Read;
 use url::Url;
 
 pub mod api_keys;
 pub mod by_url;
 pub mod target;
 
+/// A Codex Route: by the ChatGPT login a token is, or by API key.
 #[derive(Clone)]
-pub struct Route {
+pub enum Route {
+    Account(AccountRoute),
+    Api(ProviderRoute),
+}
+
+/// A Codex API Key Route: a provider's, a URL route's or `fallback`'s. A
+/// provider whose saved login is a ChatGPT one names its account (`ext`).
+pub type ProviderRoute = api_keys::ApiRoute<Option<String>>;
+
+/// A Route by a ChatGPT login, to `base_url.account`.
+#[derive(Clone)]
+pub struct AccountRoute {
     pub token: String,
-    pub account_id: Option<String>,
+    pub account_id: String,
     pub account_label: Option<String>,
-    pub provider: Option<String>,
     pub proxy: Choice,
     pub upstream: String,
-    pub custom_upstream: bool,
-    /// The credential is one the configuration holds or maps, not one a
-    /// fallback or an unchecked URL route lets through.
+    /// A saved login, or an identity the routing maps; not one
+    /// `account_fallback` carries.
     pub configured: bool,
+}
+
+impl Route {
+    pub fn proxy(&self) -> &Choice {
+        match self {
+            Self::Account(route) => &route.proxy,
+            Self::Api(route) => &route.proxy,
+        }
+    }
+    pub fn upstream(&self) -> &str {
+        match self {
+            Self::Account(route) => &route.upstream,
+            Self::Api(route) => &route.upstream,
+        }
+    }
+    /// The ChatGPT account the Route's credential names.
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::Account(route) => Some(&route.account_id),
+            Self::Api(route) => route.ext.as_deref(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Route {
+    /// The account Route a test expects.
+    pub(crate) fn account(self) -> AccountRoute {
+        match self {
+            Self::Account(route) => route,
+            Self::Api(route) => panic!("API Key Route {}", route.selector),
+        }
+    }
+    /// The API Key Route a test expects.
+    pub(crate) fn api(self) -> ProviderRoute {
+        match self {
+            Self::Api(route) => route,
+            Self::Account(route) => panic!("account Route {}", route.account_id),
+        }
+    }
+}
+
+impl crate::config::Codex {
+    /// Codex's API Key Routes: a URL, or a provider ID or API Key
+    /// environment variable its homes define.
+    pub(crate) fn api_keys(&self) -> api_keys::ApiKeys<'_> {
+        api_keys::ApiKeys::new(
+            &self.routing.api_key,
+            api_keys::Texts {
+                ambiguous: "Bearer token matches multiple routes; configure distinct credentials.",
+                duplicate: "Multiple routes have the same credential.",
+            },
+        )
+    }
 }
 
 /// The app a proxied request belongs to. The proxy decides it once from the
@@ -58,25 +123,27 @@ impl Service {
 
 pub use target::logged_service;
 
+/// Two of Codex's routes take one token.
+const AMBIGUOUS: &str = "Bearer token matches multiple routes; configure distinct credentials.";
+
 impl Config {
     pub fn resolve_url(&self, authorization: Option<&str>, target: &str) -> Result<Option<Route>> {
-        let Some((base, proxy)) = by_url::match_route(&self.codex.routing.api_key, target)? else {
+        let Some((selector, proxy, upstream)) = self.codex.api_keys().url_route(target)? else {
             return Ok(None);
         };
         let token = authorization
             .and_then(|s| s.strip_prefix("Bearer "))
             .filter(|s| valid_token(s))
             .ok_or(Error::new(401, "An API Bearer token is required."))?;
-        Ok(Some(Route {
-            token: token.into(),
-            account_id: None,
-            account_label: None,
-            provider: Some(base.into()),
-            proxy: proxy.clone(),
-            upstream: by_url::validate_upstream(base)?.into(),
-            custom_upstream: true,
+        Ok(Some(Route::Api(ProviderRoute {
+            selector,
+            proxy,
+            upstream: upstream.into(),
+            key: token.into(),
             configured: false,
-        }))
+            custom_upstream: true,
+            ext: None,
+        })))
     }
 
     pub async fn resolve(&self, authorization: Option<&str>, fallback: bool) -> Result<Route> {
@@ -103,47 +170,33 @@ impl Config {
                 identities.push((i, None));
             }
         }
-        let mut matches = Vec::new();
-        for p in &self.codex.providers {
-            match p
-                .credentials(
-                    &self.codex.base_url.api_key,
-                    identities.is_empty(),
-                    &self.codex,
-                )
-                .await
-            {
-                Ok(credentials) => {
-                    for credential in credentials.into_iter().filter(|c| c.token == token) {
-                        // A provider with its own base_url is a third-party API, like
-                        // an explicit URL route: use native TLS for compatibility with
-                        // certificates rustls rejects (e.g. a self-signed CA as leaf).
-                        let custom_upstream = credential.upstream != self.codex.base_url.api_key;
-                        if custom_upstream {
-                            self.codex.base_url.validate_api_upstream(
-                                &by_url::validate_upstream(&credential.upstream)?,
-                            )?;
-                        }
-                        matches.push(Route {
-                            token: credential.token,
-                            account_id: credential.account_id,
-                            account_label: None,
-                            provider: Some(p.label().into()),
-                            proxy: p.proxy.clone(),
-                            upstream: credential.upstream,
-                            custom_upstream,
-                            configured: true,
-                        });
-                    }
-                }
-                Err(_) => unavailable = true,
-            }
-        }
-        if matches.len() + identities.len() > 1 {
-            return Err(Error::new(
-                409,
-                "Bearer token matches multiple routes; configure distinct credentials.",
-            ));
+        // A provider's credentials come from each home; one matching key
+        // with two upstreams is ambiguous.
+        let (codex, shell) = (&self.codex, identities.is_empty());
+        let found = codex
+            .api_keys()
+            .find(|selector| async move {
+                let provider = crate::config::Provider {
+                    selector: selector.into(),
+                    proxy: Choice::direct(),
+                };
+                let Ok(credentials) = provider
+                    .credentials(&codex.base_url.api_key, shell, codex)
+                    .await
+                else {
+                    return Ok(Read::Unavailable);
+                };
+                let mut matching = credentials.into_iter().filter(|c| c.token == token);
+                Ok(match (matching.next(), matching.next()) {
+                    (Some(credential), None) => Read::Match(credential),
+                    (None, _) => Read::Other,
+                    (Some(_), Some(_)) => return Err(Error::new(409, AMBIGUOUS)),
+                })
+            })
+            .await?;
+        unavailable |= found.unavailable;
+        if identities.len() + usize::from(found.named.is_some()) > 1 {
+            return Err(Error::new(409, AMBIGUOUS));
         }
         if let Some((i, source)) = identities.pop() {
             let proxy = self.account_choice(&i, source)?;
@@ -156,19 +209,34 @@ impl Config {
                 &i.usernames,
                 source.unwrap_or(""),
             );
-            return Ok(Route {
+            return Ok(Route::Account(AccountRoute {
                 token: i.token,
-                account_id: Some(i.account_id),
+                account_id: i.account_id,
                 account_label,
-                provider: None,
                 proxy,
                 upstream: self.codex.base_url.account.clone(),
-                custom_upstream: false,
                 configured,
-            });
+            }));
         }
-        if let Some(r) = matches.pop() {
-            return Ok(r);
+        if let Some((selector, proxy, credential)) = found.named {
+            // A provider with its own base_url is a third-party API, like
+            // an explicit URL route: use native TLS for compatibility with
+            // certificates rustls rejects (e.g. a self-signed CA as leaf).
+            let custom_upstream = credential.upstream != self.codex.base_url.api_key;
+            if custom_upstream {
+                self.codex
+                    .base_url
+                    .validate_api_upstream(&by_url::validate_upstream(&credential.upstream)?)?;
+            }
+            return Ok(Route::Api(ProviderRoute {
+                selector: selector.clone(),
+                proxy: proxy.clone(),
+                upstream: credential.upstream,
+                key: credential.token,
+                configured: true,
+                custom_upstream,
+                ext: credential.account_id,
+            }));
         }
         if self.codex.account_auth_file_only && Identity::from_token(token).is_some() {
             return Err(Error::new(
@@ -178,16 +246,15 @@ impl Config {
         }
         if fallback {
             if let Some(proxy) = &self.codex.routing.fallback {
-                return Ok(Route {
-                    token: token.into(),
-                    account_id: None,
-                    account_label: None,
-                    provider: Some("openai-fallback".into()),
+                return Ok(Route::Api(ProviderRoute {
+                    selector: "openai-fallback".into(),
                     proxy: proxy.clone(),
                     upstream: self.codex.base_url.api_key.clone(),
-                    custom_upstream: false,
+                    key: token.into(),
                     configured: false,
-                });
+                    custom_upstream: false,
+                    ext: None,
+                }));
             }
         }
         if unavailable {
@@ -494,7 +561,7 @@ mod tests {
                 .resolve(Some("Bearer api-key"), true)
                 .await
                 .unwrap()
-                .proxy
+                .proxy()
                 .label(),
             "none"
         );
@@ -516,7 +583,7 @@ mod tests {
                 .resolve(Some(&format!("Bearer {account_token}")), true)
                 .await
                 .unwrap()
-                .proxy
+                .proxy()
                 .label(),
             "account"
         );
@@ -559,11 +626,12 @@ mod tests {
             let route = config
                 .resolve_url(Some("Bearer supplied-key"), target)
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .api();
             assert!(route.custom_upstream);
             assert_eq!(route.proxy.label(), "none");
             assert_eq!(route.upstream, "https://api.invalid/v1");
-            assert!(route.account_id.is_none());
+            assert!(route.ext.is_none());
             assert_eq!(config.resolve_url(None, target).err().unwrap().status, 401);
         }
         assert!(
