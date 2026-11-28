@@ -9,18 +9,27 @@ pub(crate) fn is_url_selector(value: &str) -> bool {
     value.contains(['.', ':', '/'])
 }
 
-/// Two HTTPS route bases overlap if either covers the other's path on the same origin.
+/// Two HTTPS route bases overlap if either covers the other's path on the
+/// same origin, as a server that decodes the path and merges repeated
+/// slashes sees it. A dot segment that only decoding reveals could mean
+/// anything upstream, so it overlaps everything.
 pub(crate) fn overlaps(a: &Url, b: &Url) -> bool {
-    fn covers(base: &str, path: &str) -> bool {
-        path.strip_prefix(base.trim_end_matches('/'))
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    fn segments(url: &Url) -> Option<Vec<String>> {
+        let path = percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy();
+        let segments: Vec<String> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (!segments.iter().any(|s| s == "." || s == "..")).then_some(segments)
     }
     if a.origin() != b.origin() {
         return false;
     }
-    let a = percent_encoding::percent_decode_str(a.path()).decode_utf8_lossy();
-    let b = percent_encoding::percent_decode_str(b.path()).decode_utf8_lossy();
-    covers(&a, &b) || covers(&b, &a)
+    let (Some(a), Some(b)) = (segments(a), segments(b)) else {
+        return true;
+    };
+    a.starts_with(&b) || b.starts_with(&a)
 }
 
 /// Rejects two URL selectors that normalize to the same base.
@@ -250,5 +259,30 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+    #[test]
+    fn overlap_survives_doubled_slashes_and_encoded_segments() {
+        let reserved = Url::parse("https://chatgpt.com/backend-api").unwrap();
+        for base in [
+            "https://chatgpt.com//backend-api",
+            "https://chatgpt.com/backend-api//codex",
+            "https://chatgpt.com/%2Fbackend-api",
+            "https://chatgpt.com/%2fbackend-api/codex",
+            "https://chatgpt.com/v1/%2e%2e/backend-api",
+            "https://chatgpt.com/",
+        ] {
+            let url = validate_upstream(base).unwrap();
+            assert!(overlaps(&url, &reserved), "{base} -> {url}");
+        }
+        for base in [
+            "https://chatgpt.com/backend-apix",
+            "https://chatgpt.com/v1",
+            "https://api.openai.com/backend-api",
+        ] {
+            assert!(
+                !overlaps(&validate_upstream(base).unwrap(), &reserved),
+                "{base}"
+            );
+        }
     }
 }
