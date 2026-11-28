@@ -259,22 +259,9 @@ pub enum KeyHeader {
     Bearer,
 }
 
-/// A Route by a Claude login: always a Bearer token, to Claude's own API.
-#[derive(Clone)]
-pub struct AccountRoute {
-    pub token: String,
-    /// The token is a saved login's, or one a lookup named.
-    pub matched_account: bool,
-    /// The account source, routing key or fallback name that carried it.
-    pub label: String,
-    pub proxy: Choice,
-    pub identity: Option<ClaudeIdentity>,
-    pub needs_profile: bool,
-    pub upstream: String,
-    /// The credential is one the configuration holds or maps, not one a
-    /// fallback lets through.
-    pub configured: bool,
-}
+/// A Route by a Claude login: always a Bearer token, to the upstream that
+/// is Claude's own part, `base_url`.
+pub type AccountRoute = crate::routing::accounts::AccountRoute<ClaudeIdentity, String>;
 
 pub const TOKEN_REFRESH_UPSTREAM: &str = "https://platform.claude.com/v1/oauth/token";
 
@@ -655,13 +642,14 @@ impl Claude {
         };
         Ok(ClaudeRoute::Account(AccountRoute {
             token: token.into(),
-            matched_account,
-            label,
             proxy,
+            account_label: self.account_label(identity.as_ref(), &label),
             identity,
-            needs_profile,
-            upstream: self.base_url.clone(),
+            matched_login: matched_account,
+            provider: Some(label),
             configured,
+            needs_profile,
+            ext: self.base_url.clone(),
         }))
     }
 
@@ -757,11 +745,24 @@ impl Claude {
                 .usernames
                 .iter()
                 .any(|u| self.routing.account.contains_key(u));
-        route.label = "claude-account".into();
+        route.provider = Some("claude-account".into());
+        route.account_label = self.account_label(Some(&identity), "claude-account");
         route.identity = Some(identity);
         route.needs_profile = false;
-        route.matched_account = true;
+        route.matched_login = true;
         Ok(())
+    }
+    /// The route name records give a login's requests, by its account, or
+    /// else by the source or fallback name `label` that carried it.
+    fn account_label(&self, identity: Option<&ClaudeIdentity>, label: &str) -> Option<String> {
+        identity.and_then(|identity| {
+            crate::identity::routing_account_label(
+                &self.routing,
+                &identity.account_id,
+                &identity.usernames,
+                label,
+            )
+        })
     }
     pub fn url(&self, target: &str) -> Result<Url> {
         api_url(&self.base_url, target)
@@ -789,7 +790,7 @@ impl ClaudeRoute {
     /// The upstream URL of a target. OAuth endpoints are an account's.
     pub fn url(&self, target: &str) -> Result<Url> {
         let (upstream, oauth) = match self {
-            Self::Account(route) => (&route.upstream, true),
+            Self::Account(route) => (&route.ext, true),
             Self::Api(route) => (&route.upstream, false),
         };
         let url = api_url(upstream, target)?;
@@ -854,7 +855,7 @@ impl ClaudeRoute {
     pub(crate) fn api(self) -> ApiRoute {
         match self {
             Self::Api(route) => route,
-            Self::Account(route) => panic!("account Route {}", route.label),
+            Self::Account(route) => panic!("account Route {:?}", route.provider),
         }
     }
 }
@@ -1065,7 +1066,7 @@ mod tests {
                 format!("Bearer token-{label}").parse().unwrap(),
             );
             let route = c.resolve(&headers).await.unwrap().account();
-            assert_eq!(route.label, "default");
+            assert_eq!(route.provider.as_deref(), Some("default"));
             assert_eq!(route.identity.unwrap().account_id, label);
         }
         c.config_dirs.pop();
@@ -1239,9 +1240,9 @@ claude:
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer first-secret".parse().unwrap());
         let r = c.resolve(&h).await.unwrap().account();
-        assert!(r.matched_account);
+        assert!(r.matched_login);
         assert_eq!(r.proxy.label(), "selected");
-        assert_eq!(r.label, "default");
+        assert_eq!(r.provider.as_deref(), Some("default"));
         write("personal", "second-secret");
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
         h.insert("authorization", "Bearer second-secret".parse().unwrap());
@@ -1291,7 +1292,7 @@ claude:
         assert_eq!(source.claude_token().await.unwrap(), "keychain-secret");
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer keychain-secret".parse().unwrap());
-        assert!(c.resolve(&h).await.unwrap().account().matched_account);
+        assert!(c.resolve(&h).await.unwrap().account().matched_login);
         h.insert("authorization", "Bearer file-secret".parse().unwrap());
         assert_eq!(c.resolve(&h).await.err().unwrap().status, 401);
         assert!(
@@ -1343,7 +1344,7 @@ claude:
             let r = c.resolve(&h).await.unwrap();
             // A Bearer token takes the account fallback, a key the key's.
             assert!(match &r {
-                ClaudeRoute::Account(route) => bearer && !route.matched_account,
+                ClaudeRoute::Account(route) => bearer && !route.matched_login,
                 ClaudeRoute::Api(_) => !bearer,
             });
             let mut forwarded = crate::server::filtered_headers(&h);
