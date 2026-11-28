@@ -27,8 +27,8 @@ pub(super) enum Body {
 
 /// Checks a request head, without its terminating blank line.
 pub(super) fn check_head(head: &[u8]) -> Result<Body> {
-    let head = std::str::from_utf8(head)
-        .map_err(|_| Error::new(400, "Invalid request headers."))?;
+    let head =
+        std::str::from_utf8(head).map_err(|_| Error::new(400, "Invalid request headers."))?;
     let mut names = std::collections::HashSet::new();
     let mut length = 0;
     for line in head.split("\r\n").skip(1) {
@@ -169,7 +169,8 @@ impl Tracker {
         else {
             *bytes = &bytes[take..];
             if head.len() > MAX_HEAD {
-                self.verdicts.push(Err(Error::new(431, "Headers exceed 64 KiB.")));
+                self.verdicts
+                    .push(Err(Error::new(431, "Headers exceed 64 KiB.")));
                 return State::Done;
             }
             return State::Head(head);
@@ -220,7 +221,7 @@ fn take_line(line: &mut Vec<u8>, bytes: &mut &[u8]) -> Option<()> {
             Some(())
         }
         None => {
-            line.extend_from_slice(*bytes);
+            line.extend_from_slice(bytes);
             *bytes = &[];
             None
         }
