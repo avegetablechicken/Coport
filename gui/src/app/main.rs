@@ -1,5 +1,5 @@
 //! Menu bar (macOS) / system tray (Windows, Linux) app for coport.
-//! The panel UI is HTML/CSS in `../ui`, rendered by the system WebView.
+//! The panel UI is HTML/CSS in `../../ui`, rendered by the system WebView.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 

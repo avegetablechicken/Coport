@@ -9,11 +9,11 @@ default-run = "coport-gui"
 
 [[bin]]
 name = "coport-gui"
-path = "src/main.rs"
+path = "src/app/main.rs"
 
 [[bin]]
 name = "coportd"
-path = "src/daemon_main.rs"
+path = "src/bin/coportd.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

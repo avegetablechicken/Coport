@@ -232,7 +232,7 @@ fn set_scalar(text: &str, keys: &[&str], value: &str) -> Result<String, String> 
 mod tests {
     use super::*;
 
-    const EXAMPLE: &str = include_str!("../../config.example.yaml");
+    const EXAMPLE: &str = include_str!("../../../config.example.yaml");
     const BASE: &str = "listen_port: 8787 # local\nrequest_timeout_seconds: 300\n";
 
     #[test]

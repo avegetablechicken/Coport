@@ -1426,7 +1426,7 @@ mod tests {
         }
     }
 
-    const EXAMPLE: &str = include_str!("../../config.example.yaml");
+    const EXAMPLE: &str = include_str!("../../../config.example.yaml");
 
     #[test]
     fn connect_urls_use_the_field_names_the_panel_reads() {

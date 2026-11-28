@@ -44,9 +44,9 @@ Development, service management, and macOS packaging require no Python installat
 | `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming; per-App forwarding, relays and its tests in `src/server/` |
 | `src/observability/` | Redacted structured logs and rotation, Model calls, request IDs |
 | `src/service.rs` | Built-in per-user platform service management (`coport service`) |
-| `gui/src/main.rs` | Desktop app startup, Tauri commands registration |
-| `gui/src/core.rs` | Shared state and the snapshot sent to the panel |
-| `gui/src/panel.rs`, `gui/src/tray.rs` | Panel placement and dismissal, status icon and menu |
+| `gui/src/app/main.rs` | Desktop app startup, Tauri commands registration |
+| `gui/src/app/core.rs` | Shared state and the snapshot sent to the panel |
+| `gui/src/app/panel.rs`, `gui/src/app/tray.rs` | Panel placement and dismissal, status icon and menu |
 | `gui/src/proxy.rs`, `gui/src/logs.rs` | In-process proxy lifecycle, log tailing and statistics |
 | `gui/ui/` | Panel UI (HTML, CSS, vanilla JS) |
 

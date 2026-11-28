@@ -500,7 +500,7 @@ pub fn set_config_value(
     result
 }
 
-const EXAMPLE: &str = include_str!("../../config.example.yaml");
+const EXAMPLE: &str = include_str!("../../../config.example.yaml");
 
 #[tauri::command]
 pub fn create_example_config(state: State<AppState>) -> Result {

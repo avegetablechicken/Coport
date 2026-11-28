@@ -768,7 +768,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn menu_bar_light_takes_the_panel_color() {
-        let css = include_str!("../ui/style.css");
+        let css = include_str!("../../ui/style.css");
         let panel = |name: &str| {
             let key = format!("--{name}-1: #");
             let at = css.find(&key).unwrap() + key.len();
