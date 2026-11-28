@@ -37,10 +37,12 @@ Development, service management, and macOS packaging require no Python installat
 | --- | --- |
 | `src/main.rs` | CLI, configuration overrides, startup and shutdown |
 | `src/config.rs` | YAML parsing and validation |
-| `src/identity.rs` | Account metadata, native TOML parsing, environment and shell credentials |
-| `src/routing.rs` | Credential matching, upstream URL mapping |
-| `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming |
-| `src/logger.rs` | Redacted structured logs and rotation |
+| `src/identity.rs` | Credential checks shared by every App: environment and shell API Keys, traffic labels |
+| `src/codex.rs`, `src/claude.rs`, `src/antigravity.rs`, `src/grok.rs` | Each App's logins, settings and routing rules, with its helpers in the directory of the same name |
+| `src/saved_login.rs` | Saved logins every App renews and rotates, one adapter per App in `src/saved_login/` |
+| `src/routing.rs` | Credential matching, upstream URL mapping; `routing/target.rs` classifies requests |
+| `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming; per-App forwarding, relays and its tests in `src/server/` |
+| `src/observability/` | Redacted structured logs and rotation, Model calls, request IDs |
 | `src/service.rs` | Built-in per-user platform service management (`coport service`) |
 | `gui/src/main.rs` | Desktop app startup, Tauri commands registration |
 | `gui/src/core.rs` | Shared state and the snapshot sent to the panel |
