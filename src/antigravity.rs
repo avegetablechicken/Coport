@@ -608,22 +608,10 @@ impl Renewed {
     }
 }
 
-pub struct AntigravityRoute {
-    pub token: String,
-    pub proxy: Choice,
-    pub identity: Option<AntigravityIdentity>,
-    /// The token is the saved login's.
-    pub matched_login: bool,
-    /// The saved login's refresh token, under which a looked-up identity is
-    /// learned.
-    pub refresh_token: Option<String>,
-    /// A Google lookup names the account before the request is sent.
-    pub needs_profile: bool,
-    pub label: String,
-    /// The credential is the saved login or an account the routing maps, not
-    /// one a fallback carries.
-    pub configured: bool,
-}
+/// A Google login's Route, and the saved login's refresh token, under
+/// which an identity a lookup names is learned.
+pub type AntigravityRoute =
+    crate::routing::accounts::AccountRoute<AntigravityIdentity, Option<String>>;
 
 /// A Gemini API key's Route, and where its request carried the key.
 pub type ApiRoute = crate::routing::api_keys::ApiRoute<ApiCredential>;
@@ -1065,6 +1053,21 @@ impl Antigravity {
                 .then(|| "default".to_owned())
         })
     }
+    /// The route name records give a login's requests: the saved login's
+    /// label, or the routing key naming another account, else the fallback.
+    pub(crate) fn account_label(
+        &self,
+        saved: bool,
+        identity: Option<&AntigravityIdentity>,
+    ) -> Option<String> {
+        if saved {
+            self.login_label(identity)
+        } else {
+            identity.and_then(|i| self.mapped_key(i))
+        }
+        .or_else(|| crate::identity::routing_account_label(&self.routing, "", &[], ""))
+    }
+
     /// The routing key naming this account, regardless of case.
     pub(crate) fn mapped_key(&self, identity: &AntigravityIdentity) -> Option<String> {
         self.routing
@@ -1106,11 +1109,12 @@ impl Antigravity {
                     || identity
                         .as_ref()
                         .is_some_and(|i| self.mapped_choice(i).is_some()),
+                account_label: self.account_label(matched_login, identity.as_ref()),
                 identity,
                 matched_login,
-                refresh_token: None,
+                provider: Some(label.into()),
                 needs_profile,
-                label: label.into(),
+                ext: None,
             })
         };
         // The saved login's current token, or one a relayed refresh issued
@@ -1137,7 +1141,7 @@ impl Antigravity {
                     route(proxy, identity, true, false, "default")?
                 }
             };
-            matched.refresh_token = login.refresh_token;
+            matched.ext = login.refresh_token;
             return Ok(matched);
         }
         if self.account_auth_file_only {
@@ -1285,7 +1289,8 @@ impl Antigravity {
             .ok_or(Error::config("Antigravity account has no proxy route."))?
             .clone();
         route.configured |= self.mapped_choice(&identity).is_some();
-        route.label = "antigravity-account".into();
+        route.provider = Some("antigravity-account".into());
+        route.account_label = self.account_label(route.matched_login, Some(&identity));
         route.identity = Some(identity);
         route.needs_profile = false;
         Ok(())
@@ -2033,7 +2038,7 @@ mod tests {
             .await
             .unwrap();
         assert!(route.needs_profile && route.matched_login);
-        assert_eq!(route.refresh_token.as_deref(), Some("saved-refresh"));
+        assert_eq!(route.ext.as_deref(), Some("saved-refresh"));
         let bob = AntigravityIdentity::userinfo(&json!({"email": "Bob@Example.com"})).unwrap();
         probed
             .antigravity

@@ -98,7 +98,7 @@ impl Server {
         }
         RouteRecord {
             account_id: route.identity.as_ref().map(|i| i.email.clone()),
-            account_label: self.antigravity_label(route.saved, route.identity.as_ref()),
+            account_label: settings.account_label(route.saved, route.identity.as_ref()),
             configured: route.configured,
             ..Default::default()
         }
@@ -125,20 +125,6 @@ impl Server {
     /// The route a credential takes, as records name it: the saved login's
     /// email route, else `default`; another account's email route; else the
     /// fallback that carried it.
-    fn antigravity_label(
-        &self,
-        saved: bool,
-        identity: Option<&AntigravityIdentity>,
-    ) -> Option<String> {
-        let settings = &self.config.antigravity;
-        if saved {
-            settings.login_label(identity)
-        } else {
-            identity.and_then(|i| settings.mapped_key(i))
-        }
-        .or_else(|| crate::identity::routing_account_label(&settings.routing, "", &[], ""))
-    }
-
     /// Keeps the account a lookup named for the saved login. A failure to
     /// save it is logged; the request goes on.
     pub(crate) fn learn_antigravity_login(
@@ -387,7 +373,7 @@ impl Adapter for super::pipeline::Antigravity {
             let identity = server
                 .lookup_account::<super::pipeline::Antigravity>(&route.token, &route.proxy, log)
                 .await?;
-            if let Some(refresh) = route.refresh_token.as_deref() {
+            if let Some(refresh) = route.ext.as_deref() {
                 server.learn_antigravity_login(refresh, &identity);
             }
             server
@@ -398,18 +384,12 @@ impl Adapter for super::pipeline::Antigravity {
         Ok(Route::Account(route, url))
     }
 
-    fn record(server: &Server, route: &Route) -> RouteRecord {
+    fn record(_: &Server, route: &Route) -> RouteRecord {
         match route {
             Route::Api(route, _) => RouteRecord::api("Antigravity", route),
-            Route::Account(route, url) => RouteRecord {
-                provider: Some(route.label.clone()),
-                upstream_base_url: Some(url.origin().ascii_serialization()),
-                account_id: route.identity.as_ref().map(|i| i.email.clone()),
-                account_label: server
-                    .antigravity_label(route.matched_login, route.identity.as_ref()),
-                configured: route.configured,
-                ..Default::default()
-            },
+            Route::Account(route, url) => {
+                RouteRecord::account(route, url.origin().ascii_serialization())
+            }
         }
     }
 
@@ -444,7 +424,7 @@ impl Adapter for super::pipeline::Antigravity {
                         .map(|id| id.email.to_ascii_lowercase());
                     let credential = login
                         .as_deref()
-                        .or(route.refresh_token.as_deref())
+                        .or(route.ext.as_deref())
                         .unwrap_or(&route.token);
                     Scope::new("oauth", credential)
                 }),
