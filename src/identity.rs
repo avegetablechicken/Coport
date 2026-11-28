@@ -179,7 +179,7 @@ impl Config {
     /// exports raw credentials/configuration to a peer.
     pub async fn traffic_provider_references(&self) -> Vec<TrafficProviderReference> {
         let mut result = Vec::new();
-        for provider in &self.codex.providers {
+        for provider in self.codex.providers() {
             if let Ok(credentials) = provider
                 .credentials(&self.codex.base_url.api_key, false, &self.codex)
                 .await

@@ -344,7 +344,7 @@ impl Server {
                 ),
             }
         }
-        for p in &self.config.codex.providers {
+        for p in self.config.codex.providers() {
             let event = if p
                 .credentials(
                     &self.config.codex.base_url.api_key,

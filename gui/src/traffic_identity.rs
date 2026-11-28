@@ -149,7 +149,7 @@ fn canonical(base: &str) -> Option<String> {
 impl Identities {
     pub fn from_config(config: &Config, assignments: &[TrafficAssignment]) -> Self {
         let mut result = Self::default();
-        for provider in &config.codex.providers {
+        for provider in config.codex.providers() {
             for base in provider
                 .upstreams(&config.codex.base_url.api_key, &config.codex)
                 .into_iter()

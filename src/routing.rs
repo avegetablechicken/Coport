@@ -67,6 +67,16 @@ impl Route {
 }
 
 impl crate::config::Codex {
+    /// The Codex provider IDs and API Key variables `routing.api_key` names.
+    pub fn providers(&self) -> impl Iterator<Item = crate::config::Provider> + '_ {
+        self.api_keys()
+            .named()
+            .map(|(selector, proxy)| crate::config::Provider {
+                selector: selector.clone(),
+                proxy: proxy.clone(),
+            })
+    }
+
     /// Codex's API Key Routes: a URL, or a provider ID or API Key
     /// environment variable its homes define.
     pub(crate) fn api_keys(&self) -> api_keys::ApiKeys<'_> {
@@ -610,7 +620,7 @@ mod tests {
     async fn explicit_url_routes_need_auth_but_no_local_key_source_or_fallback() {
         let config = Config::parse("listen_port: 7889\nrequest_timeout_seconds: 3\ncodex:\n  routing:\n    api_key:\n      'api.invalid/v1': none\n").unwrap();
         config.check_credentials().await.unwrap();
-        assert!(config.codex.providers.is_empty());
+        assert!(config.codex.providers().next().is_none());
         for target in [
             "/https://api.invalid/v1/responses",
             "/codex/https://api.invalid/v1/responses",

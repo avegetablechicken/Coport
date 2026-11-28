@@ -16,11 +16,7 @@ fn display(url: &str) -> String {
 /// home (a loopback `http://127.0.0.1:PORT/https://…` wrapper is unwrapped),
 /// otherwise the API key base.
 pub fn codex_api_key(config: &Config, selector: &str) -> Option<String> {
-    let provider = config
-        .codex
-        .providers
-        .iter()
-        .find(|p| p.selector == selector)?;
+    let provider = config.codex.providers().find(|p| p.selector == selector)?;
     let mut lines: Vec<String> = Vec::new();
     for upstream in provider.upstreams(&config.codex.base_url.api_key, &config.codex) {
         let line = match upstream {

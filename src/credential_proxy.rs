@@ -221,7 +221,7 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     }
     // Resolve configured provider definitions, not credentials or active profiles.
     // One unavailable home must not hide routes from the other configured homes.
-    for provider in &config.codex.providers {
+    for provider in config.codex.providers() {
         for upstream in provider
             .upstreams(&config.codex.base_url.api_key, &config.codex)
             .into_iter()
@@ -484,7 +484,11 @@ mod tests {
         }
         assert!(!routes.contains_key(&("custom.settings.json".into(), 443)));
         // env_key aliases use the same definition, and other homes survive an unreadable definition.
-        c.codex.providers[0].selector = "FAKE_PROVIDER_KEY".into();
+        c.codex.routing.api_key.remove("ShareCoder");
+        c.codex
+            .routing
+            .api_key
+            .insert("FAKE_PROVIDER_KEY".into(), crate::config::Choice::direct());
         std::fs::write(b.join("config.toml"), "invalid [").unwrap();
         assert!(
             scopes(&c)

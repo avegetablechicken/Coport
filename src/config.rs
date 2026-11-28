@@ -115,8 +115,6 @@ pub struct Codex {
     pub auth_env: Option<String>,
     pub routing: Routing,
     pub account_auth_file_only: bool,
-    #[serde(skip)]
-    pub providers: Vec<Provider>,
 }
 impl Default for Codex {
     fn default() -> Self {
@@ -126,7 +124,6 @@ impl Default for Codex {
             auth_env: None,
             routing: Routing::default(),
             account_auth_file_only: true,
-            providers: Vec::new(),
         }
     }
 }
@@ -279,17 +276,7 @@ impl Config {
                 "Invalid YAML configuration; check required fields against config.example.yaml.",
             )
         })?;
-        let mut codex = raw.codex;
-        codex.providers = codex
-            .routing
-            .api_key
-            .iter()
-            .filter(|(key, _)| !crate::routing::by_url::is_url_selector(key))
-            .map(|(selector, proxy)| Provider {
-                selector: selector.clone(),
-                proxy: proxy.clone(),
-            })
-            .collect();
+        let codex = raw.codex;
         let c = Self {
             codex,
             grok: raw.grok,
@@ -1033,8 +1020,9 @@ claude:
 "#;
         let c = Config::parse(text).unwrap();
         // URL selectors route explicit upstreams; only the others are providers.
-        assert_eq!(c.codex.providers.len(), 1);
-        assert_eq!(c.codex.providers[0].label(), "OPENAI_API_KEY");
+        let providers: Vec<_> = c.codex.providers().collect();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].label(), "OPENAI_API_KEY");
         assert_eq!(c.codex.auth_env, None);
         assert_eq!(c.claude.auth_env.as_deref(), Some("CLAUDE_TOKEN"));
         assert_eq!(c.claude.base_url, "https://api.anthropic.com");
@@ -1064,7 +1052,7 @@ codex:
             "{BASE}codex:\n  routing:\n    api_key:\n      'provider.invalid/v1': none\n"
         ))
         .unwrap();
-        assert!(c.codex.providers.is_empty());
+        assert!(c.codex.providers().next().is_none());
         c.check_credentials().await.unwrap();
         assert!(
             c.resolve_url(
