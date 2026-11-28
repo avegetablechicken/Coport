@@ -169,16 +169,12 @@ pub(crate) async fn saved_auth_store(home: &Path) -> Result<(crate::saved_login:
                 "Codex encrypted auth storage (secret_auth_storage) is not supported.",
             ));
         }
-        crate::keychain::read(KEYRING_SERVICE, &keyring_account(home))
+        let account = keyring_account(home);
+        crate::keychain::read(KEYRING_SERVICE, &account)
             .await?
             .map(|raw| {
                 serde_json::from_str::<Value>(&raw)
-                    .map(|value| {
-                        (
-                            Store::Keychain(KEYRING_SERVICE.into(), keyring_account(home)),
-                            value,
-                        )
-                    })
+                    .map(|value| (Store::Keychain(KEYRING_SERVICE.into(), account), value))
                     .map_err(|_| Error::config("Invalid Codex login in the OS credential store."))
             })
             .transpose()
