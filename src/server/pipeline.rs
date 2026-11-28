@@ -5,8 +5,8 @@
 //! with a renewed Saved login. Each App's adapter only answers what its Route
 //! is.
 use super::*;
+use crate::antigravity::cooldown::Scope;
 use crate::claude::ClaudeIdentity;
-use antigravity_cooldown::Scope;
 use auto_refresh::{Renewal, Snapshot};
 use hyper::http::request::Parts;
 

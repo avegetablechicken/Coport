@@ -88,32 +88,20 @@ pub type ConnectionHandler = Arc<
 >;
 
 pub type Body = UnsyncBoxBody<Bytes, std::io::Error>;
-#[path = "credential_checks.rs"]
 mod credential_checks;
-#[path = "relay.rs"]
 mod relay;
+use crate::antigravity::cooldown;
 pub use antigravity_forward::AntigravityProfiles;
 pub use credential_checks::CredentialReport;
-#[path = "antigravity_cooldown.rs"]
-mod antigravity_cooldown;
-#[path = "server_antigravity.rs"]
 mod antigravity_forward;
-#[path = "server_claude.rs"]
 mod claude_forward;
-#[path = "server_codex.rs"]
 mod codex_forward;
-#[path = "server_grok.rs"]
 mod grok_forward;
-#[path = "server_identity_directory.rs"]
 mod identity_directory;
-#[path = "server_pipeline.rs"]
 mod pipeline;
-#[path = "server_transport.rs"]
 mod transport;
-#[path = "websocket_relay.rs"]
 mod websocket_relay;
 use transport::*;
-#[path = "auto_refresh.rs"]
 mod auto_refresh;
 
 use identity_directory::Directory;
@@ -131,7 +119,7 @@ pub struct Server {
     probes: Mutex<HashMap<ProbeKey, ProbeState>>,
     claude_identities: Directory<crate::claude::ClaudeIdentity>,
     antigravity_identities: Directory<crate::antigravity::AntigravityIdentity>,
-    location_cooldowns: antigravity_cooldown::LocationCooldowns,
+    location_cooldowns: cooldown::LocationCooldowns,
     antigravity_refresh_routes:
         Arc<crate::refresh_routes::RefreshRoutes<crate::antigravity::AntigravityIdentity>>,
     antigravity_renewed: Arc<crate::antigravity::RenewedTokens>,
@@ -545,10 +533,7 @@ impl Server {
         }
         match forwarded {
             Ok(mut upstream) => {
-                if let Some(inspect) = upstream
-                    .extensions_mut()
-                    .remove::<antigravity_cooldown::Inspect>()
-                {
+                if let Some(inspect) = upstream.extensions_mut().remove::<cooldown::Inspect>() {
                     let status = upstream.status().as_u16();
                     let Some(response) = self
                         .location_cooldowns
@@ -1327,5 +1312,4 @@ fn response(status: u16, text: &str) -> Response<Body> {
 }
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
 mod tests;

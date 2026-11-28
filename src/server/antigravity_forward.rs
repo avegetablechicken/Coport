@@ -2,10 +2,10 @@
 //! forwarded unchanged otherwise; and its Gemini API key requests, routed by
 //! their key or upstream URL. Account lookups, their caches, route states and
 //! statistics labels follow Claude's.
-use super::antigravity_cooldown::Scope;
 use super::identity_directory::{Directory, Lookup, State, Texts};
 use super::pipeline::{Adapter, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
+use crate::antigravity::cooldown::Scope;
 use crate::{
     antigravity::{Antigravity, AntigravityIdentity, AntigravityRoute, ApiCredential, ApiRoute},
     refresh_routes::RefreshRoutes,

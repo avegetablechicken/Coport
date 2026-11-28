@@ -4,9 +4,15 @@
 //!
 //! A rejection soon after a cooldown ends doubles the next one, up to the last
 //! step; a model call the upstream accepts starts the login over.
-use super::*;
+use crate::logger::RequestLog;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use http_body_util::BodyExt;
+use hyper::HeaderMap;
 use std::io::Read;
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 use tokio::time::{Instant as Tick, sleep_until};
+use url::Url;
 
 const STEPS: [Duration; 3] = [
     Duration::from_secs(3 * 60),
@@ -20,14 +26,14 @@ const ERROR_LIMIT: usize = 16 * 1024;
 const MESSAGE_LIMIT: usize = 300;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
-pub(super) struct Scope(String, String);
+pub(crate) struct Scope(String, String);
 
 impl Scope {
-    pub(super) fn new(upstream: &str, credential: &str) -> Self {
+    pub(crate) fn new(upstream: &str, credential: &str) -> Self {
         Self(upstream.to_owned(), crate::antigravity::digest(credential))
     }
 
-    pub(super) fn model(
+    pub(crate) fn model(
         method: &hyper::Method,
         url: &Url,
         scope: impl FnOnce() -> Self,
@@ -41,7 +47,7 @@ impl Scope {
 
 /// An upstream error to inspect, with the login it may cool down.
 #[derive(Clone)]
-pub(super) struct Inspect(Option<Scope>);
+pub(crate) struct Inspect(Option<Scope>);
 
 /// A login's current or most recent cooldown and its step in `STEPS`.
 #[derive(Clone, Copy)]
@@ -51,7 +57,7 @@ struct Cooldown {
 }
 
 #[derive(Default)]
-pub(super) struct LocationCooldowns(Mutex<HashMap<Scope, Cooldown>>);
+pub(crate) struct LocationCooldowns(Mutex<HashMap<Scope, Cooldown>>);
 
 /// Also records elapsed waiting when the client cancels the pending request.
 struct WaitTiming<'a> {
@@ -70,13 +76,13 @@ impl Drop for WaitTiming<'_> {
 
 impl LocationCooldowns {
     #[cfg(test)]
-    pub(super) fn shorten_for_test(&self, duration: Duration) {
+    pub(crate) fn shorten_for_test(&self, duration: Duration) {
         for cooldown in self.0.lock().unwrap().values_mut() {
             cooldown.until = Tick::now() + duration;
         }
     }
 
-    pub(super) async fn wait(&self, scope: Option<&Scope>, log: &mut RequestLog) {
+    pub(crate) async fn wait(&self, scope: Option<&Scope>, log: &mut RequestLog) {
         let Some(scope) = scope else { return };
         let mut timing = WaitTiming { log, started: None };
         loop {
@@ -96,7 +102,7 @@ impl LocationCooldowns {
     /// Mark an upstream error for inspection; only a 400 model call can
     /// start a location cooldown. An accepted model call ends its login's
     /// episode, unless it was sent before a cooldown that is still running.
-    pub(super) fn observe(
+    pub(crate) fn observe(
         &self,
         scope: Option<Scope>,
         mut response: reqwest::Response,
@@ -140,7 +146,7 @@ impl LocationCooldowns {
 
     /// Inspect only a small error envelope. Replay every original byte (and
     /// any body error) for ordinary, oversized or unrecognized errors.
-    pub(super) async fn inspect(
+    pub(crate) async fn inspect(
         &self,
         Inspect(scope): Inspect,
         response: reqwest::Response,
@@ -251,7 +257,10 @@ fn location_error(error: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logger::{Logger, Outcome};
     use futures_util::FutureExt;
+    use hyper::Response;
+    use std::sync::Arc;
     const LOCATION: &[u8] = br#"{"error":{"status":"FAILED_PRECONDITION","message":"User location is not supported for the API use."}}"#;
 
     fn bad(body: Vec<u8>) -> reqwest::Response {

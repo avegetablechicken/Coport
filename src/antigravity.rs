@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+pub(crate) mod cooldown;
+
 /// The Cloud Code endpoint Antigravity answers from first.
 pub const DEFAULT_BASE: &str = "https://daily-cloudcode-pa.googleapis.com";
 /// Every Cloud Code origin Antigravity sends to. An explicit target may name
