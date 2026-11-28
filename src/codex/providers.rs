@@ -3,7 +3,8 @@
 use super::login::saved_auth;
 use crate::{
     Error, Result,
-    config::{Codex, Provider, expand, unwrap_upstream},
+    codex::{Codex, Provider},
+    config::{expand, unwrap_upstream},
     identity::{environment_key_with_shell, key, valid_token},
 };
 use serde::Deserialize;

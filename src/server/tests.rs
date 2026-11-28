@@ -305,7 +305,7 @@ async fn running_with_server(
     if config.claude.config_dirs == crate::config::default_claude_config_dirs() {
         config.claude.config_dirs = isolated("claude");
     }
-    if config.codex.homes == crate::config::default_codex_homes() {
+    if config.codex.homes == crate::codex::default_codex_homes() {
         config.codex.homes = isolated("codex");
     }
     if config.grok.homes.is_none() && config.grok.auth_file.is_none() {

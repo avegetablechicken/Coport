@@ -2,7 +2,8 @@
 //! where Codex keeps it for a home (`auth.json` or the OS credential store).
 use crate::{
     Error, Result,
-    config::{AccountSource, Codex, Config, expand},
+    codex::Codex,
+    config::{AccountSource, Config, expand},
     identity::{claims, environment_key_with_shell, key, routing_account_label, valid_token},
 };
 use serde::Deserialize;
@@ -309,7 +310,7 @@ impl Config {
         codex
             .api_keys()
             .check_distinct(&mut keys, |selector| async move {
-                let provider = crate::config::Provider {
+                let provider = crate::codex::Provider {
                     selector: selector.into(),
                     proxy: crate::config::Choice::direct(),
                 };

@@ -66,12 +66,12 @@ impl Route {
     }
 }
 
-impl crate::config::Codex {
+impl crate::codex::Codex {
     /// The Codex provider IDs and API Key variables `routing.api_key` names.
-    pub fn providers(&self) -> impl Iterator<Item = crate::config::Provider> + '_ {
+    pub fn providers(&self) -> impl Iterator<Item = crate::codex::Provider> + '_ {
         self.api_keys()
             .named()
-            .map(|(selector, proxy)| crate::config::Provider {
+            .map(|(selector, proxy)| crate::codex::Provider {
                 selector: selector.clone(),
                 proxy: proxy.clone(),
             })
@@ -177,7 +177,7 @@ impl Config {
         let found = codex
             .api_keys()
             .find(|selector| async move {
-                let provider = crate::config::Provider {
+                let provider = crate::codex::Provider {
                     selector: selector.into(),
                     proxy: Choice::direct(),
                 };
