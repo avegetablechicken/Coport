@@ -16,9 +16,9 @@ use crate::{
     identity::valid_token,
     refresh_routes::RefreshRoutes,
 };
-mod copool;
-pub(crate) use copool::Endpoint;
-pub use copool::GrokAccount;
+mod account;
+pub(crate) use account::Endpoint;
+pub use account::GrokAccount;
 pub const API: &str = "https://cli-chat-proxy.grok.com";
 pub const ISSUER: &str = AUTH_ORIGIN;
 pub(crate) const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";

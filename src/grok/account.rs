@@ -1,4 +1,5 @@
-//! Copool subscription endpoints and identity learned from successful OAuth renewals.
+//! Grok's account endpoints outside model requests (sign-in, renewal,
+//! billing and settings) and the account a successful renewal names.
 use super::{CLIENT_ID, DEFAULT_BASE, Grok};
 use crate::{
     Error, Result,
