@@ -125,7 +125,9 @@ impl Config {
         let account_sources = self.codex.account_sources();
         for (label, source) in &account_sources {
             match self.codex.account_identity(source).await {
-                Ok(i) if i.token == token => identities.push((i, Some(label.as_str()))),
+                Ok(i) if crate::identity::same_secret(Some(&i.token), token) => {
+                    identities.push((i, Some(label.as_str())))
+                }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
             }
@@ -155,7 +157,9 @@ impl Config {
                 else {
                     return Ok(Read::Unavailable);
                 };
-                let mut matching = credentials.into_iter().filter(|c| c.token == token);
+                let mut matching = credentials
+                    .into_iter()
+                    .filter(|c| crate::identity::same_secret(Some(&c.token), token));
                 Ok(match (matching.next(), matching.next()) {
                     (Some(credential), None) => Read::Match(credential),
                     (None, _) => Read::Other,
@@ -253,15 +257,27 @@ impl Config {
         learned: Option<&Identity>,
     ) -> Result<(Choice, Option<Identity>, bool)> {
         let mut unavailable = false;
-        for (label, source) in &self.codex.account_sources() {
+        let mut saved = Vec::new();
+        let sources = self.codex.account_sources();
+        for (label, source) in &sources {
             match self.codex.account_identity(source).await {
-                Ok(i) if i.refresh_token.as_deref() == Some(refresh_token) => {
-                    let proxy = self.account_choice(&i, Some(label))?;
-                    return Ok((proxy, Some(i), true));
+                Ok(i)
+                    if crate::identity::same_secret(i.refresh_token.as_deref(), refresh_token) =>
+                {
+                    saved.push((label, i))
                 }
                 Ok(_) => {}
                 Err(_) => unavailable = true,
             }
+        }
+        // As for an access token, two saved logins with one refresh token
+        // leave its route ambiguous.
+        if saved.len() > 1 {
+            return Err(Error::new(409, AMBIGUOUS));
+        }
+        if let Some((label, i)) = saved.pop() {
+            let proxy = self.account_choice(&i, Some(label))?;
+            return Ok((proxy, Some(i), true));
         }
         if !self.codex.account_auth_file_only {
             if let Some(identity) = learned {

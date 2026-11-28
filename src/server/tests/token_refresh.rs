@@ -381,7 +381,9 @@ async fn refresh_failure_is_not_replayed_and_counts_once() {
     let response = http()
         .post(format!("{}/anthropic/v1/oauth/token", running.url))
         .header("content-type", "application/json")
-        .body(r#"{"grant_type":"refresh_token","refresh_token":"refresh-secret"}"#)
+        .body(
+            r#"{"client_id":"app","grant_type":"refresh_token","refresh_token":"refresh-secret"}"#,
+        )
         .send()
         .await
         .unwrap();
@@ -414,4 +416,36 @@ async fn refresh_failure_is_not_replayed_and_counts_once() {
     let log = std::fs::read_to_string(running._temp.path().join("proxy.log")).unwrap();
     assert!(!log.contains("upstream_retry"));
     assert!(!log.contains("refresh-secret"));
+}
+
+#[tokio::test]
+async fn codex_refresh_token_saved_in_two_homes_is_ambiguous() {
+    let homes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    for (home, account) in homes.iter().zip(["acct-1", "acct-2"]) {
+        std::fs::write(
+            home.path().join("auth.json"),
+            format!(
+                r#"{{"tokens":{{"account_id":"{account}","access_token":"access-{account}","refresh_token":"refresh-secret"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let running = running(&format!(
+        // An unreachable proxy keeps a wrongly forwarded refresh off the network.
+        "proxies:\n  dead: http://127.0.0.1:9\ncodex:\n  homes: [{}, {}]\n  routing:\n    account_fallback: dead\n",
+        serde_json::to_string(&homes[0].path()).unwrap(),
+        serde_json::to_string(&homes[1].path()).unwrap(),
+    ))
+    .await;
+    let response = http()
+        .post(format!("{}/oauth/token", running.url))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"client_id":"app","grant_type":"refresh_token","refresh_token":"refresh-secret"}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert_eq!(status, 409, "{}", response.text().await.unwrap());
 }
