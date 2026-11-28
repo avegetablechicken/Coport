@@ -10,6 +10,7 @@ use url::Url;
 pub(crate) mod env;
 mod login;
 mod providers;
+pub mod routes;
 
 pub use login::Identity;
 pub(crate) use login::saved_auth_store;
@@ -43,7 +44,7 @@ impl Bases {
         for reserved in [
             self.account.as_str(),
             CODEX_ACCOUNT_BASE,
-            crate::routing::TOKEN_REFRESH_UPSTREAM,
+            crate::codex::routes::TOKEN_REFRESH_UPSTREAM,
         ] {
             let reserved = Url::parse(reserved)
                 .map_err(|_| Error::config("Invalid Codex account upstream."))?;

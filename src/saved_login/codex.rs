@@ -43,7 +43,7 @@ impl SavedLogin for Codex {
             .filter(|s| crate::identity::valid_token(s))
             .unwrap_or("app_EMoamEEZ73f0CkXaXp7hrann");
         Ok(Refresh {
-            url: crate::routing::TOKEN_REFRESH_UPSTREAM,
+            url: crate::codex::routes::TOKEN_REFRESH_UPSTREAM,
             content_type: "application/x-www-form-urlencoded",
             body: url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("grant_type", "refresh_token")
@@ -92,7 +92,10 @@ mod tests {
         ));
         assert_eq!(refresh::<Codex>(&saved), Some("spent"));
         let sent = request::<Codex>(&saved, &()).unwrap();
-        assert_eq!(sent.url().as_str(), crate::routing::TOKEN_REFRESH_UPSTREAM);
+        assert_eq!(
+            sent.url().as_str(),
+            crate::codex::routes::TOKEN_REFRESH_UPSTREAM
+        );
         assert_eq!(
             sent.headers()["content-type"],
             "application/x-www-form-urlencoded"

@@ -36,9 +36,12 @@ impl Target {
         let (scope, rest) = split(raw);
         let kind = model_kind(method, &rest).unwrap_or_else(|| {
             let refresh = match scope {
-                None => crate::claude::token_refresh(&rest) || crate::routing::token_refresh(&rest),
+                None => {
+                    crate::claude::token_refresh(&rest)
+                        || crate::codex::routes::token_refresh(&rest)
+                }
                 Some(Service::Claude) => crate::claude::token_refresh(&rest),
-                Some(Service::Codex) => crate::routing::token_refresh(&rest),
+                Some(Service::Codex) => crate::codex::routes::token_refresh(&rest),
                 Some(Service::Antigravity) => crate::antigravity::token_refresh(&rest),
                 Some(Service::Grok) => false,
             };

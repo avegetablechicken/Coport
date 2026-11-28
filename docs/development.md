@@ -40,7 +40,7 @@ Development, service management, and macOS packaging require no Python installat
 | `src/identity.rs` | Credential checks shared by every App: environment and shell API Keys, traffic labels |
 | `src/codex.rs`, `src/claude.rs`, `src/antigravity.rs`, `src/grok.rs` | Each App's logins, settings and routing rules, with its helpers in the directory of the same name |
 | `src/saved_login.rs` | Saved logins every App renews and rotates, one adapter per App in `src/saved_login/` |
-| `src/routing.rs` | Credential matching, upstream URL mapping; `routing/target.rs` classifies requests |
+| `src/routing.rs` | Upstream URL mapping; `routing/target.rs` classifies requests, `routing/api_keys.rs` and `routing/accounts.rs` hold the API Key and account Routes every App shares |
 | `src/server.rs` | Bounded HTTP listener, proxy selection, TLS and streaming; per-App forwarding, relays and its tests in `src/server/` |
 | `src/observability/` | Redacted structured logs and rotation, Model calls, request IDs |
 | `src/service.rs` | Built-in per-user platform service management (`coport service`) |

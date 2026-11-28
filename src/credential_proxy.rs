@@ -158,7 +158,10 @@ fn scopes(config: &Config) -> Result<BTreeMap<(String, u16), String>> {
     }
     if !codex.account.is_empty() || codex.account_default().is_some() {
         add(&url(&config.codex.base_url.account)?, "/codex/");
-        add(&url(crate::routing::TOKEN_REFRESH_UPSTREAM)?, "/codex/");
+        add(
+            &url(crate::codex::routes::TOKEN_REFRESH_UPSTREAM)?,
+            "/codex/",
+        );
     }
     if codex.fallback.is_some() || credential_selectors(&codex.api_key) {
         add(&url(&config.codex.base_url.api_key)?, "/codex/");

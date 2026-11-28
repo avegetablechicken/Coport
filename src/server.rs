@@ -1,10 +1,12 @@
 use crate::{
     Error, Result,
+    codex::routes::{
+        MCP_PATH, MCP_UPSTREAM, TOKEN_REFRESH_UPSTREAM, account_query_for_route, query_url,
+    },
     config::{Choice, Config, redacted_endpoint},
     observability::logger::{Logger, Outcome, RequestLog},
     routing::{
-        MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
-        query_url, refresh_token,
+        Service, refresh_token,
         target::{Kind, Target},
         upstream_url,
     },

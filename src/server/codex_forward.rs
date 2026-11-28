@@ -2,7 +2,7 @@
 //! URL route; OpenAI's docs MCP by a login when one is sent.
 use super::pipeline::{Adapter, Codex, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
-use crate::routing::Route;
+use crate::codex::routes::Route;
 use hyper::http::request::Parts;
 
 /// A Codex Route: its credential's, or none for the docs MCP's fallback.
