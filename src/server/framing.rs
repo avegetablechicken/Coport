@@ -15,8 +15,6 @@ use std::sync::{Arc, Mutex};
 /// The largest request head, including its terminating blank line.
 pub(super) const MAX_HEAD: usize = 65536;
 const MAX_BODY: u64 = 32 * 1024 * 1024;
-/// The longest chunk-size or trailer line followed.
-const MAX_LINE: usize = 4096;
 
 /// How a request's body ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +89,14 @@ enum State {
     Head(Vec<u8>),
     /// Content-Length bytes left.
     Body(u64),
-    ChunkSize(Vec<u8>),
+    /// A chunk-size line: the size so far, and whether its digits ended.
+    ChunkSize {
+        size: u64,
+        digits_ended: bool,
+    },
     /// Chunk bytes left, with the CRLF after them.
     ChunkData(u64),
-    Trailer(Vec<u8>),
+    Trailer(Line),
     /// Nothing more to follow: framing was rejected (Hyper closes the
     /// connection after its response), or the bytes are not HTTP Hyper would
     /// accept, such as an upgraded stream.
@@ -126,25 +128,13 @@ impl Tracker {
                     left => State::Body(left),
                 },
                 State::ChunkData(left) => match skip(left, &mut bytes) {
-                    0 => State::ChunkSize(Vec::new()),
+                    0 => CHUNK_START,
                     left => State::ChunkData(left),
                 },
-                State::ChunkSize(mut line) => match take_line(&mut line, &mut bytes) {
-                    None if line.len() > MAX_LINE => State::Done,
-                    None => State::ChunkSize(line),
-                    Some(()) => match std::str::from_utf8(&line).ok().and_then(chunk_size) {
-                        Some(0) => State::Trailer(Vec::new()),
-                        Some(n) => State::ChunkData(n.saturating_add(2)),
-                        None => State::Done,
-                    },
-                },
-                State::Trailer(mut line) => match take_line(&mut line, &mut bytes) {
-                    None if line.len() > MAX_LINE => State::Done,
-                    None => State::Trailer(line),
-                    // A blank line ends the trailer section, and the body.
-                    Some(()) if line.is_empty() || line == b"\r" => State::Head(Vec::new()),
-                    Some(()) => State::Trailer(Vec::new()),
-                },
+                State::ChunkSize { size, digits_ended } => {
+                    chunk_size(size, digits_ended, &mut bytes)
+                }
+                State::Trailer(line) => trailer(line, &mut bytes),
             };
         }
     }
@@ -187,7 +177,7 @@ impl Tracker {
                 match body {
                     Body::Length(0) => State::Head(Vec::new()),
                     Body::Length(n) => State::Body(n),
-                    Body::Chunked => State::ChunkSize(Vec::new()),
+                    Body::Chunked => CHUNK_START,
                 }
             }
             Err(error) => {
@@ -198,10 +188,61 @@ impl Tracker {
     }
 }
 
-/// A chunk-size line's size, ignoring chunk extensions.
-fn chunk_size(line: &str) -> Option<u64> {
-    let size = line.trim_end_matches('\r').split(';').next()?;
-    u64::from_str_radix(size.trim(), 16).ok()
+// Chunk lines are followed a byte at a time and never buffered, so a line
+// split across reads is followed as it is whole. Hyper bounds them (16 KiB of
+// extensions per body, 16 KiB of trailers) and closes the connection on
+// anything it rejects, so the tracker only needs to be no stricter than Hyper.
+const CHUNK_START: State = State::ChunkSize {
+    size: 0,
+    digits_ended: false,
+};
+
+/// Reads a chunk-size line: its leading hex digits are the size; the rest
+/// (whitespace, extensions in any bytes, the CR) is skipped up to the LF.
+fn chunk_size(mut size: u64, mut digits_ended: bool, bytes: &mut &[u8]) -> State {
+    while let Some((&b, rest)) = bytes.split_first() {
+        *bytes = rest;
+        if b == b'\n' {
+            return match size {
+                0 => State::Trailer(Line::Empty),
+                n => State::ChunkData(n.saturating_add(2)),
+            };
+        }
+        if digits_ended {
+            continue;
+        }
+        match (b as char).to_digit(16) {
+            // Hyper rejects a size that overflows.
+            Some(d) => match size.checked_mul(16).and_then(|s| s.checked_add(d.into())) {
+                Some(s) => size = s,
+                None => return State::Done,
+            },
+            None => digits_ended = true,
+        }
+    }
+    State::ChunkSize { size, digits_ended }
+}
+
+/// What a trailer line holds so far.
+#[derive(Clone, Copy)]
+enum Line {
+    Empty,
+    Cr,
+    Text,
+}
+
+/// Skips trailer lines; a blank one ends the trailer section, and the body.
+fn trailer(mut line: Line, bytes: &mut &[u8]) -> State {
+    while let Some((&b, rest)) = bytes.split_first() {
+        *bytes = rest;
+        line = match (b, line) {
+            (b'\n', Line::Empty | Line::Cr) => return State::Head(Vec::new()),
+            (b'\n', Line::Text) => Line::Empty,
+            (b'\r', Line::Empty) => Line::Cr,
+            _ => Line::Text,
+        };
+    }
+    State::Trailer(line)
 }
 
 /// Skips up to `left` bytes, returning how many are still to come.
@@ -209,23 +250,6 @@ fn skip(left: u64, bytes: &mut &[u8]) -> u64 {
     let n = left.min(bytes.len() as u64);
     *bytes = &bytes[n as usize..];
     left - n
-}
-
-/// Moves bytes into `line` up to its LF, which is consumed but not kept.
-/// `Some` once the line is complete.
-fn take_line(line: &mut Vec<u8>, bytes: &mut &[u8]) -> Option<()> {
-    match bytes.iter().position(|b| *b == b'\n') {
-        Some(p) => {
-            line.extend_from_slice(&bytes[..p]);
-            *bytes = &bytes[p + 1..];
-            Some(())
-        }
-        None => {
-            line.extend_from_slice(bytes);
-            *bytes = &[];
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -268,13 +292,29 @@ mod tests {
     fn unfollowable_bytes_fail_closed() {
         let verdicts = Verdicts::default();
         let mut tracker = Tracker::new(verdicts.clone());
-        tracker.observe(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n");
+        // A chunk size Hyper rejects as overflowing.
+        tracker.observe(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        tracker.observe(b"10000000000000000\r\n");
         tracker.observe(b"GET / HTTP/1.1\r\n\r\n");
         assert!(verdicts.pop().is_ok());
         assert_eq!(
             verdicts.pop().unwrap_err().message,
             "Invalid request framing."
         );
+    }
+
+    #[test]
+    fn chunk_lines_are_followed_on_any_split() {
+        // Hyper skips extensions in any bytes and accepts long trailers; how
+        // the lines arrive changes nothing.
+        let mut input = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3 ;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 5 * 1024));
+        input.extend_from_slice(b"=\xff\xfe\r\nabc\r\n0\r\nX-Trailer: ");
+        input.extend(std::iter::repeat_n(b'y', 5 * 1024));
+        input.extend_from_slice(b"\r\n\r\nGET / HTTP/1.1\r\n\r\n");
+        for step in [1, 7, 4096, input.len()] {
+            assert_eq!(verdicts(&input, step), [Ok(()), Ok(())], "step {step}");
+        }
     }
 
     #[test]
