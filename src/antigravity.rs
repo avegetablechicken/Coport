@@ -9,6 +9,7 @@ use crate::{
     config::{Choice, Config, Routing, validate_upstream},
     identity::valid_token,
     refresh_routes::RefreshRoutes,
+    routing::api_keys::{ApiKeys, Read, Texts},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::HeaderMap;
@@ -624,19 +625,8 @@ pub struct AntigravityRoute {
     pub configured: bool,
 }
 
-/// How a Gemini API key request routes: by its configured upstream URL.
-pub struct ApiRoute {
-    /// The `routing.api_key` key, which records name.
-    pub selector: String,
-    pub proxy: Choice,
-    pub upstream: String,
-    pub key: String,
-    pub credential: ApiCredential,
-    /// The key is a named one, not one a URL route or `fallback` carries.
-    pub configured: bool,
-    /// A URL route's upstream, reached with the platform's TLS as Codex's.
-    pub custom_upstream: bool,
-}
+/// A Gemini API key's Route, and where its request carried the key.
+pub type ApiRoute = crate::routing::api_keys::ApiRoute<ApiCredential>;
 impl ApiRoute {
     /// The upstream URL of an origin-form or explicit target.
     pub fn url(&self, target: &str) -> Result<Url> {
@@ -813,15 +803,21 @@ impl Antigravity {
     /// token past its account route.
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
         self.api_upstream(&validate_upstream(&self.base_url.api_key)?)?;
-        for (selector, choice) in &self.routing.api_key {
-            if crate::routing::by_url::is_url_selector(selector) {
-                self.api_upstream(&crate::routing::by_url::validate_upstream(selector)?)?;
-            } else {
-                crate::config::validate_env(selector)?;
-            }
-            config.validate_choice(choice)?;
-        }
-        crate::routing::by_url::validate_routes(&self.routing.api_key)
+        self.api_keys().validate(
+            config,
+            |url| self.api_upstream(&crate::routing::by_url::validate_upstream(url)?),
+            crate::config::validate_env,
+        )
+    }
+
+    fn api_keys(&self) -> ApiKeys<'_> {
+        ApiKeys::new(
+            &self.routing.api_key,
+            Texts {
+                ambiguous: "Antigravity credential matches multiple routes.",
+                duplicate: "Multiple Antigravity routes have the same credential.",
+            },
+        )
     }
 
     /// Refuses a Gemini API upstream on a Cloud Code, token or login
@@ -846,46 +842,31 @@ impl Antigravity {
         Ok(())
     }
 
-    /// Environment variable selectors, as opposed to URL routes.
-    fn key_selectors(&self) -> impl Iterator<Item = (&String, &Choice)> {
-        self.routing
-            .api_key
-            .iter()
-            .filter(|(selector, _)| !crate::routing::by_url::is_url_selector(selector))
-    }
-
     /// Whether API keys without a URL route are served: by name or `fallback`.
     pub(crate) fn serves_api_keys(&self) -> bool {
-        self.routing.fallback.is_some() || self.key_selectors().next().is_some()
+        self.routing.fallback.is_some() || self.api_keys().named().next().is_some()
     }
 
     /// Display classification, as Codex's and Claude's `api_key_kind`.
     pub fn api_key_kind(&self, selector: &str) -> &'static str {
-        if crate::routing::by_url::is_url_selector(selector) {
-            "gateway"
-        } else {
-            "api_key"
-        }
+        self.api_keys().kind(selector)
     }
 
     /// The upstream a selector forwards to when its request names none, as
     /// Claude's `api_key_upstream`; none for URL routes, whose requests name it.
     pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
-        (!crate::routing::by_url::is_url_selector(selector))
-            .then_some(self.base_url.api_key.as_str())
+        (!self.api_keys().is_url(selector)).then_some(self.base_url.api_key.as_str())
     }
 
     /// Whether an API key route serves this unprefixed target.
     pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
-        Ok(crate::routing::by_url::match_route(&self.routing.api_key, target)?.is_some())
+        Ok(self.api_keys().url_route(target)?.is_some())
     }
 
     /// The URL route of an explicit target, as for Codex and Claude: any key,
     /// forwarded as sent, for the upstream to validate.
     pub(crate) fn api_route(&self, headers: &HeaderMap, target: &str) -> Result<Option<ApiRoute>> {
-        let Some((selector, proxy)) =
-            crate::routing::by_url::match_route(&self.routing.api_key, target)?
-        else {
+        let Some((selector, proxy, upstream)) = self.api_keys().url_route(target)? else {
             return Ok(None);
         };
         let (key, credential) = api_credential(headers, target)?.ok_or(Error::new(
@@ -893,13 +874,13 @@ impl Antigravity {
             "Antigravity API routes require a Gemini API key.",
         ))?;
         Ok(Some(ApiRoute {
-            selector: selector.into(),
-            proxy: proxy.clone(),
-            upstream: crate::routing::by_url::validate_upstream(selector)?.into(),
+            selector,
+            proxy,
+            upstream: upstream.into(),
             key,
-            credential,
             configured: false,
             custom_upstream: true,
+            ext: credential,
         }))
     }
 
@@ -958,26 +939,16 @@ impl Antigravity {
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<String>>,
     {
-        let mut matches = Vec::new();
-        let mut unavailable = false;
-        for (name, proxy) in self.key_selectors() {
-            match lookup(name.clone()).await {
-                Ok(value) if value == key => matches.push((name, proxy)),
-                Ok(_) => {}
-                Err(_) => unavailable = true,
-            }
-        }
-        if matches.len() > 1 {
-            return Err(Error::new(
-                409,
-                "Antigravity credential matches multiple routes.",
-            ));
-        }
-        let (selector, proxy, configured) = if let Some((name, proxy)) = matches.pop() {
+        let (lookup, sent) = (&lookup, key.as_str());
+        let found = self
+            .api_keys()
+            .find(|name| async move { Ok(Read::compare(lookup(name.into()).await, sent)) })
+            .await?;
+        let (selector, proxy, configured) = if let Some((name, proxy, ())) = found.named {
             (name.clone(), proxy.clone(), true)
         } else if let Some(proxy) = &self.routing.fallback {
             (API_KEY_FALLBACK.into(), proxy.clone(), false)
-        } else if unavailable {
+        } else if found.unavailable {
             return Err(Error::config(
                 "No matching Antigravity route; credential source unavailable.",
             ));
@@ -992,23 +963,21 @@ impl Antigravity {
             proxy,
             upstream: self.base_url.api_key.clone(),
             key,
-            credential,
             configured,
             custom_upstream: false,
+            ext: credential,
         })
     }
 
     /// As Claude's: each named key is readable and names one route.
     async fn check_api_keys(&self) -> Result<()> {
-        let mut keys = std::collections::HashSet::new();
-        for (name, _) in self.key_selectors() {
-            if !keys.insert(crate::identity::environment_key_with_shell(name, true).await?) {
-                return Err(Error::config(
-                    "Multiple Antigravity routes have the same credential.",
-                ));
-            }
-        }
-        Ok(())
+        self.api_keys()
+            .check_distinct(&mut Default::default(), |name| async move {
+                Ok(vec![
+                    crate::identity::environment_key_with_shell(name, true).await?,
+                ])
+            })
+            .await
     }
 
     /// Origins Antigravity sends its login's requests to, whole: Cloud Code
@@ -1861,7 +1830,7 @@ mod tests {
         header.insert("x-goog-api-key", "header-key".parse().unwrap());
         let route = ag.api_route(&header, target).unwrap().unwrap();
         assert_eq!(
-            (route.key.as_str(), route.credential),
+            (route.key.as_str(), route.ext),
             ("header-key", ApiCredential::Header)
         );
         // The longest matching path wins.
@@ -1876,17 +1845,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (route.key.as_str(), route.credential),
+            (route.key.as_str(), route.ext),
             ("bearer-key", ApiCredential::Bearer)
         );
         let query = "/https://relay.example.com/antigravity/v1/models?alt=json&key=query%2Dkey";
         let route = ag.api_route(&HeaderMap::new(), query).unwrap().unwrap();
         assert_eq!(
-            (
-                route.key.as_str(),
-                route.credential,
-                route.selector.as_str()
-            ),
+            (route.key.as_str(), route.ext, route.selector.as_str()),
             (
                 "query-key",
                 ApiCredential::Query,

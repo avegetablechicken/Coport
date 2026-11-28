@@ -6,6 +6,7 @@ use crate::{
 };
 use url::Url;
 
+pub mod api_keys;
 pub mod by_url;
 pub mod target;
 

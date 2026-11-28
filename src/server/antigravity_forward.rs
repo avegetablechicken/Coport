@@ -400,17 +400,7 @@ impl Adapter for super::pipeline::Antigravity {
 
     fn record(server: &Server, route: &Route) -> RouteRecord {
         match route {
-            Route::Api(route, _) => RouteRecord {
-                provider: Some(route.selector.clone()),
-                upstream_base_url: Some(route.upstream.clone()),
-                credential_ref: crate::identity::shared_api_reference(
-                    "Antigravity",
-                    &route.upstream,
-                    &route.key,
-                ),
-                configured: route.configured,
-                ..Default::default()
-            },
+            Route::Api(route, _) => RouteRecord::api("Antigravity", route),
             Route::Account(route, url) => RouteRecord {
                 provider: Some(route.label.clone()),
                 upstream_base_url: Some(url.origin().ascii_serialization()),
@@ -438,7 +428,7 @@ impl Adapter for super::pipeline::Antigravity {
                 url,
                 proxy: route.proxy,
                 native_tls: route.custom_upstream,
-                credential: if route.credential == ApiCredential::Bearer {
+                credential: if route.ext == ApiCredential::Bearer {
                     Credential::Bearer(route.key)
                 } else {
                     Credential::AsSent

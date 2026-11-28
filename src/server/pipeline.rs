@@ -91,6 +91,17 @@ pub(super) struct RouteRecord {
 }
 
 impl RouteRecord {
+    /// An API Key Route's fields, as every App records them.
+    pub(super) fn api<E>(app: &str, route: &crate::routing::api_keys::ApiRoute<E>) -> Self {
+        Self {
+            provider: Some(route.selector.clone()),
+            upstream_base_url: Some(route.upstream.clone()),
+            credential_ref: crate::identity::shared_api_reference(app, &route.upstream, &route.key),
+            configured: route.configured,
+            ..Default::default()
+        }
+    }
+
     pub(super) fn stamp(self, log: &mut RequestLog) {
         for (name, value) in [
             ("provider", self.provider),
