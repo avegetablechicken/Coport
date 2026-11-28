@@ -17,7 +17,7 @@ impl SavedLogin for Codex {
             .collect()
     }
     async fn load(source: Option<&AccountSource>, _: bool) -> Result<(Store, Value)> {
-        in_directory(source, crate::identity::saved_auth_store).await
+        in_directory(source, crate::codex::saved_auth_store).await
     }
     fn access(login: &Value) -> Option<&str> {
         login["tokens"]["access_token"].as_str()
@@ -55,7 +55,7 @@ impl SavedLogin for Codex {
 
     fn merge(login: &Value, access: &str, payload: &Value) -> Result<Value> {
         // Do not allow an unexpected response to switch the routed account.
-        if crate::identity::Identity::from_token(access).is_some_and(|id| {
+        if crate::codex::Identity::from_token(access).is_some_and(|id| {
             Some(id.account_id.as_str()) != login["tokens"]["account_id"].as_str()
         }) {
             return Err(Error::config("OAuth refresh changed the account."));

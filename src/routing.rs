@@ -1,7 +1,8 @@
 use crate::{
     Error, Result,
+    codex::Identity,
     config::{Choice, Config},
-    identity::{Identity, valid_token},
+    identity::valid_token,
 };
 use url::Url;
 #[derive(Clone)]

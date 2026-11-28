@@ -6,7 +6,7 @@
 //! account a lookup named for it is kept the same way. Only a SHA-256 digest
 //! of each refresh token is kept, so neither memory nor the file holds a
 //! credential.
-use crate::{antigravity::AntigravityIdentity, claude::ClaudeIdentity, identity::Identity};
+use crate::{antigravity::AntigravityIdentity, claude::ClaudeIdentity, codex::Identity};
 use std::{
     collections::HashMap,
     io::Write,

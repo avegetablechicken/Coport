@@ -1,6 +1,6 @@
 pub mod antigravity;
 pub mod claude;
-mod codex_env;
+pub mod codex;
 pub mod config;
 pub mod credential_proxy;
 pub mod external_access;

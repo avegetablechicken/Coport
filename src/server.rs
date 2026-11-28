@@ -125,7 +125,7 @@ pub struct Server {
     antigravity_renewed: Arc<crate::antigravity::RenewedTokens>,
     refresh_routes: Arc<crate::refresh_routes::RefreshRoutes>,
     grok_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::grok::GrokAccount>>,
-    codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::identity::Identity>>,
+    codex_refresh_routes: Arc<crate::refresh_routes::RefreshRoutes<crate::codex::Identity>>,
     auto_refresh: auto_refresh::RefreshState,
     credential_checks: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<CredentialReport>)>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -183,7 +183,7 @@ impl Server {
     /// Keep the Codex refresh routes learned from token responses.
     pub fn with_codex_refresh_routes(
         mut self,
-        routes: crate::refresh_routes::RefreshRoutes<crate::identity::Identity>,
+        routes: crate::refresh_routes::RefreshRoutes<crate::codex::Identity>,
     ) -> Self {
         self.codex_refresh_routes = Arc::new(routes);
         self
