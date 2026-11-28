@@ -17,7 +17,6 @@ use tokio::{
     process::{Child, Command},
 };
 
-#[path = "forwarding_status.rs"]
 mod telemetry;
 use telemetry::{Active, CountWriter, Counters};
 pub use telemetry::{Health, RemoteSummary, RemoteTraffic, RemoteWindow, Traffic};

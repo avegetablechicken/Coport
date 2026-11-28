@@ -10,7 +10,6 @@ use std::{
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
-#[path = "background.rs"]
 mod background;
 pub use background::{BackgroundController, Completion};
 
