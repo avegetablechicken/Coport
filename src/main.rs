@@ -2,7 +2,7 @@ use clap::Parser;
 use coport::{
     Error, Result,
     config::{Config, expand},
-    logger::Logger,
+    observability::logger::Logger,
     server::Server,
 };
 use std::sync::Arc;

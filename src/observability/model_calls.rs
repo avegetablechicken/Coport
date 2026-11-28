@@ -1,6 +1,6 @@
 //! Content-free model-call observations, separate from HTTP/tunnel lifecycle logs.
-use crate::logger::{Logger, RequestLog};
-use crate::observation_memory::Buffer;
+use crate::observability::logger::{Logger, RequestLog};
+use crate::observability::observation_memory::Buffer;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
@@ -284,7 +284,7 @@ pub(crate) fn http_event(log: &RequestLog, event: &str) {
 }
 
 pub(crate) fn observe_request(bytes: &[u8], log: &mut RequestLog) {
-    crate::request_ids::body(bytes, &mut log.fields, false);
+    crate::observability::request_ids::body(bytes, &mut log.fields, false);
     // Compressed bodies are forwarded as they are and not decoded; the response
     // reports the model as well.
     if let Ok(event) = serde_json::from_slice::<Envelope>(bytes) {
@@ -798,7 +798,7 @@ impl WsCalls {
             }
             let mut fields = self.fields.clone();
             field(&mut fields, "model_call_id", uuid::Uuid::new_v4());
-            crate::request_ids::body(bytes, &mut fields, true);
+            crate::observability::request_ids::body(bytes, &mut fields, true);
             field(&mut fields, "wrote_downstream", false);
             event.apply(&mut fields);
             self.logger.write("model_call_started", fields.clone());
@@ -1200,7 +1200,7 @@ mod tests {
             Arc::new(Logger::new(path.to_owned())),
             "request",
             serde_json::from_value(fields).unwrap(),
-            crate::logger::Outcome::Finished,
+            crate::observability::logger::Outcome::Finished,
         );
         log.status = 101;
         log
@@ -1348,13 +1348,13 @@ mod tests {
         for outcome in ["request_finished", "request_failed"] {
             let mut log = log_at(&path);
             log.model_call(outcome);
-            crate::request_ids::headers(&hyper::HeaderMap::new(), &mut log.fields);
+            crate::observability::request_ids::headers(&hyper::HeaderMap::new(), &mut log.fields);
             log.event("request_received");
             observe_request(br#"{"metadata":{"user_id":"user_PRIVATE_account_PRIVATE_session_550e8400-e29b-41d4-a716-446655440000"},"request_id":"client-http","model":"test","input":"PRIVATE"}"#, &mut log);
             log.outcome = if outcome == "request_failed" {
-                crate::logger::Outcome::Failed
+                crate::observability::logger::Outcome::Failed
             } else {
-                crate::logger::Outcome::Finished
+                crate::observability::logger::Outcome::Finished
             };
             log.status = if outcome == "request_failed" {
                 502
@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn http_observers_share_a_budget_and_release_it_when_abandoned() {
         let dir = tempfile::tempdir().unwrap();
-        let budget = Arc::new(crate::observation_memory::Budget::new(2048));
+        let budget = Arc::new(crate::observability::observation_memory::Budget::new(2048));
         let observer = || {
             let mut log = log_at(&dir.path().join("proxy.log"));
             let mut observer = HttpObserver::new(false, None, &mut log);
@@ -1884,7 +1884,7 @@ mod tests {
 
     #[test]
     fn websocket_message_charge_lives_until_the_delivered_message_is_dropped() {
-        let budget = Arc::new(crate::observation_memory::Budget::new(2048));
+        let budget = Arc::new(crate::observability::observation_memory::Budget::new(2048));
         let parser = || {
             let mut parser = FrameObserver::new(false, false);
             parser.message = Buffer::with_budget(budget.clone());

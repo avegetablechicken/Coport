@@ -1,7 +1,7 @@
 //! A detached, GUI-free proxy process. Discovery is per-user; control requests
 //! use a random capability stored in an owner-only file, never on the proxy port.
 
-use coport::{config::Config, logger::Logger, server::Server};
+use coport::{config::Config, observability::logger::Logger, server::Server};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},

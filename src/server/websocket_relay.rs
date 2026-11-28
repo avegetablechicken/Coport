@@ -1,9 +1,9 @@
 //! Responses WebSocket relay with protocol-phase deadlines. CONNECT uses relay.rs.
 use crate::{
     config::WebSocketTimeouts,
-    logger::{Outcome, RequestLog},
-    model_calls::WsCalls,
-    observation_memory::{Buffer, Exhausted},
+    observability::logger::{Outcome, RequestLog},
+    observability::model_calls::WsCalls,
+    observability::observation_memory::{Buffer, Exhausted},
 };
 use std::{
     io,
@@ -502,7 +502,7 @@ pub(super) async fn run<A, B>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logger::Logger;
+    use crate::observability::logger::Logger;
     use serde_json::{Value, json};
     use tokio::io::DuplexStream;
     fn data_frame(value: Value, masked: bool) -> Vec<u8> {
@@ -591,7 +591,9 @@ mod tests {
         let (mut sender, mut reader) = tokio::io::duplex(64);
         // An unmasked, 1024-byte frame: the payload need not arrive at all.
         sender.write_all(&[0x81, 126, 4, 0]).await.unwrap();
-        let buffer = Buffer::with_budget(Arc::new(crate::observation_memory::Budget::new(64)));
+        let buffer = Buffer::with_budget(Arc::new(
+            crate::observability::observation_memory::Budget::new(64),
+        ));
         let error = read_frame_into(&mut reader, false, buffer)
             .await
             .err()

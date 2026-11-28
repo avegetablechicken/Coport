@@ -124,10 +124,14 @@ impl Write for Stderr {
 
 const QUEUE_RECORDS: usize = 1024;
 const MAX_RECORD: usize = 256 * 1024;
-static QUEUE_BUDGET: LazyLock<Arc<crate::observation_memory::Budget>> =
-    LazyLock::new(|| Arc::new(crate::observation_memory::Budget::new(8 * 1024 * 1024)));
+static QUEUE_BUDGET: LazyLock<Arc<crate::observability::observation_memory::Budget>> =
+    LazyLock::new(|| {
+        Arc::new(crate::observability::observation_memory::Budget::new(
+            8 * 1024 * 1024,
+        ))
+    });
 
-struct RecordBytes(crate::observation_memory::Buffer);
+struct RecordBytes(crate::observability::observation_memory::Buffer);
 impl Write for RecordBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.0.len().saturating_add(bytes.len()) > MAX_RECORD {
@@ -143,7 +147,7 @@ impl Write for RecordBytes {
 
 enum Message {
     ReportDrops,
-    Record(crate::observation_memory::Buffer),
+    Record(crate::observability::observation_memory::Buffer),
     Flush(mpsc::SyncSender<std::io::Result<()>>),
 }
 
@@ -192,9 +196,9 @@ impl Logger {
     pub fn write(&self, event: &str, mut fields: Map<String, Value>) {
         fields.insert("event".into(), json!(event));
         fields.insert("timestamp".into(), json!(timestamp()));
-        let mut bytes = RecordBytes(crate::observation_memory::Buffer::with_budget(
-            QUEUE_BUDGET.clone(),
-        ));
+        let mut bytes = RecordBytes(
+            crate::observability::observation_memory::Buffer::with_budget(QUEUE_BUDGET.clone()),
+        );
         if serde_json::to_writer(&mut bytes, &fields).is_err() || bytes.write_all(b"\n").is_err() {
             self.report_drop();
             return;
@@ -483,7 +487,7 @@ impl RequestLog {
     }
     pub fn event(&self, event: &str) {
         self.logger.write(event, self.record());
-        crate::model_calls::http_event(self, event);
+        crate::observability::model_calls::http_event(self, event);
     }
     /// An event of an Auxiliary request made on this record: not its Model
     /// call's.

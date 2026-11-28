@@ -487,7 +487,9 @@ mod tests {
     /// Route activation as the proxy reports it for `config`.
     async fn activation(config: &Config) -> [BTreeMap<String, &'static str>; 4] {
         let dir = tempfile::tempdir().unwrap();
-        let logger = std::sync::Arc::new(crate::logger::Logger::new(dir.path().join("proxy.log")));
+        let logger = std::sync::Arc::new(crate::observability::logger::Logger::new(
+            dir.path().join("proxy.log"),
+        ));
         crate::server::Server::new(config.clone(), logger)
             .account_route_states()
             .await

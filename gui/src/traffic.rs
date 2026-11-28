@@ -43,7 +43,10 @@ fn is_historical_http_call(entry: &Entry) -> bool {
     !entry.event.starts_with("model_call_")
         && !entry.fields.contains_key("model_call_id")
         && entry.get("method") == Some("POST")
-        && coport::model_calls::is_model_endpoint("POST", entry.get("path").unwrap_or(""))
+        && coport::observability::model_calls::is_model_endpoint(
+            "POST",
+            entry.get("path").unwrap_or(""),
+        )
 }
 
 // Later lifecycle stages supply the outcome and credential, but a request is
@@ -1407,7 +1410,7 @@ fn ordered_files(
             Err(_) => return Err("Cannot read traffic history".to_owned()),
         }
     }
-    let archives = coport::logger::history_paths(path)
+    let archives = coport::observability::logger::history_paths(path)
         .map_err(|_| "Cannot read traffic archives".to_owned())?;
     files.extend(
         archives

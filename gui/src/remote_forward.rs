@@ -712,7 +712,9 @@ mod tests {
         let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let server = Arc::new(coport::server::Server::new(
             config,
-            Arc::new(coport::logger::Logger::new(dir.path().join("test.log"))),
+            Arc::new(coport::observability::logger::Logger::new(
+                dir.path().join("test.log"),
+            )),
         ));
         let (mut client, socket) = tokio::io::duplex(1024);
         let task = tokio::spawn(routing.handler()(server, Box::new(socket)));
@@ -795,7 +797,9 @@ mod tests {
         let config = coport::config::Config::parse("listen_port: 8787\nrequest_timeout_seconds: 30\ncodex:\n  homes: []\nclaude:\n  config_dirs: []\n").unwrap();
         let server = Arc::new(coport::server::Server::new(
             config,
-            Arc::new(coport::logger::Logger::new(dir.path().join("test.log"))),
+            Arc::new(coport::observability::logger::Logger::new(
+                dir.path().join("test.log"),
+            )),
         ));
         let (mut client, socket) = tokio::io::duplex(128);
         let connection = tokio::spawn(routing.handler()(server, Box::new(socket)));

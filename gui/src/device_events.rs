@@ -207,7 +207,7 @@ fn persist(
     fields.insert("timestamp".into(), chrono::Utc::now().to_rfc3339().into());
     let mut bytes = serde_json::to_vec(&fields)?;
     bytes.push(b'\n');
-    coport::logger::open_private(log)?.write_all(&bytes)
+    coport::observability::logger::open_private(log)?.write_all(&bytes)
 }
 
 #[cfg(test)]

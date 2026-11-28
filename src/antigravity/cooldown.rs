@@ -4,7 +4,7 @@
 //!
 //! A rejection soon after a cooldown ends doubles the next one, up to the last
 //! step; a model call the upstream accepts starts the login over.
-use crate::logger::RequestLog;
+use crate::observability::logger::RequestLog;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -257,7 +257,7 @@ fn location_error(error: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logger::{Logger, Outcome};
+    use crate::observability::logger::{Logger, Outcome};
     use futures_util::FutureExt;
     use hyper::Response;
     use std::sync::Arc;

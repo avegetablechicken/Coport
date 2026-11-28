@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     config::{Choice, Config, redacted_endpoint},
-    logger::{Logger, Outcome, RequestLog},
+    observability::logger::{Logger, Outcome, RequestLog},
     routing::{
         MCP_PATH, MCP_UPSTREAM, Service, TOKEN_REFRESH_UPSTREAM, account_query_for_route,
         query_url, refresh_token, upstream_url,
@@ -475,7 +475,7 @@ impl Server {
             log.model_call(uuid::Uuid::new_v4());
             log.field("model_transport", "http");
         }
-        crate::request_ids::headers(incoming.headers(), &mut log.fields);
+        crate::observability::request_ids::headers(incoming.headers(), &mut log.fields);
         if let Some(destination) = &destination {
             log.field(
                 "client_connect",
@@ -619,9 +619,9 @@ impl Server {
                 record_upstream_response(&mut log, status.as_u16(), relayed);
                 let headers = filtered_headers(upstream.headers());
                 let mut observer = (target.kind() == Kind::ModelCall).then(|| {
-                    crate::model_calls::record_response_encoding(&mut log, &headers);
+                    crate::observability::model_calls::record_response_encoding(&mut log, &headers);
                     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-                    crate::model_calls::HttpObserver::new(
+                    crate::observability::model_calls::HttpObserver::new(
                         header("content-type").is_some_and(|v| {
                             v.trim()
                                 .to_ascii_lowercase()

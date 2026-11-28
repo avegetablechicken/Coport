@@ -80,7 +80,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, logger::Logger};
+    use crate::{config::Config, observability::logger::Logger};
     use std::sync::Arc;
 
     #[tokio::test(start_paused = true)]

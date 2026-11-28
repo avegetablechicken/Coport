@@ -316,7 +316,7 @@ impl Server {
             .wait(relay.cooldown.as_ref(), log)
             .await;
         if target.kind() == Kind::ModelCall {
-            crate::model_calls::observe_request(&bytes, log);
+            crate::observability::model_calls::observe_request(&bytes, log);
         }
         let mut headers = filtered_headers(&parts.headers);
         relay.credential.apply(&mut headers)?;

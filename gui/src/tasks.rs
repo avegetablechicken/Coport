@@ -2,7 +2,7 @@
 use crate::daemon;
 use coport::{
     config::Config,
-    logger::Logger,
+    observability::logger::Logger,
     server::{AntigravityProfiles, ClaudeProfiles, Server},
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
