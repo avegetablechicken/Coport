@@ -195,13 +195,13 @@ impl Adapter for Claude {
         mut route: ClaudeRoute,
         log: &mut RequestLog,
     ) -> Result<ClaudeRoute> {
-        if let ClaudeRoute::Account(route) = &mut route
-            && route.needs_profile
-        {
-            let identity = server
-                .lookup_account::<Claude>(&route.token, &route.proxy, log)
-                .await?;
-            server.config.claude.apply_profile(route, identity)?;
+        if let ClaudeRoute::Account(route) = &mut route {
+            if route.needs_profile {
+                let identity = server
+                    .lookup_account::<Claude>(&route.token, &route.proxy, log)
+                    .await?;
+                server.config.claude.apply_profile(route, identity)?;
+            }
         }
         Ok(route)
     }
