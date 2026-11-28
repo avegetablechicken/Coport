@@ -19,7 +19,6 @@ mod saved_login;
 pub mod server;
 pub mod service;
 pub mod target;
-mod tunnel;
 pub mod url_routing;
 
 #[derive(Debug, Clone)]

@@ -205,7 +205,7 @@ impl Server {
         {
             return Err(Error::new(413, "Request body exceeds 32 MiB."));
         }
-        let websocket = crate::tunnel::websocket(&incoming)?;
+        let websocket = super::tunnel::websocket(&incoming)?;
         if incoming.headers().contains_key("expect") {
             return Err(Error::new(417, "Expect is unsupported."));
         }

@@ -578,7 +578,7 @@ impl Server {
         &self,
         key: &ProbeKey,
         deadline: Deadline,
-    ) -> Result<crate::tunnel::Socket> {
+    ) -> Result<super::tunnel::Socket> {
         let url = Url::parse(&key.origin).map_err(|_| Error::config("Invalid tunnel origin."))?;
         let host = url
             .host_str()
@@ -586,7 +586,7 @@ impl Server {
             .trim_start_matches('[')
             .trim_end_matches(']');
         deadline
-            .run(crate::tunnel::open(
+            .run(super::tunnel::open(
                 host,
                 url.port_or_known_default().unwrap(),
                 &key.endpoint,

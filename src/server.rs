@@ -100,6 +100,7 @@ mod grok_forward;
 mod identity_directory;
 mod pipeline;
 mod transport;
+mod tunnel;
 mod websocket_relay;
 use transport::*;
 mod auto_refresh;
@@ -559,8 +560,8 @@ impl Server {
                             Error::config("Unexpected upstream protocol upgrade."),
                         ));
                     };
-                    let accept = crate::tunnel::websocket_accept(key.as_bytes());
-                    if !crate::tunnel::header_token(upstream.headers(), "connection", "upgrade")
+                    let accept = tunnel::websocket_accept(key.as_bytes());
+                    if !tunnel::header_token(upstream.headers(), "connection", "upgrade")
                         || upstream
                             .headers()
                             .get("upgrade")
@@ -686,7 +687,7 @@ impl Server {
             .uri()
             .authority()
             .ok_or(Error::new(400, "CONNECT requires host:port."))?;
-        let (host, port) = crate::tunnel::authority(authority.as_str())?;
+        let (host, port) = tunnel::authority(authority.as_str())?;
         // Logged before routing, so a denied destination is visible too.
         log.field("destination", format!("{host}:{port}"));
         let Some(proxy) = &self.credential_proxy else {
@@ -1059,7 +1060,7 @@ fn reject(log: &mut RequestLog, error: Error) -> Response<Body> {
 /// Model calls; any other upgrade, byte for byte.
 fn relay_websocket_or_tunnel(
     upgrade: hyper::upgrade::OnUpgrade,
-    upstream: crate::tunnel::Socket,
+    upstream: tunnel::Socket,
     model_websocket: bool,
     mut log: RequestLog,
     seconds: f64,
@@ -1086,7 +1087,7 @@ fn relay_websocket_or_tunnel(
 
 fn relay_stream(
     upgrade: hyper::upgrade::OnUpgrade,
-    mut upstream: crate::tunnel::Socket,
+    mut upstream: tunnel::Socket,
     mut log: RequestLog,
     seconds: f64,
 ) -> Relay {
