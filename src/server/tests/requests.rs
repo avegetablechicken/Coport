@@ -156,6 +156,8 @@ async fn request_limits_duplicates_and_chunked_upload() {
     // whose framing is held to the first request's rules.
     for framing in [
         "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+        // Hyper drops this Content-Length, so only the raw head shows it.
+        "Transfer-Encoding: chunked\r\nContent-Length: 2\r\n",
         "Transfer-Encoding: gzip, chunked\r\n",
     ] {
         let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))

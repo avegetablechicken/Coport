@@ -99,6 +99,7 @@ pub use credential_checks::CredentialReport;
 mod antigravity_forward;
 mod claude_forward;
 mod codex_forward;
+mod framing;
 mod grok_forward;
 mod identity_directory;
 mod pipeline;
@@ -426,6 +427,7 @@ impl Server {
     async fn handle(
         self: Arc<Self>,
         mut incoming: Request<Incoming>,
+        framing: Result<()>,
         relay: tokio::sync::mpsc::UnboundedSender<Relay>,
         destination: Option<Arc<crate::credential_proxy::Destination>>,
         tunnel: Option<TunnelLog>,
@@ -452,7 +454,12 @@ impl Server {
         if let Some(destination) = destination.as_ref().filter(|_| valid) {
             target = format!("{}{target}", destination.scope);
         }
-        if valid && destination.is_none() && incoming.method() == "GET" && target == "/health" {
+        if framing.is_ok()
+            && valid
+            && destination.is_none()
+            && incoming.method() == "GET"
+            && target == "/health"
+        {
             return Ok(response(200, "{\"ok\":true}"));
         }
         // A CONNECT target is its authority (host:port); one carrying user
@@ -493,6 +500,9 @@ impl Server {
             log.field("service", service.name());
         }
         log.event("request_received");
+        if let Err(error) = framing {
+            return Ok(reject(&mut log, error));
+        }
         if !valid {
             return Ok(reject(
                 &mut log,
@@ -970,6 +980,8 @@ impl Server {
                 }
             };
             let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Relay>();
+            // Each request's framing verdict, taken in the order Hyper serves them.
+            let verdicts = framing::Verdicts::default();
             // Forwarded responses keep the connection for further requests,
             // which the header read timeout closes once idle; local error
             // responses close it. A stream failing midway aborts the
@@ -979,10 +991,15 @@ impl Server {
                 .timer(TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(30))
                 .serve_connection(
-                    TokioIo::new(PrefixedSocket { prefix, socket }),
+                    TokioIo::new(PrefixedSocket {
+                        prefix,
+                        socket,
+                        framing: framing::Tracker::new(verdicts.clone()),
+                    }),
                     service_fn(move |r| {
                         self.clone().handle(
                             r,
+                            verdicts.pop(),
                             relay_tx.clone(),
                             destination.clone(),
                             tunnel.clone(),
@@ -1166,7 +1183,8 @@ fn repeatable_request_header(name: &str) -> bool {
 }
 
 // Reject ambiguity before Hyper normalizes duplicate Content-Length or TE+CL.
-// Buffered bytes (including any body prefix) are then passed to Hyper unchanged.
+// Buffered bytes (including any body prefix) are then passed to Hyper
+// unchanged; the connection's later heads are checked by a framing Tracker.
 async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Bytes> {
     use tokio::io::AsyncReadExt;
     let mut data = Vec::with_capacity(8192);
@@ -1181,42 +1199,13 @@ async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<B
         }
         data.extend_from_slice(&chunk[..n]);
         if let Some(end) = data.windows(4).position(|s| s == b"\r\n\r\n") {
-            if end + 4 > 65536 {
+            if end + 4 > framing::MAX_HEAD {
                 return Err(Error::new(431, "Headers exceed 64 KiB."));
             }
-            let head = std::str::from_utf8(&data[..end])
-                .map_err(|_| Error::new(400, "Invalid request headers."))?;
-            let mut names = std::collections::HashSet::new();
-            for line in head.split("\r\n").skip(1) {
-                let (name, value) = line
-                    .split_once(':')
-                    .ok_or(Error::new(400, "Invalid request header."))?;
-                let name = name.to_ascii_lowercase();
-                if !names.insert(name.clone()) && !repeatable_request_header(&name) {
-                    return Err(Error::new(400, "Duplicate request header."));
-                }
-                if name == "transfer-encoding" && !value.trim().eq_ignore_ascii_case("chunked") {
-                    return Err(Error::new(400, "Unsupported body framing."));
-                }
-                if name == "content-length" {
-                    let v = value.trim();
-                    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err(Error::new(400, "Invalid Content-Length."));
-                    }
-                    if v.parse::<u64>().map_or(true, |n| n > 32 * 1024 * 1024) {
-                        return Err(Error::new(413, "Body exceeds 32 MiB."));
-                    }
-                }
-            }
-            if names.contains("transfer-encoding") && names.contains("content-length") {
-                return Err(Error::new(400, "Ambiguous body framing."));
-            }
-            if names.contains("expect") {
-                return Err(Error::new(417, "Expect is unsupported."));
-            }
+            framing::check_head(&data[..end])?;
             return Ok(Bytes::from(data));
         }
-        if data.len() > 65536 {
+        if data.len() > framing::MAX_HEAD {
             return Err(Error::new(431, "Headers exceed 64 KiB."));
         }
     }
@@ -1224,6 +1213,7 @@ async fn read_head(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<B
 struct PrefixedSocket<S> {
     prefix: Bytes,
     socket: S,
+    framing: framing::Tracker,
 }
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedSocket<S> {
     fn poll_read(
@@ -1231,13 +1221,20 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedSocket<S>
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.prefix.is_empty() {
-            let n = buf.remaining().min(self.prefix.len());
-            buf.put_slice(&self.prefix[..n]);
-            self.prefix.advance(n);
-            return std::task::Poll::Ready(Ok(()));
+        let this = &mut *self;
+        let before = buf.filled().len();
+        let poll = if this.prefix.is_empty() {
+            std::pin::Pin::new(&mut this.socket).poll_read(cx, buf)
+        } else {
+            let n = buf.remaining().min(this.prefix.len());
+            buf.put_slice(&this.prefix[..n]);
+            this.prefix.advance(n);
+            std::task::Poll::Ready(Ok(()))
+        };
+        if let std::task::Poll::Ready(Ok(())) = poll {
+            this.framing.observe(&buf.filled()[before..]);
         }
-        std::pin::Pin::new(&mut self.socket).poll_read(cx, buf)
+        poll
     }
 }
 impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedSocket<S> {
