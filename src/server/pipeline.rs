@@ -223,6 +223,21 @@ impl Server {
         }) {
             return Err(Error::new(400, "Duplicate request header."));
         }
+        // A reused connection's later requests skip `read_head`, so its framing
+        // rules are repeated on what Hyper parsed. Hyper already drops a
+        // Content-Length that follows Transfer-Encoding and decodes the body as
+        // chunked; framing headers are never forwarded.
+        if let Some(te) = incoming.headers().get("transfer-encoding") {
+            if !te
+                .to_str()
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("chunked"))
+            {
+                return Err(Error::new(400, "Unsupported body framing."));
+            }
+            if incoming.headers().contains_key("content-length") {
+                return Err(Error::new(400, "Ambiguous body framing."));
+            }
+        }
         if incoming
             .headers()
             .get("content-length")

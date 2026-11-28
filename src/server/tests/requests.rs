@@ -152,14 +152,28 @@ async fn request_limits_duplicates_and_chunked_upload() {
             "{output}"
         );
     }
-    let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
-        .await
-        .unwrap();
-    socket.write_all(b"POST /responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").await.unwrap();
-    // A forwarded response keeps the connection open for further requests.
-    let output = read_response_head(&mut socket).await;
-    assert!(output.starts_with("HTTP/1.1 302"), "{output}");
-    assert!(fixture.requests.recv().await.unwrap().ends_with("abcde"));
+    // A forwarded response keeps the connection open for further requests,
+    // whose framing is held to the first request's rules.
+    for framing in [
+        "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: gzip, chunked\r\n",
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(running.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        socket.write_all(b"POST /responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").await.unwrap();
+        let output = read_response_head(&mut socket).await;
+        assert!(output.starts_with("HTTP/1.1 302"), "{output}");
+        assert!(fixture.requests.recv().await.unwrap().ends_with("abcde"));
+        socket.write_all(format!("POST /responses HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer model-secret\r\n{framing}\r\n0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(2), socket.read_to_string(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.contains("HTTP/1.1 400"), "{framing}: {output}");
+        assert!(fixture.requests.try_recv().is_err(), "{framing}");
+    }
 }
 
 #[tokio::test]
