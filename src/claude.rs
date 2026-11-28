@@ -435,7 +435,12 @@ impl Claude {
                 continue;
             };
             match value {
-                Ok(value) if value["claudeAiOauth"]["refreshToken"].as_str() == Some(token) => {
+                Ok(value)
+                    if crate::identity::same_secret(
+                        value["claudeAiOauth"]["refreshToken"].as_str(),
+                        token,
+                    ) =>
+                {
                     matches.push((label, account.claude_identity(), value));
                 }
                 Ok(_) => {}
@@ -529,7 +534,9 @@ impl Claude {
             let mut sources = Vec::new();
             for (label, account) in &account_sources {
                 match account.claude_token().await {
-                    Ok(value) if value == token => sources.push((label, account)),
+                    Ok(value) if crate::identity::same_secret(Some(&value), token) => {
+                        sources.push((label, account))
+                    }
                     Ok(_) => {}
                     Err(_) => unavailable = true,
                 }
@@ -560,7 +567,9 @@ impl Claude {
             .api_keys()
             .find(|name| async move {
                 Ok(match settings::load(dirs, name)? {
-                    Some(profile) if profile.token == token => Read::Match(Some(profile.upstream)),
+                    Some(profile) if crate::identity::same_secret(Some(&profile.token), token) => {
+                        Read::Match(Some(profile.upstream))
+                    }
                     Some(_) => Read::Other,
                     None => {
                         match Read::compare(environment_key_with_shell(name, shell).await, token) {

@@ -10,6 +10,19 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
+/// Whether a credential a request carries is the one a route holds,
+/// compared in time that depends on their lengths, not on where they differ.
+pub(crate) fn same_secret(held: Option<&str>, sent: &str) -> bool {
+    held.is_some_and(|held| {
+        held.len() == sent.len()
+            && std::hint::black_box(
+                held.bytes()
+                    .zip(sent.bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b)),
+            ) == 0
+    })
+}
+
 pub fn valid_token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b > 32 && b < 127)
 }
@@ -435,6 +448,19 @@ pub(crate) fn routing_account_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_secret_needs_a_held_secret_equal_in_every_byte() {
+        assert!(same_secret(Some("token-a"), "token-a"));
+        for (held, sent) in [
+            (Some("token-a"), "token-b"),
+            (Some("token-a"), "token-ab"),
+            (Some("token"), ""),
+            (None, "token-a"),
+        ] {
+            assert!(!same_secret(held, sent), "{held:?} {sent}");
+        }
+    }
 
     #[test]
     fn shared_api_proofs_bind_service_endpoint_and_secret_without_names() {

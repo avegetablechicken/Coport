@@ -120,7 +120,7 @@ impl Grok {
         let field = if refresh { "refresh_token" } else { "key" };
         let Some(login) = logins
             .into_iter()
-            .find(|login| login[field].as_str() == Some(token))
+            .find(|login| crate::identity::same_secret(login[field].as_str(), token))
         else {
             return Ok(None);
         };

@@ -506,7 +506,10 @@ impl Grok {
         } else {
             (Vec::new(), false)
         };
-        if let Some(login) = logins.into_iter().find(|l| l.access_token == token) {
+        if let Some(login) = logins
+            .into_iter()
+            .find(|l| crate::identity::same_secret(Some(&l.access_token), token))
+        {
             let label = self
                 .account_label(&login.identity, true)
                 .ok_or(Error::config("Grok account has no proxy route."))?;

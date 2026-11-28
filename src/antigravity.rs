@@ -1094,7 +1094,8 @@ impl Antigravity {
         let renewed = renewed.get(token);
         let (login, unavailable) = self
             .saved_for(|login| {
-                login.access_token == token || renewed.as_ref().is_some_and(|r| r.renews(login))
+                crate::identity::same_secret(Some(&login.access_token), token)
+                    || renewed.as_ref().is_some_and(|r| r.renews(login))
             })
             .await;
         let route = |proxy: &Choice,
@@ -1120,7 +1121,8 @@ impl Antigravity {
         // The saved login's current token, or one a relayed refresh issued
         // for its refresh token; the credential store's is checked first.
         if let Some(login) = login.filter(|login| {
-            login.access_token == token || renewed.as_ref().is_some_and(|r| r.renews(login))
+            crate::identity::same_secret(Some(&login.access_token), token)
+                || renewed.as_ref().is_some_and(|r| r.renews(login))
         }) {
             let identity = Self::login_identity(&login, learned)
                 .or_else(|| renewed.as_ref().and_then(|r| r.identity.clone()));
@@ -1187,11 +1189,13 @@ impl Antigravity {
         learned: &RefreshRoutes<AntigravityIdentity>,
     ) -> Result<RefreshRoute> {
         let (login, unavailable) = self
-            .saved_for(|login| login.refresh_token.as_deref() == Some(refresh_token))
+            .saved_for(|login| {
+                crate::identity::same_secret(login.refresh_token.as_deref(), refresh_token)
+            })
             .await;
-        if let Some(login) =
-            login.filter(|login| login.refresh_token.as_deref() == Some(refresh_token))
-        {
+        if let Some(login) = login.filter(|login| {
+            crate::identity::same_secret(login.refresh_token.as_deref(), refresh_token)
+        }) {
             let identity = Self::login_identity(&login, learned);
             if identity.is_none() {
                 if let Some(probe) = &self.routing.account_probe {

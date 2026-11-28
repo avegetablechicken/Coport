@@ -132,7 +132,9 @@ impl Server {
             let Ok((store, value)) = L::load(source.as_ref(), true).await else {
                 continue;
             };
-            if login::access::<L>(&value) == Some(token) && login::refresh::<L>(&value).is_some() {
+            if crate::identity::same_secret(login::access::<L>(&value), token)
+                && login::refresh::<L>(&value).is_some()
+            {
                 if found.is_some() {
                     return None;
                 }

@@ -53,7 +53,7 @@ impl Read<()> {
     /// A selector's key as read, compared with the request's.
     pub(crate) fn compare(read: Result<String>, key: &str) -> Self {
         match read {
-            Ok(value) if value == key => Self::Match(()),
+            Ok(value) if crate::identity::same_secret(Some(&value), key) => Self::Match(()),
             Ok(_) => Self::Other,
             Err(_) => Self::Unavailable,
         }
