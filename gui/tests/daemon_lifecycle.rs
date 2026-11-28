@@ -1046,6 +1046,18 @@ fn a_second_control_restart_forces_the_waiting_one() {
     )
     .unwrap();
     let _request = hanging_request(port, &client);
+    // A detached Daemon must not inherit the control command's output pipes:
+    // reading them must reach EOF while the new Daemon is still running.
+    let output = |child: std::process::Child| {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(child.wait_with_output());
+        });
+        receive
+            .recv_timeout(Duration::from_secs(30))
+            .expect("Control command did not exit and close its output pipes")
+            .unwrap()
+    };
     let control = |args: &[&str]| {
         Command::new(helper())
             .arg("--control")
@@ -1065,10 +1077,10 @@ fn a_second_control_restart_forces_the_waiting_one() {
         note.starts_with("Waiting for 1 request(s) in flight"),
         "{note}"
     );
-    let forced = control(&["restart", "--force"]).wait_with_output().unwrap();
+    let forced = output(control(&["restart", "--force"]));
     assert!(forced.status.success(), "{forced:?}");
     assert!(String::from_utf8_lossy(&forced.stderr).contains("Another restart is in progress"));
-    let waited = waiting.wait_with_output().unwrap();
+    let waited = output(waiting);
     assert!(waited.status.success(), "{waited:?}");
     let notes: Vec<_> = notes.map(Result::unwrap).collect();
     assert_eq!(

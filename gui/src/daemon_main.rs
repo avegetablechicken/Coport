@@ -3,6 +3,8 @@
 use std::io::Write;
 
 fn main() {
+    #[cfg(windows)]
+    prevent_stdio_inheritance();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--capabilities") {
         match helper_directory(&args, 1) {
@@ -114,6 +116,28 @@ fn main() {
     )) {
         eprintln!("Cannot run proxy daemon: {error}");
         std::process::exit(1);
+    }
+}
+
+/// A detached Daemon must not keep a control command's pipes open. Windows
+/// inherits every inheritable handle, even when the child's stdio is redirected.
+#[cfg(windows)]
+fn prevent_stdio_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: these are borrowed standard handles; changing only the
+        // inheritance flag neither closes them nor changes this process's I/O.
+        // Missing console handles are harmless and need no update.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
     }
 }
 

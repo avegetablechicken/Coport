@@ -36,7 +36,25 @@ impl Platform for Native {
     fn supervisor(&self, pid: u32) -> Option<String> {
         #[cfg(target_os = "linux")]
         {
-            supervisor(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
+            supervisor(
+                &std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?,
+                pid,
+                |unit, user| {
+                    let mut command = Command::new("systemctl");
+                    if user {
+                        command.arg("--user");
+                    }
+                    let output = command
+                        .args(["show", "-p", "MainPID", "--value", "--", unit])
+                        .output()
+                        .ok()?;
+                    output
+                        .status
+                        .success()
+                        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+                        .flatten()
+                },
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -77,11 +95,26 @@ impl Platform for Native {
     }
 }
 
+/// A cgroup is inherited by children, including detached Daemons launched
+/// by CI runners or terminals. Only the service's main process is supervised.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn supervisor(
+    cgroup: &str,
+    pid: u32,
+    mut main_pid: impl FnMut(&str, bool) -> Option<u32>,
+) -> Option<String> {
+    let unit = service_unit(cgroup)?;
+    [false, true]
+        .into_iter()
+        .any(|user| main_pid(&unit, user) == Some(pid))
+        .then_some(unit)
+}
+
 /// The systemd service in a `/proc/PID/cgroup` listing, unless it is a
 /// desktop session or an app the desktop launched: those run the process
 /// without starting it again.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(super) fn supervisor(cgroup: &str) -> Option<String> {
+fn service_unit(cgroup: &str) -> Option<String> {
     cgroup.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
         let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
@@ -165,8 +198,24 @@ mod tests {
             (unified("/user.slice/user-1000.slice/session-3.scope"), None),
             ("4:memory:/system.slice/other.service\n".to_owned(), None),
         ] {
-            assert_eq!(supervisor(&cgroup).as_deref(), unit, "{cgroup}");
+            assert_eq!(service_unit(&cgroup).as_deref(), unit, "{cgroup}");
         }
+    }
+
+    #[test]
+    fn inherited_service_membership_does_not_supervise_a_child() {
+        let cgroup = "0::/system.slice/hosted-compute-agent.service\n";
+        assert_eq!(supervisor(cgroup, 42, |_, _| Some(7)), None);
+        assert_eq!(supervisor(cgroup, 42, |_, _| None), None);
+        assert_eq!(
+            supervisor(cgroup, 7, |_, user| (!user).then_some(7)).as_deref(),
+            Some("hosted-compute-agent.service")
+        );
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/coportd.service\n";
+        assert_eq!(
+            supervisor(cgroup, 42, |_, user| user.then_some(42)).as_deref(),
+            Some("coportd.service")
+        );
     }
 
     #[test]
