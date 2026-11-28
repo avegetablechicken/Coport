@@ -38,6 +38,10 @@ _Avoid_: request log, history
 The upstream a request is sent to, the proxy it goes through and the credential it carries, chosen by its **App** from the credential or the target the client sent.
 _Avoid_: destination, path
 
+**API Key Route**:
+A **Route** chosen by the API key a request carries: a key the configuration names, a URL route that forwards any key to its upstream for the upstream to check, or the **App**'s fallback. Every other **Route** is by account: the login a token is.
+_Avoid_: key route
+
 **Saved login**:
 An **App**'s OAuth login stored on this computer where the **App** keeps it. When a **Model call** carrying a Codex, Claude or Antigravity Saved login's access token is rejected as expired, Coport renews it with a **Token refresh** and sends the call again. Grok's own client renews Grok's; Coport relays that **Token refresh** and learns its account.
 _Avoid_: credential file, stored token
