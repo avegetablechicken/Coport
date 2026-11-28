@@ -91,6 +91,22 @@ pub(super) struct RouteRecord {
 }
 
 impl RouteRecord {
+    /// An account Route's fields, as every App records them, with the
+    /// upstream its request goes to.
+    pub(super) fn account<I: crate::routing::accounts::RouteIdentity, E>(
+        route: &crate::routing::accounts::AccountRoute<I, E>,
+        upstream: String,
+    ) -> Self {
+        Self {
+            provider: route.provider.clone(),
+            upstream_base_url: Some(upstream),
+            account_id: route.account_id().map(str::to_owned),
+            account_label: route.account_label.clone(),
+            configured: route.configured,
+            ..Default::default()
+        }
+    }
+
     /// An API Key Route's fields, as every App records them.
     pub(super) fn api<E>(app: &str, route: &crate::routing::api_keys::ApiRoute<E>) -> Self {
         Self {

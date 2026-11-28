@@ -7,6 +7,7 @@ use crate::{
 use api_keys::Read;
 use url::Url;
 
+pub mod accounts;
 pub mod api_keys;
 pub mod by_url;
 pub mod target;
@@ -22,18 +23,8 @@ pub enum Route {
 /// provider whose saved login is a ChatGPT one names its account (`ext`).
 pub type ProviderRoute = api_keys::ApiRoute<Option<String>>;
 
-/// A Route by a ChatGPT login, to `base_url.account`.
-#[derive(Clone)]
-pub struct AccountRoute {
-    pub token: String,
-    pub account_id: String,
-    pub account_label: Option<String>,
-    pub proxy: Choice,
-    pub upstream: String,
-    /// A saved login, or an identity the routing maps; not one
-    /// `account_fallback` carries.
-    pub configured: bool,
-}
+/// A Route by a ChatGPT login, and the `base_url.account` it goes to.
+pub type AccountRoute = accounts::AccountRoute<Identity, String>;
 
 impl Route {
     pub fn proxy(&self) -> &Choice {
@@ -44,14 +35,14 @@ impl Route {
     }
     pub fn upstream(&self) -> &str {
         match self {
-            Self::Account(route) => &route.upstream,
+            Self::Account(route) => &route.ext,
             Self::Api(route) => &route.upstream,
         }
     }
     /// The ChatGPT account the Route's credential names.
     pub fn account_id(&self) -> Option<&str> {
         match self {
-            Self::Account(route) => Some(&route.account_id),
+            Self::Account(route) => route.account_id(),
             Self::Api(route) => route.ext.as_deref(),
         }
     }
@@ -70,7 +61,7 @@ impl Route {
     pub(crate) fn api(self) -> ProviderRoute {
         match self {
             Self::Api(route) => route,
-            Self::Account(route) => panic!("account Route {}", route.account_id),
+            Self::Account(route) => panic!("account Route {:?}", route.account_id()),
         }
     }
 }
@@ -210,12 +201,15 @@ impl Config {
                 source.unwrap_or(""),
             );
             return Ok(Route::Account(AccountRoute {
-                token: i.token,
-                account_id: i.account_id,
-                account_label,
+                token: i.token.clone(),
                 proxy,
-                upstream: self.codex.base_url.account.clone(),
+                identity: Some(i),
+                matched_login: source.is_some(),
+                provider: None,
+                account_label,
                 configured,
+                needs_profile: false,
+                ext: self.codex.base_url.account.clone(),
             }));
         }
         if let Some((selector, proxy, credential)) = found.named {

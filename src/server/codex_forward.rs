@@ -141,13 +141,7 @@ impl Adapter for Codex {
     fn record(_: &Server, route: &CodexRoute) -> RouteRecord {
         match &route.route {
             None => RouteRecord::default(),
-            Some(Route::Account(r)) => RouteRecord {
-                upstream_base_url: Some(r.upstream.clone()),
-                account_id: Some(r.account_id.clone()),
-                account_label: r.account_label.clone(),
-                configured: r.configured,
-                ..Default::default()
-            },
+            Some(Route::Account(r)) => RouteRecord::account(r, r.ext.clone()),
             // A provider's ChatGPT login is recorded by its account.
             Some(Route::Api(r)) if r.ext.is_some() => RouteRecord {
                 credential_ref: None,
@@ -200,7 +194,10 @@ impl Adapter for Codex {
         let route = route.unwrap();
         let account = route.account_id().is_some();
         let (token, account_id, upstream, custom_upstream, provider) = match route {
-            Route::Account(r) => (r.token, Some(r.account_id), r.upstream, false, false),
+            Route::Account(r) => {
+                let account_id = r.account_id().map(str::to_owned);
+                (r.token, account_id, r.ext, false, false)
+            }
             Route::Api(r) => (r.key, r.ext, r.upstream, r.custom_upstream, true),
         };
         let url = if let Some(method) = account_query_for_route(target, account) {

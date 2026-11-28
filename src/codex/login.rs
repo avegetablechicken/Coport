@@ -572,7 +572,7 @@ secret_auth_storage = false
             .unwrap()
             .account();
         assert_eq!(route.account_label.as_deref(), Some("profile@example.com"));
-        assert_eq!(route.account_id, "account-1");
+        assert_eq!(route.account_id(), Some("account-1"));
         assert_eq!(route.proxy.label(), "other");
         email_config.codex.account_auth_file_only = true;
         assert!(
