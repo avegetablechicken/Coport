@@ -15,6 +15,7 @@ use crate::{
     config::{Choice, Config, Routing, validate_upstream},
     identity::valid_token,
     refresh_routes::RefreshRoutes,
+    routing::api_keys::{ApiKeys, Read, Texts},
 };
 mod account;
 pub(crate) use account::Endpoint;
@@ -215,23 +216,13 @@ pub struct GrokRoute {
     pub url: Url,
 }
 
-/// How an API key's request routes: by its key or upstream URL.
-pub struct ApiRoute {
-    /// The `routing.api_key` key, which records name.
-    pub selector: String,
-    pub proxy: Choice,
-    pub upstream: String,
-    /// The key is a named one, not one a URL route or `fallback` carries.
-    pub configured: bool,
-    /// An upstream other than xAI's, reached with the platform's TLS as
-    /// Codex's URL routes.
-    pub custom_upstream: bool,
-    pub url: Url,
-}
+/// An API key's Route: by its key or upstream URL. Grok adds nothing.
+pub type ApiRoute = crate::routing::api_keys::ApiRoute;
 
 pub enum GrokTarget {
     Account(GrokRoute),
-    Api(ApiRoute),
+    /// An API Key Route and the URL its request goes to.
+    Api(ApiRoute, Url),
 }
 
 /// Whether a target names an upstream URL rather than a path.
@@ -330,15 +321,21 @@ impl Grok {
     /// value is the key, such as `XAI_API_KEY`, or an upstream URL.
     fn validate_api_routes(&self, config: &Config) -> Result<()> {
         self.api_upstream(&validate_upstream(&self.base_url.api_key)?, true)?;
-        for (selector, choice) in &self.routing.api_key {
-            if crate::routing::by_url::is_url_selector(selector) {
-                self.api_upstream(&crate::routing::by_url::validate_upstream(selector)?, false)?;
-            } else {
-                crate::config::validate_env(selector)?;
-            }
-            config.validate_choice(choice)?;
-        }
-        crate::routing::by_url::validate_routes(&self.routing.api_key)
+        self.api_keys().validate(
+            config,
+            |url| self.api_upstream(&crate::routing::by_url::validate_upstream(url)?, false),
+            crate::config::validate_env,
+        )
+    }
+
+    fn api_keys(&self) -> ApiKeys<'_> {
+        ApiKeys::new(
+            &self.routing.api_key,
+            Texts {
+                ambiguous: "Grok credential matches multiple routes.",
+                duplicate: "Multiple Grok routes have the same credential.",
+            },
+        )
     }
 
     /// xAI's own hosts stay routed by credential: a URL route forwards any
@@ -362,38 +359,25 @@ impl Grok {
         Ok(())
     }
 
-    /// Environment variable selectors, as opposed to URL routes.
-    fn key_selectors(&self) -> impl Iterator<Item = (&String, &Choice)> {
-        self.routing
-            .api_key
-            .iter()
-            .filter(|(selector, _)| !crate::routing::by_url::is_url_selector(selector))
-    }
-
     /// Whether API keys without a URL route are served: by name or `fallback`.
     pub(crate) fn serves_api_keys(&self) -> bool {
-        self.routing.fallback.is_some() || self.key_selectors().next().is_some()
+        self.routing.fallback.is_some() || self.api_keys().named().next().is_some()
     }
 
     /// Display classification, as Codex's and Claude's `api_key_kind`.
     pub fn api_key_kind(&self, selector: &str) -> &'static str {
-        if crate::routing::by_url::is_url_selector(selector) {
-            "gateway"
-        } else {
-            "api_key"
-        }
+        self.api_keys().kind(selector)
     }
 
     /// The upstream a selector forwards to when its request names none; none
     /// for URL routes, whose requests name it.
     pub fn api_key_upstream(&self, selector: &str) -> Option<&str> {
-        (!crate::routing::by_url::is_url_selector(selector))
-            .then_some(self.base_url.api_key.as_str())
+        (!self.api_keys().is_url(selector)).then_some(self.base_url.api_key.as_str())
     }
 
     /// Whether an API key URL route serves this unprefixed target.
     pub(crate) fn url_route_matches(&self, target: &str) -> Result<bool> {
-        Ok(crate::routing::by_url::match_route(&self.routing.api_key, target)?.is_some())
+        Ok(self.api_keys().url_route(target)?.is_some())
     }
 
     /// Origins of the session API: the configured one and Grok Build's own.
@@ -553,33 +537,29 @@ impl Grok {
             return self.account_route(token, Some(identity), false, label, rest);
         }
         // A URL route forwards any key to its upstream, for it to validate.
-        if let Some((selector, proxy)) =
-            crate::routing::by_url::match_route(&self.routing.api_key, rest)?
-        {
-            let upstream = crate::routing::by_url::validate_upstream(selector)?;
-            return Ok(GrokTarget::Api(ApiRoute {
-                selector: selector.into(),
-                proxy: proxy.clone(),
-                url: crate::routing::upstream_url(upstream.as_str(), rest, false)?,
-                upstream: upstream.as_str().trim_end_matches('/').into(),
-                configured: false,
-                custom_upstream: true,
-            }));
+        if let Some((selector, proxy, upstream)) = self.api_keys().url_route(rest)? {
+            let url = crate::routing::upstream_url(upstream.as_str(), rest, false)?;
+            return Ok(GrokTarget::Api(
+                ApiRoute {
+                    selector,
+                    proxy,
+                    upstream: upstream.as_str().trim_end_matches('/').into(),
+                    key: token.into(),
+                    configured: false,
+                    custom_upstream: true,
+                    ext: (),
+                },
+                url,
+            ));
         }
-        let mut matches = Vec::new();
-        let mut keys_unavailable = false;
-        for (name, proxy) in self.key_selectors() {
-            match lookup(name.clone()).await {
-                Ok(value) if value == token => matches.push((name, proxy)),
-                Ok(_) => {}
-                Err(_) => keys_unavailable = true,
-            }
-        }
-        if matches.len() > 1 {
-            return Err(Error::new(409, "Grok credential matches multiple routes."));
-        }
-        if let Some((name, proxy)) = matches.pop() {
-            return self.api_route(name, proxy, true, rest).map(GrokTarget::Api);
+        let lookup = &lookup;
+        let found = self
+            .api_keys()
+            .find(|name| async move { Ok(Read::compare(lookup(name.into()).await, token)) })
+            .await?;
+        let keys_unavailable = found.unavailable;
+        if let Some((name, proxy, ())) = found.named {
+            return self.api_route(name, proxy, true, token, rest);
         }
         // xAI's access tokens are JWTs; its API keys are opaque.
         if let Some(identity) = GrokIdentity::claims(token) {
@@ -596,9 +576,7 @@ impl Grok {
             return self.account_route(token, Some(identity), false, label, rest);
         }
         if let Some(proxy) = &self.routing.fallback {
-            return self
-                .api_route(API_KEY_FALLBACK, proxy, false, rest)
-                .map(GrokTarget::Api);
+            return self.api_route(API_KEY_FALLBACK, proxy, false, token, rest);
         }
         Err(if unavailable || keys_unavailable {
             Error::config("No matching Grok route; credential source unavailable.")
@@ -643,15 +621,22 @@ impl Grok {
         selector: &str,
         proxy: &Choice,
         configured: bool,
+        key: &str,
         rest: &str,
-    ) -> Result<ApiRoute> {
-        let route = |upstream: &str, url: Url, custom_upstream: bool| ApiRoute {
-            selector: selector.into(),
-            proxy: proxy.clone(),
-            upstream: upstream.trim_end_matches('/').into(),
-            configured,
-            custom_upstream,
-            url,
+    ) -> Result<GrokTarget> {
+        let route = |upstream: &str, url: Url, custom_upstream: bool| {
+            GrokTarget::Api(
+                ApiRoute {
+                    selector: selector.into(),
+                    proxy: proxy.clone(),
+                    upstream: upstream.trim_end_matches('/').into(),
+                    key: key.into(),
+                    configured,
+                    custom_upstream,
+                    ext: (),
+                },
+                url,
+            )
         };
         let base = self.base_url.api_key.as_str();
         if !explicit(rest) {
@@ -740,15 +725,13 @@ impl Grok {
 
     /// As Claude's: each named key is readable and names one route.
     async fn check_api_keys(&self) -> Result<()> {
-        let mut keys = std::collections::HashSet::new();
-        for (name, _) in self.key_selectors() {
-            if !keys.insert(crate::identity::environment_key_with_shell(name, true).await?) {
-                return Err(Error::config(
-                    "Multiple Grok routes have the same credential.",
-                ));
-            }
-        }
-        Ok(())
+        self.api_keys()
+            .check_distinct(&mut Default::default(), |name| async move {
+                Ok(vec![
+                    crate::identity::environment_key_with_shell(name, true).await?,
+                ])
+            })
+            .await
     }
 
     /// Whether named API keys and, for file-only routing, a saved login can
@@ -824,13 +807,24 @@ pub(crate) mod tests {
     fn account(target: Result<GrokTarget>) -> GrokRoute {
         match target {
             Ok(GrokTarget::Account(route)) => route,
-            Ok(GrokTarget::Api(route)) => panic!("API route {}", route.selector),
+            Ok(GrokTarget::Api(route, _)) => panic!("API route {}", route.selector),
             Err(error) => panic!("{}", error.message),
         }
     }
-    fn api(target: Result<GrokTarget>) -> ApiRoute {
+    /// An API Key Route, with the URL its request goes to.
+    struct Api {
+        route: ApiRoute,
+        url: Url,
+    }
+    impl std::ops::Deref for Api {
+        type Target = ApiRoute;
+        fn deref(&self) -> &ApiRoute {
+            &self.route
+        }
+    }
+    fn api(target: Result<GrokTarget>) -> Api {
         match target {
-            Ok(GrokTarget::Api(route)) => route,
+            Ok(GrokTarget::Api(route, url)) => Api { route, url },
             Ok(GrokTarget::Account(_)) => panic!("account route"),
             Err(error) => panic!("{}", error.message),
         }

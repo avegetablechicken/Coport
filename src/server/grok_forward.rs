@@ -250,7 +250,7 @@ pub(super) enum Route {
     Account(GrokRoute),
     /// An xAI API or gateway request, as Codex's and Claude's API key
     /// requests: its key is relayed as sent, for the upstream to validate.
-    Api(ApiRoute, String),
+    Api(ApiRoute, Url),
 }
 
 impl Adapter for super::pipeline::Grok {
@@ -289,16 +289,7 @@ impl Adapter for super::pipeline::Grok {
                 .await?
             {
                 GrokTarget::Account(route) => Route::Account(route),
-                GrokTarget::Api(route) => {
-                    let key = parts
-                        .headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "))
-                        .unwrap_or_default()
-                        .to_owned();
-                    Route::Api(route, key)
-                }
+                GrokTarget::Api(route, url) => Route::Api(route, url),
             },
         ))
     }
@@ -347,20 +338,14 @@ impl Adapter for super::pipeline::Grok {
                 configured: route.configured,
                 ..Default::default()
             },
-            Route::Api(route, key) => RouteRecord {
-                provider: Some(route.selector.clone()),
-                upstream_base_url: Some(route.upstream.clone()),
-                credential_ref: crate::identity::shared_api_reference("Grok", &route.upstream, key),
-                configured: route.configured,
-                ..Default::default()
-            },
+            Route::Api(route, _) => RouteRecord::api("Grok", route),
         }
     }
 
     fn build(_: &Server, route: Route, _: &Parts, _: &Target, _: &mut RequestLog) -> Result<Relay> {
         let (url, proxy, native_tls, token) = match route {
             Route::Account(route) => (route.url, route.proxy, false, route.token),
-            Route::Api(route, key) => (route.url, route.proxy, route.custom_upstream, key),
+            Route::Api(route, url) => (url, route.proxy, route.custom_upstream, route.key),
         };
         Ok(Relay {
             url,
