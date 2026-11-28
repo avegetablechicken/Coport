@@ -11,7 +11,7 @@ pub struct AccountRoute<I, E = ()> {
     /// The account, once the App knows it: locally, or by an Account lookup.
     pub identity: Option<I>,
     /// The token is a Saved login's. Claude counts one its Account lookup
-    /// named as matched too.
+    /// named as matched too, but only once it has.
     pub matched_login: bool,
     /// What records name the Route as `provider`, where the App names one.
     pub provider: Option<String>,
@@ -23,6 +23,14 @@ pub struct AccountRoute<I, E = ()> {
     /// An Account lookup must name the account before the request is sent.
     pub needs_profile: bool,
     pub ext: E,
+}
+
+impl<I, E> AccountRoute<I, E> {
+    /// The token of the Saved login a Model call may renew: this Route's,
+    /// if it is a Saved login's. Renewal still checks the login it reads.
+    pub fn saved_login(&self) -> Option<&str> {
+        self.matched_login.then_some(self.token.as_str())
+    }
 }
 
 /// The account an App's identity records name.

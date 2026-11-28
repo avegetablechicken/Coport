@@ -3,7 +3,7 @@
 use super::identity_directory::{Directory, Lookup, State, Texts};
 use super::pipeline::{Adapter, Claude, Credential, Plan, Relay, RouteRecord, TokenRoute};
 use super::*;
-use crate::claude::{ClaudeIdentity, ClaudeRoute, KeyHeader};
+use crate::claude::{ClaudeIdentity, ClaudeRoute};
 use crate::route_activation::Login;
 use hyper::http::request::Parts;
 
@@ -182,13 +182,11 @@ impl Adapter for Claude {
         Ok(route)
     }
 
-    /// A Bearer token on Claude's own upstream may be a Saved login's; only
-    /// one whose account the lookup matches is renewed.
+    /// Only an account Route's token can be a Saved login's.
     fn saved_login(pending: &ClaudeRoute) -> Option<&str> {
         match pending {
-            ClaudeRoute::Account(route) => Some(&route.token),
-            ClaudeRoute::Api(route) => (route.ext == KeyHeader::Bearer && !route.custom_upstream)
-                .then_some(route.key.as_str()),
+            ClaudeRoute::Account(route) => route.saved_login(),
+            ClaudeRoute::Api(_) => None,
         }
     }
 

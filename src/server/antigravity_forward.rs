@@ -361,7 +361,7 @@ impl Adapter for super::pipeline::Antigravity {
     }
 
     fn saved_login((route, _): &(AntigravityRoute, Url)) -> Option<&str> {
-        route.matched_login.then_some(route.token.as_str())
+        route.saved_login()
     }
 
     async fn complete(

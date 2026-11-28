@@ -129,7 +129,7 @@ impl Adapter for Codex {
 
     fn saved_login(pending: &CodexRoute) -> Option<&str> {
         match &pending.route {
-            Some(Route::Account(route)) if !pending.docs => Some(&route.token),
+            Some(Route::Account(route)) => route.saved_login(),
             _ => None,
         }
     }
