@@ -93,7 +93,6 @@ function configSettings() {
     `${field("listen_port", "Listen port")}
      ${flag("allow_external_access", "Share statistics", "Requires external_data in the configuration file. Shares read-only statistics. Restart to apply.")}
      ${flag("connect_credential_routing", "Enable HTTPS proxy", "Other apps can use Coport via HTTPS_PROXY. Routes by account or API key. Requires trusting Coport's CA. Restart to apply.")}
-     ${v.connect_credential_routing ? flag("connect_passthrough", "Pass through other hosts", "Non-API hosts follow the system proxy settings, unread and unlogged. Restart to apply.") : ""}
      ${field("request_timeout_seconds", "Request timeout", "s")}
      <details class="disclosure" id="websocket-timeouts" ${ui.websocketOpen ? "open" : ""}><summary>${ICON.chevron}WebSocket timeouts</summary>
        ${field("websocket.first_message_seconds", "First message", "s")}
